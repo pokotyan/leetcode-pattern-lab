@@ -14,7 +14,9 @@ export type GNode = {
 export type GEdge = {
   from: number
   to: number
-  state?: 'idle' | 'active' | 'dim' | 'good'
+  state?: 'idle' | 'active' | 'dim' | 'good' | 'bad'
+  /** 辺の中点に出す小さなラベル（重みなど） */
+  label?: string | number
 }
 
 const EDGE_COLOR = {
@@ -22,6 +24,7 @@ const EDGE_COLOR = {
   active: 'var(--accent)',
   dim: 'var(--border)',
   good: 'var(--ok)',
+  bad: 'var(--danger)',
 } as const
 
 const R = 20
@@ -48,7 +51,7 @@ export function GraphView({
       role="img"
     >
       <defs>
-        {(['idle', 'active', 'dim', 'good'] as const).map((k) => (
+        {(['idle', 'active', 'dim', 'good', 'bad'] as const).map((k) => (
           <marker
             key={k}
             id={`arrow-${k}`}
@@ -74,19 +77,50 @@ export function GraphView({
         const ux = dx / len
         const uy = dy / len
         const k = e.state ?? 'idle'
+        const mx = (a.x + b.x) / 2
+        const my = (a.y + b.y) / 2
         return (
-          <line
-            key={i}
-            x1={a.x + ux * R}
-            y1={a.y + uy * R}
-            x2={b.x - ux * (R + 4)}
-            y2={b.y - uy * (R + 4)}
-            stroke={EDGE_COLOR[k]}
-            strokeWidth={k === 'active' || k === 'good' ? 2.5 : 1.5}
-            strokeDasharray={k === 'dim' ? '4 4' : undefined}
-            opacity={k === 'dim' ? 0.4 : 1}
-            markerEnd={directed ? `url(#arrow-${k})` : undefined}
-          />
+          <g key={i}>
+            <line
+              x1={a.x + ux * R}
+              y1={a.y + uy * R}
+              x2={b.x - ux * (R + 4)}
+              y2={b.y - uy * (R + 4)}
+              stroke={EDGE_COLOR[k]}
+              strokeWidth={k === 'active' || k === 'good' ? 2.5 : 1.5}
+              strokeDasharray={k === 'dim' ? '4 4' : undefined}
+              opacity={k === 'dim' ? 0.4 : 1}
+              markerEnd={directed ? `url(#arrow-${k})` : undefined}
+            />
+            {e.label !== undefined && (
+              <>
+                <rect
+                  x={mx - 9}
+                  y={my - 8}
+                  width={18}
+                  height={14}
+                  rx={3}
+                  fill="var(--bg-soft)"
+                  stroke={EDGE_COLOR[k]}
+                  strokeWidth={1}
+                  opacity={k === 'dim' ? 0.5 : 1}
+                />
+                <text
+                  x={mx}
+                  y={my - 1}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  fontSize="10"
+                  fontWeight="700"
+                  fontFamily="ui-monospace, monospace"
+                  fill={EDGE_COLOR[k]}
+                  opacity={k === 'dim' ? 0.5 : 1}
+                >
+                  {e.label}
+                </text>
+              </>
+            )}
+          </g>
         )
       })}
 

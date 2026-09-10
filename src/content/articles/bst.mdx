@@ -1,46 +1,145 @@
 ---
-title: 二分探索木
-description: 左部分木 < 節点 < 右部分木。in-order が昇順になる性質を使う
+title: 二分探索木（並び順そのものが構造になっている木）
+description: 「左の子より大きい」だけでは足りない。部分木全体が範囲に収まっているかを、DFS で確かめる
 section: tree
 order: 2
-status: planned
+status: published
 requires:
   - tree-traversal
+  - binary-search
 problems:
   - name: Validate Binary Search Tree
     url: https://leetcode.com/problems/validate-binary-search-tree/
     level: Medium
     importance: 高
     technique: 範囲を渡す DFS
+  - name: Insert into a Binary Search Tree
+    url: https://leetcode.com/problems/insert-into-a-binary-search-tree/
+    level: Medium
+    importance: 高
+    technique: 探索と同じ経路
   - name: Kth Smallest Element in a BST
     url: https://leetcode.com/problems/kth-smallest-element-in-a-bst/
     level: Medium
     importance: 高
     technique: in-order
-  - name: Lowest Common Ancestor of a BST
+  - name: Lowest Common Ancestor of a Binary Search Tree
     url: https://leetcode.com/problems/lowest-common-ancestor-of-a-binary-search-tree/
     level: Medium
     importance: 高
     technique: 性質の利用
-  - name: Insert into a Binary Search Tree
-    url: https://leetcode.com/problems/insert-into-a-binary-search-tree/
-    level: Medium
-    importance: 中
-    technique: 挿入
 ---
 
-## BST の定義
+import Callout from '../../components/Callout.astro'
+import ValidateBST from '../../components/sim/problems/ValidateBST'
+import InsertIntoBST from '../../components/sim/problems/InsertIntoBST'
 
-「左の子より大きい」ではなく「左部分木のすべてより大きい」であること。
+## 二分探索木は「並んでいる」木です
 
-## 検証は範囲を渡す
+二分探索木（BST）は、こういう性質を持つ特別な二分木です。
 
-各ノードに取りうる下限と上限を渡しながら降りる。
+> どのノードを見ても、**その左の部分木にある値はすべて自分より小さく、右の部分木にある値はすべて自分より大きい**
 
-## in-order は昇順
+この性質のおかげで、配列の二分探索と同じように、「探している値より大きいか小さいか」を見て、毎回左右どちらかだけに絞って進めます。木の高さを `H` とすると、探索・挿入・削除がすべて O(H) で済みます。バランスの取れた木なら `H` はだいたい `log N` です。
 
-k 番目を求める問題が in-order の途中で打ち切れる理由。
+## 「左の子より大きい」だけでは、実は足りません
 
-## 平衡が崩れると O(N)
+BST かどうかを判定する問題を見てみます。
 
-一直線の BST での最悪計算量と、平衡二分探索木の存在。
+> 二分木の根が与えられます。これが二分探索木の条件を満たしているか判定してください。
+
+一見すると、「各ノードで、左の子より大きく、右の子より小さいか」を確認すればよさそうに思えるかもしれません。でも、これだけでは不十分です。次のような木を考えてみてください。
+
+```
+        5
+       / \
+      3   8
+         / \
+        7   9
+```
+
+ここに、右の子 `8` の**左**の子として `7` ではなく `1` が入っていたとします。`8` から見れば「左の子1は8より小さい」ので条件を満たしているように見えますが、`1` は根の `5` から見ると**左の部分木（3未満）に属すべき値**です。つまり、**「直接の親子関係」だけを見ていると、もっと遠くの祖先との関係を見落とします。**
+
+正しくは、**各ノードが「取りうる値の範囲」を、根から再帰的に絞り込みながら渡していく**必要があります。根では範囲は無限大（`-∞` 〜 `∞`）ですが、左の子に進むたびに上限が今のノードの値に更新され、右の子に進むたびに下限が更新されます。
+
+```python
+def is_valid_bst(root):
+    def dfs(node, lo, hi):
+        if not node:
+            return True
+        if not (lo < node.val < hi):
+            return False              # 許される範囲からはみ出した
+        # 左の部分木は (lo, node.val)、右の部分木は (node.val, hi) の範囲で
+        return dfs(node.left, lo, node.val) and dfs(node.right, node.val, hi)
+    return dfs(root, float("-inf"), float("inf"))
+```
+
+<ValidateBST client:visible />
+
+「一見それらしいが無効」のプリセットを試してみてください。木の見た目はそれらしいのに、ある `7` が、根から見た範囲をはみ出しているために `False` と判定される様子が見えます。**部分木の情報を、行きがけに「範囲」という形で下へ渡している**のが、前の記事の「行きがけ」の使い方の実例です。
+
+<Callout type="tip" title="in-order 巡回でも判定できます">
+  BST を in-order（左 → 自分 → 右の順）で巡回すると、値が必ず昇順に並びます。この性質を使って、「in-order で訪れた値が、直前の値より大きいかどうか」を確認していく方法でも同じ問題が解けます。どちらの解き方も知っておくと、フォローアップで「別の方法でも解けますか」と聞かれたときに困りません。
+</Callout>
+
+## 探索と同じ道を通って、挿入する
+
+BST の「並んでいる」という性質は、挿入にもそのまま活きます。
+
+> BST の根と、挿入したい値 `val` が与えられます。BST の性質を保ったまま `val` を挿入してください。
+
+やることは、探索とほとんど同じです。根から出発して、`val` が今のノードより小さければ左へ、大きければ右へ進みます。これを、**進みたい方向に子がいなくなるまで**繰り返し、子がいない場所に新しいノードを作ってつなげます。
+
+```python
+def insert_into_bst(root, val):
+    if not root:
+        return TreeNode(val)
+    node = root
+    while True:
+        if val < node.val:
+            if not node.left:
+                node.left = TreeNode(val)   # 空いている場所を見つけた
+                return root
+            node = node.left                 # まだ先がある。潜る
+        else:
+            if not node.right:
+                node.right = TreeNode(val)
+                return root
+            node = node.right
+```
+
+<InsertIntoBST client:visible />
+
+<Callout type="tip" title="挿入の答えは1通りではありません">
+  同じ値の集合でも、挿入する順番によってできあがる木の形は変わります。この問題は「BST の性質さえ保たれていれば、どこに挿入してもよい」ので、**探索で見つけた「値が無い場所」にそのまま置く**という一番素直な方法で十分です。無理に木のバランスを取ろうとする必要はありません（バランスを保つ木は別の発展的な話題になります）。
+</Callout>
+
+## なぜ計算量が O(log N) になったり O(N) になったりするのか
+
+BST の操作はどれも「木の高さの分だけ」で終わります。問題は、その高さが常に `log N` とは限らないことです。
+
+値を `1, 2, 3, 4, 5` の順番で挿入していくとどうなるか考えてみてください。`1` の右に `2`、その右に `3`……というふうに、**右にだけ伸びる一直線の木**ができあがります。これでは高さが `N` になってしまい、探索も挿入も O(N) かかります。連結リストと同じ形になってしまうわけです。
+
+これを防ぐために、木の高さを一定に保つ工夫をした「平衡二分探索木」という発展的な構造がありますが、コーディング面接で実装を求められることはまずありません。**「BST は入力の順番によって最悪 O(N) になり得る」ということを知っていて、口頭で説明できる**ことのほうが重要です。
+
+## この型の計算量
+
+| 用途 | 平均（バランスが取れている場合） | 最悪（偏っている場合） |
+| --- | --- | --- |
+| 探索・挿入 | O(log N) | O(N) |
+| Validate BST（全ノードを見る） | O(N) | O(N) |
+
+## 「これは二分探索木だ」と気づくためのサイン
+
+- 問題文に「二分探索木（Binary Search Tree）」と明記されている
+- 「探索・挿入・削除を効率的に」という要求
+- 「in-order で辿ると昇順になる」という性質を使えそうな問題（k番目に小さい値、など）
+- 2つのノードの共通祖先を求める問題で、**値の大小関係だけで、どちらの方向に進むべきか判断できる**（普通の二分木の LCA より簡単に解けます）
+
+## この記事のチェックリスト
+
+- [ ] 「親子関係だけを見る」判定方法が、なぜ不十分なのか、具体例で説明できる
+- [ ] 範囲 `(lo, hi)` が、左の子・右の子に進むときにどう更新されるか説明できる
+- [ ] 挿入が「探索と同じ経路をたどる」理由を説明できる
+- [ ] BST の高さが最悪 O(N) になってしまう入力例を1つ挙げられる
+- [ ] 記事冒頭のリストの Medium を、解説を見ずに実装できる

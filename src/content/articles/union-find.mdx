@@ -1,22 +1,22 @@
 ---
-title: Union-Find（動的な連結判定）
-description: グループの併合と所属判定をほぼ定数時間で行う
+title: Union-Find（グループ分けを、その場でどんどん更新する）
+description: 辺が追加されるたびに「同じグループか」をほぼ定数時間で判定する。閉路検出の新しい道具
 section: graph
 order: 3
-status: planned
+status: published
 requires:
   - graph-bfs-dfs
 problems:
+  - name: Redundant Connection
+    url: https://leetcode.com/problems/redundant-connection/
+    level: Medium
+    importance: 高
+    technique: Union-Find
   - name: Number of Provinces
     url: https://leetcode.com/problems/number-of-provinces/
     level: Medium
     importance: 高
     technique: Union-Find
-  - name: Redundant Connection
-    url: https://leetcode.com/problems/redundant-connection/
-    level: Medium
-    importance: 高
-    technique: 閉路検出
   - name: Accounts Merge
     url: https://leetcode.com/problems/accounts-merge/
     level: Medium
@@ -29,18 +29,82 @@ problems:
     technique: 最小全域木
 ---
 
-## BFS/DFS で足りない場面
+import Callout from '../../components/Callout.astro'
+import RedundantConnection from '../../components/sim/problems/RedundantConnection'
 
-辺が動的に追加され、その都度グループ数を知りたい場合。
+## DFS / BFS だけでは足りない場面
 
-## 経路圧縮とランク
+グラフの記事で、「閉路があるかどうか」を DFS で判定する方法を見ました。ただし、それは**グラフが最初から全部揃っている**ことが前提でした。次のような問題ではどうでしょうか。
 
-2つの最適化を入れるとほぼ O(1) になる仕組み。
+> 辺が1本ずつ、順番に追加されていきます。追加した瞬間に、両端のノードがすでに何らかの経路でつながっていたら、その辺は「輪っかを作ってしまう余分な1本」です。最初に見つかる、その余分な辺を答えてください。
 
-## 閉路検出
+「辺が追加されるたびに、毎回グラフ全体を DFS で確認する」ことでも解けますが、辺の数だけ DFS を繰り返すことになり、遅くなってしまいます。ここで使うのが Union-Find（またはUnion-Find Forest）という、専用のデータ構造です。
 
-追加する辺の両端がすでに同じグループなら閉路になる。
+## 「同じグループの代表」という考え方
 
-## クラスカル法
+Union-Find は、それぞれのノードが「自分の属するグループの代表（root）は誰か」という情報だけを持ちます。最初は全員がバラバラなので、**自分自身が自分の代表**です。
 
-辺を軽い順に見て、閉路を作らないものを採用する最小全域木。
+辺で2つのノードを繋ぐときは、**それぞれの代表を調べて、片方の代表をもう片方に合わせます。** こうすると、同じグループに属するノードは、たどっていくと必ず同じ代表にたどり着くようになります。
+
+「2つのノードが同じグループか」を調べたいときは、両方の代表を調べて、それが一致するかどうかを見るだけです。**もし新しく繋ごうとしている2つのノードが、すでに同じ代表を持っているなら、その2つはすでにどこかの経路でつながっている**ということです。これが、新しく引こうとしている辺が「余分」だと判定できる理由です。
+
+```python
+def find_redundant_connection(edges):
+    n = len(edges)
+    root = list(range(n + 1))
+
+    def find(x):
+        while root[x] != x:
+            root[x] = root[root[x]]   # 経路圧縮（簡易版）
+            x = root[x]
+        return x
+
+    for a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return [a, b]              # すでに繋がっていた辺が冗長
+        root[ra] = rb
+    return []
+```
+
+<RedundantConnection client:visible />
+
+「一直線 + 輪っか」のプリセットを試してみてください。`1-2-3-4` と順番に繋がったあと、最後に `4-1` の辺が来ます。この時点で `4` の代表と `1` の代表はすでに同じグループになっているので、この辺が「余分」だと判定されます。
+
+<Callout type="tip" title="経路圧縮：なぜ ほぼ 定数時間で済むのか">
+  `find` 関数の中にある `root[x] = root[root[x]]` という1行が、**経路圧縮**と呼ばれる工夫です。代表を調べるついでに、たどった経路を短くしておくことで、次に同じノードの代表を調べるときの手間を減らします。
+  これに加えて「小さいグループを大きいグループにくっつける」というランクによる工夫も組み合わせると、`find` と `union` は理論上、ほぼ定数時間（正確には逆アッカーマン関数という、実用上は定数とみなせるとても小さい値）で終わります。名前だけ知っておけば十分で、証明までは覚える必要はありません。
+</Callout>
+
+## なぜ DFS より速いと言えるのか
+
+DFS で閉路を検出する場合、辺が1本追加されるたびに、グラフ全体を歩き直す必要があります。辺の数を `M` とすると、全体では O(M × N) になりかねません。
+
+Union-Find なら、`find` と `union` がそれぞれほぼ定数時間で終わるので、辺を1本追加するたびの処理がほぼ O(1) です。辺が `M` 本あっても、全体でほぼ O(M) で済みます。**「関係性が、あとからどんどん追加されていく」という状況に強い**のが Union-Find の一番の持ち味です。
+
+## この型の計算量
+
+| 操作 | 時間（経路圧縮 + ランクありの場合） | 空間 |
+| --- | --- | --- |
+| `find`（代表を調べる） | ほぼ O(1) | O(N) |
+| `union`（2つのグループを繋げる） | ほぼ O(1) | O(N) |
+| 辺が M 本あるときの合計 | ほぼ O(M) | O(N) |
+
+## 「これは Union-Find だ」と気づくためのサイン
+
+- 「グループが**あとから追加される関係**によって、どんどん変わっていく」
+- 「2つのものが**同じグループに属するか**」を、何度も繰り返し判定したい
+- 「閉路を作ってしまう辺を見つけよ」（`Redundant Connection` のように）
+- 「連結成分の**個数**」を求めたいが、グラフが動的に変化する（`Number of Provinces` など）
+
+<Callout type="warn" title="静的なグラフなら、無理に使わなくてよい">
+  最初からグラフ全体が揃っていて、一度だけ連結成分を数えればいい場合（`Number of Islands` のような問題）は、DFS や BFS で十分です。Union-Find は「関係性があとから追加されていく」場面や、「同じグループかどうかを何度も問い合わせる」場面で本領を発揮します。どちらの型で解くべきか、問題の性質を見て選んでください。
+</Callout>
+
+## この記事のチェックリスト
+
+- [ ] Union-Find が「あとから辺が追加される」場面で DFS より有利な理由を説明できる
+- [ ] 「代表が同じ」がなぜ「すでに繋がっている」を意味するのか説明できる
+- [ ] 経路圧縮が何をしている工夫か、一言で説明できる
+- [ ] Union-Find を使うべきでない場面（静的なグラフの一括処理）を1つ挙げられる
+- [ ] 記事冒頭のリストの Medium を、解説を見ずに実装できる
