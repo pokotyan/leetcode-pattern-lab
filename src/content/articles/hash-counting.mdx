@@ -1,0 +1,58 @@
+---
+title: ハッシュテーブル（O(1) 参照で二重ループを潰す）
+description: 存在判定・カウント・グルーピング。Medium で最も併用される道具
+section: hashing
+order: 1
+status: planned
+problems:
+  - name: Two Sum
+    url: https://leetcode.com/problems/two-sum/
+    level: Easy
+    importance: 高
+    technique: 存在判定
+  - name: Contains Duplicate
+    url: https://leetcode.com/problems/contains-duplicate/
+    level: Easy
+    importance: 高
+    technique: 集合
+  - name: Valid Anagram
+    url: https://leetcode.com/problems/valid-anagram/
+    level: Easy
+    importance: 高
+    technique: カウント
+  - name: Group Anagrams
+    url: https://leetcode.com/problems/group-anagrams/
+    level: Medium
+    importance: 高
+    technique: キー設計
+  - name: Top K Frequent Elements
+    url: https://leetcode.com/problems/top-k-frequent-elements/
+    level: Medium
+    importance: 高
+    technique: カウント + バケット
+  - name: Longest Consecutive Sequence
+    url: https://leetcode.com/problems/longest-consecutive-sequence/
+    level: Medium
+    importance: 高
+    technique: 集合 + 起点判定
+---
+
+## 探しながら入れる
+
+Two Sum を1パスで解く形。「後で使う値」ではなく「今欲しい値」を引く。
+
+## カウンタの型
+
+defaultdict と Counter。文字種が固定なら長さ26の配列で代用でき、定数倍が軽くなる。
+
+## キーを設計する
+
+Group Anagrams で「ソート済み文字列」や「26要素のタプル」をキーにする発想。
+
+## 集合で O(N) にする
+
+Longest Consecutive Sequence で、連続列の起点だけから伸ばすことで全体を O(N) に保つ。
+
+## ハッシュが O(1) でない場合
+
+最悪計算量が O(N) になる仕組みと、面接での言及の仕方。

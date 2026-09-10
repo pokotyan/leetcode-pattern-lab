@@ -1,0 +1,60 @@
+---
+title: 二次元 DP
+description: 状態を2つ持つ。文字列2本、グリッド、選ぶ/選ばない + 容量
+section: dp
+order: 2
+status: planned
+requires:
+  - dp-basics
+problems:
+  - name: Unique Paths
+    url: https://leetcode.com/problems/unique-paths/
+    level: Medium
+    importance: 高
+    technique: グリッド DP
+  - name: Longest Common Subsequence
+    url: https://leetcode.com/problems/longest-common-subsequence/
+    level: Medium
+    importance: 高
+    technique: 文字列2本
+  - name: Edit Distance
+    url: https://leetcode.com/problems/edit-distance/
+    level: Medium
+    importance: 高
+    technique: 文字列2本
+  - name: Partition Equal Subset Sum
+    url: https://leetcode.com/problems/partition-equal-subset-sum/
+    level: Medium
+    importance: 高
+    technique: ナップサック
+  - name: Best Time to Buy and Sell Stock with Cooldown
+    url: https://leetcode.com/problems/best-time-to-buy-and-sell-stock-with-cooldown/
+    level: Medium
+    importance: 高
+    technique: 状態機械
+  - name: Coin Change II
+    url: https://leetcode.com/problems/coin-change-ii/
+    level: Medium
+    importance: 中
+    technique: ナップサック
+---
+
+## 状態が2つ必要になる合図
+
+「i 番目まで」だけでは遷移が書けないとき、何を足すか。
+
+## ナップサック
+
+「i 番目までの品物」×「容量 w 以下」で表を埋める。
+
+## 文字列2本の DP
+
+dp[i][j] を「s の i 文字目まで」×「t の j 文字目まで」に置く定石。
+
+## 状態機械として捉える
+
+株の売買問題で「保有している / していない」を状態にする。
+
+## 行を使い回して空間を削る
+
+直前の行しか使わないなら O(min(H, W)) にできる。

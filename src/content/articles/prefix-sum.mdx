@@ -1,0 +1,55 @@
+---
+title: 累積和（区間の和を O(1) で引く）
+description: 事前計算で区間クエリを定数時間にする。ハッシュテーブルと組み合わせる形まで
+section: array
+order: 3
+status: planned
+requires:
+  - sliding-window
+problems:
+  - name: Running Sum of 1d Array
+    url: https://leetcode.com/problems/running-sum-of-1d-array/
+    level: Easy
+    importance: 高
+    technique: 累積和
+  - name: Product of Array Except Self
+    url: https://leetcode.com/problems/product-of-array-except-self/
+    level: Medium
+    importance: 高
+    technique: 前後からの累積
+  - name: Subarray Sum Equals K
+    url: https://leetcode.com/problems/subarray-sum-equals-k/
+    level: Medium
+    importance: 高
+    technique: 累積和 + ハッシュ
+  - name: Subarray Sums Divisible by K
+    url: https://leetcode.com/problems/subarray-sums-divisible-by-k/
+    level: Medium
+    importance: 中
+    technique: 累積和 + 余り
+  - name: Range Sum Query - Immutable
+    url: https://leetcode.com/problems/range-sum-query-immutable/
+    level: Easy
+    importance: 中
+    technique: 累積和
+---
+
+## 区間和を毎回足し直さない
+
+長さ N+1 の配列を作り、S[j+1] - S[i] で [i, j] の和を得る形。添字が1つずれる理由。
+
+## Sliding Window との使い分け
+
+任意の区間を何度も問い合わせるなら累積和、端から順にずらすだけならウィンドウ。
+
+## 累積和とハッシュテーブル
+
+「和が k の部分配列の個数」を O(N) で数える。負の数があってもウィンドウが使えない代わりにこれが効く。
+
+## 余りで分類する
+
+「k で割り切れる部分配列」を、累積和の余りが等しいペアの数として数える。
+
+## 二次元累積和
+
+長方形領域の和を4点の足し引きで求める。

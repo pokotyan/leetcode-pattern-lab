@@ -1,0 +1,30 @@
+---
+import { getCollection, render } from 'astro:content'
+import ArticleLayout from '../../layouts/ArticleLayout.astro'
+import { SECTIONS } from '../../lib/curriculum'
+
+export async function getStaticPaths() {
+  const all = await getCollection('articles')
+  const rank = new Map(SECTIONS.map((s, i) => [s.id, i]))
+  const sorted = [...all].sort((a, b) => {
+    const sa = rank.get(a.data.section) ?? 99
+    const sb = rank.get(b.data.section) ?? 99
+    return sa !== sb ? sa - sb : a.data.order - b.data.order
+  })
+  return sorted.map((entry, i) => ({
+    params: { slug: entry.id },
+    props: {
+      entry,
+      prev: sorted[i - 1] && { id: sorted[i - 1]!.id, title: sorted[i - 1]!.data.title },
+      next: sorted[i + 1] && { id: sorted[i + 1]!.id, title: sorted[i + 1]!.data.title },
+    },
+  }))
+}
+
+const { entry, prev, next } = Astro.props
+const { Content, headings } = await render(entry)
+---
+
+<ArticleLayout entry={entry} prev={prev} next={next} headings={headings}>
+  <Content />
+</ArticleLayout>

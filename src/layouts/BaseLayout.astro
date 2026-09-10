@@ -1,0 +1,73 @@
+---
+import '../styles/global.css'
+
+type Props = { title: string; description?: string }
+const { title, description = 'LeetCode Medium を「型」で解けるようにする、図とシミュレーター付きの学習ノート' } =
+  Astro.props
+const base = import.meta.env.BASE_URL
+---
+
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧭</text></svg>"
+    />
+    <script is:inline>
+      const saved = localStorage.getItem('theme')
+      if (saved) document.documentElement.dataset.theme = saved
+    </script>
+  </head>
+  <body>
+    <header
+      class="sticky top-0 z-20 border-b backdrop-blur"
+      style="border-color: var(--border); background: color-mix(in srgb, var(--bg) 88%, transparent)"
+    >
+      <div class="mx-auto flex max-w-6xl items-center gap-4 px-4 py-3">
+        <a href={base} class="font-bold tracking-tight no-underline" style="color: var(--fg)">
+          <span style="color: var(--accent)">▲</span> LeetCode Pattern Lab
+        </a>
+        <nav class="ml-auto flex items-center gap-4 text-sm">
+          <a href={base} style="color: var(--fg-muted)">目次</a>
+          <button
+            id="theme-toggle"
+            class="rounded border px-2 py-1 text-xs"
+            style="border-color: var(--border); color: var(--fg-muted)"
+            aria-label="配色を切り替える">◑</button
+          >
+        </nav>
+      </div>
+    </header>
+
+    <main class="mx-auto max-w-6xl px-4 py-10">
+      <slot />
+    </main>
+
+    <footer
+      class="mt-16 border-t px-4 py-8 text-center text-xs"
+      style="border-color: var(--border); color: var(--fg-muted)"
+    >
+      LeetCode Pattern Lab — 図とシミュレーターで Medium を落とす
+    </footer>
+
+    <script is:inline>
+      document.getElementById('theme-toggle')?.addEventListener('click', () => {
+        const el = document.documentElement
+        const now =
+          el.dataset.theme ??
+          (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        const next = now === 'dark' ? 'light' : 'dark'
+        el.dataset.theme = next
+        localStorage.setItem('theme', next)
+      })
+    </script>
+  </body>
+</html>

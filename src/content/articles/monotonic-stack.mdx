@@ -1,0 +1,46 @@
+---
+title: 単調スタック（次に大きい要素）
+description: 「右で最初に自分より大きい要素」を全要素について O(N) で求める
+section: stack
+order: 2
+status: planned
+requires:
+  - stack-basics
+problems:
+  - name: Daily Temperatures
+    url: https://leetcode.com/problems/daily-temperatures/
+    level: Medium
+    importance: 高
+    technique: 単調スタック
+  - name: Next Greater Element I
+    url: https://leetcode.com/problems/next-greater-element-i/
+    level: Easy
+    importance: 高
+    technique: 単調スタック
+  - name: Largest Rectangle in Histogram
+    url: https://leetcode.com/problems/largest-rectangle-in-histogram/
+    level: Hard
+    importance: 中
+    technique: 単調スタック
+  - name: Maximal Rectangle
+    url: https://leetcode.com/problems/maximal-rectangle/
+    level: Hard
+    importance: 低
+    technique: ヒストグラム化
+---
+
+## 二重ループで書くと O(N^2)
+
+各要素から右を舐める素朴解と、その無駄がどこにあるか。
+
+## スタックに index を積む
+
+値ではなく index を積むと、距離も同時に求まる。
+
+## 単調性を保つ
+
+新しい要素が来たら、それより小さい要素を pop しながら答えを確定する。
+
+## ヒストグラムへの応用
+
+各要素を高さと見て、左右の限界を単調スタックで求めて最大長方形を出す。

@@ -1,0 +1,261 @@
+---
+title: グラフ探索（BFS / DFS とグリッド、トポロジカルソート）
+description: 最短距離なら BFS、連結成分や部分木の情報なら DFS。グリッドをグラフとして見る目と、依存関係を順序に直す型まで
+section: graph
+order: 1
+status: published
+requires: []
+problems:
+  - name: Number of Islands
+    url: https://leetcode.com/problems/number-of-islands/
+    level: Medium
+    importance: 高
+    technique: グリッド DFS
+  - name: Max Area of Island
+    url: https://leetcode.com/problems/max-area-of-island/
+    level: Medium
+    importance: 高
+    technique: グリッド DFS
+  - name: Rotting Oranges
+    url: https://leetcode.com/problems/rotting-oranges/
+    level: Medium
+    importance: 高
+    technique: 多始点 BFS
+  - name: 01 Matrix
+    url: https://leetcode.com/problems/01-matrix/
+    level: Medium
+    importance: 高
+    technique: 多始点 BFS
+  - name: Shortest Path in Binary Matrix
+    url: https://leetcode.com/problems/shortest-path-in-binary-matrix/
+    level: Medium
+    importance: 高
+    technique: グリッド BFS
+  - name: Course Schedule
+    url: https://leetcode.com/problems/course-schedule/
+    level: Medium
+    importance: 高
+    technique: トポロジカルソート
+  - name: Course Schedule II
+    url: https://leetcode.com/problems/course-schedule-ii/
+    level: Medium
+    importance: 高
+    technique: トポロジカルソート
+  - name: Clone Graph
+    url: https://leetcode.com/problems/clone-graph/
+    level: Medium
+    importance: 中
+    technique: DFS + ハッシュ
+---
+
+import Callout from '../../components/Callout.astro'
+import NumberOfIslands from '../../components/sim/problems/NumberOfIslands'
+import GridShortestPathBFS from '../../components/sim/problems/GridShortestPathBFS'
+import CourseSchedule from '../../components/sim/problems/CourseSchedule'
+
+## グラフの持ち方
+
+ノードとエッジで表せるものはすべてグラフになる。持ち方は2つ。
+
+| 表現 | 空間 | 2点間の関係を調べる | 使いどころ |
+| --- | --- | --- | --- |
+| 隣接リスト `graph[u] = [v, ...]` | O(N + E) | O(次数) | ほとんどの問題 |
+| 隣接行列 `graph[u][v]` | O(N²) | O(1) | ノード数が小さく、関係を頻繁に引くとき |
+
+問題では辺のリストで与えられることが多いので、まず隣接リストに変換する。
+
+```python
+graph = [[] for _ in range(n)]
+for a, b in edges:
+    graph[a].append(b)
+    graph[b].append(a)   # 無向グラフなら両方向
+```
+
+<Callout type="warn" title="無向グラフの両方向を忘れない">
+  `graph[b].append(a)` を書き忘れるのは典型的なミス。
+  有向グラフなら片方向だけ。問題文の「A を終えないと B を取れない」のような**向きの有無**を必ず確認する。
+</Callout>
+
+## BFS と DFS の使い分け
+
+どちらも全ノードを O(N + E) で訪問できるが、**訪問する順序**が違う。
+
+| | BFS | DFS |
+| --- | --- | --- |
+| データ構造 | キュー（`deque`） | 再帰（＝コールスタック） |
+| 順序 | 始点から近い順 | 行けるところまで潜る |
+| 得意 | **最短距離**、階層ごとの処理 | 連結成分、部分木の集約、閉路検出 |
+
+<Callout type="tip" title="最短距離なら必ず BFS">
+  重みなしグラフの最短距離を DFS で求めようとすると、
+  「先に着いた経路が最短とは限らない」ため全経路を試すことになる。
+  BFS は近い順に確定するので、**最初に到達した時点でそのノードの最短距離が確定**する。
+  この性質が BFS の核心になる。
+</Callout>
+
+## グリッドはグラフである
+
+Medium で最も出るのがこの形になる。二次元配列の各マスをノード、隣接するマスをエッジと見る。
+
+```python
+DIRS = ((-1, 0), (0, 1), (1, 0), (0, -1))   # 上 右 下 左
+
+for dr, dc in DIRS:
+    nr, nc = r + dr, c + dc
+    if not (0 <= nr < H and 0 <= nc < W):
+        continue          # 盤外
+    ...
+```
+
+隣接リストを作る必要はない。**4方向を計算で出す**のがグリッド問題の定石になる。
+
+### 連結成分を数える：Number of Islands
+
+未訪問の陸を見つけたらカウントを1増やし、そこから繋がる陸をすべて訪問済みにする。
+
+```python
+def num_islands(grid):
+    H, W = len(grid), len(grid[0])
+    seen = [[False] * W for _ in range(H)]
+    count = 0
+
+    def dfs(r, c):
+        if not (0 <= r < H and 0 <= c < W):
+            return                       # 盤外
+        if grid[r][c] == "0" or seen[r][c]:
+            return                       # 海 or 訪問済み
+        seen[r][c] = True
+        dfs(r - 1, c); dfs(r, c + 1)
+        dfs(r + 1, c); dfs(r, c - 1)
+
+    for r in range(H):
+        for c in range(W):
+            if grid[r][c] == "1" and not seen[r][c]:
+                count += 1               # 新しい島を発見
+                dfs(r, c)
+    return count
+```
+
+<NumberOfIslands client:visible />
+
+セルをクリックすると陸と海を入れ替えられる。島を分断したり繋げたりして、
+コールスタックの伸び方がどう変わるかを見るとよい。
+
+<Callout type="warn" title="訪問済みフラグを立てるタイミング">
+  `seen[r][c] = True` は**再帰に入った直後**に立てる。
+  子を呼ぶ前に立てておかないと、隣のマスから戻ってきて同じマスに再突入し、無限再帰になる。
+
+  なお、入力を書き換えてよい問題なら `grid[r][c] = "0"` と海に変えてしまえば `seen` は不要で、
+  空間 O(1)（再帰スタックを除く）にできる。面接ではこのトレードオフを口に出すとよい。
+</Callout>
+
+### 最短距離：グリッド BFS
+
+キューに入れる時点で距離を確定させる。取り出すときではない点に注意。
+
+```python
+from collections import deque
+
+def shortest_path(grid):
+    H, W = len(grid), len(grid[0])
+    dist = [[-1] * W for _ in range(H)]
+    q = deque([(0, 0)])
+    dist[0][0] = 0
+    while q:
+        r, c = q.popleft()                  # 近い順に取り出される
+        if (r, c) == (H - 1, W - 1):
+            return dist[r][c]
+        for dr, dc in ((-1,0),(0,1),(1,0),(0,-1)):
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < H and 0 <= nc < W):
+                continue
+            if grid[nr][nc] == 1 or dist[nr][nc] != -1:
+                continue                     # 壁 or 発見済み
+            dist[nr][nc] = dist[r][c] + 1
+            q.append((nr, nc))
+    return -1
+```
+
+<GridShortestPathBFS client:visible />
+
+`dist` が訪問済みフラグを兼ねている。`-1` なら未発見、それ以外なら距離が確定済み。
+**発見済みのマスには二度と触らない**のが正しさと計算量の両方を支えている。
+
+<Callout type="tip" title="多始点 BFS">
+  `Rotting Oranges` や `01 Matrix` は、**始点が複数ある** BFS になる。
+  やることは1つだけで、**最初に全部の始点をキューに入れてから**同じループを回す。
+  すると各マスは「最も近い始点からの距離」で確定する。始点ごとに BFS を回す必要はない。
+</Callout>
+
+## 依存関係を順序に直す：トポロジカルソート
+
+`Course Schedule` は「A を終えないと B を取れない」という有向グラフから、
+全部を消化できる順序があるか（＝閉路が無いか）を判定する。
+
+Kahn のアルゴリズムは**入次数**を使う。入次数とは、そのノードに入ってくる辺の数、
+つまり「まだ残っている前提の数」になる。
+
+```python
+from collections import deque
+
+def can_finish(n, prerequisites):
+    graph = [[] for _ in range(n)]
+    indeg = [0] * n
+    for a, b in prerequisites:        # a を終えないと b を取れない
+        graph[a].append(b)
+        indeg[b] += 1
+    q = deque(i for i in range(n) if indeg[i] == 0)
+    order = []
+    while q:
+        u = q.popleft()               # 依存先が無くなったものから確定
+        order.append(u)
+        for v in graph[u]:
+            indeg[v] -= 1             # u を消したので依存が1つ減る
+            if indeg[v] == 0:
+                q.append(v)
+    return len(order) == n            # 全部並べられたら閉路なし
+```
+
+<CourseSchedule client:visible />
+
+「閉路あり」の例に切り替えると、入次数が 0 にならないノードが残ってキューが空になる。
+**確定できた数がノード数に届かない = 閉路がある**、という判定になる。
+
+<Callout type="tip" title="DFS でも書ける">
+  DFS では、ノードを「未訪問 / 探索中 / 完了」の3状態で持ち、
+  **探索中のノードに再び到達したら閉路**と判定する。順序は帰りがけに記録して最後に反転する。
+  どちらでも書けるようにしておくと、フォローアップで別解を求められても対応できる。
+</Callout>
+
+## 計算量
+
+| 手法 | 時間 | 空間 |
+| --- | --- | --- |
+| BFS / DFS（隣接リスト） | O(N + E) | O(N) |
+| グリッド BFS / DFS | O(H · W) | O(H · W) |
+| トポロジカルソート | O(N + E) | O(N + E) |
+
+グリッドで O(H·W) になるのは、1マスから出る辺が高々4本（定数）だから。
+
+<Callout type="warn" title="再帰の深さ">
+  グリッドが 1000×1000 で全部陸だと、DFS の再帰は最大 10<sup>6</sup> 段になる。
+  Python のデフォルト再帰上限（1000）を超えるため、`sys.setrecursionlimit` を上げるか、
+  スタックを自前で持つ反復版に書き換えるか、BFS を使う。面接では言及だけでもしておく。
+</Callout>
+
+## 気づくためのトリガー
+
+- 二次元配列で「隣接するマス」「上下左右」→ グリッドのグラフ問題
+- 「**最短**の手数 / 距離 / ステップ数」で辺の重みが等しい → BFS
+- 「いくつのかたまり」「連結成分」「領域の面積」→ DFS（または Union-Find）
+- 「A の前に B」「依存関係」「前提条件」「実行順序」→ トポロジカルソート
+- 「閉路があるか」「デッドロックするか」→ トポロジカルソート、または DFS の3状態管理
+
+## チェックリスト
+
+- [ ] BFS が最短距離を保証する理由を説明できる
+- [ ] 訪問済みフラグを立てるタイミングと、遅らせると何が起きるかを説明できる
+- [ ] グリッドで隣接リストを作らない理由を説明できる
+- [ ] 多始点 BFS で、始点ごとに BFS を回す必要が無い理由を説明できる
+- [ ] 入次数が 0 にならないノードが残ることと閉路の関係を説明できる
+- [ ] 上のリストの Medium を、解説を見ずに実装できる

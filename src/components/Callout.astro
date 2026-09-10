@@ -1,0 +1,22 @@
+---
+type Props = { type?: 'tip' | 'warn' | 'note'; title?: string }
+const { type = 'note', title } = Astro.props
+
+const STYLE = {
+  tip: { border: 'var(--ok)', bg: 'var(--ok-soft)', mark: '💡', label: 'ポイント' },
+  warn: { border: 'var(--warn)', bg: 'var(--warn-soft)', mark: '⚠️', label: 'ハマりどころ' },
+  note: { border: 'var(--accent)', bg: 'var(--accent-soft)', mark: '📌', label: 'メモ' },
+}[type]
+---
+
+<aside
+  class="not-prose my-6 rounded-lg border-l-4 px-4 py-3 text-[14px] leading-relaxed"
+  style={`border-color: ${STYLE.border}; background: ${STYLE.bg}`}
+>
+  <p class="m-0 mb-1 text-xs font-bold" style={`color: ${STYLE.border}`}>
+    {STYLE.mark} {title ?? STYLE.label}
+  </p>
+  <div class="[&>p]:my-1 [&>ul]:my-1 [&>ul]:list-disc [&>ul]:pl-5">
+    <slot />
+  </div>
+</aside>

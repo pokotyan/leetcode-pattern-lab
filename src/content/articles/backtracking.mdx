@@ -1,0 +1,60 @@
+---
+title: バックトラック（選ぶ・選ばないの全探索）
+description: 再帰で候補を組み立て、戻すときに状態を元へ戻す
+section: backtracking
+order: 1
+status: planned
+requires:
+  - two-pointers
+problems:
+  - name: Subsets
+    url: https://leetcode.com/problems/subsets/
+    level: Medium
+    importance: 高
+    technique: 選ぶ/選ばない
+  - name: Permutations
+    url: https://leetcode.com/problems/permutations/
+    level: Medium
+    importance: 高
+    technique: 順列
+  - name: Combination Sum
+    url: https://leetcode.com/problems/combination-sum/
+    level: Medium
+    importance: 高
+    technique: 重複あり組み合わせ
+  - name: Subsets II
+    url: https://leetcode.com/problems/subsets-ii/
+    level: Medium
+    importance: 高
+    technique: 重複スキップ
+  - name: Word Search
+    url: https://leetcode.com/problems/word-search/
+    level: Medium
+    importance: 高
+    technique: グリッド + 復元
+  - name: N-Queens
+    url: https://leetcode.com/problems/n-queens/
+    level: Hard
+    importance: 中
+    technique: 枝刈り
+---
+
+## 骨格
+
+「選ぶ → 再帰 → 戻す」の3行。戻す処理を忘れると状態が漏れる。
+
+## 答えを配列に積むときのコピー
+
+同じリストの参照を積むと全部同じ中身になる。
+
+## 重複を避ける
+
+ソートしてから「直前と同じ値はスキップ」。3Sum と同じ考え方。
+
+## 枝刈り
+
+途中で条件を満たせないと分かった時点で打ち切る。計算量の見積もりは最悪ケースで。
+
+## bit 全探索との対応
+
+部分集合の列挙は bit で書くこともできる。

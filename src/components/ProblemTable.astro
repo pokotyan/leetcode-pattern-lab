@@ -1,0 +1,56 @@
+---
+import { LEVEL_TONE } from '../lib/curriculum'
+
+type Problem = {
+  name: string
+  url: string
+  level: 'Easy' | 'Medium' | 'Hard'
+  importance: '高' | '中' | '低'
+  technique: string
+}
+type Props = { problems: Problem[]; title?: string }
+const { problems, title = 'この記事で身につく LeetCode 問題' } = Astro.props
+---
+
+{
+  problems.length > 0 && (
+    <section class="not-prose my-8 rounded-xl border" style="border-color: var(--border)">
+      <h3
+        class="m-0 border-b px-4 py-3 text-sm font-bold"
+        style="border-color: var(--border); background: var(--bg-soft)"
+      >
+        {title}
+      </h3>
+      <ul class="m-0 list-none p-0">
+        {problems.map((p) => (
+          <li
+            class="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2.5 text-sm last:border-b-0"
+            style="border-color: var(--border)"
+          >
+            <a
+              href={p.url}
+              target="_blank"
+              rel="noopener"
+              class="font-medium no-underline hover:underline"
+              style="color: var(--accent)"
+            >
+              {p.name}
+            </a>
+            <span
+              class="rounded px-1.5 py-0.5 text-[11px] font-bold"
+              style={`color: ${LEVEL_TONE[p.level]}; border: 1px solid ${LEVEL_TONE[p.level]}`}
+            >
+              {p.level}
+            </span>
+            <span class="text-xs" style="color: var(--fg-muted)">
+              重要度 {p.importance}
+            </span>
+            <span class="ml-auto font-mono text-xs" style="color: var(--fg-muted)">
+              {p.technique}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}

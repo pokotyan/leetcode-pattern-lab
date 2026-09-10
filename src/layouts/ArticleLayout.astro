@@ -1,0 +1,96 @@
+---
+import BaseLayout from './BaseLayout.astro'
+import ProblemTable from '../components/ProblemTable.astro'
+import { sectionById } from '../lib/curriculum'
+import type { CollectionEntry } from 'astro:content'
+
+type Props = {
+  entry: CollectionEntry<'articles'>
+  prev?: { id: string; title: string }
+  next?: { id: string; title: string }
+  headings: { depth: number; slug: string; text: string }[]
+}
+const { entry, prev, next, headings } = Astro.props
+const d = entry.data
+const section = sectionById.get(d.section)
+const base = import.meta.env.BASE_URL
+const toc = headings.filter((h) => h.depth === 2)
+---
+
+<BaseLayout title={`${d.title} | LeetCode Pattern Lab`} description={d.description}>
+  <div class="grid gap-10 lg:grid-cols-[minmax(0,1fr)_16rem]">
+    <article class="prose min-w-0">
+      <p class="m-0 text-xs font-bold" style="color: var(--accent)">
+        {section?.title ?? d.section}
+      </p>
+      <h1 class="mt-1 mb-2 text-3xl font-bold leading-snug">{d.title}</h1>
+      <p class="mt-0 text-[15px]" style="color: var(--fg-muted)">{d.description}</p>
+
+      {
+        d.status === 'planned' && (
+          <div
+            class="not-prose my-6 rounded-lg border px-4 py-3 text-sm"
+            style="border-color: var(--warn); background: var(--warn-soft); color: var(--warn)"
+          >
+            この記事は骨組みだけの状態です。下の見出しが書く予定の内容です。
+          </div>
+        )
+      }
+
+      <ProblemTable problems={d.problems} />
+
+      <slot />
+
+      <nav
+        class="not-prose mt-16 flex flex-wrap gap-3 border-t pt-6 text-sm"
+        style="border-color: var(--border)"
+      >
+        {
+          prev && (
+            <a
+              href={`${base}articles/${prev.id}/`}
+              class="flex-1 rounded-lg border px-4 py-3 no-underline"
+              style="border-color: var(--border); color: var(--fg)"
+            >
+              <span class="block text-xs" style="color: var(--fg-muted)">
+                ← 前
+              </span>
+              {prev.title}
+            </a>
+          )
+        }
+        {
+          next && (
+            <a
+              href={`${base}articles/${next.id}/`}
+              class="flex-1 rounded-lg border px-4 py-3 text-right no-underline"
+              style="border-color: var(--border); color: var(--fg)"
+            >
+              <span class="block text-xs" style="color: var(--fg-muted)">
+                次 →
+              </span>
+              {next.title}
+            </a>
+          )
+        }
+      </nav>
+    </article>
+
+    <aside class="hidden lg:block">
+      <div class="sticky top-20 text-sm">
+        <p class="mb-2 text-xs font-bold" style="color: var(--fg-muted)">目次</p>
+        <ul class="m-0 list-none space-y-1.5 border-l p-0 pl-3" style="border-color: var(--border)">
+          {
+            toc.map((h) => (
+              <li>
+                <a href={`#${h.slug}`} class="no-underline" style="color: var(--fg-muted)">
+                  {h.text}
+                </a>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+    </aside>
+  </div>
+</BaseLayout>

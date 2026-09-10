@@ -1,0 +1,63 @@
+---
+title: 動的計画法（状態と遷移式）
+description: 「i 番目まで」を状態にする一次元 DP。まずはここだけ確実にする
+section: dp
+order: 1
+status: planned
+problems:
+  - name: Climbing Stairs
+    url: https://leetcode.com/problems/climbing-stairs/
+    level: Easy
+    importance: 高
+    technique: 一次元 DP
+  - name: Min Cost Climbing Stairs
+    url: https://leetcode.com/problems/min-cost-climbing-stairs/
+    level: Easy
+    importance: 高
+    technique: 一次元 DP
+  - name: House Robber
+    url: https://leetcode.com/problems/house-robber/
+    level: Medium
+    importance: 高
+    technique: 「まで」を状態にする
+  - name: House Robber II
+    url: https://leetcode.com/problems/house-robber-ii/
+    level: Medium
+    importance: 高
+    technique: 場合分け + 一次元 DP
+  - name: Coin Change
+    url: https://leetcode.com/problems/coin-change/
+    level: Medium
+    importance: 高
+    technique: 状態の拡張
+  - name: Word Break
+    url: https://leetcode.com/problems/word-break/
+    level: Medium
+    importance: 高
+    technique: 「まで」を状態にする
+  - name: Longest Increasing Subsequence
+    url: https://leetcode.com/problems/longest-increasing-subsequence/
+    level: Medium
+    importance: 高
+    technique: 一次元 DP
+---
+
+## DP とは何か
+
+一度計算した値を記録して再利用する。遷移式が立つときに使える。
+
+## 状態の決め方
+
+求めたい値から逆算して「何が分かれば答えが出るか」を状態にする。
+
+## "i 番目の" と "i 番目まで" の違い
+
+House Robber でなぜ "まで" が必要になるか。
+
+## 貰う DP と配る DP
+
+未知を求めるために既知を参照するか、既知から未知へ足し込むか。
+
+## 空間を削る
+
+直前の1つか2つしか使わないなら配列は要らない。フォローアップで頻出。

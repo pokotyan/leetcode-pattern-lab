@@ -1,0 +1,50 @@
+---
+title: ダイクストラ（重み付き最短経路）
+description: ヒープで「まだ確定していない中で最も近いノード」を取り出す
+section: graph
+order: 2
+status: planned
+requires:
+  - graph-bfs-dfs
+problems:
+  - name: Network Delay Time
+    url: https://leetcode.com/problems/network-delay-time/
+    level: Medium
+    importance: 高
+    technique: ダイクストラ
+  - name: Path with Maximum Probability
+    url: https://leetcode.com/problems/path-with-maximum-probability/
+    level: Medium
+    importance: 中
+    technique: 変形ダイクストラ
+  - name: Swim in Rising Water
+    url: https://leetcode.com/problems/swim-in-rising-water/
+    level: Hard
+    importance: 中
+    technique: 変形ダイクストラ
+  - name: Cheapest Flights Within K Stops
+    url: https://leetcode.com/problems/cheapest-flights-within-k-stops/
+    level: Medium
+    importance: 高
+    technique: 状態拡張
+---
+
+## BFS が使えなくなる場面
+
+辺に重みがあると「近い順」がキューの順序と一致しなくなる。
+
+## 近い順に確定する
+
+ヒープから最小距離のノードを取り出して確定し、隣接ノードを緩和する。
+
+## ヒープ版とヒープなし版
+
+疎グラフなら O(E log N)、密グラフなら O(N^2) が有利になる理由。
+
+## 負の重みでは使えない
+
+確定したはずの距離が後から縮む可能性。ベルマンフォードとの境界。
+
+## 状態を増やす
+
+「残り乗り継ぎ回数」などをノードに含めて拡張する型。

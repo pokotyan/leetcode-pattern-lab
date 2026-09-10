@@ -1,0 +1,54 @@
+---
+title: スタック（対応関係と巻き戻し）
+description: 括弧の対応、パスの正規化、直前の要素との比較
+section: stack
+order: 1
+status: planned
+problems:
+  - name: Valid Parentheses
+    url: https://leetcode.com/problems/valid-parentheses/
+    level: Easy
+    importance: 高
+    technique: スタック
+  - name: Min Stack
+    url: https://leetcode.com/problems/min-stack/
+    level: Medium
+    importance: 高
+    technique: 補助スタック
+  - name: Evaluate Reverse Polish Notation
+    url: https://leetcode.com/problems/evaluate-reverse-polish-notation/
+    level: Medium
+    importance: 高
+    technique: スタック
+  - name: Simplify Path
+    url: https://leetcode.com/problems/simplify-path/
+    level: Medium
+    importance: 中
+    technique: スタック
+  - name: Asteroid Collision
+    url: https://leetcode.com/problems/asteroid-collision/
+    level: Medium
+    importance: 中
+    technique: スタック
+  - name: Remove All Adjacent Duplicates In String
+    url: https://leetcode.com/problems/remove-all-adjacent-duplicates-in-string/
+    level: Easy
+    importance: 高
+    technique: スタック
+---
+
+## 対応関係はスタックで持つ
+
+開き括弧を積み、閉じ括弧で取り出す。空チェックと最後の残りチェックの2つが判定条件。
+
+## 隣り合う要素を潰す
+
+直前の要素と比較して消す・変える処理は、スタックにすると素直に書ける。
+
+## 補助情報を一緒に積む
+
+Min Stack で「その時点の最小値」を値と一緒に積む設計。
+
+## 計算量
+
+各要素が高々1回 push され1回 pop されるので O(N)。

@@ -1,0 +1,237 @@
+---
+title: Two Pointers（2つの位置を同時に動かす）
+description: 二重ループ O(N²) を O(N) に落とす最初の武器。逆方向と同方向の2つの形を、動かしながら覚える
+section: array
+order: 1
+status: published
+requires: []
+problems:
+  - name: Valid Palindrome
+    url: https://leetcode.com/problems/valid-palindrome/
+    level: Easy
+    importance: 高
+    technique: 逆方向
+  - name: Two Sum II - Input Array Is Sorted
+    url: https://leetcode.com/problems/two-sum-ii-input-array-is-sorted/
+    level: Medium
+    importance: 高
+    technique: 逆方向
+  - name: 3Sum
+    url: https://leetcode.com/problems/3sum/
+    level: Medium
+    importance: 高
+    technique: ソート + 逆方向
+  - name: Container With Most Water
+    url: https://leetcode.com/problems/container-with-most-water/
+    level: Medium
+    importance: 高
+    technique: 逆方向
+  - name: Move Zeroes
+    url: https://leetcode.com/problems/move-zeroes/
+    level: Easy
+    importance: 高
+    technique: 同方向
+  - name: Remove Duplicates from Sorted Array
+    url: https://leetcode.com/problems/remove-duplicates-from-sorted-array/
+    level: Easy
+    importance: 高
+    technique: 同方向
+  - name: Sort Colors
+    url: https://leetcode.com/problems/sort-colors/
+    level: Medium
+    importance: 中
+    technique: 3方向分割
+---
+
+import Callout from '../../components/Callout.astro'
+import ValidPalindrome from '../../components/sim/problems/ValidPalindrome'
+import TwoSumII from '../../components/sim/problems/TwoSumII'
+import ThreeSum from '../../components/sim/problems/ThreeSum'
+
+## この型が解決すること
+
+配列の中から**2つの要素の組み合わせ**を探したい。素直に書くと二重ループになる。
+
+```python
+for i in range(n):
+    for j in range(i + 1, n):
+        ...  # O(N^2)
+```
+
+N が 10<sup>5</sup> なら 10<sup>10</sup> 回で、当然間に合わない。
+
+Two Pointers は、**片方を動かしたときにもう片方をどちらに動かすべきかが一意に決まる**状況を作り、
+2つのポインタを合計 N 回しか動かさないことで O(N) にする。
+
+鍵は「戻らない」こと。ポインタが行ったり来たりしないなら、全体の移動回数は N に収まる。
+
+## 2つの形
+
+| 形 | ポインタの初期位置 | 動き | 典型 |
+| --- | --- | --- | --- |
+| 逆方向 | 両端（0 と n-1） | 内側へ寄っていく | 回文判定、和が target のペア、面積の最大化 |
+| 同方向 | 両方とも先頭 | 速い方が先行し、遅い方が「確定した位置」を指す | 要素の詰め直し、重複除去、部分列判定 |
+
+まずは逆方向から。
+
+## 逆方向：両端から寄せる
+
+最小形は回文判定になる。両端の文字を比べ、一致していれば内側へ1つずつ寄せる。
+
+```python
+def is_palindrome(s: str) -> bool:
+    left, right = 0, len(s) - 1
+    while left < right:
+        if s[left] != s[right]:
+            return False
+        left += 1
+        right -= 1
+    return True
+```
+
+<ValidPalindrome client:visible />
+
+入力を `interviewcat` に変えると、1文字目で不一致になって即 `False` を返す様子が見える。
+最後まで見なくてよいのが Two Pointers の効きどころになる。
+
+<Callout type="tip" title="なぜ O(1) の空間で済むのか">
+  `s[::-1]` と比較する書き方でも判定はできるが、反転した文字列を作るぶん O(N) のメモリを使う。
+  Two Pointers なら添字を2つ持つだけなので O(1)。**フォローアップで必ず聞かれる差**になる。
+</Callout>
+
+## 逆方向が成立する条件
+
+回文判定は「両端から寄せる」以外に選択肢がないので、なぜそれでいいのかを考える機会が無い。
+本題は次の問題になる。
+
+> 昇順ソート済みの配列から、和が target になる2要素を探せ。
+
+```python
+def two_sum(numbers, target):
+    left, right = 0, len(numbers) - 1
+    while left < right:
+        s = numbers[left] + numbers[right]
+        if s == target:
+            return [left + 1, right + 1]
+        if s < target:
+            left += 1     # 和を大きくしたい
+        else:
+            right -= 1    # 和を小さくしたい
+    return []
+```
+
+ここで効いているのは**ソートされていること**になる。
+
+- 和が足りない → `right` を左に動かしても和は減るだけ。だから動かすべきは `left`
+- 和が多すぎる → `left` を右に動かしても和は増えるだけ。だから動かすべきは `right`
+
+つまり**どちらを動かすべきかが毎回1通りに決まる**。これが逆方向 Two Pointers の成立条件になる。
+
+<TwoSumII client:visible />
+
+<Callout type="warn" title="捨てた範囲は本当に捨ててよいか">
+  `left` を1つ右に進めた瞬間、「元の left と、right より左のどの要素の組み合わせ」も同時に捨てている。
+  捨ててよい理由は、`numbers[left] + numbers[right]` が**その left にとって最大の和**であり、
+  それでも target に届かなかったから。この「今の端点にとっての最良を試して、届かないなら端点ごと捨てる」
+  という論法が、逆方向 Two Pointers の正当性の中身になる。
+</Callout>
+
+## ソートして持ち込む：3Sum
+
+`3Sum` は Medium の中でも出題頻度が高い。和が 0 になる**3つ組**を重複なく全部求める。
+
+3つ選ぶので素直には O(N<sup>3</sup>)。ここで使うのが「**1つ固定すれば残りは2つ選ぶ問題**」という発想になる。
+
+1. まず**ソートする**（Two Pointers を使うための前提を作る）
+2. `i` を1つ固定し、残り `[i+1, n-1]` から和が `-nums[i]` になるペアを Two Pointers で探す
+3. 同じ3つ組を二度数えないよう、重複をスキップする
+
+```python
+def three_sum(nums):
+    nums.sort()
+    res = []
+    for i in range(len(nums)):
+        if i > 0 and nums[i] == nums[i - 1]:
+            continue                       # i の重複をスキップ
+        left, right = i + 1, len(nums) - 1
+        while left < right:
+            s = nums[i] + nums[left] + nums[right]
+            if s < 0:
+                left += 1
+            elif s > 0:
+                right -= 1
+            else:
+                res.append([nums[i], nums[left], nums[right]])
+                left += 1
+                while left < right and nums[left] == nums[left - 1]:
+                    left += 1              # left の重複をスキップ
+    return res
+```
+
+<ThreeSum client:visible />
+
+入力を `-2, 0, 0, 2, 2` にすると、重複スキップが2箇所とも働くのが見える。
+スキップを外すと `[-2, 0, 2]` が3回出てくることになる。
+
+<Callout type="warn" title="重複スキップの位置">
+  スキップは**2箇所**必要になる。
+
+  - `i` の重複: `i > 0 and nums[i] == nums[i-1]` で `continue`。`i > 0` を忘れると先頭を飛ばす
+  - `left` の重複: **答えを1つ採用した直後だけ**でよい。採用していない場面でスキップしても意味がない
+
+  `right` 側のスキップは書かなくてもよい。`left` を進めた時点で同じ3つ組は再度採用されないため。
+</Callout>
+
+## 同方向：遅い方が「確定した位置」を指す
+
+同方向は、**書き込み位置**と**読み取り位置**を分けるのが本質になる。
+
+```python
+def move_zeroes(nums):
+    left = 0                       # 次に非ゼロを置く位置
+    for right in range(len(nums)): # 読み取り位置
+        if nums[right] != 0:
+            nums[left], nums[right] = nums[right], nums[left]
+            left += 1
+```
+
+`left` は「ここまでは詰め終わった」という境界を指し、`right` が配列を走査する。
+`Remove Element`、`Remove Duplicates from Sorted Array`、`Is Subsequence` はすべてこの形になる。
+
+同方向にはもうひとつ、**速度差をつける**形（Slow / Fast Pointers）がある。
+連結リストの中央検出やサイクル検出で使うため、連結リストの記事で扱う。
+
+## 計算量
+
+| 形 | 時間 | 空間 | 備考 |
+| --- | --- | --- | --- |
+| 逆方向（ソート済み前提） | O(N) | O(1) | 2つのポインタが合計 N 回動く |
+| 逆方向（自前でソート） | O(N log N) | O(1)〜O(N) | ソートが支配的。空間は言語の実装による |
+| 3Sum | O(N²) | O(1) | 外側 N × 内側 N。出力配列は除く |
+| 同方向 | O(N) | O(1) | in-place |
+
+## 気づくためのトリガー
+
+問題文に次の要素があれば、Two Pointers を疑う。
+
+- 「**ソート済み**の配列が与えられる」→ ほぼ確定でソート済みを利用する解法がある
+- 「**2つの要素**の組み合わせ」「ペア」「3つ組」
+- 「**in-place** で」「追加の配列を使わずに」→ 同方向の詰め直し
+- 「**両端**」「回文」「面積」「容器」
+- ソートしても答えが壊れない（順序が答えに関係しない）→ ソートして持ち込める
+
+<Callout type="tip" title="ソートしてよいかの判断">
+  `3Sum` は「値の組み合わせ」を求めるのでソートしてよい。
+  一方 `Two Sum`（無印）は**元の index** を返す必要があるため、素直にソートすると壊れる。
+  ソートするなら値と index をペアで持つか、ハッシュテーブルの解法に切り替える。
+</Callout>
+
+## チェックリスト
+
+この記事を終えた時点で、次が言えるようになっていればよい。
+
+- [ ] 逆方向 Two Pointers が O(N) になる理由を、ポインタの総移動回数で説明できる
+- [ ] 和が target に届かないときに `left` を進める根拠を説明できる
+- [ ] `3Sum` の重複スキップが2箇所必要な理由と、`right` 側が不要な理由を説明できる
+- [ ] 同方向で `left` が何を指しているかを一言で言える
+- [ ] 上のリストの問題を、解説を見ずに実装できる

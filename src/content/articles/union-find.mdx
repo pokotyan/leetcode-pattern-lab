@@ -1,0 +1,46 @@
+---
+title: Union-Find（動的な連結判定）
+description: グループの併合と所属判定をほぼ定数時間で行う
+section: graph
+order: 3
+status: planned
+requires:
+  - graph-bfs-dfs
+problems:
+  - name: Number of Provinces
+    url: https://leetcode.com/problems/number-of-provinces/
+    level: Medium
+    importance: 高
+    technique: Union-Find
+  - name: Redundant Connection
+    url: https://leetcode.com/problems/redundant-connection/
+    level: Medium
+    importance: 高
+    technique: 閉路検出
+  - name: Accounts Merge
+    url: https://leetcode.com/problems/accounts-merge/
+    level: Medium
+    importance: 中
+    technique: グルーピング
+  - name: Min Cost to Connect All Points
+    url: https://leetcode.com/problems/min-cost-to-connect-all-points/
+    level: Medium
+    importance: 中
+    technique: 最小全域木
+---
+
+## BFS/DFS で足りない場面
+
+辺が動的に追加され、その都度グループ数を知りたい場合。
+
+## 経路圧縮とランク
+
+2つの最適化を入れるとほぼ O(1) になる仕組み。
+
+## 閉路検出
+
+追加する辺の両端がすでに同じグループなら閉路になる。
+
+## クラスカル法
+
+辺を軽い順に見て、閉路を作らないものを採用する最小全域木。

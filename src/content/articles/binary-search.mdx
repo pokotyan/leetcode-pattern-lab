@@ -1,0 +1,242 @@
+---
+title: 二分探索（条件を満たす限界を探す）
+description: 値を探す道具ではなく「境界を探す」道具として捉え直す。ok / ng 方式で境界バグを潰し、答えそのものを二分探索する型まで
+section: search
+order: 1
+status: published
+requires: []
+problems:
+  - name: Binary Search
+    url: https://leetcode.com/problems/binary-search/
+    level: Easy
+    importance: 高
+    technique: 値の探索
+  - name: First Bad Version
+    url: https://leetcode.com/problems/first-bad-version/
+    level: Easy
+    importance: 高
+    technique: 境界の探索
+  - name: Find First and Last Position of Element in Sorted Array
+    url: https://leetcode.com/problems/find-first-and-last-position-of-element-in-sorted-array/
+    level: Medium
+    importance: 高
+    technique: 下界・上界
+  - name: Search in Rotated Sorted Array
+    url: https://leetcode.com/problems/search-in-rotated-sorted-array/
+    level: Medium
+    importance: 高
+    technique: 回転配列
+  - name: Find Minimum in Rotated Sorted Array
+    url: https://leetcode.com/problems/find-minimum-in-rotated-sorted-array/
+    level: Medium
+    importance: 高
+    technique: 回転配列
+  - name: Koko Eating Bananas
+    url: https://leetcode.com/problems/koko-eating-bananas/
+    level: Medium
+    importance: 高
+    technique: 答えの決めうち
+  - name: Minimum Time to Complete Trips
+    url: https://leetcode.com/problems/minimum-time-to-complete-trips/
+    level: Medium
+    importance: 高
+    technique: 答えの決めうち
+  - name: Search a 2D Matrix
+    url: https://leetcode.com/problems/search-a-2d-matrix/
+    level: Medium
+    importance: 中
+    technique: 一次元化 + 二分探索
+---
+
+import Callout from '../../components/Callout.astro'
+import LowerBoundOkNg from '../../components/sim/problems/LowerBoundOkNg'
+import SearchInRotated from '../../components/sim/problems/SearchInRotated'
+import KokoEatingBananas from '../../components/sim/problems/KokoEatingBananas'
+
+## 二分探索を「値探し」だと思っていると詰まる
+
+最初に習う二分探索は「ソート済み配列から値 x の位置を返す」だった。
+しかし Medium で出るのはそこではなく、次のような問題になる。
+
+- 値 x が**複数ある**とき、その**最初の位置**を返せ
+- x 以上の最小の要素を返せ
+- 条件を満たす**最小の速度**を返せ
+
+これらは「値を探す」形では書けない。二分探索の本質は次になる。
+
+> **単調な条件について、成立する側と成立しない側の境界を探す**
+
+配列である必要すらない。条件を判定する関数さえあればよい。
+
+## ok / ng 方式
+
+境界バグ（`mid + 1` か `mid` か、`<` か `<=` か）で落ちるのは、
+「探索範囲」を管理しているからになる。代わりに**条件を満たす候補 `ok` と満たさない候補 `ng`** を管理する。
+
+```python
+ok, ng = 条件を必ず満たす値, 条件を必ず満たさない値
+while abs(ok - ng) > 1:
+    mid = (ok + ng) // 2
+    if condition(mid):
+        ok = mid
+    else:
+        ng = mid
+return ok        # 条件を満たす限界
+```
+
+覚えることは3つだけになる。
+
+1. `ok` と `ng` の初期値は、**絶対に条件を満たす / 絶対に満たさない**値を置く（範囲外の番兵でよい）
+2. ループ条件は `abs(ok - ng) > 1`。隣り合ったら終わり
+3. 最後に返すのは `ok`
+
+`abs` を使うのは、`ok` が `ng` より大きいことも小さいこともあるため。
+**どちらが大きいかを気にしなくてよくなる**のがこの書き方の利点になる。
+
+### 下界（lower bound）を ok / ng で書く
+
+条件を `nums[i] >= x` に置くと、成立する最小の index が答えになる。
+
+```python
+def lower_bound(nums, x):
+    # 条件 P(i): nums[i] >= x
+    ok, ng = len(nums), -1     # ok は範囲外だが「必ず成立」扱い
+    while abs(ok - ng) > 1:
+        mid = (ok + ng) // 2
+        if nums[mid] >= x:
+            ok = mid
+        else:
+            ng = mid
+    return ok
+```
+
+<LowerBoundOkNg client:visible />
+
+セルの下の `T` / `F` が条件の成立を表す。
+**`F` が並んだ後に `T` が並ぶ**という単調性があるからこそ、境界が一意に決まる。
+
+`[1,3,3,4,4,4,4,19]` に `x=4` を入れると、`4` が4つあっても**最初の index 3** が返る。
+素直な `nums[mid] == x` の二分探索ではこれができない。
+
+<Callout type="tip" title="上界も同じ形で書ける">
+  条件を `nums[i] <= x` にして `ok, ng = 0, len(nums)` から始めれば、
+  条件を満たす**最大**の index（上界）が求まる。
+  条件式と番兵を入れ替えるだけで、ループの中身は一切変わらない。
+</Callout>
+
+<Callout type="warn" title="ng は和製英語">
+  英語話者との面接では `ok` / `ng` ではなく `ok` / `no`、あるいは `good` / `bad` を使う。
+</Callout>
+
+## 単調性が崩れて見える問題：回転ソート配列
+
+`Search in Rotated Sorted Array` は、ソート済み配列をどこかで回転させた配列から値を探す。
+全体としては単調でないが、**mid で切ると必ずどちらか片方はソート済み**という性質がある。
+
+```python
+def search(nums, target):
+    lo, hi = 0, len(nums) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if nums[mid] == target:
+            return mid
+        if nums[lo] <= nums[mid]:               # 左半分がソート済み
+            if nums[lo] <= target < nums[mid]:
+                hi = mid - 1                    # 答えは左半分
+            else:
+                lo = mid + 1
+        else:                                   # 右半分がソート済み
+            if nums[mid] < target <= nums[hi]:
+                lo = mid + 1                    # 答えは右半分
+            else:
+                hi = mid - 1
+    return -1
+```
+
+<SearchInRotated client:visible />
+
+判断の流れは2段階になる。
+
+1. どちらの半分がソート済みか（`nums[lo] <= nums[mid]` で判定）
+2. ソート済みの側に target が**入るか**（入るならそちら、入らないなら反対側）
+
+ソート済みでない側について「入るか」を判定しようとすると条件が複雑になる。
+**確実なことが言える側だけで判断する**のがこの問題の型になる。
+
+<Callout type="warn" title="等号の位置">
+  `nums[lo] <= nums[mid]` の等号は、要素が1つ（`lo == mid`）のときに左半分をソート済みと見なすために必要。
+  また `nums[lo] <= target < nums[mid]` は左が閉、右が開。`nums[mid]` は既に一致しないと分かっているため。
+  この非対称を雑に書くと、要素数が2のときに落ちる。
+</Callout>
+
+## 答えそのものを二分探索する
+
+ここからが Medium の本丸になる。配列が無くても二分探索は使える。
+
+> `piles` の山からバナナを食べる。1時間に最大 k 本食べられる（食べ残しがあってもその時間は終わり）。
+> h 時間以内に全部食べ切れる最小の k を求めよ。
+
+k を1から順に試せば答えは出るが、`k ≤ 10^9` なので間に合わない。
+ここで**「k が大きいほど間に合いやすい」という単調性**に気づく。
+
+| k | 1 | 2 | 3 | ... | 答え | ... | max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 間に合うか | F | F | F | ... | **T** | T | T |
+
+`F` の後に `T` が並ぶ。境界を探せばよいので、二分探索が使える。
+
+```python
+def min_eating_speed(piles, h):
+    def hours(k):          # 速度 k での所要時間
+        return sum((p + k - 1) // k for p in piles)
+
+    # 条件 P(k): hours(k) <= h
+    ok, ng = max(piles), 0   # ok は必ず成立 / ng は不成立
+    while abs(ok - ng) > 1:
+        mid = (ok + ng) // 2
+        if hours(mid) <= h:
+            ok = mid
+        else:
+            ng = mid
+    return ok
+```
+
+<KokoEatingBananas client:visible />
+
+横軸が配列ではなく**速度 k の候補**になっている点に注目。
+探索している空間が「入力の配列」から「答えの候補」に変わっただけで、やっていることは lower bound と同じになる。
+
+<Callout type="tip" title="答えの決めうちが使えるかの判定">
+  次の2つが言えれば使える。
+
+  1. 答えの候補に**順序**がある（数値であることがほとんど）
+  2. 「候補 x が条件を満たすか」を**単独で判定できる**（他の候補の答えを必要としない）
+
+  そして判定関数が単調（`F...FT...T` の形）になっていることを確認する。
+  ここが確認できていないと、二分探索しても嘘の答えが返る。
+</Callout>
+
+計算量は「二分探索の回数 × 判定1回のコスト」になる。
+Koko なら O(N log(max(piles)))。判定関数のコストを忘れて O(log N) と答えると減点される。
+
+## 気づくためのトリガー
+
+- 「**ソート済み**の配列」+ 「O(log N) で」
+- 「最小の〜を求めよ」「最大の〜を求めよ」で、**候補が数値**かつ範囲が広い（10<sup>9</sup> など）
+- 「〜できる最小の速度 / 時間 / 容量」
+- 判定は簡単だが、最適値を直接求めるのは難しい
+
+<Callout type="warn" title="オーバーフローと無限ループ">
+  - `mid = (lo + hi) // 2` は Python では問題ないが、C++/Java では `lo + (hi - lo) // 2` と書く
+  - `while lo <= hi` 形式で `lo = mid` と書くと無限ループになる。必ず `mid ± 1` で動かす
+  - ok / ng 方式なら `ok = mid` / `ng = mid` でよい（`abs(ok - ng) > 1` が終了を保証するため）
+</Callout>
+
+## チェックリスト
+
+- [ ] 二分探索を「値探し」ではなく「境界探し」として説明できる
+- [ ] ok / ng の初期値に範囲外の番兵を置く理由を説明できる
+- [ ] 重複がある配列で `nums[mid] == x` 方式が最初の位置を返せない理由を説明できる
+- [ ] 回転配列で「ソート済みの側だけで判断する」理由を説明できる
+- [ ] 答えの決めうちが使える条件を2つ挙げられる
+- [ ] 答えの決めうちの計算量に、判定関数のコストを含めて答えられる

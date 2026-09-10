@@ -1,0 +1,46 @@
+---
+title: 二分探索木
+description: 左部分木 < 節点 < 右部分木。in-order が昇順になる性質を使う
+section: tree
+order: 2
+status: planned
+requires:
+  - tree-traversal
+problems:
+  - name: Validate Binary Search Tree
+    url: https://leetcode.com/problems/validate-binary-search-tree/
+    level: Medium
+    importance: 高
+    technique: 範囲を渡す DFS
+  - name: Kth Smallest Element in a BST
+    url: https://leetcode.com/problems/kth-smallest-element-in-a-bst/
+    level: Medium
+    importance: 高
+    technique: in-order
+  - name: Lowest Common Ancestor of a BST
+    url: https://leetcode.com/problems/lowest-common-ancestor-of-a-binary-search-tree/
+    level: Medium
+    importance: 高
+    technique: 性質の利用
+  - name: Insert into a Binary Search Tree
+    url: https://leetcode.com/problems/insert-into-a-binary-search-tree/
+    level: Medium
+    importance: 中
+    technique: 挿入
+---
+
+## BST の定義
+
+「左の子より大きい」ではなく「左部分木のすべてより大きい」であること。
+
+## 検証は範囲を渡す
+
+各ノードに取りうる下限と上限を渡しながら降りる。
+
+## in-order は昇順
+
+k 番目を求める問題が in-order の途中で打ち切れる理由。
+
+## 平衡が崩れると O(N)
+
+一直線の BST での最悪計算量と、平衡二分探索木の存在。

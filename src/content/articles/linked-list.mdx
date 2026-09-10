@@ -1,0 +1,58 @@
+---
+title: 連結リスト（付け替えと Slow / Fast）
+description: ダミーノードで場合分けを消す。速度差ポインタで中央検出とサイクル検出
+section: linkedlist
+order: 1
+status: planned
+problems:
+  - name: Reverse Linked List
+    url: https://leetcode.com/problems/reverse-linked-list/
+    level: Easy
+    importance: 高
+    technique: 反転
+  - name: Merge Two Sorted Lists
+    url: https://leetcode.com/problems/merge-two-sorted-lists/
+    level: Easy
+    importance: 高
+    technique: ダミーノード
+  - name: Linked List Cycle
+    url: https://leetcode.com/problems/linked-list-cycle/
+    level: Easy
+    importance: 高
+    technique: Slow/Fast
+  - name: Remove Nth Node From End of List
+    url: https://leetcode.com/problems/remove-nth-node-from-end-of-list/
+    level: Medium
+    importance: 高
+    technique: 先行ポインタ
+  - name: Reorder List
+    url: https://leetcode.com/problems/reorder-list/
+    level: Medium
+    importance: 高
+    technique: 中央 + 反転 + マージ
+  - name: LRU Cache
+    url: https://leetcode.com/problems/lru-cache/
+    level: Medium
+    importance: 高
+    technique: 双方向リスト + ハッシュ
+---
+
+## 反転の3行
+
+prev / cur / next_node の付け替え順序。next を先に退避する理由。
+
+## ダミーノードで先頭を特別扱いしない
+
+削除・挿入で head が変わる場合の分岐を消す定石。
+
+## Slow / Fast ポインタ
+
+中央検出とサイクル検出が同じ道具で解ける理由。
+
+## 組み合わせて解く
+
+Reorder List が「中央を探す」「後半を反転する」「交互にマージする」の合成であること。
+
+## LRU Cache
+
+双方向リストで O(1) 削除、ハッシュで O(1) 参照を両立させる設計。

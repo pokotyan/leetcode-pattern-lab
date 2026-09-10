@@ -1,0 +1,65 @@
+---
+title: 二分木（DFS の帰りがけで集約する）
+description: 部分木の情報を返す再帰の型。BFS で階層ごとに処理する型
+section: tree
+order: 1
+status: planned
+requires:
+  - graph-bfs-dfs
+problems:
+  - name: Maximum Depth of Binary Tree
+    url: https://leetcode.com/problems/maximum-depth-of-binary-tree/
+    level: Easy
+    importance: 高
+    technique: DFS
+  - name: Invert Binary Tree
+    url: https://leetcode.com/problems/invert-binary-tree/
+    level: Easy
+    importance: 高
+    technique: DFS
+  - name: Diameter of Binary Tree
+    url: https://leetcode.com/problems/diameter-of-binary-tree/
+    level: Easy
+    importance: 高
+    technique: 帰りがけ集約
+  - name: Binary Tree Level Order Traversal
+    url: https://leetcode.com/problems/binary-tree-level-order-traversal/
+    level: Medium
+    importance: 高
+    technique: BFS
+  - name: Binary Tree Right Side View
+    url: https://leetcode.com/problems/binary-tree-right-side-view/
+    level: Medium
+    importance: 高
+    technique: BFS
+  - name: Lowest Common Ancestor of a Binary Tree
+    url: https://leetcode.com/problems/lowest-common-ancestor-of-a-binary-tree/
+    level: Medium
+    importance: 高
+    technique: 帰りがけ集約
+  - name: Binary Tree Maximum Path Sum
+    url: https://leetcode.com/problems/binary-tree-maximum-path-sum/
+    level: Hard
+    importance: 中
+    technique: 帰りがけ集約
+---
+
+## 再帰関数が何を返すかを先に決める
+
+「この部分木について何が分かれば親が計算できるか」から設計する。
+
+## 行きがけと帰りがけ
+
+根からの経路情報は行きがけ（引数）、部分木の集約は帰りがけ（戻り値）。
+
+## 直径の型
+
+各ノードで「左の深さ + 右の深さ」を答えの候補にし、戻り値は深さだけにする。
+
+## 階層が要るなら BFS
+
+キューに深さを一緒に入れるか、階層単位でまとめて取り出す。
+
+## 計算量
+
+全ノードを1回ずつ訪問して O(N)。空間は木の高さ分の再帰スタック。

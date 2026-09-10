@@ -1,0 +1,53 @@
+---
+title: ヒープ（常に最小・最大を取り出す）
+description: サイズ k のヒープで Top-K を O(N log k) にする
+section: heap
+order: 1
+status: planned
+problems:
+  - name: Kth Largest Element in an Array
+    url: https://leetcode.com/problems/kth-largest-element-in-an-array/
+    level: Medium
+    importance: 高
+    technique: サイズ k のヒープ
+  - name: Top K Frequent Elements
+    url: https://leetcode.com/problems/top-k-frequent-elements/
+    level: Medium
+    importance: 高
+    technique: カウント + ヒープ
+  - name: K Closest Points to Origin
+    url: https://leetcode.com/problems/k-closest-points-to-origin/
+    level: Medium
+    importance: 高
+    technique: サイズ k のヒープ
+  - name: Merge k Sorted Lists
+    url: https://leetcode.com/problems/merge-k-sorted-lists/
+    level: Hard
+    importance: 中
+    technique: k-way マージ
+  - name: Find Median from Data Stream
+    url: https://leetcode.com/problems/find-median-from-data-stream/
+    level: Hard
+    importance: 中
+    technique: 2つのヒープ
+---
+
+## ヒープの3操作
+
+heapify が O(N) になる理由、push と pop が O(log N) である理由。
+
+## Python の heapq は最小ヒープ
+
+符号を反転して最大ヒープとして使う定石。
+
+## Top-K はサイズ k で回す
+
+全体をソートする O(N log N) との差。
+
+## 2つのヒープで中央値
+
+前半を最大ヒープ、後半を最小ヒープに分けてバランスを保つ。
+
+## Quickselect との比較
+
+平均 O(N) だが最悪 O(N^2)。安定性を取るならヒープ。

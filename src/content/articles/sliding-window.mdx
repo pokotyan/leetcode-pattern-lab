@@ -1,0 +1,238 @@
+---
+title: Sliding Window（区間を伸ばして縮める）
+description: 「連続する部分配列・部分文字列」と書いてあったら真っ先に疑う型。固定長と可変長の2つを、伸縮を見ながら覚える
+section: array
+order: 2
+status: published
+requires:
+  - two-pointers
+problems:
+  - name: Maximum Average Subarray I
+    url: https://leetcode.com/problems/maximum-average-subarray-i/
+    level: Easy
+    importance: 高
+    technique: 固定長
+  - name: Longest Substring Without Repeating Characters
+    url: https://leetcode.com/problems/longest-substring-without-repeating-characters/
+    level: Medium
+    importance: 高
+    technique: 可変長
+  - name: Minimum Size Subarray Sum
+    url: https://leetcode.com/problems/minimum-size-subarray-sum/
+    level: Medium
+    importance: 高
+    technique: 可変長
+  - name: Longest Repeating Character Replacement
+    url: https://leetcode.com/problems/longest-repeating-character-replacement/
+    level: Medium
+    importance: 高
+    technique: 可変長 + カウント
+  - name: Fruit Into Baskets
+    url: https://leetcode.com/problems/fruit-into-baskets/
+    level: Medium
+    importance: 高
+    technique: 可変長 + カウント
+  - name: Permutation in String
+    url: https://leetcode.com/problems/permutation-in-string/
+    level: Medium
+    importance: 中
+    technique: 固定長 + カウント
+  - name: Minimum Window Substring
+    url: https://leetcode.com/problems/minimum-window-substring/
+    level: Hard
+    importance: 中
+    technique: 可変長 + カウント
+---
+
+import Callout from '../../components/Callout.astro'
+import MaxAverageFixedWindow from '../../components/sim/problems/MaxAverageFixedWindow'
+import LongestSubstringNoRepeat from '../../components/sim/problems/LongestSubstringNoRepeat'
+import MinSizeSubarraySum from '../../components/sim/problems/MinSizeSubarraySum'
+
+## この型が解決すること
+
+「**連続する**部分配列（部分文字列）について、和・長さ・種類数などを求めよ」という問題は非常に多い。
+
+素直に書くと、始点と終点の全組み合わせで O(N²)、区間の中身を毎回舐めると O(N³) になる。
+
+```python
+for i in range(n):
+    for j in range(i, n):
+        total = sum(nums[i:j+1])   # O(N^3)
+```
+
+Sliding Window は、区間を作り直さずに**端で足し引きするだけで隣の区間へ移る**。
+これで区間の評価が O(1) になり、全体が O(N) に落ちる。
+
+Two Pointers との違いは、**2つのポインタで挟んだ区間そのものに意味がある**点になる。
+
+## 固定長：1つ入れて1つ出す
+
+窓の幅 k が問題文で与えられている場合は、最も単純な形になる。
+
+```python
+def find_max_average(nums, k):
+    cur = sum(nums[:k])        # 最初のウィンドウ
+    best = cur
+    for i in range(k, len(nums)):
+        cur += nums[i]         # 右端を入れる
+        cur -= nums[i - k]     # 左端を出す
+        best = max(best, cur)
+    return best / k
+```
+
+<MaxAverageFixedWindow client:visible />
+
+「入れてから出す」ため、一瞬だけ幅が k+1 になる。ステップ実行で幅が戻るところを確認するとよい。
+
+<Callout type="tip" title="累積和との使い分け">
+  この問題は累積和でも解ける。区間の和を**何度も任意の位置で問い合わせる**なら累積和、
+  **端から順に1つずつずらす**だけなら Sliding Window のほうが空間 O(1) で済む。
+</Callout>
+
+## 可変長：伸ばして、条件が壊れたら縮める
+
+Medium で出るのはほぼこちら。窓の幅が問題文で与えられず、**条件を満たす最長 / 最短**を求める。
+
+骨格は共通している。
+
+```python
+left = 0
+for right in range(n):
+    # 1. right を1つ伸ばして、状態を更新する
+    while 条件が壊れている:      # または「条件を満たしている間」
+        # 2. left を進めて、状態を戻す
+        left += 1
+    # 3. この時点のウィンドウで答えを更新する
+```
+
+**どちらの向きで while を書くか**が、最長を求めるか最短を求めるかで変わる。
+
+| 求めるもの | while の条件 | 答えの更新位置 |
+| --- | --- | --- |
+| 条件を満たす**最長** | 条件が**壊れている**間だけ縮める | while を抜けた後 |
+| 条件を満たす**最短** | 条件を**満たしている**間ずっと縮める | while の中 |
+
+### 最長を求める：重複のない最長部分文字列
+
+`Longest Substring Without Repeating Characters` は可変長の代表になる。
+「ウィンドウ内に同じ文字が2つある」が壊れた状態にあたる。
+
+```python
+def length_of_longest_substring(s):
+    last = {}          # 文字 -> 最後に見た index
+    left = 0
+    best = 0
+    for right, ch in enumerate(s):
+        if ch in last and last[ch] >= left:
+            left = last[ch] + 1    # 重複をウィンドウの外へ追い出す
+        last[ch] = right
+        best = max(best, right - left + 1)
+    return best
+```
+
+<LongestSubstringNoRepeat client:visible />
+
+<Callout type="warn" title="last[ch] >= left の条件を落とさない">
+  `tmmzuxt` を入れると分かる。最後の `t` を見たとき、`last['t'] = 0` は残っているが、
+  すでに `left` は 0 より右にある。この `t` は**もうウィンドウの外**なので、
+  `left` を戻してはいけない。`last[ch] >= left` を書き忘れると `left` が巻き戻り、答えが壊れる。
+
+  辞書を持たずに集合 `set` で管理し、`while ch in seen:` で1文字ずつ外す書き方もある。
+  そちらなら巻き戻りは起きないが、`left` が1つずつしか進まないぶん記述が増える。
+</Callout>
+
+### 最短を求める：和が target 以上の最短部分配列
+
+`Minimum Size Subarray Sum` は、条件を**満たしている間ずっと縮める**形になる。
+
+```python
+def min_sub_array_len(target, nums):
+    left = 0
+    cur = 0
+    best = float("inf")
+    for right in range(len(nums)):
+        cur += nums[right]          # 右を伸ばす
+        while cur >= target:        # 条件を満たす間だけ
+            best = min(best, right - left + 1)
+            cur -= nums[left]       # 左を縮める
+            left += 1
+    return 0 if best == float("inf") else best
+```
+
+<MinSizeSubarraySum client:visible />
+
+最長のときは while を抜けてから答えを更新したが、最短では**縮める直前**に更新する。
+縮めたあとでは条件を満たさなくなっているため。
+
+## なぜ二重ループに見えて O(N) なのか
+
+`for` の中に `while` があるので O(N²) に見える。しかし `left` は**単調に増えるだけ**で、
+一度も戻らない。したがって while の実行回数は全体を通して高々 N 回になる。
+
+`right` が N 回、`left` が N 回、合計 2N 回の移動で O(N)。
+**「ポインタが戻らない」ことが計算量の根拠**であり、これは Two Pointers と共通する。
+
+<Callout type="warn" title="この型が使えない場合">
+  Sliding Window が成立するのは、**区間を伸ばすと条件が単調に厳しくなる**（または緩くなる）ときだけ。
+
+  たとえば「和がちょうど k の部分配列」を負の数を含む配列で探す場合、
+  右を伸ばしても和が単調に増えないため、縮める判断ができない。
+  この場合は累積和とハッシュテーブルの組み合わせを使う。
+</Callout>
+
+## カウントを持つ発展形
+
+`Longest Repeating Character Replacement` や `Fruit Into Baskets` は、
+ウィンドウ内の**文字ごとの個数**を持つ形になる。骨格は同じで、状態が数値からカウンタに変わるだけ。
+
+```python
+from collections import Counter
+
+def character_replacement(s, k):
+    count = Counter()
+    left = 0
+    best = 0
+    for right, ch in enumerate(s):
+        count[ch] += 1
+        # 窓の幅 - 最頻文字の個数 = 置換が必要な数
+        while (right - left + 1) - max(count.values()) > k:
+            count[s[left]] -= 1
+            left += 1
+        best = max(best, right - left + 1)
+    return best
+```
+
+「条件が壊れている＝置換が k 回を超える」を while の条件に置く。**最長を求めるので壊れている間だけ縮める**。
+
+## 計算量
+
+| 形 | 時間 | 空間 |
+| --- | --- | --- |
+| 固定長（和や平均） | O(N) | O(1) |
+| 可変長（数値の状態） | O(N) | O(1) |
+| 可変長 + カウンタ | O(N · A) | O(A)（A は文字種数） |
+
+`max(count.values())` を毎回呼ぶと文字種 A に比例するため、
+厳密には O(N·A)。最頻値を差分で保持すれば O(N) にできる。
+
+## 気づくためのトリガー
+
+- 「**連続する**部分配列」「部分文字列」（連続でないなら DP や別の型）
+- 「最長の」「最短の」「ちょうど k 個の」
+- 「**高々 k 個まで**」「k 回まで変更してよい」→ 可変長の制約そのもの
+- 制約が N ≤ 10<sup>5</sup> 以上で、二重ループが通らない
+
+<Callout type="tip" title="固定長か可変長かの見分け">
+  問題文に窓の幅が数値で書いてあれば固定長。
+  「最長」「最短」を求めるなら可変長。
+  「ちょうど k 種類」を求めるタイプは、**「k 種類以下」-「k-1 種類以下」** に分解すると可変長2本で解ける。
+</Callout>
+
+## チェックリスト
+
+- [ ] 固定長で「入れてから出す」順序と、幅が一瞬 k+1 になる理由を説明できる
+- [ ] 最長と最短で while の条件と更新位置が入れ替わる理由を説明できる
+- [ ] for の中に while があっても O(N) である根拠を説明できる
+- [ ] `last[ch] >= left` を落とすとどう壊れるか、具体的な入力を1つ挙げられる
+- [ ] 上のリストの Medium を、解説を見ずに実装できる
