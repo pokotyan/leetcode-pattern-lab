@@ -1,0 +1,246 @@
+---
+title: bit DP（集合を整数1つで持つ）
+description: 「どれを選んだか」の組み合わせを状態にしたい。集合をビット列に押し込むと、辞書の代わりに配列の添字が使えるようになる
+section: advanced-dp
+order: 3
+level: 発展
+status: published
+requires:
+  - dp-basics
+  - backtracking
+problems:
+  - name: Shortest Path Visiting All Nodes
+    url: https://leetcode.com/problems/shortest-path-visiting-all-nodes/
+    level: Hard
+    importance: 高
+    technique: 状態を「いる点 × 訪問集合」にする BFS
+  - name: Smallest Sufficient Team
+    url: https://leetcode.com/problems/smallest-sufficient-team/
+    level: Hard
+    importance: 高
+    technique: 集合を添字にする DP
+  - name: Partition to K Equal Sum Subsets
+    url: https://leetcode.com/problems/partition-to-k-equal-sum-subsets/
+    level: Medium
+    importance: 高
+    technique: 使用済み集合のメモ化
+  - name: Find the Shortest Superstring
+    url: https://leetcode.com/problems/find-the-shortest-superstring/
+    level: Hard
+    importance: 中
+    technique: 巡回セールスマン型の bit DP
+  - name: Number of Ways to Wear Different Hats to Each Other
+    url: https://leetcode.com/problems/number-of-ways-to-wear-different-hats-to-each-other/
+    level: Hard
+    importance: 中
+    technique: 人の集合をビットで持つ数え上げ
+  - name: Maximum Students Taking Exam
+    url: https://leetcode.com/problems/maximum-students-taking-exam/
+    level: Hard
+    importance: 低
+    technique: 行ごとの配置をビットで持つ
+---
+
+import Callout from '../../components/Callout.astro'
+import ShortestPathAllNodes from '../../components/sim/problems/ShortestPathAllNodes'
+import SmallestSufficientTeam from '../../components/sim/problems/SmallestSufficientTeam'
+
+## この記事を読む前に押さえておく型
+
+- **動的計画法**：「状態を決めて、遷移式を立てて、表を埋める」という手順そのものは変わりません。この記事で変わるのは**状態の表し方**だけです
+- **バックトラック**：この記事が扱うのは、素直に書くと「全部の組み合わせを試す」ことになる問題です。バックトラックで全探索を書いたときに、なぜ同じ計算を何度も繰り返してしまうのかが分かっていると、メモ化の置き場所として集合が必要になる理由が見えます
+
+## まず、困っている状況を体験してみます
+
+> 無向グラフが与えられます。**どの点から出発してもよく、同じ点を何度通ってもよい**ので、すべての点を訪問する最短の歩数を求めてください。
+
+普通の BFS を思い出してください。BFS が正しく最短距離を出せたのは、「**一度訪れた点には二度と行かなくてよい**」と言えたからです。ところがこの問題では、同じ点を何度通ってもよく、むしろ通り直さないと全点を回れない場合があります。
+
+たとえば中心の点0から3本の枝が伸びている星型のグラフでは、枝の先へ行っては中心へ戻る、を繰り返す必要があります。点0を「訪問済みだから飛ばす」としてしまうと、答えが出ません。
+
+では、何をもって「同じ状況」と見なせばよいのでしょうか。ここで、**「いまどこにいるか」だけでは状況が決まっていない**ことに気づきます。同じ点0にいても、
+
+- まだどこも回っていない状態の点0
+- 枝を2本回り終えた状態の点0
+
+は、まったく違う状況です。**残りに何をしなければならないかが違う**からです。つまり状態には、「いる場所」に加えて「**すでに訪問した点の集合**」が要ります。
+
+## 発想を変える：集合を n ビットの整数1つで表す
+
+「訪問した点の集合」を状態にしたいとして、それをどう持てばよいでしょうか。集合をそのまま `set` で持つと、DP の添字にできず、辞書のキーにするにも比較のコストがかかります。
+
+ここで使うのが、**集合を2進数の整数1つで表す**という書き方です。点が n 個なら、n 桁の2進数を用意して、`i` 番目の桁が 1 なら「点 `i` を訪問済み」とします。
+
+| 集合 | ビット列 | 整数 |
+| --- | --- | --- |
+| {} | 000 | 0 |
+| {0} | 001 | 1 |
+| {1, 2} | 110 | 6 |
+| {0, 1, 2} | 111 | 7 |
+
+こうすると、集合に対する操作がすべて整数の演算になります。
+
+| やりたいこと | 書き方 |
+| --- | --- |
+| 点 `i` を集合に加える | `mask \| (1 << i)` |
+| 点 `i` が入っているか | `(mask >> i) & 1`（または `mask & (1 << i)`） |
+| 2つの集合を合わせる | `a \| b` |
+| 全部入っているか | `mask == (1 << n) - 1` |
+| 要素数 | `bin(mask).count('1')` |
+
+そして何より、**整数なので配列の添字にそのまま使えます。** 集合の種類は 2<sup>n</sup> 個なので、長さ 2<sup>n</sup> の配列を用意すれば、どの集合についても O(1) で値を出し入れできます。これが bit DP です。
+
+## 状態を広げて BFS する：Shortest Path Visiting All Nodes
+
+最初の問題に戻ります。状態を「**(いる点, 訪問済み集合)**」の組にすれば、あとは普通の BFS です。この組を1回訪れたら二度と訪れない、という BFS の原則もそのまま使えます。
+
+状態の数は `n × 2^n` です。n が 12 なら `12 × 4096 = 約5万`。十分に小さい数です。
+
+```python
+from collections import deque
+
+def shortest_path_length(graph):
+    n = len(graph)
+    full = (1 << n) - 1
+    q = deque((i, 1 << i, 0) for i in range(n))   # どこから出発してもよい
+    seen = {(i, 1 << i) for i in range(n)}
+    while q:
+        u, mask, d = q.popleft()
+        if mask == full:
+            return d                              # 全部訪問できた
+        for v in graph[u]:
+            nmask = mask | (1 << v)
+            if (v, nmask) not in seen:            # 状態は (いる点, 訪問済み集合)
+                seen.add((v, nmask))
+                q.append((v, nmask, d + 1))
+    return 0
+```
+
+<ShortestPathAllNodes client:visible />
+
+「どこから出発してもよい」という条件は、**すべての点を最初からキューに入れる**ことで表現しています。BFS は「キューに入っているものを距離の近い順に処理する」だけなので、出発点が複数あっても正しく動きます（多点スタート BFS と呼ばれます）。
+
+<Callout type="warn" title="訪問済みの判定を「点」ではなく「状態」で行ってください">
+  この問題で最も多い誤りは、`seen` を点だけで管理してしまうことです。
+
+  ```python
+  if v not in seen:        # 間違い。点だけで判定している
+  ```
+
+  こう書くと、一度通った点へ戻れなくなり、星型のグラフで答えが出せません。正しくは `(v, nmask)` という**組**で判定します。「同じ点にいても、訪問済み集合が違えば別の状態」というのが、この型の中心です。
+
+  なお、`mask == full` の判定はキューから**取り出したとき**に行ってください。入れるときに判定して即座に返す書き方でも、BFS なら結果は同じになりますが、判定箇所が2つに分かれてミスが出やすくなります。
+</Callout>
+
+## 集合を添字にする DP：Smallest Sufficient Team
+
+もう1つ、典型的な形を見ます。
+
+> 必要なスキルの一覧と、各人が持つスキルの一覧が与えられます。必要なスキルをすべて満たす、**最小人数のチーム**を作ってください。
+
+人数は最大60人なので、「誰を選ぶか」の組み合わせは 2<sup>60</sup> 通りあり、全探索はできません。ところが**スキルの数は最大16**です。ここに気づけるかどうかが分かれ目になります。
+
+状態を「選んだ人の集合」にすると爆発しますが、「**達成済みスキルの集合**」にすれば、状態はたかだか 2<sup>16</sup> = 65,536 個です。誰を選んだかは答えを復元するためのおまけとして持てばよく、状態としては数えなくて構いません。
+
+```python
+def smallest_sufficient_team(req_skills, people):
+    idx = {s: i for i, s in enumerate(req_skills)}
+    full = (1 << len(req_skills)) - 1
+    dp = {0: []}                       # 達成済みスキル集合 -> そのときのチーム
+    for i, p in enumerate(people):
+        mask = 0
+        for s in p:
+            mask |= 1 << idx[s]        # その人が持つスキルを1つの整数にまとめる
+        if mask == 0:
+            continue
+        for have, team in list(dp.items()):
+            merged = have | mask       # この人を入れたときの集合
+            if merged == have:
+                continue               # 増えないなら入れる意味がない
+            if merged not in dp or len(dp[merged]) > len(team) + 1:
+                dp[merged] = team + [i]
+    return dp[full]
+```
+
+<SmallestSufficientTeam client:visible />
+
+<Callout type="warn" title="ループ中に dp を書き換えるときの落とし穴">
+  `for have, team in list(dp.items()):` の `list()` は、飾りではありません。**ループを回しながら `dp` に新しいキーを追加している**ので、そのままイテレートすると「いま追加したばかりの状態」まで同じ周回で拾ってしまいます。
+
+  これが起きると、1人を**複数回**チームに入れたことになり、答えが壊れます（ナップサック DP で、配列を前から更新するか後ろから更新するかで「1個まで」と「何個でも」が切り替わるのと、まったく同じ現象です）。
+
+  スナップショットを取ってから回す、と決めてください。
+</Callout>
+
+## 状態の数をどう見積もるか
+
+bit DP を使うかどうかは、**2<sup>n</sup> が現実的な大きさに収まるか**で決まります。
+
+| n | 2<sup>n</sup> | 判断 |
+| --- | --- | --- |
+| 10 | 1,024 | 余裕 |
+| 15 | 32,768 | 余裕 |
+| 20 | 約100万 | 遷移が軽ければ可能 |
+| 25 | 約3,300万 | 厳しい |
+| 30 | 約10億 | 不可能 |
+
+つまり、**問題の制約に「n ≤ 12」「n ≤ 16」「n ≤ 20」といった、不自然に小さい数が出てきたら bit DP を疑ってください。** これは出題者からの合図です。
+
+計算量は「状態の数 × 1状態あたりの遷移」で決まります。
+
+- Shortest Path Visiting All Nodes：状態 `n × 2^n`、遷移は隣接点の数。全体で O(2<sup>n</sup> × n²)
+- Smallest Sufficient Team：状態 2<sup>k</sup>（k はスキル数）、人ごとに全状態を見るので O(人数 × 2<sup>k</sup>)
+- 巡回セールスマン型：O(2<sup>n</sup> × n²)
+
+<Callout type="tip" title="よく使うビット演算の書き方">
+  ```python
+  mask | (1 << i)        # i を加える
+  mask & ~(1 << i)       # i を取り除く
+  mask & (1 << i)        # i が入っていれば 0 以外
+  mask ^ (1 << i)        # i の有無を反転する
+  mask == (1 << n) - 1   # 全部そろったか
+  bin(mask).count('1')   # 要素数
+  mask & -mask           # 一番下の 1 のビット（BIT の lowbit と同じ）
+  ```
+
+  部分集合をすべて列挙したいときは、次の書き方が定番です。
+
+  ```python
+  sub = mask
+  while sub > 0:
+      ...                # sub は mask の部分集合
+      sub = (sub - 1) & mask
+  ```
+
+  この列挙は、全体で 3<sup>n</sup> 回で終わります（各要素が「入っている・部分集合にも入っている」「入っているが部分集合には入っていない」「入っていない」の3通りだからです）。n = 16 なら約4,300万回で、ぎりぎり間に合う規模です。
+</Callout>
+
+## 「これは bit DP だ」と気づくためのサイン
+
+- 制約の n が **12〜20 程度**と不自然に小さい
+- 「**すべてを**訪問する／覆う／使い切る」
+- 「どれを選んだか」の**組み合わせ**によって、その先の選択肢が変わる
+- 素直に書くと、順列（n!）や部分集合（2<sup>n</sup>）の全探索になる
+- 同じ集合に別の道順でたどり着いたとき、**その先の最適な進み方は同じ**（だからメモ化が効く）
+
+<Callout type="warn" title="集合として持つべきものを見極めてください">
+  Smallest Sufficient Team で「人の集合」ではなく「スキルの集合」を状態にしたように、**どちらを集合にするかで状態数が桁違いに変わります。**
+
+  判断の基準は2つです。
+
+  1. **数が小さいほう**を集合にする（60人と16スキルなら、スキル）
+  2. **その先の選択に影響するもの**を集合にする（すでに誰を選んだかは、残りの選び方に影響しない。達成済みスキルは影響する）
+
+  両方を満たすものが見つかれば、それが状態です。見つからないなら、bit DP ではない可能性を疑ってください。
+</Callout>
+
+## この記事のチェックリスト
+
+- [ ] 全点訪問の問題で、「いる点」だけでは状態が足りない理由を説明できる
+- [ ] 集合をビット列で持つときの、加える・含むか調べる・合わせる操作をそれぞれ書ける
+- [ ] `seen` を点ではなく (点, 集合) の組で持つ理由を説明できる
+- [ ] 多点スタート BFS が正しく動く理由を説明できる
+- [ ] Smallest Sufficient Team で、人ではなくスキルを集合にする理由を2つ挙げられる
+- [ ] `list(dp.items())` のスナップショットが必要な理由を説明できる
+- [ ] 制約の n からこの型を疑う目安（2<sup>n</sup> の大きさ）を言える
+- [ ] 記事冒頭のリストの問題を、解説を見ずに実装できる

@@ -1,0 +1,296 @@
+---
+title: キャッシュの設計（LRU / LFU）
+description: 「すべての操作を O(1) で」という要求から、使うデータ構造を逆算する。1つの構造では届かない場面で、2つを組み合わせる発想を身につける
+section: design
+order: 1
+level: 発展
+status: published
+requires:
+  - linked-list
+  - hash-counting
+problems:
+  - name: LRU Cache
+    url: https://leetcode.com/problems/lru-cache/
+    level: Medium
+    importance: 高
+    technique: 辞書 + 双方向連結リスト
+  - name: LFU Cache
+    url: https://leetcode.com/problems/lfu-cache/
+    level: Hard
+    importance: 高
+    technique: 回数ごとの列 + min_freq
+  - name: Design Browser History
+    url: https://leetcode.com/problems/design-browser-history/
+    level: Medium
+    importance: 中
+    technique: 双方向連結リスト / 2つのスタック
+  - name: Insert Delete GetRandom O(1)
+    url: https://leetcode.com/problems/insert-delete-getrandom-o1/
+    level: Medium
+    importance: 高
+    technique: 配列 + 位置の辞書
+  - name: Design Twitter
+    url: https://leetcode.com/problems/design-twitter/
+    level: Medium
+    importance: 中
+    technique: 辞書 + ヒープでのマージ
+  - name: Time Based Key-Value Store
+    url: https://leetcode.com/problems/time-based-key-value-store/
+    level: Medium
+    importance: 中
+    technique: 辞書 + 二分探索
+---
+
+import Callout from '../../components/Callout.astro'
+import LruCache from '../../components/sim/problems/LruCache'
+import LfuCache from '../../components/sim/problems/LfuCache'
+
+## この記事を読む前に押さえておく型
+
+- **連結リスト**：この記事の答えの半分は双方向連結リストです。ノードの前後の参照を付け替えるだけで順番を変えられること、そして番兵（ダミーノード）を置くと端の場合分けが消えることを、先に体に入れておいてください
+- **ハッシュテーブル**：もう半分は辞書です。key から目的の場所へ O(1) でたどり着けること、そして辞書には**順番の情報が無い**ことの両方が、この記事の出発点になります
+
+## まず、困っている状況を体験してみます
+
+> 容量 `capacity` のキャッシュを作ってください。`get(key)` と `put(key, value)` を用意し、容量を超えたときは**最も長く使われていない項目**を捨てます。**両方の操作を平均 O(1) で**行ってください。
+
+設計問題は、**要求されている計算量が設計図そのもの**です。まず、必要な操作を書き出してみます。
+
+1. key から値を引く
+2. 使った項目を「最近使ったもの」として記録し直す
+3. 容量を超えたとき、「最も長く使われていない項目」を1つ取り出して消す
+
+それぞれ、知っている道具で何ができるかを確かめます。
+
+**辞書だけで作る場合。** 操作1は O(1) でできます。ところが辞書には順番の情報が無いので、操作3で「最も古いもの」を知るには全件を見るしかありません。O(N) です。
+
+**配列（リスト）だけで作る場合。** 使った順に並べておけば、操作3は末尾を見るだけで O(1) です。しかし操作1で key を探すのに O(N) かかり、操作2で要素を途中から先頭へ移すのにも、後ろの要素をずらすので O(N) かかります。
+
+どちらも片方だけでは届きません。ここが設計問題の分かれ目です。**1つの構造で無理なら、2つ組み合わせて、それぞれの弱点を相手に埋めてもらいます。**
+
+## 発想を変える：「探す」と「並べ替える」を別の構造に担当させる
+
+必要な能力を2つに分けます。
+
+| 能力 | 適した構造 | 理由 |
+| --- | --- | --- |
+| key から一発でたどり着く | ハッシュテーブル | O(1) の参照 |
+| 順番を保ちつつ、途中の要素を O(1) で動かす | 双方向連結リスト | 前後の参照を付け替えるだけ |
+
+配列では途中の要素を動かすのに O(N) かかりますが、連結リストなら**そのノードの前後さえ分かっていれば**、参照を数本つなぎ替えるだけで済みます。そして「そのノード」は、辞書が O(1) で教えてくれます。
+
+- **辞書**：`key → ノードへの参照`
+- **連結リスト**：新しく使った順にノードを並べる。先頭が最も新しく、末尾が最も古い
+
+この2つを常に同期させるのが、LRU キャッシュの実装です。
+
+```python
+class Node:
+    def __init__(self, key, val):
+        self.key, self.val = key, val
+        self.prev = self.next = None
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cap = capacity
+        self.map = {}                      # key -> Node
+        self.head = Node(0, 0)             # 番兵。head の次が最近使ったもの
+        self.tail = Node(0, 0)             # 番兵。tail の前が最も古いもの
+        self.head.next = self.tail
+        self.tail.prev = self.head
+
+    def _remove(self, node):
+        node.prev.next = node.next
+        node.next.prev = node.prev
+
+    def _add_front(self, node):
+        node.next = self.head.next
+        node.prev = self.head
+        self.head.next.prev = node
+        self.head.next = node
+
+    def get(self, key):
+        if key not in self.map:
+            return -1
+        node = self.map[key]
+        self._remove(node)
+        self._add_front(node)              # 使ったので先頭へ移す
+        return node.val
+
+    def put(self, key, value):
+        if key in self.map:
+            self._remove(self.map[key])
+        node = Node(key, value)
+        self.map[key] = node
+        self._add_front(node)
+        if len(self.map) > self.cap:
+            lru = self.tail.prev           # 一番古いもの
+            self._remove(lru)
+            del self.map[lru.key]
+```
+
+<LruCache client:visible />
+
+<Callout type="warn" title="設計問題で落とすのは、たいてい次の3つです">
+  - **単方向リストで書き始めてしまう。** 途中のノードを取り除くには、その**1つ前**のノードが必要です。単方向だと前をたどれないので、結局 O(N) の探索が要ります。**双方向でなければ O(1) になりません**
+  - **番兵（ダミーの head / tail）を置かない。** 先頭を消すとき、末尾を消すとき、要素が1つだけのとき、と場合分けが増え、そのどこかを必ず落とします。連結リストの記事でやったのと同じ理由で、両端に番兵を置くと分岐がすべて消えます
+  - **ノードに key を持たせ忘れる。** 追い出すときに必要なのは「リストの末尾のノード」ですが、辞書から消すには**その key** が要ります。ノードが自分の key を覚えていないと、辞書から消せません。値だけ持たせて詰まるのは、よくある失敗です
+</Callout>
+
+<Callout type="tip" title="Python では OrderedDict 1つで済みます">
+  Python の `collections.OrderedDict` は、内部が「辞書 + 双方向連結リスト」でできています。つまり、この記事でこれから作るものそのものです。
+
+  ```python
+  from collections import OrderedDict
+
+  class LRUCache:
+      def __init__(self, capacity):
+          self.cap = capacity
+          self.od = OrderedDict()
+
+      def get(self, key):
+          if key not in self.od:
+              return -1
+          self.od.move_to_end(key)          # 使ったので末尾（最新）へ
+          return self.od[key]
+
+      def put(self, key, value):
+          if key in self.od:
+              self.od.move_to_end(key)
+          self.od[key] = value
+          if len(self.od) > self.cap:
+              self.od.popitem(last=False)   # 先頭（最も古い）を追い出す
+  ```
+
+  面接では「組み込みを使わずに書いてください」と言われることがほとんどなので、自力で組み立てられるようにしておいたうえで、**中身が辞書 + 双方向連結リストであることを説明できる**状態を目指してください。
+</Callout>
+
+## もう一段：使用回数で追い出す LFU
+
+> 同じ要求で、追い出す基準を「**最も使われていない（使用回数が最小の）項目**」に変えてください。使用回数が同じものが複数あるときは、その中で**最も長く使われていないもの**を追い出します。
+
+LRU との違いは、順番が1本ではなくなることです。使用回数ごとにグループがあり、**その中でさらに新旧の順序**が要ります。
+
+ここで、素直にヒープを使いたくなります。使用回数が最小のものを取り出す、というのはまさにヒープの仕事だからです。ところがヒープでは、使用回数が変わったときに**途中の要素を更新できません**。しかも `get` のたびに回数は変わります。O(1) の要求も満たせません。
+
+そこで、次のように持ちます。
+
+- `vals`：`key → 値`
+- `freq`：`key → 使用回数`
+- `buckets`：`使用回数 → その回数のキーの列（古い順）`
+- `min_freq`：いまキャッシュにある中で、最小の使用回数
+
+`buckets` の各列の中は、LRU とまったく同じ「新旧の順番」です。ここに連結リスト（または `OrderedDict`）を使えば、先頭の取り出しも途中の削除も O(1) です。
+
+追い出すときは、`buckets[min_freq]` の**先頭**を見るだけで済みます。
+
+```python
+from collections import defaultdict, OrderedDict
+
+class LFUCache:
+    def __init__(self, capacity):
+        self.cap = capacity
+        self.vals = {}                      # key -> value
+        self.freq = {}                      # key -> 使われた回数
+        self.buckets = defaultdict(OrderedDict)  # 回数 -> その回数のキー（古い順）
+        self.min_freq = 0
+
+    def _touch(self, key):
+        f = self.freq[key]
+        del self.buckets[f][key]
+        if not self.buckets[f]:
+            del self.buckets[f]
+            if self.min_freq == f:
+                self.min_freq = f + 1       # その回数の住人がいなくなった
+        self.freq[key] = f + 1
+        self.buckets[f + 1][key] = None
+
+    def get(self, key):
+        if key not in self.vals:
+            return -1
+        self._touch(key)
+        return self.vals[key]
+
+    def put(self, key, value):
+        if self.cap == 0:
+            return
+        if key in self.vals:
+            self.vals[key] = value
+            self._touch(key)
+            return
+        if len(self.vals) >= self.cap:
+            old, _ = self.buckets[self.min_freq].popitem(last=False)  # 同率なら古いほう
+            del self.vals[old]
+            del self.freq[old]
+        self.vals[key] = value
+        self.freq[key] = 1
+        self.buckets[1][key] = None
+        self.min_freq = 1
+```
+
+<LfuCache client:visible />
+
+<Callout type="warn" title="min_freq の更新は2箇所だけです">
+  LFU で難しいのは「使用回数の最小値をどう追いかけるか」ですが、更新が必要な場面は2つしかありません。
+
+  1. **新しい項目を入れたとき**：その項目の回数は必ず 1 なので、`min_freq = 1` で確定します
+  2. **`min_freq` の列が空になったとき**：`min_freq` だった項目が使われて `min_freq + 1` へ移り、その列に誰もいなくなった場合です。このとき、次に小さい回数は必ず `min_freq + 1` です（そこへ移った本人がいるからです）。**1つずつ探し直す必要はありません**
+
+  それ以外の場面では `min_freq` は動きません。「最小値を持ち続けるのは大変そう」と感じるところですが、変わるきっかけがこの2つに限られていると分かれば、素直に書けます。
+</Callout>
+
+## 設計問題への向き合い方
+
+この2問に共通する手順を、一般化しておきます。
+
+1. **必要な操作を書き出す**（「key で引く」「順番を変える」「最小のものを取り出す」など）
+2. **それぞれに必要な計算量を、問題文から読み取る**（「O(1) で」と明記されていることが多い）
+3. **操作ごとに、それを O(1) または O(log N) でできる構造を当てはめる**
+4. **1つの構造で足りなければ、複数を組み合わせて同期させる**
+
+組み合わせの定番は次の通りです。
+
+| 欲しい組み合わせ | 使う構造 | 代表問題 |
+| --- | --- | --- |
+| key で引く + 順番の入れ替え | 辞書 + 双方向連結リスト | LRU Cache |
+| key で引く + 最小値の取り出し | 辞書 + ヒープ（または回数ごとの列） | LFU Cache |
+| key で引く + ランダムな取り出し | 辞書 + 配列（末尾と入れ替えて pop） | Insert Delete GetRandom O(1) |
+| key で引く + 時刻の検索 | 辞書 + 二分探索 | Time Based Key-Value Store |
+| 複数の列から新しい順に取る | 辞書 + ヒープでのマージ | Design Twitter |
+
+<Callout type="tip" title="削除を O(1) にする「末尾と入れ替えて pop」">
+  Insert Delete GetRandom O(1) は、配列の途中の要素を O(1) で消す必要があります。素直に消すと後ろがずれるので O(N) です。
+
+  そこで、**消したい要素を配列の末尾と入れ替えてから、末尾を pop します。** 順番は壊れますが、この問題では順番に意味がないので問題ありません。入れ替えた要素の位置は、辞書のほうも書き換えて同期を保ちます。
+
+  「順番が必要ないなら、順番を壊してよい」というのは、設計問題で効く発想です。**問題文が保証を求めていないものは、保証しなくてよい**という読み方を身につけてください。
+</Callout>
+
+## この型の計算量
+
+| 操作 | LRU | LFU |
+| --- | --- | --- |
+| get | O(1) | O(1) |
+| put | O(1) | O(1) |
+| 空間 | O(capacity) | O(capacity) |
+
+どちらも、**すべての操作が O(1)** です。ハッシュテーブルの参照が平均 O(1) であることに依存しているので、正確には「平均 O(1)」と答えるのが丁寧です。
+
+## 「これは設計問題だ」と気づくためのサイン
+
+- 問題文が「`class` を実装してください」という形になっている
+- **要求される計算量が明記されている**（「O(1) で」「平均 O(1) で」）
+- 操作が2種類以上あり、それぞれ求められる能力が違う
+- 1つのデータ構造では、どちらかの操作が O(N) になってしまう
+
+## この記事のチェックリスト
+
+- [ ] 辞書だけ、配列だけでは LRU が O(1) にならない理由を、それぞれ説明できる
+- [ ] 辞書と双方向連結リストが、それぞれ何を担当しているか言える
+- [ ] 単方向リストでは O(1) にならない理由を説明できる
+- [ ] 番兵を両端に置く理由を説明できる
+- [ ] ノードに key を持たせる必要がある理由を説明できる
+- [ ] LFU でヒープが使えない理由を説明できる
+- [ ] `min_freq` が変わる場面が2つだけであることを説明できる
+- [ ] 設計問題を「操作 → 必要な計算量 → 構造の割り当て」の順で分解できる
+- [ ] 記事冒頭のリストの問題を、解説を見ずに実装できる
