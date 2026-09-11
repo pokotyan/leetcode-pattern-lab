@@ -1,0 +1,214 @@
+---
+title: 最小全域木（全部つなぐ最小コスト）
+description: 最短経路とは別の問題。「全員をつなぐ」ための最小コストを、短い辺から採る Kruskal と、木を育てる Prim の2通りで求める
+section: advanced-graph
+order: 2
+level: 発展
+status: published
+requires:
+  - union-find
+  - heap-topk
+problems:
+  - name: Min Cost to Connect All Points
+    url: https://leetcode.com/problems/min-cost-to-connect-all-points/
+    level: Medium
+    importance: 高
+    technique: Kruskal / Prim
+  - name: Connecting Cities With Minimum Cost
+    url: https://leetcode.com/problems/connecting-cities-with-minimum-cost/
+    level: Medium
+    importance: 高
+    technique: Kruskal の基本形
+  - name: Optimize Water Distribution in a Village
+    url: https://leetcode.com/problems/optimize-water-distribution-in-a-village/
+    level: Hard
+    importance: 高
+    technique: 仮想ノードを足して MST に落とす
+  - name: Find Critical and Pseudo-Critical Edges in Minimum Spanning Tree
+    url: https://leetcode.com/problems/find-critical-and-pseudo-critical-edges-in-minimum-spanning-tree/
+    level: Hard
+    importance: 中
+    technique: 辺を強制／除外して MST を作り直す
+  - name: Number of Operations to Make Network Connected
+    url: https://leetcode.com/problems/number-of-operations-to-make-network-connected/
+    level: Medium
+    importance: 中
+    technique: 連結成分の数え上げ
+---
+
+import Callout from '../../components/Callout.astro'
+import KruskalMst from '../../components/sim/problems/KruskalMst'
+import PrimMst from '../../components/sim/problems/PrimMst'
+
+## この記事を読む前に押さえておく型
+
+- **Union-Find**：Kruskal 法は「この辺を足すと閉路ができるか」を毎回判定します。この判定を「2つの点が同じグループか」に言い換えて、ほぼ定数時間で答えるのが Union-Find です。これを知らないと、Kruskal は成立しません
+- **ヒープ**：Prim 法は「いま木に入っている点から一番近い点」を毎回取り出します。ダイクストラと同じく、最小値の取り出しをヒープに任せます
+
+## まず、困っている状況を体験してみます
+
+> 平面上に点が `[[0,0], [2,2], [3,10], [5,2], [7,0]]` と置かれています。2点をつなぐ費用は、そのマンハッタン距離です。**すべての点が互いに行き来できるようにする**ための、最小の合計費用を求めてください。
+
+まず確認したいのは、**これは最短経路の問題ではない**ということです。最短経路は「ある2点の間を安く移動したい」でしたが、ここで求められているのは「**全員がつながっている状態**を、最小の合計費用で作る」ことです。
+
+たとえば点0から点4までの最短経路だけを考えるなら、間の点を通らない直行の辺があればそれで済みます。しかしこの問題では、点1、点2、点3もどこかにつながっていなければなりません。
+
+ここで、答えとして選ばれる辺の集合がどんな形になるかを考えてみます。
+
+- 全部つながっている必要がある（連結）
+- 閉路があってはいけない。もし閉路があるなら、その中の1本を取り除いてもつながったままで、費用だけが減ります
+
+**連結で、閉路が無いグラフ**を木と呼びます。すべての頂点を含む木なので、全域木（spanning tree）です。その中で費用が最小のものが最小全域木（MST）です。
+
+木の性質から、辺の本数は必ず `頂点数 - 1` 本になります。これは終了条件として使えます。
+
+## 発想を変える：短い辺から採用して、閉路になるものだけ捨てる
+
+一番素直な発想は、**安い辺から順に採用していく**ことです。ただし、そのまま全部採用すると閉路ができてしまいます。
+
+そこで、辺を短い順に見ていき、次のように判断します。
+
+- その辺の両端が**別々のグループ**にいるなら、採用する。2つのグループが1つにつながる
+- 両端が**すでに同じグループ**なら、その辺はつながっているもの同士を重ねて結ぶだけなので、閉路になる。捨てる
+
+「同じグループか」を高速に判定し、採用したら「グループを1つにまとめる」。これはまさに Union-Find の仕事です。
+
+```python
+def min_cost_connect_points(points):
+    n = len(points)
+    edges = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = abs(points[i][0] - points[j][0]) + abs(points[i][1] - points[j][1])
+            edges.append((d, i, j))
+    edges.sort()                      # 短い辺から順に見る
+
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    total = used = 0
+    for d, u, v in edges:
+        ru, rv = find(u), find(v)
+        if ru == rv:
+            continue                  # 同じグループ = 閉路になるので捨てる
+        parent[ru] = rv
+        total += d
+        used += 1
+        if used == n - 1:             # 辺が n-1 本そろえば全体がつながる
+            break
+    return total
+```
+
+<KruskalMst client:visible />
+
+赤くなる辺が「閉路になるので捨てた辺」です。捨てられた辺は、必ず**それより短い辺ですでにつながっている**ペアだけであることを確認してみてください。
+
+<Callout type="tip" title="なぜ短い順に採って大丈夫なのか">
+  「その場で一番よく見えるものを選ぶ」やり方（貪欲法）は、たいていの問題では失敗します。ところが最小全域木では、これが必ず最適になります。
+
+  理由はこうです。いま見ている辺 `e` が、両端が別グループである最短の辺だとします。もし最適な答えが `e` を含んでいないとすると、その答えの中には `e` の両端をつなぐ別の経路があるはずです。その経路のどこかに、2つのグループをまたぐ辺が必ず1本あります。その辺を取り除いて `e` を足しても、やはり全体はつながったままです。そして `e` はグループをまたぐ最短の辺なので、費用は減るか、変わりません。
+
+  つまり **`e` を含む最適解が必ず作れる**ので、`e` を採用して損をすることがありません。この議論を「カットの性質」と呼びます。細かい形式は覚えなくて構いませんが、「**2つのグループをまたぐ最短の辺は、必ず答えに入れてよい**」という一文は覚えておく価値があります。
+</Callout>
+
+## もう1つのやり方：木を1点ずつ育てる
+
+Kruskal は「グラフ全体に散らばった辺を、短い順に拾っていく」やり方でした。もう1つ、**1点から始めて木を大きくしていく**やり方があります。これが Prim 法です。
+
+手順はこうです。
+
+1. どこか1点を木に入れる
+2. **いま木に入っている点から、木の外の点へ伸びる辺の中で最短のもの**を選び、その先の点を木に取り込む
+3. 全点が木に入るまで繰り返す
+
+「最短のものを選ぶ」ところにヒープを使います。形はダイクストラとほとんど同じです。
+
+```python
+import heapq
+
+def min_cost_connect_points(points):
+    n = len(points)
+    visited = [False] * n
+    heap = [(0, 0)]                   # (その点に届くコスト, 点)
+    total = count = 0
+    while count < n:
+        d, u = heapq.heappop(heap)
+        if visited[u]:
+            continue                  # すでに木に入っている点は飛ばす
+        visited[u] = True
+        total += d
+        count += 1
+        for v in range(n):            # 木に入っていない点への辺を全部入れる
+            if not visited[v]:
+                w = abs(points[u][0] - points[v][0]) + abs(points[u][1] - points[v][1])
+                heapq.heappush(heap, (w, v))
+    return total
+```
+
+<PrimMst client:visible />
+
+<Callout type="warn" title="ダイクストラと1文字しか違わないのに、意味は別物です">
+  Prim とダイクストラは、コードの形がほとんど同じです。違うのは、ヒープに入れる値です。
+
+  - **ダイクストラ**：`dist[u] + w`（**始点からの累積距離**）
+  - **Prim**：`w`（**その1本の辺の重みだけ**）
+
+  ダイクストラは「始点からどれだけ遠いか」を最小化しますが、Prim は「木に取り込むのに1本いくらかかるか」を最小化します。累積を足してしまうと、まったく別の（そして間違った）答えになります。
+
+  もう1つ、`if visited[u]: continue` を忘れないでください。ヒープには同じ点への辺が何本も入るので、取り出した時点で既に木の中にいることがよくあります。これを弾かないと、同じ点を何度も数えてしまいます。
+</Callout>
+
+## どちらを使うか
+
+| | Kruskal | Prim |
+| --- | --- | --- |
+| 必要な道具 | ソート + Union-Find | ヒープ |
+| 時間 | O(E log E) | O(E log V) |
+| 向いているグラフ | 辺が少ない（疎） | 辺が多い（密） |
+| 辺のリストが与えられている問題 | そのまま使える | 隣接リストを作る手間がある |
+
+LeetCode で出てくる MST 問題は、**辺のリストが最初から与えられている**ことが多いので、Kruskal のほうが書きやすい場面が目立ちます。一方 Min Cost to Connect All Points のように、点の座標だけが与えられてすべての組に辺がある（完全グラフ）場合は、辺が `N²/2` 本になるので、Prim のほうが有利です。
+
+どちらか一方でよいので、**すぐ書けるほうを確実に書けるようにしておく**のが実戦的です。
+
+<Callout type="tip" title="仮想の点を1つ足すと MST に化ける問題">
+  Optimize Water Distribution in a Village は、一見すると MST に見えません。
+
+  > 各家には「井戸を掘る費用」と「他の家とパイプでつなぐ費用」があります。全部の家に水を引く最小費用を求めてください。
+
+  ここで、**「水源」という架空の点0を1つ足します。** そして「家 i に井戸を掘る」を「点0 と家 i を、井戸の費用でつなぐ」と読み替えます。すると、問題は「点0 を含むすべての点をつなぐ最小費用」、つまり普通の MST になります。
+
+  「選択肢が2種類あって、どちらも費用がかかる」という問題で、片方を**仮想ノードへの辺**に読み替える手口は、繰り返し出てきます。
+</Callout>
+
+## 「これは最小全域木だ」と気づくためのサイン
+
+- 「**すべての**都市／家／点を**つなぐ**」「全体が行き来できるように」
+- 求めるのが「2点間の距離」ではなく「**合計費用**」
+- 「最小のコストで全員を接続」「ネットワークを構築する」
+- つないだ結果に閉路があっても意味が無い（無駄になる）構造
+- 選択肢が「つなぐ」以外にもう1つあり、仮想ノードへの辺に読み替えられそう
+
+<Callout type="warn" title="最短経路と混同しないでください">
+  MST は「全点をつなぐ合計費用の最小化」で、最短経路は「2点間の距離の最小化」です。**MST の上の2点間の経路が、その2点の最短経路になっているとは限りません。**
+
+  たとえば3点が三角形に並び、辺の重みが 1, 1, 1.9 のとき、MST は重み1の辺2本を選びます。しかし最初と最後の点の間の最短経路は、直接つなぐ 1.9 のほうです。MST 上では 1 + 1 = 2 になってしまいます。
+
+  問題文が「合計」を聞いているのか「距離」を聞いているのかを、最初に確認してください。
+</Callout>
+
+## この記事のチェックリスト
+
+- [ ] 答えが必ず木（連結で閉路なし）になる理由を説明できる
+- [ ] 辺の本数が `頂点数 - 1` になることを終了条件に使える
+- [ ] Kruskal で「同じグループなら捨てる」判定に Union-Find を使う理由を説明できる
+- [ ] 短い辺から採って最適になる理由を、グループをまたぐ辺の言葉で説明できる
+- [ ] Prim とダイクストラの違いが、ヒープに入れる値の違いであることを説明できる
+- [ ] Prim で `visited` の確認が必要な理由を説明できる
+- [ ] 仮想ノードを足して MST に落とす読み替えを説明できる
+- [ ] MST と最短経路の違いを、具体例で説明できる
+- [ ] 記事冒頭のリストの問題を、解説を見ずに実装できる

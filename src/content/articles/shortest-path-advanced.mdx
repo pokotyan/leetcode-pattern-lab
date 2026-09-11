@@ -1,0 +1,227 @@
+---
+title: 最短経路の発展（Bellman-Ford / Floyd-Warshall / 0-1 BFS）
+description: ダイクストラが使えない場面を3つに分けて整理する。負の辺、全点間、そして「辺のコストが 0 か 1 しかない」場合
+section: advanced-graph
+order: 1
+level: 発展
+status: published
+requires:
+  - dijkstra
+problems:
+  - name: Cheapest Flights Within K Stops
+    url: https://leetcode.com/problems/cheapest-flights-within-k-stops/
+    level: Medium
+    importance: 高
+    technique: Bellman-Ford（ラウンド数で制限）
+  - name: Find the City With the Smallest Number of Neighbors at a Threshold Distance
+    url: https://leetcode.com/problems/find-the-city-with-the-smallest-number-of-neighbors-at-a-threshold-distance/
+    level: Medium
+    importance: 高
+    technique: Floyd-Warshall
+  - name: Minimum Obstacle Removal to Reach Corner
+    url: https://leetcode.com/problems/minimum-obstacle-removal-to-reach-corner/
+    level: Hard
+    importance: 高
+    technique: 0-1 BFS
+  - name: Path With Minimum Effort
+    url: https://leetcode.com/problems/path-with-minimum-effort/
+    level: Medium
+    importance: 中
+    technique: 変形ダイクストラ / 二分探索 + BFS
+  - name: Minimum Cost to Make at Least One Valid Path in a Grid
+    url: https://leetcode.com/problems/minimum-cost-to-make-at-least-one-valid-path-in-a-grid/
+    level: Hard
+    importance: 中
+    technique: 0-1 BFS
+  - name: Number of Ways to Arrive at Destination
+    url: https://leetcode.com/problems/number-of-ways-to-arrive-at-destination/
+    level: Medium
+    importance: 中
+    technique: ダイクストラ + 経路数の数え上げ
+---
+
+import Callout from '../../components/Callout.astro'
+import CheapestFlights from '../../components/sim/problems/CheapestFlights'
+import FloydWarshall from '../../components/sim/problems/FloydWarshall'
+
+## この記事を読む前に押さえておく型
+
+- **ダイクストラ法**：この記事は「ダイクストラでは解けない場面」を並べたものです。ダイクストラが「一番近い未確定ノードを確定させる」ことで成り立っていること、そしてその正しさが**辺の重みが負でないこと**に依存していることを理解していないと、ここから先の分岐が意味を持ちません
+
+## まず、困っている状況を体験してみます
+
+> 都市が `n` 個あり、フライトが `[出発地, 到着地, 運賃]` の形で与えられます。都市 `src` から `dst` まで、**乗り継ぎ（経由地）を k 回までに抑えて**行くときの最安運賃を求めてください。
+
+ダイクストラをそのまま使うと、どうなるでしょうか。ダイクストラは「一番安く着ける都市から順に確定させる」方法です。ところがこの問題では、**安い経路が乗り継ぎ回数の上限を超えていて使えず、高いけれど直行できる経路のほうが正解**という場合があります。
+
+たとえば `0 → 1 → 2` が合計 200、`0 → 2` が 500 で、乗り継ぎ 0 回までという条件なら、答えは 500 です。ところがダイクストラは 2 を「200 で確定」としてしまい、それ以上更新しません。**「一番近いものから確定させてよい」という前提が、制約の追加によって崩れています。**
+
+ダイクストラが使えなくなる場面は、大きく3つに分けられます。この記事では、それぞれに対応する道具を見ていきます。
+
+| 困っている点 | 使う道具 | 計算量 |
+| --- | --- | --- |
+| 辺に負の重みがある／使える辺の本数に上限がある | Bellman-Ford | O(V × E) |
+| すべての組み合わせの最短距離が要る | Floyd-Warshall | O(V³) |
+| 辺のコストが 0 か 1 しかない | 0-1 BFS（両端キュー） | O(V + E) |
+
+## Bellman-Ford：確定させず、全部の辺を何度も見直す
+
+ダイクストラは「一番近いものを1つ確定させる」ことを繰り返しますが、Bellman-Ford は**何も確定させません。** 代わりに、**すべての辺について「この辺を使うと短くなるか」を確かめる**という作業を、繰り返します。
+
+1回の繰り返し（ラウンド）で、すべての辺を1本ずつ見て、`dist[v] > dist[u] + w` なら更新します。これを1回やると、**辺を1本使って行ける範囲の最短距離が正しくなります。** 2回やれば辺2本ぶん、3回やれば辺3本ぶんです。
+
+ここで、この問題の制約「乗り継ぎ k 回まで」が、**そのままラウンド数の制限になります。** 経由地が k 個ということは、使える辺は `k + 1` 本までです。つまり、ラウンドを `k + 1` 回で打ち切ればよいだけです。
+
+```python
+def find_cheapest_price(n, flights, src, dst, k):
+    INF = float('inf')
+    dist = [INF] * n
+    dist[src] = 0
+    for _ in range(k + 1):            # 経由地 k 個 = 辺 k+1 本まで
+        nxt = dist[:]                 # 1ラウンド前の値だけを使う
+        for u, v, w in flights:
+            if dist[u] + w < nxt[v]:
+                nxt[v] = dist[u] + w
+        dist = nxt
+    return -1 if dist[dst] == INF else dist[dst]
+```
+
+<CheapestFlights client:visible />
+
+「直行のみ（k=0）」を選んでみてください。ラウンドが1回しか回らないので、`0 → 1 → 2` の 200 は見つからず、答えは直行の 500 になります。「乗り継ぎ可（k=1）」に切り替えると、2ラウンド目で 200 に更新されます。
+
+<Callout type="warn" title="コピーを取る理由。ここが最大のハマりどころです">
+  上のコードで `nxt = dist[:]` としてコピーを取り、更新は `nxt` に書き、参照は `dist` から読んでいます。**これを省いて1つの配列を使い回すと、この問題では間違った答えが出ます。**
+
+  1つの配列で更新していくと、同じラウンドの中で「さっき更新したばかりの値」を使って、さらに先へ更新が伝わってしまいます。すると、辺を1本しか使っていないつもりのラウンドで、2本ぶん、3本ぶんと進んでしまい、乗り継ぎ回数の制限が効かなくなります。
+
+  逆に言うと、**「ラウンド数 = 使える辺の本数」という対応を保つためにコピーが必要**です。辺の本数に制限が無い普通の Bellman-Ford（負の閉路の検出など）では、コピーせずに書いても最終的な答えは同じになります。「制限があるからコピーする」と覚えてください。
+</Callout>
+
+負の重みが扱えるのも Bellman-Ford の特徴です。ダイクストラは「確定させたノードはもう更新されない」という前提で動くので、後から負の辺で短くなる可能性があると壊れます。Bellman-Ford は確定という概念を持たないので、そのまま動きます。
+
+さらに、頂点数 V に対して `V - 1` ラウンド回してもまだ更新が起きるなら、**負の閉路が存在する**と判定できます（回るたびに距離が減り続けるためです）。
+
+## Floyd-Warshall：中継してよい点を1つずつ増やす
+
+> 都市が `n` 個あり、距離の閾値が与えられます。閾値以内で行ける都市の数が最も少ない都市を求めてください。
+
+この問題で要るのは、`src` から各都市への距離ではなく、**すべての組み合わせ**の距離です。ダイクストラを全頂点から回してもよいのですが、頂点数が小さいなら、もっと短く書ける方法があります。
+
+Floyd-Warshall の発想は、次の1行に尽きます。
+
+> **中継してよい点の集合を、1つずつ増やしていく。**
+
+最初は、どこも中継してはいけない状態（直通の辺だけ）から始めます。次に「頂点 0 だけは中継してよい」ことにして、すべての `(i, j)` について `i → 0 → j` が近道になっていないかを確かめます。続いて「頂点 0 と 1 を中継してよい」、「0, 1, 2 を中継してよい」……と増やしていきます。
+
+すべての頂点を中継してよい状態まで来れば、それが最短距離です。
+
+```python
+def floyd_warshall(n, edges):
+    INF = float('inf')
+    dist = [[0 if i == j else INF for j in range(n)] for i in range(n)]
+    for u, v, w in edges:
+        dist[u][v] = min(dist[u][v], w)
+        dist[v][u] = min(dist[v][u], w)      # 無向グラフなら両方向
+    for k in range(n):                       # 中継してよい点を1つずつ増やす
+        for i in range(n):
+            for j in range(n):
+                if dist[i][k] + dist[k][j] < dist[i][j]:
+                    dist[i][j] = dist[i][k] + dist[k][j]
+    return dist
+```
+
+<FloydWarshall client:visible />
+
+<Callout type="warn" title="ループの順番を絶対に入れ替えないでください">
+  `k` のループが**一番外側**にあることが、この手法の正しさそのものです。
+
+  `k` が外側にあるからこそ、「頂点 `k` まで中継してよいときの答え」が、その1周のあいだ全体で一貫します。うっかり `for i: for j: for k:` の順に書いてしまうと、中継してよい集合が `(i, j)` ごとにばらばらになり、答えが合いません。
+
+  この3重ループは、見た目こそ単純ですが、中身は「中継できる点の集合」を状態とした立派な動的計画法です。`k` が DP の段階（フェーズ）に当たると理解しておくと、順番を間違えなくなります。
+</Callout>
+
+計算量は O(V³) です。V が 100 なら 100 万回なので十分間に合いますが、V が 1,000 を超えると 10 億回になり厳しくなります。**「全点間が欲しい」かつ「頂点数が数百まで」**という条件が揃ったときの道具だと覚えてください。
+
+## 0-1 BFS：コストが 0 か 1 しかないとき
+
+> グリッドがあり、`0` は空きマス、`1` は障害物です。左上から右下へ行くために、取り除く障害物の最小数を求めてください。
+
+これは最短経路問題です。空きマスへの移動はコスト 0、障害物のマスへの移動はコスト 1 と考えれば、「合計コスト最小の経路」を求めているだけだからです。
+
+ダイクストラでも解けます。ただし、辺のコストが **0 と 1 の2種類しかない**場合、ヒープを使わずに済ませられます。
+
+普通の BFS のキューを、両端キュー（deque）に変えます。そして、
+
+- **コスト 0 の辺**で進むときは、**キューの先頭に**入れる（距離が増えていないので、いま処理している集団と同じ扱い）
+- **コスト 1 の辺**で進むときは、**キューの末尾に**入れる（1つ後ろの集団に回す）
+
+こうすると、キューの中身は常に「距離がほぼ揃った状態」に保たれ、ヒープと同じ順序が実現できます。ヒープの `log` が消えるので、O(V + E) になります。
+
+```python
+from collections import deque
+
+def minimum_obstacles(grid):
+    rows, cols = len(grid), len(grid[0])
+    dist = [[float('inf')] * cols for _ in range(rows)]
+    dist[0][0] = grid[0][0]
+    dq = deque([(0, 0)])
+    while dq:
+        r, c = dq.popleft()
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                w = grid[nr][nc]                     # 0 か 1 しかない
+                if dist[r][c] + w < dist[nr][nc]:
+                    dist[nr][nc] = dist[r][c] + w
+                    if w == 0:
+                        dq.appendleft((nr, nc))      # 同じ距離なので先頭へ
+                    else:
+                        dq.append((nr, nc))          # 1つ遠いので末尾へ
+    return dist[rows - 1][cols - 1]
+```
+
+<Callout type="tip" title="BFS が最短距離を保証していた理由を思い出してください">
+  重みの無いグラフで BFS が最短距離を与えるのは、キューの中身が「距離 d のノード」と「距離 d+1 のノード」の2種類しか混ざらず、順序が崩れないからでした。
+
+  0-1 BFS は、この性質を保つために「コスト 0 の辺は先頭へ、コスト 1 の辺は末尾へ」入れているだけです。**BFS の自然な拡張**として理解すると、覚えることがほとんどありません。
+
+  コストが 0 と 1 以外（たとえば 0, 1, 2）を含むなら、この工夫は使えません。素直にダイクストラへ戻ってください。
+</Callout>
+
+## 選び方をまとめます
+
+問題を読んだら、次の順に確認してください。
+
+1. **辺の重みが無い（すべて1）** → BFS
+2. **重みが 0 と 1 だけ** → 0-1 BFS
+3. **重みが非負で、1点からの距離が欲しい** → ダイクストラ
+4. **負の辺がある／使える辺の本数に上限がある** → Bellman-Ford
+5. **全点間の距離が欲しく、頂点数が数百まで** → Floyd-Warshall
+
+| 手法 | 時間 | 負の辺 | 向いている状況 |
+| --- | --- | --- | --- |
+| BFS | O(V + E) | — | 重み無し |
+| 0-1 BFS | O(V + E) | × | 重みが 0 / 1 のみ |
+| ダイクストラ | O(E log V) | × | 非負の重み、単一始点 |
+| Bellman-Ford | O(V × E) | ○ | 負の辺、辺の本数に制限 |
+| Floyd-Warshall | O(V³) | ○（負の閉路は不可） | 全点間、頂点数が小さい |
+
+## 「これは最短経路の発展形だ」と気づくためのサイン
+
+- 「**k 回まで**乗り継いでよい」「操作を k 回まで」といった、経路の長さに対する制限
+- コストに**負の値**が含まれる
+- 「**すべての都市の組**について」「各頂点から到達できる頂点数」
+- グリッドで「**取り除く数を最小に**」「壁を壊す回数を最小に」（0 か 1 のコスト）
+- 制約の頂点数が 100 前後と極端に小さい（O(V³) を許す意図がある）
+
+## この記事のチェックリスト
+
+- [ ] 乗り継ぎ回数の制限があると、ダイクストラの前提が崩れる理由を説明できる
+- [ ] Bellman-Ford の1ラウンドが何を保証するか説明できる
+- [ ] `nxt = dist[:]` のコピーが必要な理由を、乗り継ぎ回数と結びつけて説明できる
+- [ ] Bellman-Ford で負の閉路を検出する方法を説明できる
+- [ ] Floyd-Warshall の `k` が何を表していて、なぜ一番外側でなければならないか説明できる
+- [ ] 0-1 BFS で、コスト 0 を先頭に入れる理由を BFS の性質から説明できる
+- [ ] 5つの手法を、問題文のどこを見て選ぶか言える
+- [ ] 記事冒頭のリストの問題を、解説を見ずに実装できる
