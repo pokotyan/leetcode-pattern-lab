@@ -1,0 +1,239 @@
+---
+title: トライ木（接頭辞で枝を共有する）
+description: 単語をハッシュテーブルに入れるだけでは「前方一致」に答えられない。1文字ずつを枝にして共有し、探索を途中で打ち切れる形にする
+section: advanced-string
+order: 1
+level: 発展
+status: published
+requires:
+  - hash-counting
+  - tree-traversal
+problems:
+  - name: Implement Trie (Prefix Tree)
+    url: https://leetcode.com/problems/implement-trie-prefix-tree/
+    level: Medium
+    importance: 高
+    technique: トライの基本操作
+  - name: Design Add and Search Words Data Structure
+    url: https://leetcode.com/problems/design-add-and-search-words-data-structure/
+    level: Medium
+    importance: 高
+    technique: トライ + ワイルドカードの再帰
+  - name: Word Search II
+    url: https://leetcode.com/problems/word-search-ii/
+    level: Hard
+    importance: 高
+    technique: トライで枝刈りする盤面 DFS
+  - name: Replace Words
+    url: https://leetcode.com/problems/replace-words/
+    level: Medium
+    importance: 中
+    technique: 最短の接頭辞を探す
+  - name: Search Suggestions System
+    url: https://leetcode.com/problems/search-suggestions-system/
+    level: Medium
+    importance: 中
+    technique: 接頭辞ごとの候補列挙
+  - name: Maximum XOR of Two Numbers in an Array
+    url: https://leetcode.com/problems/maximum-xor-of-two-numbers-in-an-array/
+    level: Medium
+    importance: 中
+    technique: 2進数のトライ
+  - name: Palindrome Pairs
+    url: https://leetcode.com/problems/palindrome-pairs/
+    level: Hard
+    importance: 低
+    technique: トライ + 回文判定
+---
+
+import Callout from '../../components/Callout.astro'
+import TrieWordDictionary from '../../components/sim/problems/TrieWordDictionary'
+import WordSearchII from '../../components/sim/problems/WordSearchII'
+
+## この記事を読む前に押さえておく型
+
+- **ハッシュテーブル**：「その単語が登録されているか」を O(1) で答えるだけなら、集合に入れるだけで足ります。この記事は**それでは答えられない質問**から始まるので、ハッシュテーブルで何ができて何ができないかが分かっていることが出発点です
+- **二分木（DFS）**：トライは木なので、探索は根から降りる再帰です。「枝が無ければそこで打ち切る」「子を順に試して、ダメなら戻る」という木の DFS の形がそのまま出てきます
+
+## まず、困っている状況を体験してみます
+
+単語の集まり `["apple", "app", "apt"]` があるとします。
+
+> 質問1：`"app"` は登録されていますか？
+
+これはハッシュテーブル（集合）で一発です。`"app" in words` と書けば O(1) で答えが出ます。
+
+> 質問2：`"ap"` で**始まる**単語は登録されていますか？
+
+こちらは急に難しくなります。集合は「完全に一致するか」しか答えられないので、前方一致を調べるには全部の単語を1つずつ取り出して `startswith("ap")` を確認するしかありません。単語が N 個、長さが L なら O(N × L) です。
+
+> 質問3：`"a.t"`（`.` は任意の1文字）に一致する単語はありますか？
+
+これも同様に、全部の単語を舐めるしかありません。
+
+質問2と3が重い理由は、**単語どうしがばらばらに保管されていて、共通部分が活かされていない**ことです。`"apple"` と `"app"` と `"apt"` は、どれも `"ap"` という出だしを共有しているのに、集合の中では3つの独立した文字列として別々に置かれています。
+
+## 発想を変える：1文字ずつを枝にして、共通部分を1つにまとめる
+
+トライ（trie）は、単語を1文字ずつ枝に分解して木にしたものです。根から葉に向かって枝をたどると、1つの単語が綴られます。出だしが同じ単語は、同じ枝を共有します。
+
+`["apple", "app", "apt"]` をトライにすると、根から `a` → `p` と降りたところで枝が分かれ、`p` の先に `l` → `e` が続き、`t` が別の枝になります。`"app"` は途中の節点で終わるので、そこに「ここで単語が1つ終わる」という印を付けます。
+
+この形になると、さきほどの3つの質問はすべて**根から文字数ぶん降りるだけ**で答えられます。
+
+| 質問 | トライでのやり方 | 手数 |
+| --- | --- | --- |
+| `"app"` は登録されているか | `a` → `p` → `p` と降りて、終端の印があるか見る | O(単語の長さ) |
+| `"ap"` で始まる単語はあるか | `a` → `p` と降りて、**節点が存在すれば** yes | O(接頭辞の長さ) |
+| `"a.t"` に一致するものはあるか | `a` へ降り、`.` のところで**子を全部試し**、その先で `t` を探す | 分岐ぶんだけ再帰 |
+
+重要なのは、**単語の個数 N がまったく出てこない**点です。手数は探している文字列の長さだけで決まります。100万語を入れても、`"app"` を探す手数は3ステップのままです。
+
+```python
+class WordDictionary:
+    def __init__(self):
+        self.children = {}                                # 文字 -> 子ノード
+        self.is_word = False                              # ここで単語が終わるか
+
+    def add_word(self, word):
+        node = self
+        for ch in word:
+            if ch not in node.children:
+                node.children[ch] = WordDictionary()      # 枝が無ければ作る
+            node = node.children[ch]                      # 1文字ぶん降りる
+        node.is_word = True
+
+    def search(self, word, node=None):
+        node = node or self
+        for i, ch in enumerate(word):
+            if ch == '.':
+                for child in node.children.values():      # どの枝でもよい
+                    if self.search(word[i + 1:], child):
+                        return True
+                return False
+            if ch not in node.children:
+                return False                              # 枝が切れたら無い
+            node = node.children[ch]
+        return node.is_word                               # 通過点ではなく終端か
+```
+
+<TrieWordDictionary client:visible />
+
+「`ap` を検索（通過点）」を選んでみてください。`a` → `p` と問題なく降りられて、節点も存在します。それでも答えは `False` です。**節点が存在することと、そこが単語の終わりであることは別の話**だからです。`is_word` の印がこの区別を担っています。
+
+前方一致（`startsWith`）を実装するときは、まさにこの印を**見ない**ことで「途中まで届けばよい」という意味になります。`search` と `startsWith` の違いは、最後の1行だけです。
+
+<Callout type="warn" title="終端の印を忘れると、通過点が単語になってしまいます">
+  トライで最も多いバグは `is_word` の扱いです。
+
+  - 印を付け忘れると、登録したはずの単語が見つかりません
+  - 印を見ずに「節点があるか」だけで判定すると、`"ap"` のような**登録していない接頭辞**まで `True` になってしまいます
+
+  もう1つ、実装の形にも注意してください。上のコードは節点クラスを1つで済ませていますが、`children` を辞書ではなく長さ26の配列にする書き方もあります。速度は配列のほうが有利ですが、小文字以外（数字や記号）が入る問題では壊れます。**問題文の文字種の制約を確認してから決めてください。**
+</Callout>
+
+## なぜ節点の数が減るのか、数えて確かめます
+
+`["apple", "app", "apt"]` の総文字数は `5 + 3 + 3 = 11` です。それぞれ独立に持てば、11個の文字を保管することになります。
+
+トライにすると、節点は根を除いて次の6個です。
+
+`a` / `p` / `p` / `l` / `e` / `t`
+
+`"app"` は `"apple"` の途中までと完全に同じ道を通るので、新しい節点は1つも作られません（終端の印が付くだけです）。`"apt"` は `a` → `p` までを共有し、`t` の1つだけを新しく作ります。
+
+シミュレーターの変数表示に「節点数」と「総文字数」が出ています。単語が増えるほど、この差は開いていきます。**辞書のように出だしの重なる単語が大量にある場面ほど、トライは効きます。**
+
+## トライで探索を打ち切る：Word Search II
+
+トライが本当に強いのは、「登録されているか」を調べるときではなく、**探索の途中で「この先には何も無い」と即座に判断できる**ときです。
+
+> 文字が書かれた盤面と、単語のリストが与えられます。上下左右に隣り合うマスをつないで綴れる単語を、すべて見つけてください（同じマスは1回しか使えません）。
+
+素直にやるなら、単語1つごとに盤面全体から DFS で探します。単語が W 個、盤面が M マス、1回の DFS が最悪 4<sup>L</sup> 手だとすると、全体で `W × M × 4^L`。この問題の制約では単語が3万語あるので、まったく終わりません。
+
+ここで発想を変えます。**単語ごとに盤面を探すのではなく、盤面を1回だけ探して、その途中で「いま綴っている文字列が、どれかの単語の出だしになっているか」を確認します。** この確認をしてくれるのがトライです。
+
+盤面を DFS しながら、トライの節点も一緒に降りていきます。次のマスの文字がトライの枝に無ければ、**その方向には単語が1つも存在しない**ので、そこで打ち切れます。これが枝刈りです。
+
+```python
+def find_words(board, words):
+    trie = {}
+    for w in words:                       # 単語をまとめてトライに入れる
+        node = trie
+        for ch in w:
+            node = node.setdefault(ch, {})
+        node['$'] = w                     # 終端に単語そのものを置く
+
+    res = []
+    rows, cols = len(board), len(board[0])
+
+    def dfs(r, c, node):
+        ch = board[r][c]
+        if ch not in node:
+            return                        # トライに枝が無い = この先に単語は無い
+        nxt = node[ch]
+        if '$' in nxt:
+            res.append(nxt.pop('$'))      # 見つけた単語は取り除いて重複を防ぐ
+        board[r][c] = '#'                 # 訪問済みの印
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                dfs(nr, nc, nxt)
+        board[r][c] = ch                  # 戻す
+
+    for r in range(rows):
+        for c in range(cols):
+            dfs(r, c, trie)
+    return res
+```
+
+<WordSearchII client:visible />
+
+赤く光るマスが「トライに枝が無いので打ち切った」ところです。盤面のほとんどのマスが、1手で切り捨てられているのが分かります。単語ごとに探していたら、このマスを単語の数だけ何度も訪れることになっていました。
+
+<Callout type="tip" title="終端に単語そのものを置く小技">
+  上のコードでは、終端の印として `True` ではなく**単語そのもの**（`node['$'] = w`）を置いています。こうすると、見つけたときに「いまなぞってきた文字列」を組み立て直す必要がなく、`res.append(nxt.pop('$'))` で取り出すだけで済みます。
+
+  さらに `pop` にしているのがポイントです。**一度見つけた単語をトライから消してしまえば、同じ単語を二度追加する心配がなくなります。** 別の経路から同じ単語を綴れる盤面（シミュレーターの「接頭辞を共有」を試してみてください）でも、結果が重複しません。集合で後から重複を除く書き方より、こちらのほうが速く、書き忘れもありません。
+</Callout>
+
+## この型の計算量
+
+`N` を単語数、`L` を単語の長さ、`P` を接頭辞の長さとします。
+
+| 操作 | ハッシュ集合 | トライ |
+| --- | --- | --- |
+| 単語の追加 | O(L) | O(L) |
+| 完全一致の検索 | O(L) | O(L) |
+| **前方一致の判定** | O(N × L) | **O(P)** |
+| **接頭辞に続く単語の列挙** | O(N × L) | O(P + 出力数) |
+| ワイルドカード検索 | O(N × L) | 分岐した枝のぶんだけ |
+| 空間 | O(N × L) | O(節点数)。共通接頭辞のぶん少ない |
+
+Word Search II は、盤面のマス数を M、トライの深さを L として、最悪 O(M × 4<sup>L</sup>) です。ただし実際には枝刈りが強く効くので、この上限に近づくことはまずありません。
+
+## 「これはトライだ」と気づくためのサイン
+
+- 「**接頭辞**（prefix）」「〜で始まる」「オートコンプリート」「検索候補」
+- 単語の集合に対して、**何度も**問い合わせがある（1回だけなら舐めても同じ）
+- ワイルドカード（`.`）を含む検索
+- 盤面や文字列の探索で、**複数の単語を同時に**探したい
+- 2進数で表した整数に対して「XOR を最大化する相手を探す」（ビットを1文字と見なすトライ）
+
+<Callout type="warn" title="単語が1語だけならトライは不要です">
+  トライは「たくさんの単語を1つの木にまとめる」ことで効果が出る道具です。探す対象が1語しかないなら、木を作るコストのほうが高くつきます。その場合は次の記事で扱う文字列照合（KMP など）の出番です。
+
+  見分け方は単純で、**探す側が複数あるか、探される側が複数あるか**です。辞書（複数の単語）に対する問い合わせならトライ、1本の長い文字列の中から1つのパターンを探すなら文字列照合です。
+</Callout>
+
+## この記事のチェックリスト
+
+- [ ] ハッシュ集合では前方一致に答えられない理由を説明できる
+- [ ] トライの探索の手数に、単語の個数 N が出てこない理由を説明できる
+- [ ] `search` と `startsWith` の実装の違いが最後の1行だけである理由を説明できる
+- [ ] 終端の印を見ないとどんな誤りが起きるか、具体例で言える
+- [ ] Word Search II で、単語ごとに探すのをやめて盤面を1回だけ探す形に変えられる理由を説明できる
+- [ ] 終端に単語そのものを置き、見つけたら消す書き方の利点を2つ挙げられる
+- [ ] トライと文字列照合の使い分けを言える
+- [ ] 記事冒頭のリストの問題を、解説を見ずに実装できる

@@ -1,0 +1,236 @@
+---
+title: 文字列照合（KMP とローリングハッシュ）
+description: 不一致のたびに読み直すのをやめる。一致した長さを覚えて戻らない KMP と、窓のハッシュを転がす Rabin-Karp を、同じ「やり直しを減らす」発想で並べる
+section: advanced-string
+order: 2
+level: 発展
+status: published
+requires:
+  - hash-counting
+  - sliding-window
+problems:
+  - name: Find the Index of the First Occurrence in a String
+    url: https://leetcode.com/problems/find-the-index-of-the-first-occurrence-in-a-string/
+    level: Easy
+    importance: 高
+    technique: KMP / Rabin-Karp の基本形
+  - name: Repeated Substring Pattern
+    url: https://leetcode.com/problems/repeated-substring-pattern/
+    level: Easy
+    importance: 中
+    technique: lps の最後の値を使う
+  - name: Shortest Palindrome
+    url: https://leetcode.com/problems/shortest-palindrome/
+    level: Hard
+    importance: 高
+    technique: 反転文字列と連結して lps
+  - name: Longest Duplicate Substring
+    url: https://leetcode.com/problems/longest-duplicate-substring/
+    level: Hard
+    importance: 高
+    technique: 二分探索 + ローリングハッシュ
+  - name: Longest Happy Prefix
+    url: https://leetcode.com/problems/longest-happy-prefix/
+    level: Hard
+    importance: 中
+    technique: lps そのもの
+  - name: Repeated DNA Sequences
+    url: https://leetcode.com/problems/repeated-dna-sequences/
+    level: Medium
+    importance: 中
+    technique: 固定長のローリングハッシュ
+---
+
+import Callout from '../../components/Callout.astro'
+import KmpSearch from '../../components/sim/problems/KmpSearch'
+import RabinKarp from '../../components/sim/problems/RabinKarp'
+
+## この記事を読む前に押さえておく型
+
+- **Sliding Window**：ローリングハッシュは「幅 m の窓を1つずつずらす」という形そのものです。窓をずらすときに、出ていく要素の影響を引いて入ってくる要素を足す、という更新の考え方を知っていることが前提になります
+- **ハッシュテーブル**：文字列をハッシュ値という1つの数に押し込めて比較する、という発想が土台です。**違う文字列が同じ値になりうる（衝突）**という性質も、ここで押さえておいてください。この記事では、その衝突への対処が主題の1つになります
+
+## まず、困っている状況を体験してみます
+
+> `text = "aabaaabaaac"` の中から `pattern = "aabaaac"` が現れる最初の位置を探してください。
+
+素直に書くと、開始位置を1つずつずらしながら、そこから pattern と1文字ずつ比べていく形になります。
+
+```python
+for i in range(n - m + 1):
+    if text[i:i + m] == pattern:      # 内側で最大 m 回の比較
+        return i
+```
+
+開始位置が N 通り、それぞれで最大 M 回比べるので O(N × M) です。ふだんはこれで十分速く、LeetCode の Easy 問題なら通ります。
+
+問題は、**同じ文字がたくさん並んでいる入力**です。上の例で手を動かしてみます。
+
+- `i = 0` から比べると、`a a b a a a` まで6文字一致して、7文字目で不一致になります
+- 素直な方法は、ここで `i = 1` に戻って**また先頭から**比べ直します
+
+このとき、私たちは「6文字ぶん一致していた」という情報を手に入れていたのに、それを捨てて `i = 1` からやり直しています。text を読む位置も後戻りしています。最悪の入力（`"aaaa...a"` から `"aaa...ab"` を探すような場合）では、この読み直しが毎回発生して、本当に O(N × M) になります。N も M も 10 万規模だと 100 億回です。
+
+## 発想を変える：一致していた長さを覚えて、text を戻さない
+
+ここで考えたいのは、「6文字一致して7文字目で外れた」とき、**次に試すべき開始位置はどこか**です。
+
+一致していた部分は `"aabaaa"` でした。この中で、**先頭から見た並び（接頭辞）と、末尾から見た並び（接尾辞）が一致している最大の長さ**を考えます。`"aabaaa"` の場合、末尾の `"aa"` と先頭の `"aa"` が一致しているので、その長さは2です。
+
+これが分かっていると、次に試す開始位置は**2文字ぶんすでに一致している状態**から再開できます。`i` を1つ戻して先頭から比べ直す必要はありません。text を読む位置は、一度も後戻りしなくて済みます。
+
+この「接頭辞と接尾辞が一致する最大の長さ」を、pattern の各位置についてあらかじめ計算した配列が lps（longest proper prefix which is also suffix）です。text はまったく見ずに、pattern だけから作れます。
+
+```python
+def build_lps(pattern):
+    lps = [0] * len(pattern)          # lps[i] = pattern[:i+1] の「接頭辞 = 接尾辞」の最大長
+    length = 0
+    for i in range(1, len(pattern)):
+        while length > 0 and pattern[i] != pattern[length]:
+            length = lps[length - 1]  # 1つ短い候補へ戻る
+        if pattern[i] == pattern[length]:
+            length += 1
+        lps[i] = length
+    return lps
+
+def kmp(text, pattern):
+    lps = build_lps(pattern)
+    length = 0                        # いま何文字ぶん一致しているか
+    for i, ch in enumerate(text):
+        while length > 0 and ch != pattern[length]:
+            length = lps[length - 1]  # ずらす。text 側の i は戻さない
+        if ch == pattern[length]:
+            length += 1
+        if length == len(pattern):
+            return i - length + 1     # 一致した先頭位置
+    return -1
+```
+
+<KmpSearch client:visible />
+
+前半が lps を作る段階、後半が text を走査する段階です。後半で `i`（text 側の位置）が**一度も左に戻らない**ことを確認してみてください。動くのは `length`（一致している長さ）だけです。
+
+## lps を数字で読んでみます
+
+`pattern = "aabaaac"` の lps を1つずつ確かめます。「接頭辞」と「接尾辞」は、どちらも**文字列全体そのものは除きます**（それを許すと常に全長になってしまうためです）。
+
+| i | pattern[0..i] | 接頭辞かつ接尾辞になっている最長のもの | lps[i] |
+| --- | --- | --- | --- |
+| 0 | `a` | なし | 0 |
+| 1 | `aa` | `a` | 1 |
+| 2 | `aab` | なし | 0 |
+| 3 | `aaba` | `a` | 1 |
+| 4 | `aabaa` | `aa` | 2 |
+| 5 | `aabaaa` | `aa` | 2 |
+| 6 | `aabaaac` | なし | 0 |
+
+`i = 5` のところが少しややこしいので補足します。`"aabaaa"` の末尾3文字は `"aaa"` ですが、先頭3文字は `"aab"` なので一致しません。末尾2文字 `"aa"` と先頭2文字 `"aa"` は一致するので、答えは2です。**長いほうから順に試して、最初に一致したものを採る**という意味になります。
+
+そして `while length > 0 and ...: length = lps[length - 1]` という行は、まさにこの「もっと短い候補へ落としていく」操作です。1つ短くするのではなく、**次にありうる候補まで一気に飛ぶ**ので、無駄がありません。
+
+<Callout type="warn" title="text 側の i を戻したくなったら、それは KMP ではありません">
+  KMP の実装でよくある誤りが、不一致のときに `i` を触ってしまうことです。
+
+  - `length = lps[length - 1]` は、**pattern をずらす**操作です。text の読み取り位置 `i` はそのままです
+  - `while` を `if` にしてしまうと、1回しか短くできず、まだ不一致のまま先に進んでしまいます。ここは必ず `while` です
+  - 一致を見つけたあと**次の一致も探したい**場合は、`return` せずに `length = lps[length - 1]` として続けます。`length = 0` にしてしまうと、重なった位置での一致を見落とします
+
+  `i` が単調に増え続けることが、全体を O(N + M) に保っている根拠です。`length` は増えるときに1ずつしか増えないので、減る回数の合計も N 回を超えられません。単調スタックの計算量の数え方と同じ理屈です。
+</Callout>
+
+## もう1つの道具：窓のハッシュを転がす
+
+KMP とはまったく別のやり方で、同じ問題を解けます。**文字列をハッシュ値（1つの数）に変換してしまえば、比較は数の比較1回で済む**という発想です。
+
+問題は、窓を1つずらすたびにハッシュを計算し直していては、結局 m 文字を読むことになって速くならない点です。そこで、ハッシュの作り方を工夫します。文字列を、26進法の数のように扱います。
+
+> `"cat"` → `c` は3、`a` は1、`t` は20 なので、`3 × 26² + 1 × 26 + 20`
+
+この形なら、窓を1つずらすときの更新が**引き算と足し算だけ**で済みます。
+
+1. 左端の文字の寄与（`3 × 26²`）を**引く**
+2. 全体を26倍する（桁を1つ上げる）
+3. 右端に入ってきた文字を**足す**
+
+これがローリングハッシュです。桁があふれないよう、すべての計算を適当な素数で割った余りにして進めます。
+
+```python
+def val(ch):
+    return ord(ch) - ord('a') + 1     # a..z を 1..26 に
+
+def rabin_karp(text, pattern):
+    n, m = len(text), len(pattern)
+    BASE, MOD = 26, 997               # 提出時は MOD に大きい素数を使う
+    power = pow(BASE, m - 1, MOD)     # 先頭文字が持つ桁の重み
+
+    target = window = 0
+    for i in range(m):                # 最初の窓だけ普通に計算する
+        target = (target * BASE + val(pattern[i])) % MOD
+        window = (window * BASE + val(text[i])) % MOD
+
+    for i in range(n - m + 1):
+        if window == target and text[i:i + m] == pattern:
+            return i                  # ハッシュが同じでも本体を突き合わせる
+        if i + m < n:
+            window = (window - val(text[i]) * power) % MOD    # 左端を外す
+            window = (window * BASE + val(text[i + m])) % MOD  # 右端を入れる
+    return -1
+```
+
+<RabinKarp client:visible />
+
+<Callout type="warn" title="ハッシュが一致しても、必ず本体を突き合わせてください">
+  シミュレーターの「衝突が起きる例」を選んでみてください。`MOD = 997` のもとでは、`"dnc"` と `"cat"` のハッシュはどちらも 80 になります。**違う文字列なのに、ハッシュだけ見ると同じ**です。これが衝突（偽陽性）です。
+
+  だから `if window == target and text[i:i + m] == pattern:` という二段構えが必要になります。ハッシュの一致は「候補が見つかった」という合図にすぎず、確定させるには本体の比較が要ります。
+
+  ここで計算量を心配するかもしれません。本体の比較は O(m) かかるので、毎回それをすると結局 O(N × M) では、と。実際のところ、MOD に 10<sup>9</sup> 級の素数を選べば衝突はめったに起きないので、本体の比較が走るのはほぼ本物のときだけです。**平均 O(N + M)、最悪 O(N × M)** というのが正確な言い方になります。
+
+  なお、シミュレーターが `MOD = 997` という小さい値を使っているのは、衝突を実際に見せるためです。提出するコードでこの値を使ってはいけません。
+</Callout>
+
+## どちらを使うか
+
+| | KMP | ローリングハッシュ |
+| --- | --- | --- |
+| 時間 | O(N + M)（最悪でも保証される） | 平均 O(N + M)、最悪 O(N × M) |
+| 空間 | O(M)（lps） | O(1) |
+| 実装の重さ | lps の構築でつまずきやすい | 比較的素直。ただし剰余の扱いに注意 |
+| 得意なこと | 接頭辞と接尾辞の構造そのものを使う問題 | 任意の部分文字列を何度も比較する問題 |
+
+判断の目安は、**「1つのパターンを探す」だけなのか、「いろいろな部分文字列を比べたい」のか**です。
+
+前者なら KMP が堅実です。lps は pattern の構造そのものを表しているので、Longest Happy Prefix（最長の「接頭辞かつ接尾辞」を求める）や Shortest Palindrome のように、lps の値そのものが答えになる問題もあります。
+
+後者、たとえば「長さ L の重複する部分文字列があるか」を L を変えながら何度も確かめたい場合（Longest Duplicate Substring）は、ローリングハッシュが向いています。**長さ L について「重複があるか」は L が大きいほど成立しにくくなる**ので、二分探索と組み合わせて O(N log N) で解けます。二分探索の記事でやった「答えの決めうち」が、ここで効いてきます。
+
+<Callout type="tip" title="Python では in 演算子が十分速い、という現実">
+  正直に書いておくと、Python の `pattern in text` や `str.find()` は内部で効率のよいアルゴリズムを使っているので、素直に呼ぶだけで実用上は十分速く動きます。LeetCode でも、これらを使えば通ってしまう問題が少なくありません。
+
+  それでもこの記事の型を学ぶ価値があるのは、次の3つの理由です。
+
+  1. 面接では「組み込み関数を使わずに実装してください」と言われる
+  2. lps は「照合」以外の問題（周期性の判定、最長の接頭辞かつ接尾辞）にそのまま使われる
+  3. ローリングハッシュは、二分探索や集合と組み合わせて初めて解ける Hard 問題の部品になる
+
+  つまり、**道具そのものより、道具の中身の使い回しに価値があります。**
+</Callout>
+
+## 「これは文字列照合だ」と気づくためのサイン
+
+- 「部分文字列として現れるか」「最初に現れる位置」
+- 「**接頭辞でもあり接尾辞でもある**」最長のものを求める
+- 「同じ文字列の繰り返しでできているか」（周期性の判定。lps の最後の値で分かります）
+- 「長さ L の重複する部分文字列」を、L を変えながら調べたい（二分探索 + ローリングハッシュ）
+- 文字列を連結して1本にしてから調べると、うまく型にはまりそうに見える
+
+## この記事のチェックリスト
+
+- [ ] 素直な照合が最悪 O(N × M) になる入力を、具体例で挙げられる
+- [ ] lps[i] の定義を、接頭辞・接尾辞という言葉を使って正確に言える
+- [ ] `length = lps[length - 1]` が何をしている操作か説明できる
+- [ ] KMP で text 側の `i` が後戻りしない理由と、それが計算量にどう効くか説明できる
+- [ ] ローリングハッシュで窓を1つずらす手順を、3ステップで言える
+- [ ] ハッシュが一致したときに本体を比較する必要がある理由を、具体例で説明できる
+- [ ] KMP とローリングハッシュの使い分けを、問題のどこを見て判断するか言える
+- [ ] 記事冒頭のリストの問題を、解説を見ずに実装できる
