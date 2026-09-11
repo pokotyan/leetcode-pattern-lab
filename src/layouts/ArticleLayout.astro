@@ -1,7 +1,8 @@
 ---
 import BaseLayout from './BaseLayout.astro'
 import ProblemTable from '../components/ProblemTable.astro'
-import { sectionById } from '../lib/curriculum'
+import { sectionById, LEVEL_BADGE, type Level } from '../lib/curriculum'
+import { buildGraph } from '../lib/prereq'
 import type { CollectionEntry } from 'astro:content'
 
 type Props = {
@@ -15,13 +16,24 @@ const d = entry.data
 const section = sectionById.get(d.section)
 const base = import.meta.env.BASE_URL
 const toc = headings.filter((h) => h.depth === 2)
+const badge = LEVEL_BADGE[d.level as Level]
+
+const { requires, requiredBy } = await buildGraph()
+const prereqs = requires.get(entry.id) ?? []
+const nextUp = requiredBy.get(entry.id) ?? []
 ---
 
 <BaseLayout title={`${d.title} | LeetCode Pattern Lab`} description={d.description}>
   <div class="grid gap-10 lg:grid-cols-[minmax(0,1fr)_16rem]">
     <article class="prose min-w-0">
-      <p class="m-0 text-xs font-bold" style="color: var(--accent)">
-        {section?.title ?? d.section}
+      <p class="not-prose m-0 flex items-center gap-2 text-xs font-bold">
+        <span style="color: var(--accent)">{section?.title ?? d.section}</span>
+        <span
+          class="rounded px-1.5 py-0.5"
+          style={`color: ${badge.color}; background: ${badge.soft}`}
+        >
+          {d.level}
+        </span>
       </p>
       <h1 class="mt-1 mb-2 text-3xl font-bold leading-snug">{d.title}</h1>
       <p class="mt-0 text-[15px]" style="color: var(--fg-muted)">{d.description}</p>
@@ -37,9 +49,65 @@ const toc = headings.filter((h) => h.depth === 2)
         )
       }
 
+      {
+        prereqs.length > 0 && (
+          <section class="not-prose my-8 rounded-xl border" style="border-color: var(--accent)">
+            <h3
+              class="m-0 border-b px-4 py-3 text-sm font-bold"
+              style="border-color: var(--accent); background: var(--accent-soft); color: var(--accent)"
+            >
+              この記事の前に読む
+            </h3>
+            <ul class="m-0 list-none p-0">
+              {prereqs.map((r) => (
+                <li class="border-b px-4 py-2.5 last:border-b-0" style="border-color: var(--border)">
+                  <a
+                    href={`${base}articles/${r.id}/`}
+                    class="text-sm font-bold no-underline hover:underline"
+                    style="color: var(--accent)"
+                  >
+                    {r.title}
+                  </a>
+                  <p class="m-0 mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                    {r.description}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )
+      }
+
       <ProblemTable problems={d.problems} />
 
       <slot />
+
+      {
+        nextUp.length > 0 && (
+          <section class="not-prose mt-12 rounded-xl border p-4" style="border-color: var(--border)">
+            <h3 class="m-0 mb-2 text-sm font-bold">この記事を前提にしている記事</h3>
+            <p class="m-0 mb-3 text-xs" style="color: var(--fg-muted)">
+              ここまで読めたら、次はこれらに進めます。
+            </p>
+            <ul class="m-0 flex list-none flex-wrap gap-2 p-0">
+              {nextUp.map((r) => (
+                <li>
+                  <a
+                    href={`${base}articles/${r.id}/`}
+                    class="inline-block rounded-lg border px-3 py-1.5 text-xs no-underline"
+                    style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+                  >
+                    {r.title}
+                    <span class="ml-1.5" style={`color: ${LEVEL_BADGE[r.level as Level].color}`}>
+                      {r.level}
+                    </span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )
+      }
 
       <nav
         class="not-prose mt-16 flex flex-wrap gap-3 border-t pt-6 text-sm"

@@ -1,33 +1,38 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro'
 import { getCollection } from 'astro:content'
-import { SECTIONS } from '../lib/curriculum'
+import { SECTIONS, LEVELS, LEVEL_BADGE, type Level } from '../lib/curriculum'
 
 const all = await getCollection('articles')
 const base = import.meta.env.BASE_URL
 const published = all.filter((a) => a.data.status === 'published').length
 const totalProblems = new Set(all.flatMap((a) => a.data.problems.map((p) => p.url))).size
+const hardProblems = all.flatMap((a) => a.data.problems).filter((p) => p.level === 'Hard').length
+const titleById = new Map(all.map((a) => [a.id, a.data.title]))
 
-const bySection = SECTIONS.map((s) => ({
-  section: s,
-  items: all
-    .filter((a) => a.data.section === s.id)
-    .sort((a, b) => a.data.order - b.data.order),
-})).filter((g) => g.items.length > 0)
+const byLevel = LEVELS.map((lv) => ({
+  level: lv,
+  groups: SECTIONS.map((s) => ({
+    section: s,
+    items: all
+      .filter((a) => a.data.section === s.id && a.data.level === lv.id)
+      .sort((a, b) => a.data.order - b.data.order),
+  })).filter((g) => g.items.length > 0),
+})).filter((g) => g.groups.length > 0)
 ---
 
 <BaseLayout title="LeetCode Pattern Lab">
   <section class="mb-14">
     <h1 class="mb-3 text-3xl font-bold leading-snug sm:text-4xl">
-      LeetCode <span style="color: var(--accent)">Medium</span> を「型」で落とす
+      LeetCode を「型」で落とす
     </h1>
     <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
       閃きに頼らず、パターンを引き出しから取り出して解けるようにするための学習ノート。
-      各テクニックには<strong style="color: var(--fg)"
-        >1手ずつ動かせるシミュレーター</strong
+      各テクニックには<strong style="color: var(--fg)">1手ずつ動かせるシミュレーター</strong
       >を用意してあるので、コードと図と変数の動きを同時に追える。
+      <strong style="color: var(--fg)">基礎 → 応用 → 発展</strong>の順に、前提が揃った記事から読めるように並べてある。
     </p>
-    <dl class="mt-6 flex gap-8 text-sm">
+    <dl class="mt-6 flex flex-wrap gap-8 text-sm">
       <div>
         <dt style="color: var(--fg-muted)">公開済み記事</dt>
         <dd class="m-0 text-2xl font-bold">{published}</dd>
@@ -36,50 +41,90 @@ const bySection = SECTIONS.map((s) => ({
         <dt style="color: var(--fg-muted)">扱う LeetCode 問題</dt>
         <dd class="m-0 text-2xl font-bold">{totalProblems}</dd>
       </div>
+      <div>
+        <dt style="color: var(--fg-muted)">うち Hard</dt>
+        <dd class="m-0 text-2xl font-bold" style="color: var(--danger)">{hardProblems}</dd>
+      </div>
     </dl>
+    <a
+      href={`${base}path/`}
+      class="mt-6 inline-block rounded-lg border px-4 py-2 text-sm font-bold no-underline"
+      style="border-color: var(--accent); color: var(--accent)"
+    >
+      前提つきの学習経路を見る →
+    </a>
   </section>
 
-  <div class="space-y-10">
+  <div class="space-y-16">
     {
-      bySection.map((g) => (
-        <section>
-          <h2 class="mb-1 text-lg font-bold">{g.section.title}</h2>
-          <p class="mb-3 text-sm" style="color: var(--fg-muted)">
-            {g.section.summary}
-          </p>
-          <ul class="m-0 grid list-none gap-3 p-0 sm:grid-cols-2">
-            {g.items.map((a) => (
-              <li>
-                <a
-                  href={`${base}articles/${a.id}/`}
-                  class="block h-full rounded-xl border px-4 py-3 no-underline transition-colors hover:border-[var(--accent)]"
-                  style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
-                >
-                  <div class="flex items-baseline gap-2">
-                    <span class="font-bold">{a.data.title}</span>
-                    {a.data.status === 'planned' && (
-                      <span
-                        class="rounded px-1.5 py-0.5 text-[10px] font-bold"
-                        style="color: var(--warn); border: 1px solid var(--warn)"
+      byLevel.map((lv) => (
+        <div>
+          <div class="mb-6 border-b pb-3" style="border-color: var(--border)">
+            <h2 class="m-0 flex items-baseline gap-2 text-xl font-bold">
+              <span
+                class="rounded px-2 py-0.5 text-sm"
+                style={`color: ${LEVEL_BADGE[lv.level.id as Level].color}; background: ${LEVEL_BADGE[lv.level.id as Level].soft}`}
+              >
+                {lv.level.title}
+              </span>
+            </h2>
+            <p class="m-0 mt-2 text-sm" style="color: var(--fg-muted)">
+              {lv.level.summary}
+            </p>
+          </div>
+          <div class="space-y-10">
+            {lv.groups.map((g) => (
+              <section>
+                <h3 class="mb-1 text-lg font-bold">{g.section.title}</h3>
+                <p class="mb-3 text-sm" style="color: var(--fg-muted)">
+                  {g.section.summary}
+                </p>
+                <ul class="m-0 grid list-none gap-3 p-0 sm:grid-cols-2">
+                  {g.items.map((a) => (
+                    <li>
+                      <a
+                        href={`${base}articles/${a.id}/`}
+                        class="block h-full rounded-xl border px-4 py-3 no-underline transition-colors hover:border-[var(--accent)]"
+                        style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
                       >
-                        準備中
-                      </span>
-                    )}
-                  </div>
-                  <p class="m-0 mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
-                    {a.data.description}
-                  </p>
-                  {a.data.problems.length > 0 && (
-                    <p class="m-0 mt-2 font-mono text-[11px]" style="color: var(--fg-muted)">
-                      {a.data.problems.length} 問 ·{' '}
-                      {a.data.problems.filter((p) => p.level === 'Medium').length} Medium
-                    </p>
-                  )}
-                </a>
-              </li>
+                        <div class="flex items-baseline gap-2">
+                          <span class="font-bold">{a.data.title}</span>
+                          {a.data.status === 'planned' && (
+                            <span
+                              class="rounded px-1.5 py-0.5 text-[10px] font-bold"
+                              style="color: var(--warn); border: 1px solid var(--warn)"
+                            >
+                              準備中
+                            </span>
+                          )}
+                        </div>
+                        <p class="m-0 mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                          {a.data.description}
+                        </p>
+                        {a.data.requires.length > 0 && (
+                          <p class="m-0 mt-2 text-[11px]" style="color: var(--fg-muted)">
+                            前提: {a.data.requires.map((r) => titleById.get(r) ?? r).join(' / ')}
+                          </p>
+                        )}
+                        {a.data.problems.length > 0 && (
+                          <p class="m-0 mt-1 font-mono text-[11px]" style="color: var(--fg-muted)">
+                            {a.data.problems.length} 問
+                            {a.data.problems.filter((p) => p.level === 'Hard').length > 0 && (
+                              <span style="color: var(--danger)">
+                                {' · '}
+                                {a.data.problems.filter((p) => p.level === 'Hard').length} Hard
+                              </span>
+                            )}
+                          </p>
+                        )}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </section>
             ))}
-          </ul>
-        </section>
+          </div>
+        </div>
       ))
     }
   </div>

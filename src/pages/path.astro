@@ -1,0 +1,82 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro'
+import { LEVEL_BADGE, sectionById, type Level } from '../lib/curriculum'
+import { buildGraph, layerArticles } from '../lib/prereq'
+
+const base = import.meta.env.BASE_URL
+const { all, byId } = await buildGraph()
+const layers = layerArticles(all)
+---
+
+<BaseLayout
+  title="学習経路 | LeetCode Pattern Lab"
+  description="どの記事がどの記事を前提にしているかを、上から順に辿れる形で並べた学習経路"
+>
+  <section class="mb-12">
+    <h1 class="mb-3 text-3xl font-bold leading-snug">学習経路</h1>
+    <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      各記事の <code>前提</code> をすべて満たす順に、記事を段に分けて並べてある。
+      同じ段の記事どうしには前提関係がないので、どれから読んでも構わない。
+      上の段をすべて読み終えていれば、下の段の記事は前提が揃った状態で読める。
+    </p>
+    <p class="mt-3 max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      発展編（Hard 帯）の記事は、ほぼすべてが基礎・応用の型を2つ以上組み合わせたものになっている。
+      前提を飛ばして読むと「なぜその道具を持ち出すのか」の部分が丸ごと抜け落ちるので、
+      前提が埋まっていない記事に当たったら、先にそちらへ戻ることをすすめる。
+    </p>
+  </section>
+
+  <ol class="m-0 list-none space-y-10 p-0">
+    {
+      layers.map((layer, i) => (
+        <li>
+          <div class="mb-3 flex items-baseline gap-3">
+            <span
+              class="rounded-md px-2 py-0.5 font-mono text-xs font-bold"
+              style="background: var(--accent-soft); color: var(--accent)"
+            >
+              STEP {i + 1}
+            </span>
+            <span class="text-xs" style="color: var(--fg-muted)">
+              {i === 0
+                ? '前提なし。どこからでも始められる'
+                : `STEP ${i} までを読み終えていれば読める`}
+            </span>
+          </div>
+          <ul class="m-0 grid list-none gap-3 p-0 sm:grid-cols-2 lg:grid-cols-3">
+            {layer.map((a) => (
+              <li>
+                <a
+                  href={`${base}articles/${a.id}/`}
+                  class="flex h-full flex-col rounded-xl border px-4 py-3 no-underline transition-colors hover:border-[var(--accent)]"
+                  style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+                >
+                  <div class="flex items-baseline gap-2">
+                    <span
+                      class="rounded px-1.5 py-0.5 text-[10px] font-bold"
+                      style={`color: ${LEVEL_BADGE[a.data.level as Level].color}; background: ${LEVEL_BADGE[a.data.level as Level].soft}`}
+                    >
+                      {a.data.level}
+                    </span>
+                    <span class="text-[11px]" style="color: var(--fg-muted)">
+                      {sectionById.get(a.data.section)?.title ?? a.data.section}
+                    </span>
+                  </div>
+                  <span class="mt-1.5 text-sm font-bold leading-snug">{a.data.title}</span>
+                  {a.data.requires.length > 0 && (
+                    <span class="mt-2 text-[11px] leading-relaxed" style="color: var(--fg-muted)">
+                      前提:{' '}
+                      {a.data.requires
+                        .map((r) => byId.get(r)?.data.title ?? r)
+                        .join(' / ')}
+                    </span>
+                  )}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))
+    }
+  </ol>
+</BaseLayout>

@@ -20,6 +20,8 @@ const articles = defineCollection({
     section: z.string(),
     /** セクション内の並び順 */
     order: z.number(),
+    /** 学習段階。index / path ページのグルーピングに使う */
+    level: z.enum(['基礎', '応用', '発展']).default('基礎'),
     status: z.enum(['published', 'planned']).default('published'),
     /** 前提として先に読む記事の slug */
     requires: z.array(z.string()).default([]),
