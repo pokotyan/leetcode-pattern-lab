@@ -1,0 +1,187 @@
+---
+title: ブラウザの中の差分と制御（Virtual DOM・Hydration）
+description: 画面の更新を速くするために、何と何を比べているのか。木の比較を現実的な計算量に収める割り切りと、イベントの間引き
+category: web
+order: 12
+status: published
+topics:
+  - Virtual DOM
+  - Reconciliation
+  - Hydration
+  - Debounce
+  - Throttle
+basedOn:
+  - kind: article
+    slug: tree-traversal
+    why: 仮想 DOM の差分検出は、2本の木を同じ形でたどりながら比べていく処理。木の再帰そのもの
+  - kind: article
+    slug: dp-2d
+    why: 一般の木や列の差分は、本来は編集距離（LCS）の問題。React がそれを使わず O(N) に割り切った理由がここから分かる
+  - kind: article
+    slug: hash-counting
+    why: リストの差分で key が要る理由。key を辞書の鍵にして、移動した要素を対応づける
+  - kind: article
+    slug: sliding-window
+    why: debounce と throttle は「直前のイベントからどれだけ経ったか」で判断する。時間の窓での制御
+problems:
+  - name: Same Tree
+    url: https://leetcode.com/problems/same-tree/
+    level: Easy
+    importance: 中
+    technique: 2本の木を同時にたどる
+  - name: Longest Common Subsequence
+    url: https://leetcode.com/problems/longest-common-subsequence/
+    level: Medium
+    importance: 中
+    technique: 差分の本体
+  - name: Edit Distance
+    url: https://leetcode.com/problems/edit-distance/
+    level: Medium
+    importance: 中
+    technique: 最小の編集手順
+  - name: Logger Rate Limiter
+    url: https://leetcode.com/problems/logger-rate-limiter/
+    level: Easy
+    importance: 中
+    technique: throttle と同じ形
+---
+
+import Callout from '../../components/Callout.astro'
+import DebounceThrottle from '../../components/sim/problems/DebounceThrottle'
+
+## DOM を触るのが遅い、とはどういうことか
+
+ブラウザの画面は DOM という木で表されています。JavaScript から要素を1つ書き換えると、ブラウザは次の作業をします。
+
+1. **スタイルの再計算**：その要素に適用される CSS を決め直す
+2. **レイアウト**：位置と大きさを計算し直す。**兄弟や親にも波及する**
+3. **ペイント**：ピクセルを描く
+4. **合成**：レイヤーを重ねて画面に出す
+
+問題は 2 番です。1 つの要素の幅が変わると、その影響が周囲に広がります。100 個の要素を 1 つずつ書き換えると、この計算が何度も走ります。
+
+そこで、こう考えます。
+
+> **DOM を触る回数そのものを減らす。** 必要な変更だけをまとめて、1 回で適用する
+
+そのために、「変更前」と「変更後」の差分を知る必要があります。
+
+## Virtual DOM：JavaScript のオブジェクトとして木を持つ
+
+Virtual DOM は、画面の構造を**軽い JavaScript のオブジェクト**として持っておく仕組みです。
+
+```js
+{ type: 'ul', children: [
+    { type: 'li', props: { key: 'a' }, children: ['りんご'] },
+    { type: 'li', props: { key: 'b' }, children: ['みかん'] },
+]}
+```
+
+状態が変わったら、**新しい木をまるごと作り直します。** そして、古い木と新しい木を比べて、**実際に変わった部分だけ**を本物の DOM に適用します。この比較を reconciliation と呼びます。
+
+「まるごと作り直すほうが遅いのでは」と思うかもしれません。ここが要点で、**JavaScript のオブジェクトを作るのは、DOM を触るのに比べれば桁違いに安い**のです。高い操作（DOM 更新）を減らすために、安い操作（オブジェクト生成と比較）を増やす、という取引になっています。
+
+## 木の差分は、本来とても重い
+
+ここで、計算量の話が出てきます。
+
+**2 本の木の最小の差分を正確に求めるアルゴリズムは、O(N³) です。** ノードが 1,000 個なら 10 億回。毎フレーム走らせることはできません。
+
+そこで React は、正確さを捨てて 2 つの割り切りをしました。
+
+1. **種類が違えば、中身は比べない。** `<div>` が `<span>` に変わったら、その下をまるごと作り直す
+2. **同じ階層の要素だけを比べる。** 別の階層へ移動した要素は、移動とは認識せず、削除と追加として扱う
+
+この 2 つによって、比較は **O(N)** になります。最小の差分ではありませんが、実用上は十分に良い結果が出ます。
+
+<Callout type="tip" title="key が必要な理由">
+  リストの差分では、もう 1 つ問題があります。
+
+  ```
+  変更前: [A, B, C]
+  変更後: [X, A, B, C]
+  ```
+
+  同じ位置どうしを比べると、「1番目が A から X に」「2番目が B から A に」……となり、**全部が変更**に見えます。実際には先頭に 1 つ挿入されただけなのに、全要素を作り直すことになります。
+
+  これを解決するのが `key` です。各要素に安定した識別子を付けておけば、**key を鍵にした辞書で「同じ要素がどこへ移ったか」を対応づけられます。** ハッシュテーブルの記事でやった対応づけそのものです。
+
+  ここから、よくある注意の理由も出てきます。
+
+  - **配列の添字を key にしてはいけない**：並び替えたときに、key と要素の対応が崩れる。「同じ key = 同じ要素」でなくなるので、対応づけの意味が消える
+  - **key は兄弟の間で一意なら十分**：グローバルに一意である必要はない。同じ階層でしか比べないため
+
+  なお、列の差分を正確に求めるのは編集距離（Edit Distance）や LCS の問題です。**二次元 DP の記事でやったあれが、diff の本体**です。React は毎フレーム走らせるためにそれを避け、key による対応づけで済ませています。
+</Callout>
+
+## Hydration：サーバーで描いた画面に、あとから動きを付ける
+
+サーバー側で HTML を組み立てて返すと（SSR）、ユーザーは早く画面を見られます。ただし、その HTML はただの文字列なので、**ボタンを押しても何も起きません。**
+
+そこで、クライアント側で同じコンポーネントを実行し、**既存の DOM にイベントハンドラを結びつけていきます。** これが hydration です。
+
+ここで独特の問題が起きます。
+
+- **サーバーとクライアントで、出力が一致していなければならない。** 一致しないと「hydration mismatch」になる
+- 一致しない原因の代表が、**時刻、乱数、`window` への依存**。サーバーで描いた「12:00」がクライアントで「12:01」になると壊れる
+- hydration が終わるまで、**画面は見えているのに操作できない**時間がある
+
+最後の点が、体感性能としては厄介です。見えているのに押せない、という状態はユーザーを混乱させます。近年の「islands」「部分 hydration」「Server Components」といった手法は、**hydration する範囲を減らす**ことでこの時間を短くする試みです。
+
+（この教材のシミュレーターに `client:visible` が付いているのも同じ話で、画面に入ったものだけを後から動かす、という指定です。）
+
+## イベントを間引く：debounce と throttle
+
+最後に、もっと身近な最適化です。
+
+検索窓に文字を打つたびに API を呼ぶと、10 文字打てば 10 回呼ばれます。スクロールのたびに計算すると、1 秒間に何十回も走ります。
+
+間引き方に 2 通りあります。
+
+| | 動き | 使いどころ |
+| --- | --- | --- |
+| **debounce** | イベントが**止まってから**一定時間後に1回だけ実行 | 検索の入力補完、フォームの自動保存、ウィンドウのリサイズ完了後 |
+| **throttle** | 一定間隔で**定期的に**実行 | スクロール位置の追跡、マウス移動、進捗表示 |
+
+```python
+def debounce(events, wait):
+    fired = []
+    for i, t in enumerate(events):
+        nxt = events[i + 1] if i + 1 < len(events) else None
+        if nxt is None or nxt - t >= wait:
+            fired.append(t + wait)        # 静かになってから実行
+    return fired
+
+def throttle(events, interval):
+    fired = []
+    last = None
+    for t in events:
+        if last is None or t - last >= interval:
+            fired.append(t)               # 前回から interval 空いていれば実行
+            last = t
+    return fired
+```
+
+<DebounceThrottle client:visible />
+
+「ずっと連打」のプリセットが、2 つの違いを最もはっきり示します。**debounce は最後まで一度も実行されません**（静かになる瞬間が来ないため）。throttle は一定間隔で実行され続けます。
+
+この違いが、選択の基準になります。
+
+- **途中経過に意味がない**（検索クエリは最終的な文字列だけが要る）→ debounce
+- **途中経過にも意味がある**（スクロール位置は追い続けたい）→ throttle
+
+<Callout type="warn" title="debounce だけだと、永遠に実行されないことがある">
+  入力が途切れない状況で debounce を使うと、ユーザーはいつまでも結果を見られません。長時間の入力が想定される場面では、**「最大待ち時間」を設けて、それを超えたら強制的に実行する**（debounce と throttle の組み合わせ）という実装がよく使われます。
+
+  なお throttle の実装は、メッセージングの記事で出てきたレート制限とまったく同じ形です。「前回からの経過時間で判断する」か「直近の窓の中の件数で判断する」かの違いだけで、LeetCode の `Logger Rate Limiter` がそのまま throttle です。
+</Callout>
+
+## まとめ
+
+- DOM 操作が高いので、**触る回数を減らすために**安い比較を挟む
+- 木の正確な差分は O(N³)。React は「種類が違えば作り直す」「同じ階層だけ比べる」で O(N) に割り切った
+- リストの差分には `key` が要る。**添字を key にすると、並び替えで対応が崩れる**
+- 正確な列の差分は編集距離・LCS の問題。毎フレーム走らせられないから避けている
+- hydration は「見えているのに押せない」時間を作る。範囲を減らすのが最近の方向
+- debounce は静かになってから 1 回、throttle は一定間隔。**途中経過に意味があるか**で選ぶ

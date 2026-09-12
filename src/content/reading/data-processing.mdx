@@ -1,0 +1,231 @@
+---
+title: 大量データの処理（MapReduce とストリーム）
+description: 1台に載らないデータをどう扱うか。まとめて処理する型と、流れてくるものを処理する型、そして時間で区切るということ
+category: performance
+order: 11
+status: published
+topics:
+  - MapReduce
+  - Shuffle
+  - Stream Processing
+  - Windowing
+  - Lambda Architecture
+  - Data Lake
+  - Data Warehouse
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: MapReduce の shuffle は「同じキーのものを1か所に集める」。グルーピングそのもので、送り先もハッシュで決める
+  - kind: article
+    slug: sliding-window
+    why: ストリーム処理の窓の取り方。重ならない窓と重なる窓の違いは、窓の伸縮の話がそのまま出てくる
+  - kind: article
+    slug: heap-topk
+    why: メモリに載らないデータの並べ替え（外部ソート）は、分割してソートし、k-way merge でまとめる
+  - kind: article
+    slug: line-sweep
+    why: イベントを時刻順に並べて処理する形。遅れて届いたイベントをどう扱うか、という問題もここから出てくる
+problems:
+  - name: Top K Frequent Elements
+    url: https://leetcode.com/problems/top-k-frequent-elements/
+    level: Medium
+    importance: 中
+    technique: カウント + Top-K
+  - name: Merge k Sorted Lists
+    url: https://leetcode.com/problems/merge-k-sorted-lists/
+    level: Hard
+    importance: 中
+    technique: 外部ソートの中身
+  - name: Design Hit Counter
+    url: https://leetcode.com/problems/design-hit-counter/
+    level: Medium
+    importance: 中
+    technique: 時間窓での集計
+---
+
+import Callout from '../../components/Callout.astro'
+import MapReduceCount from '../../components/sim/problems/MapReduceCount'
+import Windowing from '../../components/sim/problems/Windowing'
+
+## 1台に載らないとき、何が変わるか
+
+10 GB のログから単語を数えるなら、普通に書けば終わります。
+
+```python
+from collections import Counter
+counter = Counter()
+for line in open('log.txt'):
+    counter.update(line.split())
+```
+
+これが 10 PB になると、話が変わります。1 台のディスクに入らないので、**データは最初から何千台にも分かれて置かれています。**
+
+ここで発想の転換が要ります。
+
+> **データを処理する場所へ持ってくる**のをやめ、**処理を、データのある場所へ送る**
+
+10 PB をネットワークで集めることはできませんが、集計用のコードを各マシンへ配ることはできます。
+
+## MapReduce：吐き出して、集めて、畳む
+
+この転換を型にしたのが MapReduce です。処理を 3 段階に分けます。
+
+1. **map**：各マシンが、**手元のデータだけ**を見て `(キー, 値)` の組を吐き出す。ほかのマシンのことは一切知らない
+2. **shuffle**：同じキーの組を、同じマシンへ集める
+3. **reduce**：各マシンが、集まった自分の担当キーだけを見て畳む
+
+```python
+def map_phase(docs):
+    pairs = []
+    for doc_id, text in docs:
+        for word in text.split():
+            pairs.append((word, 1))       # (キー, 値) を吐き出すだけ
+    return pairs
+
+def shuffle(pairs):
+    groups = {}
+    for key, value in pairs:
+        groups.setdefault(key, []).append(value)   # 同じキーを1か所に集める
+    return groups
+
+def reduce_phase(groups):
+    return {key: sum(values) for key, values in groups.items()}
+```
+
+<MapReduceCount client:visible />
+
+`map` が「数えずに、ただ `(単語, 1)` を並べるだけ」なのが、最初は無駄に見えます。しかしこの割り切りがあるからこそ、**map は他のマシンと一切通信せずに動けます。** 並列化できる部分を最大にするための設計です。
+
+<Callout type="tip" title="shuffle が本体です">
+  MapReduce で実際に重いのは、map でも reduce でもなく **shuffle** です。何千台ものマシンの間で、中間データをネットワーク越しに配り直す段階だからです。
+
+  送り先は `hash(key) % マシン数` で決まります。**ハッシュテーブルの記事でやった「同じキーを同じバケツに入れる」が、そのままネットワーク越しに行われている**と考えて構いません。
+
+  ここから、実務での性能問題がほぼ shuffle に集中する理由も見えてきます。
+
+  - **データの偏り（skew）**：特定のキーに値が集中すると、そのキーを担当するマシンだけが終わらない。「偏りがある」のプリセットで、`a` に集中する様子が見えます
+  - **中間データの量**：map が吐き出す量が多いほど、ネットワークを流れる量が増える
+
+  偏りの対策として、reduce の前に各マシンで部分集計してしまう（combiner）という手があります。`(a,1) (a,1) (a,1)` を送る代わりに `(a,3)` を送れば、通信量が減ります。**足し算のように、部分的にまとめても結果が変わらない演算**でのみ使える最適化です。
+</Callout>
+
+## メモリに載らないものを並べ替える
+
+MapReduce の内部でも使われている基本操作が、外部ソートです。100 GB のデータを 8 GB のメモリで並べ替える、という状況です。
+
+手順は 2 段階です。
+
+1. **分割してソート**：メモリに載る大きさ（たとえば 4 GB）ずつ読み込み、ソートしてファイルに書き出す。25 本のソート済みファイルができる
+2. **まとめる**：25 本を同時に開き、**各ファイルの先頭だけを見て**、最も小さいものから順に出力する
+
+2 番目が k-way merge です。データベースの索引の記事で見た LSM-tree の compaction と、まったく同じ操作です。ヒープには各ファイルの先頭だけが入るので、**メモリ使用量はファイル数ぶんだけ**で済みます。
+
+`Merge k Sorted Lists` を解いたことがあるなら、外部ソートの中身はすでに知っていることになります。
+
+## 流れてくるものを処理する：ストリーム処理
+
+MapReduce は「全部そろってから、まとめて処理する」型（バッチ）です。これには構造的な制約があります。**結果が出るまでに、次のバッチの周期ぶん待つ**ことになります。1 時間ごとのバッチなら、最悪 1 時間古い結果しか見られません。
+
+そこで、**データが到着した瞬間に処理する**のがストリーム処理です。Kafka Streams、Flink、Spark Streaming などがこの系統です。
+
+ここで新しい問題が出てきます。バッチには「データの終わり」がありましたが、**ストリームには終わりがありません。** 「単語の出現回数の合計」をいつ確定させればよいのでしょうか。
+
+答えは、**時間で区切る**ことです。
+
+## 窓の取り方
+
+| 種類 | 説明 | 使いどころ |
+| --- | --- | --- |
+| **tumbling**（重ならない） | 1分ごと、のように隙間なく区切る。各イベントは1つの窓にだけ属する | 集計レポート、課金 |
+| **sliding**（重なる） | 幅5分の窓を1分ずつずらす。1つのイベントが複数の窓に入る | 移動平均、異常検知 |
+| **session** | イベントが途切れたところで区切る | ユーザーの行動分析 |
+
+```python
+def tumbling(events, size):
+    out = {}
+    for t, v in events:
+        w = (t // size) * size            # 属する区間は1つだけ
+        out[w] = out.get(w, 0) + v
+    return out
+
+def sliding(events, size, step):
+    out = {}
+    for t, v in events:
+        start = (t // step) * step
+        while start > t - size:           # 1つのイベントが複数の窓に入る
+            out[start] = out.get(start, 0) + v
+            start -= step
+    return out
+```
+
+<Windowing client:visible />
+
+sliding では、**合計がイベントの総和より大きくなります。** 同じイベントが複数の窓で数えられるからです。これは誤りではなく、「直近5分間の件数」という指標がそもそもそういうものだ、というだけです。ここを取り違えると、ダッシュボードの数字が合わない、という混乱になります。
+
+<Callout type="warn" title="いつまで待つのか：遅れて届くイベント">
+  ストリーム処理でいちばん厄介なのが、**イベントが順番どおりに届かない**ことです。
+
+  - モバイル端末が圏外だった。復帰後に、30 分前のイベントがまとめて届く
+  - ネットワークの経路差で、あとに発生したイベントが先に着く
+
+  ここで、2 種類の時刻を区別する必要があります。
+
+  - **イベント時刻**：そのできごとが起きた時刻（端末が記録した時刻）
+  - **処理時刻**：システムがそれを受け取った時刻
+
+  正しい集計にはイベント時刻を使うべきですが、そうすると「10 時台の集計をいつ確定してよいか」が分からなくなります。あとから 10 時のイベントが届くかもしれないからです。
+
+  実務では、**透かし（watermark）**という考え方を使います。「イベント時刻 10:00 までのデータは、もう出そろったとみなす」という線を引き、それを過ぎたら窓を確定させます。遅れて届いたものは、捨てるか、別途訂正として扱います。
+
+  **正確さと待ち時間のどちらを取るか**という選択であり、技術的に一方が正しいわけではありません。
+</Callout>
+
+## バッチとストリームを両方持つ
+
+長らく、次の構成が定番とされてきました（Lambda Architecture）。
+
+- **バッチ層**：全履歴を保持し、定期的に正確な結果を作り直す。遅いが正しい
+- **速度層**：直近のデータをストリーム処理し、速報値を出す。速いが概算
+- **参照時**：両方を合わせて返す
+
+問題は、**同じロジックを 2 回実装することになる**点です。バッチ用と、ストリーム用。仕様変更のたびに両方を直し、両者の結果が食い違う原因を調べる羽目になります。
+
+そこで、ストリーム処理だけで完結させ、**過去の再計算が必要なら、保存しておいたイベントを最初から流し直す**という構成（Kappa Architecture）も使われるようになりました。Kafka のようにイベントを長期保持できる基盤があることが前提です。
+
+どちらを選ぶかは、**再計算にかかる時間と、二重実装のコスト**を天秤にかける話になります。
+
+## データの置き方：Lake と Warehouse
+
+最後に、そもそもデータをどう置いておくかという話です。
+
+| | Data Lake | Data Warehouse |
+| --- | --- | --- |
+| 保存するもの | 生のデータをそのまま | 整形・集約済みのデータ |
+| スキーマ | 読むときに決める（schema on read） | 書くときに決める（schema on write） |
+| 利点 | 何でも入る。後から用途を決められる | 速い。整合性がある。分析しやすい |
+| 欠点 | 何が入っているか分からなくなる | 入れる前に設計が要る。変更が重い |
+| 典型 | S3 + Parquet | BigQuery、Snowflake、Redshift |
+
+両者は対立するものではなく、**組み合わせて使う**のが普通です。生ログを Lake に置き、そこから整形して Warehouse に入れる、という流れです。
+
+<Callout type="warn" title="Data Lake が Data Swamp になるとき">
+  「とりあえず全部入れておけば、後から何とかなる」で運用すると、数年後には**何がどこにあるか誰も分からないデータの沼**になります。
+
+  沼にしないために最低限必要なのは、次の 3 つです。
+
+  - **カタログ**：どこに何があるかの一覧
+  - **スキーマの記録**：そのファイルの形式がどう変わってきたか
+  - **保持期限**：いつ消すか
+
+  「後から決める」は、「決めなくてよい」ではありません。
+</Callout>
+
+## まとめ
+
+- データが大きくなったら、**処理をデータの場所へ送る**
+- MapReduce は map で吐き出し、shuffle で集め、reduce で畳む。**重いのは shuffle**
+- キーの偏りが性能を決める。部分集計（combiner）で通信量を減らせる
+- メモリに載らない並べ替えは、分割ソート + k-way merge
+- ストリームには終わりがないので、**時間で区切る**
+- 重ならない窓と重なる窓では、合計の意味が違う
+- 遅れて届くイベントには、**正確さと待ち時間の取引**が必要
