@@ -1,0 +1,207 @@
+---
+title: 順列・組合せと二項係数
+description: 「何通りか」を数える前に、選ぶのか並べるのか、重複を許すのかを切り分ける。パスカルの三角形と、余りの世界での二項係数まで
+order: 4
+status: published
+requires:
+  - mod-arithmetic
+usedIn:
+  - slug: dp-2d
+    why: Unique Paths は、右と下への移動の並べ方を数える問題なので、DP を組む前に C(m+n-2, m-1) という閉じた式でも出せる
+  - slug: backtracking
+    why: 部分集合が 2^N 通り、順列が N! 通りという見積もりが、全探索をそのまま書いてよいかどうかの判断材料になる
+problems:
+  - name: Unique Paths
+    url: https://leetcode.com/problems/unique-paths/
+    level: Medium
+    importance: 高
+    technique: 組合せの閉じた式
+  - name: Pascal's Triangle
+    url: https://leetcode.com/problems/pascals-triangle/
+    level: Easy
+    importance: 中
+    technique: 二項係数の漸化式
+  - name: Count Sorted Vowel Strings
+    url: https://leetcode.com/problems/count-sorted-vowel-strings/
+    level: Medium
+    importance: 中
+    technique: 重複組合せ
+  - name: Number of Music Playlists
+    url: https://leetcode.com/problems/number-of-music-playlists/
+    level: Hard
+    importance: 中
+    technique: 数え上げ DP + 逆元
+  - name: Count Ways to Build Good Strings
+    url: https://leetcode.com/problems/count-ways-to-build-good-strings/
+    level: Medium
+    importance: 中
+    technique: 数え上げ DP
+---
+
+import Callout from '../../components/Callout.astro'
+import PascalTriangle from '../../components/sim/problems/PascalTriangle'
+import NcrModP from '../../components/sim/problems/NcrModP'
+
+## まず、困っている状況を体験してみます
+
+> 3 × 7 のグリッドの左上から右下まで、右か下にだけ動いて行く方法は何通りありますか。
+
+DP で解けます。各マスに「そこへ行く方法の数」を書き込んで、上と左を足していけばよいので、O(mn) です。
+
+ただ、この問題には別の見方があります。左上から右下まで行くには、**右に 6 回、下に 2 回**動く必要があります。順番は自由ですが、回数は必ずこの通りです。つまり、
+
+> 8 回の移動のうち、どの 2 回を「下」にするか
+
+を決めるだけです。これは「8 個から 2 個を選ぶ方法の数」、つまり <sub>8</sub>C<sub>2</sub> = 28 です。**DP の表を埋めなくても、1つの式で答えが出ます。**
+
+数え上げの問題では、こうした「閉じた式」に落ちるかどうかを最初に確かめる価値があります。そのために、まず数え方の種類を整理します。
+
+## 4つの数え方を切り分ける
+
+数え上げで迷う原因は、ほぼ次の2点の取り違えです。
+
+1. **順番に意味があるか**（並べるのか、選ぶだけか）
+2. **同じものを何度も選べるか**（重複を許すか）
+
+この2つの掛け合わせで、4通りになります。
+
+| | 順番に意味がある（並べる） | 順番に意味がない（選ぶ） |
+| --- | --- | --- |
+| **重複なし** | 順列 <sub>n</sub>P<sub>r</sub> = n! / (n−r)! | 組合せ <sub>n</sub>C<sub>r</sub> = n! / (r!(n−r)!) |
+| **重複あり** | n<sup>r</sup> | 重複組合せ <sub>n+r−1</sub>C<sub>r</sub> |
+
+具体例で確かめます。`{A, B, C}` から 2 つ取る場合です。
+
+- **順列**（並べる・重複なし）：AB, BA, AC, CA, BC, CB の **6 通り**（= 3 × 2）
+- **組合せ**（選ぶ・重複なし）：AB, AC, BC の **3 通り**。順列の 6 通りを、並べ替えの数 2! = 2 で割った
+- **重複ありで並べる**：AA, AB, AC, BA, BB, ... の **9 通り**（= 3<sup>2</sup>）
+- **重複組合せ**（選ぶ・重複あり）：AA, AB, AC, BB, BC, CC の **6 通り**
+
+<Callout type="tip" title="重複組合せが n+r−1 個から選ぶ形になる理由">
+  重複組合せの式だけ形が違うので、覚えにくいところです。「仕切り」で考えると腑に落ちます。
+
+  `{A, B, C}` から重複ありで 2 個選ぶのは、**「A の箱、B の箱、C の箱に、区別のない玉を 2 個配る」**のと同じです。これを記号で書くと、
+
+  ```
+  ●●||     A を2個
+  ●|●|     A と B を1個ずつ
+  |●|●     B と C を1個ずつ
+  ```
+
+  玉が `r` 個、仕切りが `n−1` 個並んだ列です。全体で `n+r−1` 個の場所があり、そのうちどこを玉にするかを選ぶので、<sub>n+r−1</sub>C<sub>r</sub> になります。
+
+  この「玉と仕切り」の言い換えは、「合計が N になる非負整数の組は何通りか」という形の問題でそのまま使えます。
+</Callout>
+
+## 二項係数を足し算だけで作る
+
+<sub>n</sub>C<sub>r</sub> の定義式には割り算が入っていますが、**足し算だけで表を埋める**こともできます。
+
+`n` 個から `r` 個を選ぶとき、**特定の1個（たとえば n 番目）に注目**します。選択肢は2つです。
+
+- n 番目を**選ぶ**：残り `n−1` 個から `r−1` 個を選ぶ → <sub>n−1</sub>C<sub>r−1</sub>
+- n 番目を**選ばない**：残り `n−1` 個から `r` 個を選ぶ → <sub>n−1</sub>C<sub>r</sub>
+
+この2つは重ならず、かつすべてを覆っているので、足せば答えです。
+
+`C(n, r) = C(n−1, r−1) + C(n−1, r)`
+
+```python
+def binomial_table(n):
+    C = [[0] * (n + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        C[i][0] = 1                             # 何も選ばない方法は1通り
+        for j in range(1, i + 1):
+            C[i][j] = C[i-1][j-1] + C[i-1][j]   # i 番目を選ぶ + 選ばない
+    return C
+```
+
+<PascalTriangle client:visible />
+
+これはパスカルの三角形そのものです。そして、この漸化式の形に見覚えがあるはずです。**「選ぶ / 選ばない」で場合分けして足す**というのは、部分集合を数えるバックトラックや、ナップサック DP とまったく同じ構造です。
+
+表を作るコストは O(n²) で、割り算も逆元も要りません。**`n` が 1000 程度までなら、これが一番事故が少ない方法**です。
+
+## n が大きいとき：階乗と逆元
+
+`n` が 10 万、20 万となると、O(n²) の表は作れません。定義式に戻ります。
+
+`C(n, r) = n! / (r! × (n−r)!)`
+
+余りの世界では割り算ができないので、剰余演算のノートでやったように**逆元の掛け算**に置き換えます。
+
+```python
+MOD = 1_000_000_007
+
+def prepare(n):
+    fact = [1] * (n + 1)
+    for i in range(1, n + 1):
+        fact[i] = fact[i-1] * i % MOD          # 階乗を前計算
+    inv_fact = [1] * (n + 1)
+    inv_fact[n] = pow(fact[n], MOD - 2, MOD)   # 末尾ぶんだけ逆元を求める
+    for i in range(n, 0, -1):
+        inv_fact[i-1] = inv_fact[i] * i % MOD  # 1つずつ戻す
+    return fact, inv_fact
+
+def ncr(n, r, fact, inv_fact):
+    if r < 0 or r > n:
+        return 0
+    return fact[n] * inv_fact[r] % MOD * inv_fact[n-r] % MOD
+```
+
+<NcrModP client:visible />
+
+<Callout type="tip" title="逆元を1回しか求めていないところが工夫です">
+  素直に書けば、`inv_fact[i]` を求めるのに `pow(fact[i], MOD-2, MOD)` を `n` 回呼ぶことになります。1回が O(log MOD) なので、全体では O(n log MOD)。`n` が 20 万なら 600 万回程度で、通らなくはありませんが無駄です。
+
+  上のコードは、**一番大きい `inv_fact[n]` だけを逆元で求め、あとは掛け算で戻しています。**
+
+  `1/(i−1)! = (1/i!) × i` という関係が成り立つからです（`i!` の逆数に `i` を掛ければ `(i−1)!` の逆数になる）。これで前処理全体が O(n + log MOD) になります。
+
+  「1回だけ重い計算をして、残りは軽い漸化式で埋める」という形は、他の前計算でもよく出てきます。
+</Callout>
+
+<Callout type="warn" title="r の範囲チェックを省かない">
+  `ncr` の中の `if r < 0 or r > n: return 0` は、実戦では必ず要ります。
+
+  数え上げ DP の途中で `C(n, r)` を呼ぶとき、式の都合で `r` が負になったり `n` を超えたりする場面がよくあります。数学的にはその場合の値は 0 ですが、配列アクセスとしては `inv_fact[-1]`（Python では末尾を指す）や範囲外エラーになります。
+
+  **Python の負の添字は例外を出さずに別の値を返す**ので、このチェックを省くと、エラーにならないまま答えだけが静かに狂います。
+</Callout>
+
+## 見積もりの道具としても使う
+
+組合せの数は、**全探索が通るかどうかの判断**にそのまま使えます。
+
+| 形 | 通り数 | n = 20 | n = 30 |
+| --- | --- | --- | --- |
+| 部分集合 | 2<sup>n</sup> | 約 100 万 | 約 10 億 |
+| 順列 | n! | 約 2.4 × 10<sup>18</sup> | 桁外れ |
+| 半分の部分集合 | <sub>n</sub>C<sub>n/2</sub> | 184,756 | 約 1.5 億 |
+
+この表から読み取れることは明確です。
+
+- **部分集合の全探索は n = 20 前後まで。** これが bit DP の制約が 12〜20 に設定される理由です
+- **順列の全探索は n = 10 前後まで。** それを超えるなら、順列を直接列挙するのではなく DP に載せ替える必要があります
+
+制約を見て「2<sup>n</sup> なら間に合う」「n! では無理」と即断できるようになると、解法の方向を決めるのが速くなります。
+
+## この知識を使う場面
+
+| 場面 | 使い方 |
+| --- | --- |
+| グリッドの経路数 | 右と下の並べ方なので <sub>m+n−2</sub>C<sub>m−1</sub> |
+| 「合計が N になる組」 | 玉と仕切りの重複組合せ |
+| 数え上げ DP の遷移 | 「選ぶ / 選ばない」に分けて足す（パスカルの漸化式と同じ形） |
+| 全探索の可否の判断 | 2<sup>n</sup> と n! の大きさを見積もる |
+| 確率の計算 | 場合の数の比として求める |
+
+## この記事のチェックリスト
+
+- [ ] 順列と組合せの違いを、具体例を出して説明できる
+- [ ] 組合せが順列を `r!` で割った形になる理由を説明できる
+- [ ] 重複組合せが <sub>n+r−1</sub>C<sub>r</sub> になる理由を、玉と仕切りで説明できる
+- [ ] `C(n, r) = C(n−1, r−1) + C(n−1, r)` を、選ぶ / 選ばないの場合分けから導ける
+- [ ] `n` の大きさで、表を作る方法と階乗を使う方法を使い分けられる
+- [ ] 逆元を1回しか求めずに `inv_fact` を埋められる理由を説明できる
+- [ ] 2<sup>n</sup> と n! について、全探索が通る `n` の目安を言える
