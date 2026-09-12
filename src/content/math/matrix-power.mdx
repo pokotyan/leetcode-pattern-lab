@@ -1,0 +1,204 @@
+---
+title: 行列累乗（線形漸化式を O(log N) にする）
+description: 「1つ前と2つ前から決まる」漸化式を、行列の掛け算1回に書き換える。N が 10^18 でも解ける形に持ち込む
+order: 9
+status: published
+requires:
+  - mod-arithmetic
+usedIn:
+  - slug: dp-basics
+    why: フィボナッチのような線形漸化式の DP は、N が 10^18 になると配列を回せない。行列のべき乗にすると O(log N) で済む
+  - slug: shortest-path-advanced
+    why: 辺をちょうど k 本使う経路が何通りあるかは、隣接行列の k 乗で求まる。Floyd-Warshall と同じ「行列で経路を考える」発想
+problems:
+  - name: Fibonacci Number
+    url: https://leetcode.com/problems/fibonacci-number/
+    level: Easy
+    importance: 中
+    technique: 行列累乗の入口
+  - name: Count Good Numbers
+    url: https://leetcode.com/problems/count-good-numbers/
+    level: Medium
+    importance: 高
+    technique: 繰り返し二乗法
+  - name: Knight Dialer
+    url: https://leetcode.com/problems/knight-dialer/
+    level: Medium
+    importance: 高
+    technique: 遷移を行列にする
+  - name: Student Attendance Record II
+    url: https://leetcode.com/problems/student-attendance-record-ii/
+    level: Hard
+    importance: 中
+    technique: 状態を並べて行列累乗
+  - name: Number of Ways to Stay in the Same Place After Some Steps
+    url: https://leetcode.com/problems/number-of-ways-to-stay-in-the-same-place-after-some-steps/
+    level: Hard
+    importance: 低
+    technique: 遷移行列
+---
+
+import Callout from '../../components/Callout.astro'
+import MatrixPower from '../../components/sim/problems/MatrixPower'
+
+## まず、困っている状況を体験してみます
+
+> フィボナッチ数 `F(n)` を求めてください。`F(0) = 0`、`F(1) = 1`、`F(n) = F(n−1) + F(n−2)` です。ただし **`n` は 10<sup>18</sup> まで**あります。
+
+DP なら 3 行で書けます。
+
+```python
+a, b = 0, 1
+for _ in range(n):
+    a, b = b, a + b
+return a
+```
+
+これは O(N) です。`n` が 100 万なら一瞬ですが、10<sup>18</sup> では終わりません。1 秒で 10<sup>8</sup> 回として、**300 年**かかります。
+
+ループの回数そのものを減らす必要があります。ここで思い出したいのが、剰余演算のノートでやった繰り返し二乗法です。`a^b` を O(log b) で求めたあの手法が、**掛け算の形になっているものなら何にでも使えます。**
+
+問題は、フィボナッチの漸化式が足し算だという点です。これを掛け算の形に書き換えられないでしょうか。
+
+## 発想を変える：2 つの値をまとめて「状態ベクトル」にする
+
+フィボナッチの漸化式は、1 つの値からは決まりません。`F(n−1)` と `F(n−2)` の **2 つ**が必要です。そこで、この 2 つをペアにして 1 つの状態として扱います。
+
+```
+状態 v(n) = (F(n), F(n−1))
+```
+
+すると、次の状態は現在の状態から機械的に作れます。
+
+```
+F(n+1) = F(n) + F(n−1)
+F(n)   = F(n)
+```
+
+これを行列の形で書くと、こうなります。
+
+```
+| F(n+1) |   | 1  1 |   | F(n)   |
+|        | = |      | × |        |
+| F(n)   |   | 1  0 |   | F(n−1) |
+```
+
+行列の掛け算は「行と列の内積」なので、1 行目は `1 × F(n) + 1 × F(n−1)`、2 行目は `1 × F(n) + 0 × F(n−1)` です。確かに上の 2 式と一致しています。
+
+**1 ステップ進むことが、行列を 1 回掛けることと同じ**になりました。ということは、
+
+```
+v(n) = A^(n−1) × v(1)     ただし A = | 1  1 |
+                                     | 1  0 |
+```
+
+`n` ステップ進むのは、**行列 A を n 乗する**ことに置き換わります。そして行列のべき乗には、繰り返し二乗法がそのまま使えます。
+
+```python
+def mat_mul(A, B, mod):
+    n = len(A)
+    C = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            for k in range(n):
+                C[i][j] = (C[i][j] + A[i][k] * B[k][j]) % mod
+    return C
+
+def mat_pow(A, e, mod):
+    n = len(A)
+    result = [[1 if i == j else 0 for j in range(n)] for i in range(n)]  # 単位行列
+    while e > 0:
+        if e & 1:
+            result = mat_mul(result, A, mod)   # この桁を使う
+        A = mat_mul(A, A, mod)                 # A を2乗して桁を1つ上げる
+        e >>= 1
+    return result
+
+def fib(n, mod=10**9 + 7):
+    if n == 0:
+        return 0
+    return mat_pow([[1, 1], [1, 0]], n - 1, mod)[0][0]
+```
+
+<MatrixPower client:visible />
+
+`mat_pow` の中身を、数のべき乗のコードと見比べてみてください。**`result = result * a` が `result = mat_mul(result, A)` に、`a = a * a` が `A = mat_mul(A, A)` に変わっただけ**です。骨格はまったく同じです。
+
+<Callout type="tip" title="単位行列は、数の世界の 1 にあたります">
+  数のべき乗では `result = 1` から始めました。行列では**単位行列**（対角が 1、それ以外が 0）から始めます。
+
+  単位行列を掛けても相手は変わらないので、ちょうど数の 1 と同じ役割です。「何も進んでいない状態」を表しています。
+
+  `[[1 if i == j else 0 for j in range(n)] for i in range(n)]` という書き方が読みにくければ、2×2 なら `[[1, 0], [0, 1]]` と直接書いても構いません。
+</Callout>
+
+## 計算量
+
+行列のサイズを `k × k` とします。
+
+- 行列の掛け算 1 回：O(k³)
+- べき乗に必要な掛け算の回数：O(log N)
+- **全体：O(k³ log N)**
+
+フィボナッチなら `k = 2` なので、`8 × 60 = 480` 回程度の演算です。10<sup>18</sup> ステップが、**500 回弱**で終わります。
+
+ここで注意が必要なのは、`k³` の部分です。状態が 100 種類あると `k³ = 100 万` になり、`log N` を掛けると 6,000 万回。ぎりぎりです。**行列のサイズは小さく保つ必要があります。** 目安として `k ≤ 50` 程度までです。
+
+## 遷移を行列にする、という見方
+
+フィボナッチだけの話ではありません。**「状態がいくつかあって、1 ステップで別の状態へ移る」**という形の問題は、すべて行列で書けます。
+
+> 電話のキーパッドの上でナイト（チェスの桂馬）が `n` 回跳ねます。何通りの番号ができますか。（Knight Dialer）
+
+状態は「いまどのキーの上にいるか」の 10 通りです。`dp[step][key]` という DP で解けますが、`n` が大きいと回せません。
+
+ここで、**10 × 10 の行列 `A` を作り、`A[i][j] = 1`（キー j からキー i へ跳べるなら）**とします。すると、
+
+- `A` の 1 乗 = 1 回跳んだときの経路数
+- `A` の 2 乗 = 2 回跳んだときの経路数
+- `A` の n 乗 = n 回跳んだときの経路数
+
+となります。行列の積の定義（`C[i][j] = Σ A[i][k] × B[k][j]`）が、ちょうど**「途中で k を経由する経路を全部足す」**という意味になっているからです。
+
+<Callout type="tip" title="Floyd-Warshall との関係">
+  最短経路のノートで出てきた Floyd-Warshall も、実は同じ構造です。
+
+  経路数を求めるときは「足す × 掛ける」でしたが、最短距離を求めるときは「**min を取る × 足す**」に置き換わります。演算の組を入れ替えただけで、「行列を掛けて経路をつなぐ」という骨格は同じです。
+
+  この見方ができると、「辺をちょうど k 本使う最短経路」のような問題も、行列累乗の枠で捉えられるようになります。
+</Callout>
+
+## 使えるかどうかの判断
+
+行列累乗が使えるのは、次の条件が揃ったときです。
+
+1. **漸化式が線形**である。つまり `dp[n] = a × dp[n−1] + b × dp[n−2] + ...` の形で、係数が定数
+2. **状態の種類が少ない**（数十まで）
+3. **ステップ数 N が極端に大きい**（10<sup>9</sup> 以上）
+
+逆に、次の場合は使えません。
+
+- `dp[n] = dp[n−1] × dp[n−2]`（掛け算が入る。線形でない）
+- `dp[n] = max(dp[n−1], dp[n−2]) + a`（max が入る。ただし min-plus 行列積という別の枠組みなら扱える）
+- 状態が N に依存して増える
+
+**制約に「N ≤ 10^9」と書いてあって、状態の数が小さいなら、行列累乗を疑う**というのが実戦的な合図です。
+
+## この知識を使う場面
+
+| 場面 | 行列の作り方 |
+| --- | --- |
+| フィボナッチ型の漸化式 | 直前 k 個をベクトルにまとめ、係数を1行目に並べる |
+| グラフ上の k 歩の経路数 | 隣接行列の k 乗 |
+| 状態遷移が固定の数え上げ | 状態 i → j の遷移数を `A[j][i]` に置く |
+| 確率の遷移（マルコフ連鎖） | 遷移確率を並べた行列のべき乗 |
+
+## この記事のチェックリスト
+
+- [ ] フィボナッチの漸化式を、状態ベクトルと行列の積で書ける
+- [ ] 行列の n 乗が「n ステップ進むこと」に対応する理由を説明できる
+- [ ] `mat_pow` が数の繰り返し二乗法と同じ骨格であることを説明できる
+- [ ] 単位行列が数の 1 にあたる理由を説明できる
+- [ ] 計算量が O(k³ log N) になる理由と、k の上限の目安を言える
+- [ ] 隣接行列の k 乗が k 歩の経路数になる理由を、行列の積の定義から説明できる
+- [ ] 行列累乗が使えない漸化式の例を挙げられる
