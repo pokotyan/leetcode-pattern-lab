@@ -61,10 +61,12 @@ export async function buildGraph() {
  * 段 0 は前提なしの記事。段 k の記事は、段 k-1 までの記事をすべて読めば読める。
  * 依存が循環していればビルドを止める。
  */
-export function layerArticles(all: Article[]): Article[][] {
+export function layerArticles<T extends { id: string; data: { requires: string[] } }>(
+  all: T[],
+): T[][] {
   const depth = new Map<string, number>()
   const rest = [...all]
-  const layers: Article[][] = []
+  const layers: T[][] = []
 
   while (rest.length > 0) {
     const ready = rest.filter((a) => a.data.requires.every((r) => depth.has(r)))
@@ -78,4 +80,52 @@ export function layerArticles(all: Article[]): Article[][] {
     for (const a of ready) rest.splice(rest.indexOf(a), 1)
   }
   return layers
+}
+
+
+export type MathNote = CollectionEntry<'math'>
+export type MathUse = { note: MathNote; why: string }
+
+/**
+ * 副読本（数学ノート）と本編記事の対応を作る。
+ * - notes: order 順の数学ノート
+ * - usedByArticle: 本編の slug -> その記事で使う数学ノートと理由（記事ページ側の逆引き）
+ * usedIn / requires に存在しない slug があればビルドを止める。
+ */
+export async function buildMathGraph() {
+  const notes = [...(await getCollection('math'))].sort((a, b) => a.data.order - b.data.order)
+  const articles = await getCollection('articles')
+  const articleById = new Map(articles.map((a) => [a.id, a]))
+  const noteById = new Map(notes.map((n) => [n.id, n]))
+
+  const usedByArticle = new Map<string, MathUse[]>()
+  const requires = new Map<string, MathNote[]>()
+
+  for (const n of notes) {
+    for (const slug of n.data.requires) {
+      if (!noteById.has(slug)) {
+        throw new Error(
+          `[math] ${n.id}.mdx の requires に存在しない数学ノート "${slug}" があります。src/content/math/ を確認してください`,
+        )
+      }
+      if (slug === n.id) throw new Error(`[math] ${n.id}.mdx の requires が自分自身を指しています`)
+    }
+    requires.set(
+      n.id,
+      n.data.requires.map((slug) => noteById.get(slug)!),
+    )
+
+    for (const use of n.data.usedIn) {
+      if (!articleById.has(use.slug)) {
+        throw new Error(
+          `[math] ${n.id}.mdx の usedIn に存在しない記事 "${use.slug}" があります。src/content/articles/ を確認してください`,
+        )
+      }
+      const list = usedByArticle.get(use.slug) ?? []
+      list.push({ note: n, why: use.why })
+      usedByArticle.set(use.slug, list)
+    }
+  }
+
+  return { notes, noteById, articleById, usedByArticle, requires }
 }

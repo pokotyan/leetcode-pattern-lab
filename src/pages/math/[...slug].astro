@@ -1,0 +1,23 @@
+---
+import { getCollection, render } from 'astro:content'
+import MathLayout from '../../layouts/MathLayout.astro'
+
+export async function getStaticPaths() {
+  const notes = [...(await getCollection('math'))].sort((a, b) => a.data.order - b.data.order)
+  return notes.map((entry, i) => ({
+    params: { slug: entry.id },
+    props: {
+      entry,
+      prev: notes[i - 1] && { id: notes[i - 1]!.id, title: notes[i - 1]!.data.title },
+      next: notes[i + 1] && { id: notes[i + 1]!.id, title: notes[i + 1]!.data.title },
+    },
+  }))
+}
+
+const { entry, prev, next } = Astro.props
+const { Content, headings } = await render(entry)
+---
+
+<MathLayout entry={entry} prev={prev} next={next} headings={headings}>
+  <Content />
+</MathLayout>

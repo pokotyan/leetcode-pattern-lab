@@ -1,0 +1,191 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro'
+import { buildMathGraph, layerArticles, orderArticles } from '../../lib/prereq'
+import { sectionById, LEVEL_BADGE, type Level } from '../../lib/curriculum'
+
+const base = import.meta.env.BASE_URL
+const { notes, usedByArticle, articleById } = await buildMathGraph()
+const layers = layerArticles(notes)
+
+// 型から引く向き。本編の並び順に沿って、数学ノートが紐づく記事だけを出す
+const byArticle = orderArticles([...articleById.values()])
+  .filter((a) => (usedByArticle.get(a.id) ?? []).length > 0)
+  .map((a) => ({ article: a, uses: usedByArticle.get(a.id)! }))
+---
+
+<BaseLayout
+  title="数学の副読本 | LeetCode Pattern Lab"
+  description="競技プログラミングで実際に使う数学だけを、型と結びつけて step by step で読む副読本"
+>
+  <section class="mb-12">
+    <h1 class="mb-3 text-3xl font-bold leading-snug">数学の副読本</h1>
+    <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      本編の型を解くときに「ここで詰まるのは、アルゴリズムではなく数学のほう」という場面がある。
+      そこだけを取り出して、<strong style="color: var(--fg)">具体的な数字から始めて順に積み上げる</strong
+      >形でまとめたのがこの副読本。数学の教科書の順序ではなく、
+      <strong style="color: var(--fg)">どの型で使うか</strong>から逆に引けるように並べてある。
+    </p>
+    <p class="mt-3 max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      本編を読み進めていて数学の前提が足りないと感じたら、記事の冒頭に出る「この記事で使う数学」から
+      該当のノートへ飛べる。逆に、ある知識をどこで使うのかを知りたいときは、下の逆引き表を見る。
+    </p>
+    <dl class="mt-6 flex flex-wrap gap-8 text-sm">
+      <div>
+        <dt style="color: var(--fg-muted)">数学ノート</dt>
+        <dd class="m-0 text-2xl font-bold">{notes.length}</dd>
+      </div>
+      <div>
+        <dt style="color: var(--fg-muted)">結びつく型</dt>
+        <dd class="m-0 text-2xl font-bold">{byArticle.length}</dd>
+      </div>
+    </dl>
+  </section>
+
+  <section class="mb-16">
+    <h2 class="mb-1 text-xl font-bold">読む順</h2>
+    <p class="mb-5 text-sm" style="color: var(--fg-muted)">
+      同じ段のノートどうしには前提関係がない。上の段を読み終えていれば、下の段は前提が揃った状態で読める。
+    </p>
+    <ol class="m-0 list-none space-y-8 p-0">
+      {
+        layers.map((layer, i) => (
+          <li>
+            <div class="mb-3 flex items-baseline gap-3">
+              <span
+                class="rounded-md px-2 py-0.5 font-mono text-xs font-bold"
+                style="background: var(--accent-soft); color: var(--accent)"
+              >
+                STEP {i + 1}
+              </span>
+              <span class="text-xs" style="color: var(--fg-muted)">
+                {i === 0 ? '前提なし。どこからでも読める' : `STEP ${i} までを読んでいれば読める`}
+              </span>
+            </div>
+            <ul class="m-0 grid list-none gap-3 p-0 sm:grid-cols-2 lg:grid-cols-3">
+              {layer.map((n) => (
+                <li>
+                  <a
+                    href={`${base}math/${n.id}/`}
+                    class="flex h-full flex-col rounded-xl border px-4 py-3 no-underline transition-colors hover:border-[var(--accent)]"
+                    style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+                  >
+                    <span class="text-sm font-bold leading-snug">{n.data.title}</span>
+                    <span class="mt-1.5 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                      {n.data.description}
+                    </span>
+                    {n.data.usedIn.length > 0 && (
+                      <span class="mt-2 font-mono text-[11px]" style="color: var(--ok)">
+                        {n.data.usedIn.length} つの型で使う
+                      </span>
+                    )}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+
+  <section class="mb-16">
+    <h2 class="mb-1 text-xl font-bold">逆引き：この知識は、この型で使う</h2>
+    <p class="mb-5 text-sm" style="color: var(--fg-muted)">
+      数学ノートから、それを実際に使う本編の型を引く。
+    </p>
+    <div class="space-y-4">
+      {
+        notes.map((n) => (
+          <div class="rounded-xl border" style="border-color: var(--border)">
+            <div
+              class="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b px-4 py-3"
+              style="border-color: var(--border); background: var(--bg-soft)"
+            >
+              <a
+                href={`${base}math/${n.id}/`}
+                class="text-sm font-bold no-underline hover:underline"
+                style="color: var(--accent)"
+              >
+                {n.data.title}
+              </a>
+            </div>
+            {n.data.usedIn.length === 0 ? (
+              <p class="m-0 px-4 py-2.5 text-xs" style="color: var(--fg-muted)">
+                本編の型には直接ひもづかない。競技プログラミングの他の場面で効く知識として置いてある。
+              </p>
+            ) : (
+              <ul class="m-0 list-none p-0">
+                {n.data.usedIn.map((u) => (
+                  <li
+                    class="border-b px-4 py-2.5 last:border-b-0"
+                    style="border-color: var(--border)"
+                  >
+                    <a
+                      href={`${base}articles/${u.slug}/`}
+                      class="text-sm no-underline hover:underline"
+                      style="color: var(--fg)"
+                    >
+                      {articleById.get(u.slug)!.data.title}
+                    </a>
+                    <p class="m-0 mt-0.5 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                      {u.why}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ))
+      }
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-1 text-xl font-bold">逆引き：この型には、この数学が要る</h2>
+    <p class="mb-5 text-sm" style="color: var(--fg-muted)">
+      本編の型から、必要になる数学ノートを引く。記事ページの冒頭にも同じ内容が出る。
+    </p>
+    <ul class="m-0 list-none space-y-3 p-0">
+      {
+        byArticle.map(({ article, uses }) => (
+          <li
+            class="rounded-xl border px-4 py-3"
+            style="border-color: var(--border); background: var(--bg-soft)"
+          >
+            <div class="flex flex-wrap items-baseline gap-2">
+              <a
+                href={`${base}articles/${article.id}/`}
+                class="text-sm font-bold no-underline hover:underline"
+                style="color: var(--fg)"
+              >
+                {article.data.title}
+              </a>
+              <span
+                class="rounded px-1.5 py-0.5 text-[10px] font-bold"
+                style={`color: ${LEVEL_BADGE[article.data.level as Level].color}; background: ${LEVEL_BADGE[article.data.level as Level].soft}`}
+              >
+                {article.data.level}
+              </span>
+              <span class="text-[11px]" style="color: var(--fg-muted)">
+                {sectionById.get(article.data.section)?.title ?? article.data.section}
+              </span>
+            </div>
+            <ul class="m-0 mt-2 flex list-none flex-wrap gap-2 p-0">
+              {uses.map((u) => (
+                <li>
+                  <a
+                    href={`${base}math/${u.note.id}/`}
+                    class="inline-block rounded-lg border px-3 py-1.5 text-xs no-underline"
+                    style="border-color: var(--ok); background: var(--ok-soft); color: var(--ok)"
+                  >
+                    {u.note.data.title}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </li>
+        ))
+      }
+    </ul>
+  </section>
+</BaseLayout>
