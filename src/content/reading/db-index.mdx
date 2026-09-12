@@ -1,0 +1,206 @@
+---
+title: データベースの索引（B-tree と LSM-tree）
+description: 読みに最適化した木と、書きに最適化したログ。どちらを選ぶかで、書き込み・読み取り・ディスク使用量のどれを犠牲にするかが決まる
+category: data
+order: 6
+status: published
+topics:
+  - B-tree
+  - B+tree
+  - LSM-tree
+  - SSTable
+  - Skip List
+  - Write Amplification
+  - Compaction
+basedOn:
+  - kind: article
+    slug: binary-search
+    why: B木の1ノード内でキーを探すのも、Skip List で層を降りるのも、範囲を絞り込んでいく形は同じ
+  - kind: article
+    slug: bst
+    why: 木をたどって値を探す形。B木は「1ノードが持つ子を極端に増やした探索木」として読める
+  - kind: article
+    slug: heap-topk
+    why: LSM の compaction は、複数のソート済みファイルを1本にまとめる k-way merge。最小をヒープで取り出し続ける
+  - kind: article
+    slug: two-pointers
+    why: 2本のソート済み列をまとめる形。k 本になるとヒープが必要になる、という発展の起点
+  - kind: math
+    slug: series-estimation
+    why: 1ノードの分岐数を増やすと木の高さが log の底で決まる。なぜ 100 分岐だと3段で1億件に届くのか
+problems:
+  - name: Design Skiplist
+    url: https://leetcode.com/problems/design-skiplist/
+    level: Hard
+    importance: 中
+    technique: Skip List
+  - name: Merge k Sorted Lists
+    url: https://leetcode.com/problems/merge-k-sorted-lists/
+    level: Hard
+    importance: 高
+    technique: k-way merge
+  - name: Kth Smallest Element in a Sorted Matrix
+    url: https://leetcode.com/problems/kth-smallest-element-in-a-sorted-matrix/
+    level: Medium
+    importance: 中
+    technique: ヒープでのマージ
+---
+
+import Callout from '../../components/Callout.astro'
+import SkipListSearch from '../../components/sim/problems/SkipListSearch'
+import LsmMerge from '../../components/sim/problems/LsmMerge'
+
+## 索引が無いと何が起きるか
+
+1 億行のテーブルから `WHERE user_id = 12345` を引くとします。索引が無ければ、全行を読んで比べるしかありません（フルスキャン）。
+
+ここで、**メモリとディスクの速度差**が効いてきます。
+
+| 操作 | だいたいの時間 |
+| --- | --- |
+| メモリの読み取り | 100 ナノ秒 |
+| SSD のランダム読み取り | 100 マイクロ秒（メモリの約 1,000 倍） |
+| HDD のランダム読み取り | 10 ミリ秒（メモリの約 100,000 倍） |
+
+アルゴリズムの計算量を数えるとき、私たちは 1 回の操作をすべて同じコストとして数えてきました。**ディスクが関わると、その前提が崩れます。** 比較の回数ではなく、**ディスクを何回読むか**が支配的になります。
+
+索引の設計は、ここから出発します。
+
+## B-tree：1ノードを大きくして、段数を減らす
+
+二分探索木は、1 ノードにつき子が 2 つでした。1 億件なら深さは `log₂(10^8) ≈ 27` 段です。
+
+**ディスク上では、これが 27 回のランダム読み取りを意味します。** SSD でも 2.7 ミリ秒。1 クエリでこれは重すぎます。
+
+そこで発想を変えます。**1 ノードをディスクの読み取り単位（ページ、たいてい 4 KB〜16 KB）いっぱいまで大きくします。** 1 ノードに 100 個のキーを詰め込めば、子は 101 個持てます。
+
+すると、深さは `log₁₀₁(10^8) ≈ 4` 段です。**27 回が 4 回になりました。**
+
+> 1 回のディスク読み取りで運べる量は決まっている。ならば、**その 1 回でできるだけ多くの枝を判断する**
+
+これが B-tree の設計思想です。ノード内の 100 個のキーから目的の範囲を探すのは、メモリ上での二分探索なので、実質ただです。
+
+| 分岐数 | 1 億件での深さ | ディスク読み取り |
+| --- | --- | --- |
+| 2（二分探索木） | 27 | 27 回 |
+| 100（B-tree） | 4 | 4 回 |
+| 500 | 3 | 3 回 |
+
+<Callout type="tip" title="B+tree：葉に全部のデータを置く">
+  実際のデータベースが使っているのは、B-tree を少し変えた **B+tree** です。違いは 2 つです。
+
+  - **データは葉にだけ置く。** 途中のノードはキーと子への参照だけなので、1 ノードにより多くのキーが入り、さらに浅くなる
+  - **葉どうしが横につながっている。** 範囲検索（`WHERE age BETWEEN 20 AND 30`）のとき、葉を見つけたらあとは横にたどるだけで済む
+
+  2 番目が実務では効きます。範囲検索やソート済みの取り出しが速いのは、この構造のおかげです。ハッシュ索引にはこれができません（ハッシュは順序を壊すので）。
+
+  「なぜ主キー以外にも索引が要るのか」「なぜ複合索引は順番が重要なのか」といった話は、この葉の並び順で説明がつきます。
+</Callout>
+
+## Skip List：木を使わずに同じことをする
+
+B-tree と同じ「段数を減らす」効果を、木ではなく**連結リストの重ね合わせ**で実現するのが Skip List です。Redis の sorted set が内部で使っています。
+
+作り方は単純です。
+
+1. 全要素をソート済みの連結リストにつなぐ（最下段）
+2. そのうちの一部を、確率的に選んで上の段にもつなぐ
+3. さらにその一部を、もう 1 段上に……
+
+上の段ほど要素が疎になるので、**上から降りてくると大きく飛ばせます。**
+
+```python
+def search(head, target):
+    node = head
+    for level in range(len(head.next) - 1, -1, -1):   # 上の層から順に
+        while node.next[level] and node.next[level].val < target:
+            node = node.next[level]                   # 同じ層を右へ進む
+        # これ以上進めないので、1段下りる
+    node = node.next[0]
+    return node is not None and node.val == target
+```
+
+<SkipListSearch client:visible />
+
+高さを**確率で決める**（コインを投げて表なら 1 段上げる、を繰り返す）ところがこの構造の面白い点です。平均すると半分が 1 段、4 分の 1 が 2 段……となり、**二分探索と同じ形が自然にできあがります。**
+
+<Callout type="tip" title="なぜ確率で決めるのか">
+  平衡二分探索木（赤黒木や AVL 木）は、挿入・削除のたびに回転して木の形を整えます。正しく実装するのは面倒で、並行処理（複数スレッドから同時に触る）となるとさらに難しくなります。
+
+  Skip List は、**形を整える操作がありません。** 高さをコイン投げで決めるだけで、全体としてはバランスの取れた形になります。期待値としての計算量は O(log N) です。
+
+  さらに、挿入は「隣のポインタを付け替える」だけなので、**局所的なロックで済み、並行処理と相性がよい**という利点があります。実装の短さと並行性のために、確率的な保証を受け入れた設計です。
+
+  確率と期待値のノートで見た「期待値の線形性」が、高さの期待値や探索手数の見積もりにそのまま使われています。
+</Callout>
+
+## 書き込みが多いとき：LSM-tree
+
+B-tree には弱点があります。**書き込みがランダムなディスクアクセスになる**ことです。
+
+新しい行を挿入するたび、その値が入るべき葉を探して、そのページを書き換えます。書き込む場所はディスク上に散らばるので、ランダム書き込みが大量に発生します。しかも 1 行（100 バイト）の更新のために、ページ全体（16 KB）を書き直します。
+
+そこで、まったく別の方針を取るのが LSM-tree（Log-Structured Merge-tree）です。RocksDB、Cassandra、LevelDB などが採用しています。
+
+> **その場を書き換えるのをやめる。** 新しい書き込みは、常に末尾へ追記する
+
+手順はこうです。
+
+1. 書き込みは、まずメモリ上のソート済み構造（memtable）に入れる。**ディスクには触らない**
+2. memtable が一定の大きさになったら、**そのままソート済みのファイル（SSTable）としてディスクへ書き出す。** 追記だけなので、シーケンシャル書き込みで速い
+3. SSTable が溜まってきたら、複数をまとめて 1 本の大きな SSTable に統合する（compaction）
+
+3 番目の統合が、**ソート済みの列を複数まとめる操作**です。
+
+```python
+import heapq
+
+def merge_runs(runs):
+    heap = []
+    for i, run in enumerate(runs):
+        if run:
+            heapq.heappush(heap, (run[0], i, 0))     # (キー, どの列か, 何番目か)
+    out = []
+    while heap:
+        key, i, j = heapq.heappop(heap)              # 全体で最小のキー
+        if not out or out[-1] != key:
+            out.append(key)                          # 同じキーは新しいほうだけ残す
+        if j + 1 < len(runs[i]):
+            heapq.heappush(heap, (runs[i][j + 1], i, j + 1))
+    return out
+```
+
+<LsmMerge client:visible />
+
+これは `Merge k Sorted Lists` そのものです。ヒープには**各列の先頭だけ**を入れるので、ファイルがどれだけ大きくてもメモリは列の数だけで済みます。外部ソート（メモリに載らないデータの並べ替え）でも同じ形が出てきます。
+
+<Callout type="warn" title="読み取りが遅くなる、という代償">
+  LSM-tree は書き込みが速い代わりに、**読み取りが重くなります。** あるキーを探すとき、どの SSTable に入っているか分からないので、**新しいファイルから順に探す**ことになります。
+
+  ここで効くのが、前の記事の Bloom Filter です。SSTable ごとに Bloom Filter を持たせておけば、**「このファイルにそのキーは無い」と分かったものはディスクを読まずに飛ばせます。** 読み取り 1 回で触るファイル数が劇的に減ります。
+
+  もう 1 つの代償が **write amplification** です。compaction のたびに同じデータを何度も書き直すので、アプリが 1 GB 書いたのにディスクには 10 GB 書かれている、といったことが起きます。SSD の寿命に直結するので、compaction の戦略（leveled か tiered か）が運用上の重要な選択になります。
+</Callout>
+
+## どちらを選ぶか
+
+| | B-tree | LSM-tree |
+| --- | --- | --- |
+| 読み取り | 速い（深さぶんの読み取り） | やや遅い（複数ファイルを探す。Bloom Filter で緩和） |
+| 書き込み | 遅い（ランダム書き込み） | 速い（追記のみ） |
+| 範囲検索 | 得意（葉が横につながっている） | できるが、複数ファイルのマージが要る |
+| ディスク使用量 | 予測しやすい | compaction 前は重複が残る |
+| 代表 | PostgreSQL、MySQL(InnoDB)、SQLite | RocksDB、Cassandra、LevelDB、ScyllaDB |
+
+選択の目安は、**読み書きの比率**です。ログや時系列データのように書き込みが圧倒的に多いなら LSM、汎用的な業務データベースなら B-tree、というのが標準的な判断になります。
+
+なお、この選択は「どちらが優れているか」ではなく、**何を犠牲にするか**の選択です。読み・書き・容量のすべてを同時に最適化することはできません。
+
+## まとめ
+
+- ディスクが絡むと、比較の回数ではなく**読み取りの回数**が支配的になる
+- B-tree は 1 ノードを大きくして段数を減らす。100 分岐なら 1 億件が 4 段
+- Skip List は確率的に層を作り、木の回転なしで同じ効果を出す
+- LSM-tree は上書きをやめて追記だけにし、あとからまとめて統合する
+- 統合は k-way merge。ヒープに各列の先頭だけを持つ
+- 読み取りの遅さは Bloom Filter で緩和する
