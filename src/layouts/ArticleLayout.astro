@@ -2,7 +2,7 @@
 import BaseLayout from './BaseLayout.astro'
 import ProblemTable from '../components/ProblemTable.astro'
 import { sectionById, LEVEL_BADGE, type Level } from '../lib/curriculum'
-import { buildGraph, buildMathGraph } from '../lib/prereq'
+import { buildGraph, buildMathGraph, buildReadingGraph } from '../lib/prereq'
 import type { CollectionEntry } from 'astro:content'
 
 type Props = {
@@ -24,6 +24,9 @@ const nextUp = requiredBy.get(entry.id) ?? []
 
 const { usedByArticle } = await buildMathGraph()
 const mathUses = usedByArticle.get(entry.id) ?? []
+
+const { byArticle } = await buildReadingGraph()
+const readingUses = byArticle.get(entry.id) ?? []
 ---
 
 <BaseLayout title={`${d.title} | LeetCode Pattern Lab`} description={d.description}>
@@ -113,6 +116,35 @@ const mathUses = usedByArticle.get(entry.id) ?? []
       <ProblemTable problems={d.problems} />
 
       <slot />
+
+      {
+        readingUses.length > 0 && (
+          <section class="not-prose my-8 rounded-xl border" style="border-color: var(--warn)">
+            <h3
+              class="m-0 border-b px-4 py-3 text-sm font-bold"
+              style="border-color: var(--warn); background: var(--warn-soft); color: var(--warn)"
+            >
+              この型が実務で効いている場面
+            </h3>
+            <ul class="m-0 list-none p-0">
+              {readingUses.map((u) => (
+                <li class="border-b px-4 py-2.5 last:border-b-0" style="border-color: var(--border)">
+                  <a
+                    href={`${base}reading/${u.note.id}/`}
+                    class="text-sm font-bold no-underline hover:underline"
+                    style="color: var(--accent)"
+                  >
+                    {u.note.data.title}
+                  </a>
+                  <p class="m-0 mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                    {u.why}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )
+      }
 
       {
         nextUp.length > 0 && (

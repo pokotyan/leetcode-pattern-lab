@@ -1,0 +1,148 @@
+---
+import BaseLayout from './BaseLayout.astro'
+import ProblemTable from '../components/ProblemTable.astro'
+import { readingSectionById } from '../lib/curriculum'
+import { buildReadingGraph } from '../lib/prereq'
+import type { CollectionEntry } from 'astro:content'
+
+type Props = {
+  entry: CollectionEntry<'reading'>
+  prev?: { id: string; title: string }
+  next?: { id: string; title: string }
+  headings: { depth: number; slug: string; text: string }[]
+}
+const { entry, prev, next, headings } = Astro.props
+const d = entry.data
+const base = import.meta.env.BASE_URL
+const toc = headings.filter((h) => h.depth === 2)
+const section = readingSectionById.get(d.category)
+
+const { articleById, mathById } = await buildReadingGraph()
+const foundations = d.basedOn.map((b) => ({
+  ...b,
+  title: b.kind === 'article' ? articleById.get(b.slug)!.data.title : mathById.get(b.slug)!.data.title,
+  href: b.kind === 'article' ? `${base}articles/${b.slug}/` : `${base}math/${b.slug}/`,
+}))
+---
+
+<BaseLayout title={`${d.title} | 読み物 | LeetCode Pattern Lab`} description={d.description}>
+  <div class="grid gap-10 lg:grid-cols-[minmax(0,1fr)_16rem]">
+    <article class="prose min-w-0">
+      <p class="not-prose m-0 flex flex-wrap items-center gap-2 text-xs font-bold">
+        <a href={`${base}reading/`} class="no-underline" style="color: var(--accent)">読み物</a>
+        <span style="color: var(--fg-muted)">{section?.title ?? d.category}</span>
+      </p>
+      <h1 class="mt-1 mb-2 text-3xl font-bold leading-snug">{d.title}</h1>
+      <p class="mt-0 text-[15px]" style="color: var(--fg-muted)">{d.description}</p>
+
+      {
+        d.topics.length > 0 && (
+          <ul class="not-prose m-0 mt-4 flex list-none flex-wrap gap-1.5 p-0">
+            {d.topics.map((t) => (
+              <li
+                class="rounded px-2 py-0.5 font-mono text-[11px]"
+                style="background: var(--bg-soft); color: var(--fg-muted); border: 1px solid var(--border)"
+              >
+                {t}
+              </li>
+            ))}
+          </ul>
+        )
+      }
+
+      {
+        foundations.length > 0 && (
+          <section class="not-prose my-8 rounded-xl border" style="border-color: var(--accent)">
+            <h3
+              class="m-0 border-b px-4 py-3 text-sm font-bold"
+              style="border-color: var(--accent); background: var(--accent-soft); color: var(--accent)"
+            >
+              この仕組みの土台になっている型
+            </h3>
+            <ul class="m-0 list-none p-0">
+              {foundations.map((f) => (
+                <li class="border-b px-4 py-2.5 last:border-b-0" style="border-color: var(--border)">
+                  <a
+                    href={f.href}
+                    class="text-sm font-bold no-underline hover:underline"
+                    style="color: var(--accent)"
+                  >
+                    {f.title}
+                  </a>
+                  <span
+                    class="ml-2 rounded px-1.5 py-0.5 text-[10px]"
+                    style={
+                      f.kind === 'math'
+                        ? 'color: var(--ok); background: var(--ok-soft)'
+                        : 'color: var(--warn); background: var(--warn-soft)'
+                    }
+                  >
+                    {f.kind === 'math' ? '数学' : '型'}
+                  </span>
+                  <p class="m-0 mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                    {f.why}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )
+      }
+
+      <ProblemTable problems={d.problems} title="関連する LeetCode 問題" />
+
+      <slot />
+
+      <nav
+        class="not-prose mt-16 flex flex-wrap gap-3 border-t pt-6 text-sm"
+        style="border-color: var(--border)"
+      >
+        {
+          prev && (
+            <a
+              href={`${base}reading/${prev.id}/`}
+              class="flex-1 rounded-lg border px-4 py-3 no-underline"
+              style="border-color: var(--border); color: var(--fg)"
+            >
+              <span class="block text-xs" style="color: var(--fg-muted)">
+                ← 前
+              </span>
+              {prev.title}
+            </a>
+          )
+        }
+        {
+          next && (
+            <a
+              href={`${base}reading/${next.id}/`}
+              class="flex-1 rounded-lg border px-4 py-3 text-right no-underline"
+              style="border-color: var(--border); color: var(--fg)"
+            >
+              <span class="block text-xs" style="color: var(--fg-muted)">
+                次 →
+              </span>
+              {next.title}
+            </a>
+          )
+        }
+      </nav>
+    </article>
+
+    <aside class="hidden lg:block">
+      <div class="sticky top-20 text-sm">
+        <p class="mb-2 text-xs font-bold" style="color: var(--fg-muted)">目次</p>
+        <ul class="m-0 list-none space-y-1.5 border-l p-0 pl-3" style="border-color: var(--border)">
+          {
+            toc.map((h) => (
+              <li>
+                <a href={`#${h.slug}`} class="no-underline" style="color: var(--fg-muted)">
+                  {h.text}
+                </a>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+    </aside>
+  </div>
+</BaseLayout>

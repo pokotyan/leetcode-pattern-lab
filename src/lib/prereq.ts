@@ -129,3 +129,40 @@ export async function buildMathGraph() {
 
   return { notes, noteById, articleById, usedByArticle, requires }
 }
+
+
+export type ReadingNote = CollectionEntry<'reading'>
+export type ReadingUse = { note: ReadingNote; why: string }
+
+/**
+ * 読み物と、その土台になっている型・数学ノートの対応を作る。
+ * - byArticle / byMath: 型・数学の slug -> その型を使っている読み物（逆向きの引き方）
+ * basedOn に存在しない slug があればビルドを止める。
+ */
+export async function buildReadingGraph() {
+  const notes = [...(await getCollection('reading'))].sort((a, b) => a.data.order - b.data.order)
+  const articles = await getCollection('articles')
+  const mathNotes = await getCollection('math')
+  const articleById = new Map(articles.map((a) => [a.id, a]))
+  const mathById = new Map(mathNotes.map((m) => [m.id, m]))
+
+  const byArticle = new Map<string, ReadingUse[]>()
+  const byMath = new Map<string, ReadingUse[]>()
+
+  for (const n of notes) {
+    for (const b of n.data.basedOn) {
+      const exists = b.kind === 'article' ? articleById.has(b.slug) : mathById.has(b.slug)
+      if (!exists) {
+        throw new Error(
+          `[reading] ${n.id}.mdx の basedOn に存在しない ${b.kind} "${b.slug}" があります`,
+        )
+      }
+      const target = b.kind === 'article' ? byArticle : byMath
+      const list = target.get(b.slug) ?? []
+      list.push({ note: n, why: b.why })
+      target.set(b.slug, list)
+    }
+  }
+
+  return { notes, articleById, mathById, byArticle, byMath }
+}

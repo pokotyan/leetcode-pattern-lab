@@ -127,3 +127,34 @@ export const LEVEL_BADGE: Record<Level, { color: string; soft: string }> = {
   応用: { color: 'var(--warn)', soft: 'var(--warn-soft)' },
   発展: { color: 'var(--danger)', soft: 'var(--danger-soft)' },
 }
+
+/** 読み物のまとまり。/reading のグルーピングに使う */
+export const READING_SECTIONS: Section[] = [
+  {
+    id: 'search',
+    title: '検索とランキング',
+    summary: '大量の文書から「関係あるものを、良い順に」返すまでに何が起きているか',
+  },
+  {
+    id: 'data',
+    title: 'データ構造とストレージ',
+    summary: '「無い」を速く言う仕組み、置き場所の決め方、そしてデータベースの索引',
+  },
+  {
+    id: 'distributed',
+    title: '分散システム',
+    summary: '複数のノードで1つの答えを決める方法と、失敗したときの後始末',
+  },
+  {
+    id: 'performance',
+    title: '性能とデータ基盤',
+    summary: '速さを勘で語らないための法則と、大量データを流して処理する枠組み',
+  },
+  {
+    id: 'web',
+    title: 'ウェブの現実',
+    summary: 'ブラウザの中で起きている差分計算と、避けて通れない security の型',
+  },
+]
+
+export const readingSectionById = new Map(READING_SECTIONS.map((s) => [s.id, s]))

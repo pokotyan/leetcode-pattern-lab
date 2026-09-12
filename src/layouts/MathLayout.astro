@@ -1,7 +1,7 @@
 ---
 import BaseLayout from './BaseLayout.astro'
 import ProblemTable from '../components/ProblemTable.astro'
-import { buildMathGraph } from '../lib/prereq'
+import { buildMathGraph, buildReadingGraph } from '../lib/prereq'
 import type { CollectionEntry } from 'astro:content'
 
 type Props = {
@@ -18,6 +18,9 @@ const toc = headings.filter((h) => h.depth === 2)
 const { requires, articleById } = await buildMathGraph()
 const prereqs = requires.get(entry.id) ?? []
 const uses = d.usedIn.map((u) => ({ ...u, article: articleById.get(u.slug)! }))
+
+const { byMath } = await buildReadingGraph()
+const readingUses = byMath.get(entry.id) ?? []
 ---
 
 <BaseLayout title={`${d.title} | 数学の副読本 | LeetCode Pattern Lab`} description={d.description}>
@@ -93,6 +96,35 @@ const uses = d.usedIn.map((u) => ({ ...u, article: articleById.get(u.slug)! }))
       <ProblemTable problems={d.problems} title="この知識が要る LeetCode 問題" />
 
       <slot />
+
+      {
+        readingUses.length > 0 && (
+          <section class="not-prose my-8 rounded-xl border" style="border-color: var(--warn)">
+            <h3
+              class="m-0 border-b px-4 py-3 text-sm font-bold"
+              style="border-color: var(--warn); background: var(--warn-soft); color: var(--warn)"
+            >
+              この型が実務で効いている場面
+            </h3>
+            <ul class="m-0 list-none p-0">
+              {readingUses.map((u) => (
+                <li class="border-b px-4 py-2.5 last:border-b-0" style="border-color: var(--border)">
+                  <a
+                    href={`${base}reading/${u.note.id}/`}
+                    class="text-sm font-bold no-underline hover:underline"
+                    style="color: var(--accent)"
+                  >
+                    {u.note.data.title}
+                  </a>
+                  <p class="m-0 mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                    {u.why}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )
+      }
 
       <nav
         class="not-prose mt-16 flex flex-wrap gap-3 border-t pt-6 text-sm"

@@ -57,4 +57,34 @@ const math = defineCollection({
   }),
 })
 
-export const collections = { articles, math }
+/**
+ * 読み物（実務で出てくる仕組みの解説）。
+ * basedOn で「この仕組みの土台になっている型・数学」を指し、
+ * 型の側からは逆向きに「この型が実務で効いている場面」として引ける。
+ */
+const reading = defineCollection({
+  loader: glob({ base: 'src/content/reading', pattern: '**/*.{md,mdx}' }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string(),
+    /** curriculum.ts の READING_SECTIONS の id */
+    category: z.string(),
+    order: z.number(),
+    status: z.enum(['published', 'planned']).default('published'),
+    /** この読み物で扱う用語。索引に出す */
+    topics: z.array(z.string()).default([]),
+    /** 土台になっている本編の型 / 数学ノートと、そこで何が効いているのか */
+    basedOn: z
+      .array(
+        z.object({
+          kind: z.enum(['article', 'math']),
+          slug: z.string(),
+          why: z.string(),
+        }),
+      )
+      .default([]),
+    problems: z.array(problem).default([]),
+  }),
+})
+
+export const collections = { articles, math, reading }
