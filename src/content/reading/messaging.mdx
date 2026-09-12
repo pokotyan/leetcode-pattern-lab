@@ -1,0 +1,212 @@
+---
+title: メッセージングの現実（冪等性・DLQ・流量制御）
+description: 「1回だけ処理する」は、そのままでは実現できない。何回来ても同じ結果になるように作る、という方針へ切り替える
+category: distributed
+order: 9
+status: published
+topics:
+  - At-least-once
+  - Exactly-once
+  - Idempotency
+  - Dead Letter Queue
+  - Backpressure
+  - Circuit Breaker
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 冪等キーを記録して「もう処理したか」を引く。存在判定そのもの
+  - kind: article
+    slug: design-cache
+    why: 処理済み ID は無限には貯められない。何をどれだけ覚えておくかという、容量と追い出しの設計になる
+  - kind: article
+    slug: sliding-window
+    why: レート制限やバックプレッシャーは「直近の一定時間に何件通したか」を数える。窓から出た記録を捨てる形が同じ
+problems:
+  - name: Logger Rate Limiter
+    url: https://leetcode.com/problems/logger-rate-limiter/
+    level: Easy
+    importance: 中
+    technique: 時刻の記録で抑制
+  - name: Design Hit Counter
+    url: https://leetcode.com/problems/design-hit-counter/
+    level: Medium
+    importance: 高
+    technique: 動く窓での計数
+  - name: Number of Recent Calls
+    url: https://leetcode.com/problems/number-of-recent-calls/
+    level: Easy
+    importance: 中
+    technique: 窓から出た記録を捨てる
+---
+
+import Callout from '../../components/Callout.astro'
+import RateLimiter from '../../components/sim/problems/RateLimiter'
+import CircuitBreakerSim from '../../components/sim/problems/CircuitBreakerSim'
+
+## 「1回だけ処理する」が難しい理由
+
+キューにメッセージを入れ、ワーカーが取り出して処理します。処理が終わったら、キューに「完了しました」と伝えて削除してもらいます。
+
+ここで、**処理は終わったのに、完了の通知が届く前にワーカーが落ちた**とします。キューから見れば、そのメッセージはまだ処理されていません。だから別のワーカーに配り直します。**同じメッセージが 2 回処理されます。**
+
+では、先に完了を伝えてから処理すればよいでしょうか。今度は、完了を伝えた直後に落ちると、**そのメッセージは二度と処理されません。**
+
+どちらを先にしても問題が残ります。これは実装の工夫では消せない、構造的な問題です。
+
+| 保証 | 意味 | 実現しやすさ |
+| --- | --- | --- |
+| **At-most-once** | 高々1回。処理されないことがある | 簡単（先に削除する） |
+| **At-least-once** | 少なくとも1回。重複することがある | 簡単（処理してから削除する） |
+| **Exactly-once** | ちょうど1回 | **一般には不可能** |
+
+## Exactly-once は「そう見えるように作る」
+
+実務で Exactly-once と呼ばれているものは、たいてい次の組み合わせです。
+
+> **At-least-once で配送し、受け取る側が何回来ても同じ結果になるように作る**
+
+後半が冪等性（idempotency）です。同じ操作を何回実行しても、1 回だけ実行したのと同じ状態になる性質を指します。
+
+| 操作 | 冪等か | 理由 |
+| --- | --- | --- |
+| `SET balance = 5000` | ○ | 何回やっても 5000 |
+| `balance = balance - 1000` | **×** | 実行回数だけ減る |
+| `DELETE WHERE id = 5` | ○ | 2 回目は何も消えないだけ |
+| `INSERT`（主キーあり） | ○ | 2 回目は一意制約で弾かれる |
+| メール送信 | **×** | 送った回数だけ届く |
+
+冪等でない操作を冪等にする定石が、**冪等キー**です。
+
+```python
+def handle(message):
+    key = message.idempotency_key          # 送信側が採番した一意な ID
+    if store.exists(key):                  # もう処理したか
+        return store.get_result(key)       # 前回と同じ結果を返す
+    result = do_work(message)
+    store.save(key, result)                # 結果とセットで記録する
+    return result
+```
+
+「処理したかどうか」を辞書で引く、というだけの話です。ハッシュテーブルの記事でやった存在判定が、そのまま出てきます。
+
+<Callout type="warn" title="冪等キーの記録には、3つの落とし穴があります">
+  **1. 処理と記録が別々だと、その間で落ちる。** 処理は終わったのに記録する前に落ちると、結局 2 回実行されます。可能なら、**業務データの更新と冪等キーの記録を同じトランザクションに入れます。** 別のデータストアに記録すると、この保証が失われます。
+
+  **2. 同時に2つ来たときに、両方が「まだ無い」と判断する。** 存在確認と記録の間に隙間があると、競合します。一意制約のある `INSERT` を先に試して、失敗したら「処理済み」と判断する、という順序にすると安全です。
+
+  **3. いつまで覚えておくのか。** 冪等キーを永久に保存すると、際限なく増えます。実際には「24 時間」「7 日」といった期限を切ります。ただし**その期限を過ぎてから再送が来ると、重複します。** キャッシュの記事でやった「何を捨てるか」の判断が、ここでも必要になります。
+</Callout>
+
+## 失敗し続けるメッセージ：DLQ
+
+処理が失敗したらリトライします。ところが、**何度やっても必ず失敗するメッセージ**があります。データが壊れている、参照先が削除されている、といった原因です。
+
+これを放置すると深刻な事態になります。そのメッセージがキューの先頭に居座り、**後続のメッセージがすべて詰まります。** リトライのたびに負荷もかかります。
+
+そこで、**一定回数失敗したメッセージを、別のキューへ隔離します。** これが Dead Letter Queue（DLQ）です。
+
+DLQ を置くと、次のことができるようになります。
+
+- 本流のキューは詰まらずに流れ続ける
+- 失敗したメッセージが消えずに残るので、**原因を調べられる**
+- 修正したあとで、DLQ から本流へ戻して再処理できる
+
+<Callout type="tip" title="DLQ は「置いて終わり」ではありません">
+  DLQ を用意したのに誰も見ていない、というのは実際によくあります。DLQ にメッセージが入ったこと自体が異常なので、**件数を監視してアラートを出す**ところまでが設計です。
+
+  また、DLQ から本流へ戻す（redrive）手順を、障害の最中に考えるのは苦しいものです。**あらかじめ手順を用意しておく**と、いざというときに慌てずに済みます。
+
+  リトライの間隔にも注意が要ります。失敗するたびに即座に再送すると、弱っている相手にとどめを刺します。**指数バックオフ**（1秒、2秒、4秒、8秒…）で間隔を広げ、さらに**ジッタ**（ランダムなずれ）を足します。ジッタが無いと、多数のクライアントが同じタイミングで一斉に再送し、復旧しかけた相手をまた落とします。
+</Callout>
+
+## 流量を制御する：レート制限とバックプレッシャー
+
+送る側が送りたいだけ送ると、受ける側が溢れます。溢れたときの挙動は、たいてい最悪です。メモリを食いつぶして落ちる、キューが無限に伸びて遅延が際限なく増える、といったことが起きます。
+
+対策の基本は、**受け取る側が「もう無理」と言えるようにする**ことです。これがバックプレッシャーです。
+
+- **キューの長さに上限を設ける。** 溢れたら、送る側を待たせるか、明示的に拒否する
+- **拒否を送る側に伝える。** HTTP なら 429、gRPC なら RESOURCE_EXHAUSTED
+- **送る側は、拒否されたら速度を落とす**
+
+拒否するかどうかの判断に使うのがレート制限です。「直近の一定時間に何件通したか」を数えます。
+
+```python
+from collections import deque
+
+def allow(timestamps, now, limit, window):
+    while timestamps and timestamps[0] <= now - window:
+        timestamps.popleft()          # 窓から出た記録を捨てる
+    if len(timestamps) < limit:
+        timestamps.append(now)
+        return True                   # 窓の中がまだ limit 未満
+    return False                      # 超えているので断る
+```
+
+<RateLimiter client:visible />
+
+このコードは、Sliding Window の記事そのままです。窓の左端から出たものを捨て、右端から入れる。`Number of Recent Calls` や `Design Hit Counter` として LeetCode にも出ています。**実務のレート制限と、あの問題は同じものです。**
+
+| 方式 | 仕組み | 特徴 |
+| --- | --- | --- |
+| 固定窓 | 1 分ごとに区切ってカウント | 実装が簡単。**窓の境目で 2 倍のバーストを通してしまう** |
+| 動く窓 | 直近 N 秒の記録を保持 | 正確。記録を持つぶんメモリを使う |
+| トークンバケツ | 一定速度でトークンを補充し、1 件につき 1 個消費 | バーストをある程度許容できる。実装も軽い |
+
+「境界をまたぐ」のプリセットを試すと、窓の取り方によって通る件数が変わる様子が見えます。固定窓の弱点はここから来ています。
+
+## 壊れている相手を呼ばない：Circuit Breaker
+
+流量制御は「自分が溢れないように」でしたが、**相手が壊れているときに呼び続けない**ための仕組みも要ります。
+
+応答しないサービスを呼び続けると、こちらのスレッドやコネクションがタイムアウト待ちで埋まります。すると**こちらも応答できなくなり**、その呼び出し元も詰まります。障害が上流へ連鎖していきます。
+
+Circuit Breaker は、電気のブレーカーと同じ発想です。
+
+| 状態 | 挙動 | 遷移 |
+| --- | --- | --- |
+| **closed** | 普通に呼ぶ | 連続失敗がしきい値を超えたら open |
+| **open** | **呼ばずに、その場で失敗を返す** | 一定時間が過ぎたら half-open |
+| **half-open** | 1 本だけ試しに通す | 成功したら closed、失敗したら open に戻る |
+
+```python
+class CircuitBreaker:
+    def __init__(self, threshold, cooldown):
+        self.state = 'closed'
+        self.failures = 0
+        self.threshold = threshold
+        self.opened_at = None
+        self.cooldown = cooldown
+
+    def call(self, now, fn):
+        if self.state == 'open':
+            if now - self.opened_at < self.cooldown:
+                raise Rejected           # 呼ばずに、その場で失敗させる
+            self.state = 'half-open'     # 1本だけ試してみる
+        ok = fn()
+        if ok:
+            self.state = 'closed'        # 復活したので通常運転へ
+            self.failures = 0
+        else:
+            self.failures += 1
+            if self.state == 'half-open' or self.failures >= self.threshold:
+                self.state = 'open'
+                self.opened_at = now
+        return ok
+```
+
+<CircuitBreakerSim client:visible />
+
+**open のときに即座に失敗させる**のが、この仕組みの本体です。こちらのスレッドがタイムアウトを待たされず、相手にも負荷をかけません。「速く失敗する（fail fast）」ことで、障害の連鎖を止めます。
+
+half-open が要るのは、**相手が復活したことを知る方法がほかにない**からです。ずっと open のままだと、直っても呼ばれません。かといって全部通すと、直っていなかった場合にまた詰まります。だから 1 本だけ試します。
+
+## まとめ
+
+- Exactly-once は一般には作れない。**At-least-once + 冪等**で「そう見えるように」作る
+- 冪等キーは、業務データの更新と**同じトランザクション**で記録するのが理想
+- 記録の保存期間は有限。期限を過ぎた再送は重複しうる
+- 失敗し続けるメッセージは DLQ へ隔離する。**監視と redrive 手順まで含めて設計**
+- リトライは指数バックオフ + ジッタ。ジッタが無いと一斉再送で相手を落とす
+- レート制限は動く窓で数える。LeetCode の `Number of Recent Calls` と同じ
+- 壊れている相手は呼ばない。open のときに**即座に失敗させる**ことで連鎖を止める
