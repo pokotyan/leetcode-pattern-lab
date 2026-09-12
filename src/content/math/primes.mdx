@@ -1,0 +1,225 @@
+---
+title: 素数と約数（篩と素因数分解）
+description: 1つの数を調べるのか、範囲全体を調べるのかで手法が変わる。試し割りが √N で済む理由と、篩でまとめて前処理する型
+order: 2
+status: published
+requires: []
+usedIn:
+  - slug: union-find
+    why: 「共通の素因数を持つ数を同じグループにする」問題では、各数を素因数分解してから、その素因数をキーにして union する
+  - slug: hash-counting
+    why: 約数や素因数をキーにして数える問題で、篩で最小素因数を前計算しておくと、各数の分解が O(log N) で済む
+problems:
+  - name: Count Primes
+    url: https://leetcode.com/problems/count-primes/
+    level: Medium
+    importance: 高
+    technique: エラトステネスの篩
+  - name: Largest Component Size by Common Factor
+    url: https://leetcode.com/problems/largest-component-size-by-common-factor/
+    level: Hard
+    importance: 高
+    technique: 素因数分解 + Union-Find
+  - name: Four Divisors
+    url: https://leetcode.com/problems/four-divisors/
+    level: Medium
+    importance: 中
+    technique: 約数の列挙
+  - name: Closest Divisors
+    url: https://leetcode.com/problems/closest-divisors/
+    level: Medium
+    importance: 中
+    technique: √N までの約数探索
+  - name: Number of Common Factors
+    url: https://leetcode.com/problems/number-of-common-factors/
+    level: Easy
+    importance: 低
+    technique: 約数の列挙
+---
+
+import Callout from '../../components/Callout.astro'
+import Sieve from '../../components/sim/problems/Sieve'
+import Factorize from '../../components/sim/problems/Factorize'
+
+## まず、困っている状況を体験してみます
+
+> `n = 100` のとき、`n` より小さい素数はいくつありますか。
+
+素数の定義は「1 と自分自身でしか割り切れない、2 以上の整数」です。定義どおりに書くと、こうなります。
+
+```python
+def is_prime(x):
+    if x < 2:
+        return False
+    for d in range(2, x):        # 2 から x-1 まで全部試す
+        if x % d == 0:
+            return False
+    return True
+```
+
+1つの数につき最大 `x` 回の割り算なので、`n` 個すべてを調べると O(N²) です。`n = 100` なら問題ありませんが、LeetCode の Count Primes は `n` が 500 万まであります。`5,000,000² = 2.5 × 10^13` 回。到底終わりません。
+
+削るところは2つあります。**1つの数を調べる手間**と、**数どうしで結果を使い回せないか**です。
+
+## まず1つの数について：√N で足りる
+
+`36` の約数を書き出してみます。
+
+`1 × 36`、`2 × 18`、`3 × 12`、`4 × 9`、`6 × 6`
+
+約数は必ず**ペア**で現れます。そして、ペアの片方は必ず `√36 = 6` 以下、もう片方は 6 以上です。大きいほうの約数を見つけるより先に、必ず小さいほうを見つけるということです。
+
+つまり、`2` から `√x` まで試して1つも割り切れなければ、その先にも約数はありません。
+
+```python
+def is_prime(x):
+    if x < 2:
+        return False
+    d = 2
+    while d * d <= x:            # √x まででよい
+        if x % d == 0:
+            return False
+        d += 1
+    return True
+```
+
+`d * d <= x` と書いているのは、`math.sqrt` の誤差を避けるためです。浮動小数点を経由すると、ちょうど平方数のときに 1 ずれることがあります。
+
+同じ理屈が素因数分解にも使えます。
+
+```python
+def factorize(n):
+    factors = []
+    d = 2
+    while d * d <= n:
+        while n % d == 0:        # 割れる限り割り続ける
+            factors.append(d)
+            n //= d
+        d += 1
+    if n > 1:
+        factors.append(n)        # 残ったものは素数
+    return factors
+```
+
+<Factorize client:visible />
+
+<Callout type="warn" title="最後の n > 1 を忘れると、大きい素因数が落ちます">
+  ループを抜けたあとの `if n > 1: factors.append(n)` は、必ず要ります。
+
+  たとえば `n = 9991 = 97 × 103` のとき、`d` が 97 まで進んで割り切れ、残りは 103 になります。その時点で `d = 98` ですが、`98 × 98 = 9604` は残りの 103 より大きいので、ループはすぐ終わります。**103 は取り出されずに残っています。**
+
+  ループが終わった時点で残っている数は、「√（残り）以下のどの数でも割り切れなかった」ということなので、それ自身が素数です。ここを落とすと、素因数の積が元の数に戻らなくなります。シミュレーターで 9991 を試すと、この場面がそのまま出ます。
+
+  なお `d` は素数だけを試す必要はありません。合成数の `d`（たとえば 4）に到達したときには、その素因数（2）でとっくに割り切られているので、`n` はもう 4 で割り切れません。**素数判定なしで素直に +1 していってよい**のはこのためです。
+</Callout>
+
+`while d * d <= n` の中で `n` 自身が小さくなっていくので、実際の手間は O(√N) より軽くなることがほとんどです。素因数の個数は多くても log₂N 個（すべて 2 の場合）なので、取り出す回数も高々 30 回程度です。
+
+## 範囲全体なら：篩で結果を使い回す
+
+「`n` 以下の素数をすべて」求めたいときは、1つずつ判定するのをやめます。`√x` で判定しても、`n` 個ぶん繰り返せば O(N√N) で、500 万件には届きません。
+
+発想を変えます。**素数を見つけるたびに、その倍数を候補から消していきます。**
+
+- 2 は素数。4, 6, 8, 10, ... はすべて 2 で割り切れるので素数ではない
+- 3 は素数。9, 12, 15, ... を消す
+- 4 はもう消されている。4 の倍数は 2 の倍数として全部消し終わっている
+- 5 は素数。25, 30, 35, ... を消す
+
+最後まで消されずに残ったものが素数です。
+
+```python
+def sieve(n):
+    is_prime = [True] * (n + 1)
+    is_prime[0] = is_prime[1] = False
+    p = 2
+    while p * p <= n:
+        if is_prime[p]:
+            for q in range(p * p, n + 1, p):   # p*p から始めてよい
+                is_prime[q] = False
+        p += 1
+    return [i for i, v in enumerate(is_prime) if v]
+```
+
+<Sieve client:visible />
+
+このコードには、効率のための工夫が2つ入っています。
+
+**1つ目：消し始めるのは `p × p` から。** `p` の倍数のうち `p × p` より小さいもの、たとえば `5 × 2` や `5 × 3` は、相方の 2 や 3 がもっと前に処理されたときに**すでに消されています**。だから `5 × 5 = 25` から始めて構いません。
+
+**2つ目：外側のループは `p × p <= n` まで。** `p` が `√n` を超えたら、`p × p` はもう `n` の外なので、消すものが1つもありません。
+
+<Callout type="tip" title="篩を1段階強くする：最小素因数を覚えておく">
+  `is_prime[q] = False` と真偽値を入れる代わりに、**そのとき消した素数 `p` を記録**しておくと、篩がもっと強力になります。
+
+  ```python
+  spf = list(range(n + 1))          # spf[x] = x の最小の素因数
+  p = 2
+  while p * p <= n:
+      if spf[p] == p:               # p は素数
+          for q in range(p * p, n + 1, p):
+              if spf[q] == q:       # まだ誰にも消されていない
+                  spf[q] = p
+      p += 1
+  ```
+
+  この `spf`（smallest prime factor）があると、任意の `x ≤ n` を **O(log x) で素因数分解**できます。`x` を `spf[x]` で割る、を繰り返すだけです。試し割りの O(√x) より速く、しかも何度分解しても速いままです。
+
+  「たくさんの数をそれぞれ素因数分解したい」という問題（Largest Component Size by Common Factor など）では、この前処理が効きます。
+</Callout>
+
+## 約数の列挙も √N で
+
+素数ではなく「約数をすべて」欲しいときも、ペアの性質をそのまま使います。
+
+```python
+def divisors(n):
+    small, large = [], []
+    d = 1
+    while d * d <= n:
+        if n % d == 0:
+            small.append(d)
+            if d != n // d:          # 平方数のときに重複させない
+                large.append(n // d)
+        d += 1
+    return small + large[::-1]        # 昇順にそろえる
+```
+
+`d` が見つかるたびに、相方の `n // d` も同時に手に入ります。ループは `√n` までなので、約数の個数がいくつあっても O(√N) です。
+
+`d != n // d` の確認は、`n` が平方数のとき（`36` の `6 × 6`）に同じ約数を2回入れないためです。
+
+## 計算量のまとめ
+
+| やりたいこと | 手法 | 時間 |
+| --- | --- | --- |
+| 1つの数が素数か | 試し割り | O(√N) |
+| 1つの数を素因数分解 | 試し割り | O(√N) |
+| 1つの数の約数を全部 | ペアで拾う | O(√N) |
+| N 以下の素数を全部 | エラトステネスの篩 | O(N log log N) |
+| N 以下の各数を素因数分解 | 最小素因数の篩 + 分解 | 前処理 O(N log log N)、1件あたり O(log N) |
+
+`O(N log log N)` の `log log N` は、N が 10<sup>7</sup> でも 3 程度にしかならない、ほとんど定数のような値です。**篩は実質 O(N) だと思って構いません。**
+
+## この知識を使う場面
+
+- 「素数」「約数」「因数」という言葉が問題文に直接出てくる
+- 「共通の因数を持つ数どうしをつなぐ」（素因数を仲立ちにして Union-Find へ持ち込む）
+- 「N 以下の整数それぞれについて何かを調べる」（篩の形で前処理できないか疑う）
+- 数を掛け算の形に分解すると、構造が見えてくる問題
+
+<Callout type="warn" title="素因数分解を使う問題で、毎回 √N してはいけない場面">
+  Largest Component Size by Common Factor は、10 万個の数それぞれを素因数分解します。1件 O(√N)、N が 10 万なら √N は約 316 なので、合計 3,160 万回。**ぎりぎり通りますが、余裕はありません。**
+
+  最小素因数の篩を先に作っておけば、1件あたり O(log N) つまり 17 回程度で済み、合計 170 万回まで落ちます。**「同じ種類の計算を何度も繰り返すなら、前処理でまとめる」**という判断は、素数に限らずどこでも効きます。
+</Callout>
+
+## この記事のチェックリスト
+
+- [ ] 素数判定が `√N` までで足りる理由を、約数のペアから説明できる
+- [ ] `math.sqrt` ではなく `d * d <= n` と書く理由を説明できる
+- [ ] 素因数分解の最後に `if n > 1` が要る理由を、具体例で説明できる
+- [ ] 試し割りの `d` を素数に限らなくてよい理由を説明できる
+- [ ] 篩で `p × p` から消し始めてよい理由を説明できる
+- [ ] 最小素因数の篩が、試し割りより速くなる場面を説明できる
+- [ ] 約数の列挙で `d != n // d` を確認する理由を説明できる
