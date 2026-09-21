@@ -3,10 +3,379 @@ title: 背景を描く
 description: スクロール量とネームテーブルの切り替えで、画面より広い世界を表示する
 track: nes
 order: 8
-status: planned
+status: published
 goal: 静止した背景画面が正しく描画される
 requires:
   - nes-07-ppu-memory
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## まず、スクロールなしで描く
+
+いきなり完全な実装を目指すと、何が間違っているか分かりません。まず**スクロールを 0 に固定して、1 画面をそのまま描きます**。
+
+```ts
+// src/nes/render.ts
+export function renderBackground(ppu: PPU): Uint8Array {
+  const frame = new Uint8Array(256 * 240)     // 各バイトが NES の色番号
+
+  const patternBase = ppu.control.backgroundPatternTable ? 0x1000 : 0x0000
+  const nametable = 0x2000
+
+  for (let tileY = 0; tileY < 30; tileY++) {
+    for (let tileX = 0; tileX < 32; tileX++) {
+      const tileIndex = ppu.readVram(nametable + tileY * 32 + tileX)
+      const palette = paletteFor(ppu, nametable, tileX, tileY)
+      const tile = decodeTile(ppu.chr, tileIndex, patternBase)
+
+      for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+          const colorIndex = tile[row]![col]!
+          // 色 0 は「透明」= 共通の背景色
+          const paletteAddr = colorIndex === 0 ? 0x3f00 : 0x3f00 + palette * 4 + colorIndex
+          const nesColor = ppu.readVram(paletteAddr)
+
+          const x = tileX * 8 + col
+          const y = tileY * 8 + row
+          frame[y * 256 + x] = nesColor
+        }
+      }
+    }
+  }
+  return frame
+}
+```
+
+**タイルごとに 4 段階の間接参照**があります。
+
+```
+ネームテーブル  →  タイル番号
+属性テーブル    →  パレット番号
+パターンテーブル →  色番号（0〜3）
+パレット        →  NES の色番号（0〜63）
+```
+
+<Callout type="warn" title="色 0 は常に共通の背景色">
+  各パレットの「色 0」は使われません。**必ず `$3F00` の値**になります。
+
+  だから背景パレットは実質 3 色 + 共通 1 色です。
+  この制約を実装しないと、画面全体の色調が変わってしまいます。
+</Callout>
+
+## 色番号を RGB にする
+
+NES の色番号（0〜63）を RGB に変換する表が要ります。
+
+```ts
+// src/nes/palette.ts
+export const NES_PALETTE: [number, number, number][] = [
+  [0x62, 0x62, 0x62], [0x00, 0x2c, 0x7c], [0x11, 0x15, 0x9c], [0x36, 0x03, 0x9c],
+  [0x55, 0x00, 0x7c], [0x67, 0x00, 0x46], [0x66, 0x06, 0x0a], [0x52, 0x1c, 0x00],
+  // ... 全 64 色
+]
+
+export function toRgba(frame: Uint8Array): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(256 * 240 * 4)
+  for (let i = 0; i < frame.length; i++) {
+    const [r, g, b] = NES_PALETTE[frame[i]! & 0x3f]!
+    out[i * 4] = r
+    out[i * 4 + 1] = g
+    out[i * 4 + 2] = b
+    out[i * 4 + 3] = 255
+  }
+  return out
+}
+```
+
+**この表は実機の測定値であり、複数の版があります。** どれを使うかで、画面の色味が変わります。「あのゲームの色が違う」という議論の元になる部分です。
+
+## スクロール
+
+ファミコンの世界は、画面より広い。横スクロールのゲームでは、**左右に 2 画面ぶんのネームテーブルを並べて、その上を窓が移動します**。
+
+```
+┌───────────┬───────────┐
+│  NT0      │  NT1      │
+│    ┌──────┼──┐        │
+│    │ 表示 │  │        │   ← scrollX が右に動くと、窓も右へ
+│    └──────┼──┘        │
+└───────────┴───────────┘
+```
+
+窓が NT0 と NT1 にまたがるとき、**左半分を NT0 から、右半分を NT1 から取ります**。
+
+```ts
+export function renderWithScroll(ppu: PPU): Uint8Array {
+  const frame = new Uint8Array(256 * 240)
+  const scrollX = ppu.scrollX
+  const scrollY = ppu.scrollY
+  const baseTable = ppu.control.nametableBase        // $2000 / $2400 / $2800 / $2C00
+
+  for (let y = 0; y < 240; y++) {
+    for (let x = 0; x < 256; x++) {
+      // 仮想的な広い平面での座標
+      const worldX = x + scrollX
+      const worldY = y + scrollY
+
+      // どのネームテーブルか（横 2 枚、縦 2 枚が並んでいる）
+      const ntX = (worldX >> 8) & 1
+      const ntY = (worldY >> 8) & 1     // 実際は 240 で割る必要がある（後述）
+      const nt = baseTable ^ (ntX * 0x400) ^ (ntY * 0x800)
+
+      const tileX = (worldX & 0xff) >> 3
+      const tileY = (worldY & 0xff) >> 3
+      const pixelX = worldX & 7
+      const pixelY = worldY & 7
+
+      const tileIndex = ppu.readVram(nt + tileY * 32 + tileX)
+      const tile = decodeTile(ppu.chr, tileIndex, ppu.backgroundPatternBase)
+      const colorIndex = tile[pixelY]![pixelX]!
+      const palette = paletteFor(ppu, nt, tileX, tileY)
+
+      const addr = colorIndex === 0 ? 0x3f00 : 0x3f00 + palette * 4 + colorIndex
+      frame[y * 256 + x] = ppu.readVram(addr)
+    }
+  }
+  return frame
+}
+```
+
+<Callout type="warn" title="縦方向は 240 で折り返す">
+  ネームテーブルは 32 × **30** タイル = 240 ピクセルです。256 ではありません。
+
+  つまり、縦スクロールの折り返しは `& 0xff` ではなく `% 240` です。
+  `scrollY` に 240〜255 を設定すると、**属性テーブルの領域が
+  タイル番号として読まれる**という奇妙な挙動になります。
+  実機でもそうなるので、これも再現の対象です。
+</Callout>
+
+## スクロールレジスタの厄介さ
+
+スクロール量の設定は、`$2005` に**2 回書き込む**ことで行います。
+
+```asm
+LDA #$10
+STA $2005      ; 1 回目：X
+LDA #$20
+STA $2005      ; 2 回目：Y
+```
+
+**どちらの書き込みかを PPU が内部フラグで覚えています。** このフラグは `$2002`（ステータス）を読むとリセットされます。
+
+```ts
+writeRegister(index: number, value: number) {
+  switch (index) {
+    case 0x05:                          // $2005 スクロール
+      if (!this.writeToggle) {
+        this.scrollX = value
+        this.writeToggle = true
+      } else {
+        this.scrollY = value
+        this.writeToggle = false
+      }
+      break
+
+    case 0x06:                          // $2006 VRAM アドレス（同じく 2 回書き）
+      if (!this.writeToggle) {
+        this.vramAddr = (this.vramAddr & 0x00ff) | ((value & 0x3f) << 8)
+        this.writeToggle = true
+      } else {
+        this.vramAddr = (this.vramAddr & 0xff00) | value
+        this.writeToggle = false
+      }
+      break
+  }
+}
+
+readRegister(index: number): number {
+  if (index === 0x02) {
+    const value = this.status
+    this.status &= ~0x80          // VBlank フラグをクリア
+    this.writeToggle = false      // ← 書き込みトグルもリセットされる
+    return value
+  }
+  ...
+}
+```
+
+<Callout type="warn" title="読むだけで状態が変わる">
+  `$2002` を読むと、**VBlank フラグがクリアされ、書き込みトグルもリセット**されます。
+
+  これが第 4 回で「デバッガ用に `peek` を別に用意する」と書いた理由です。
+  ログ出力のために `$2002` を読んでしまうと、
+  **ゲームが VBlank を検出できなくなり、動かなくなります**。
+
+  そして、その症状は「なぜかログを有効にすると動かない」という形で現れます。
+</Callout>
+
+## VRAM への書き込み
+
+CPU から PPU のメモリへは、2 つのレジスタ経由で行います。
+
+```asm
+LDA #$20
+STA $2006      ; アドレスの上位
+LDA #$00
+STA $2006      ; アドレスの下位  → $2000 を指す
+LDA #$41
+STA $2007      ; そこに書き込む。アドレスは自動で進む
+LDA #$42
+STA $2007      ; 次の場所に書く
+```
+
+**アドレスを設定して、$2007 に書くたびに自動で進む。** 連続した領域への書き込みが速くなります。
+
+進む量は `$2000`（コントロールレジスタ）の bit2 で決まります。
+
+| bit2 | 増加量 |
+| --- | --- |
+| 0 | 1（横方向） |
+| 1 | **32**（縦方向） |
+
+縦方向に書きたいときに便利です。
+
+```ts
+case 0x07:                            // $2007
+  this.writeVram(this.vramAddr, value)
+  this.vramAddr = (this.vramAddr + (this.control.vramIncrement32 ? 32 : 1)) & 0x3fff
+  break
+```
+
+<Callout type="note" title="読み出しには 1 回の遅延がある">
+  `$2007` からの**読み出し**には、内部バッファを経由する遅延があります。
+
+```ts
+case 0x07: {
+  const result = this.readBuffer          // 前回の値を返す
+  this.readBuffer = this.readVram(this.vramAddr)
+  this.vramAddr += increment
+  return result
+}
+```
+  つまり、**最初の 1 回は捨てる**必要があります。
+  ハードウェアの読み出しに時間がかかるための仕組みで、
+  ゲーム側もそれを前提に「ダミーリード」を入れています。
+
+  ただし、パレット領域（`$3F00` 以降）だけは遅延がありません。例外です。
+</Callout>
+
+## 描画のタイミング
+
+背景を描いてよいのは、**VBlank の間だけ**です。描画中に VRAM を書き換えると、画面が乱れます。
+
+1 フレームの構成です。
+
+| スキャンライン | 内容 |
+| --- | --- |
+| 0〜239 | **可視領域**（描画中。VRAM に触れない） |
+| 240 | ポストレンダ（何もしない） |
+| **241〜260** | **VBlank**（ここで書き換える。NMI が発生） |
+| 261 | プリレンダ |
+
+**241 ラインの先頭で NMI が発生**し、ゲームはそこで画面を更新します。第 5 回で見た「メインループは描画しない」構造の理由です。
+
+## テストを書く
+
+```ts
+// src/nes/render.check.ts
+import { strict as assert } from 'node:assert'
+
+// タイル 1 個を描く
+{
+  const ppu = makeTestPpu()
+  // タイル 0 を「全ピクセルが色 1」にする
+  for (let r = 0; r < 8; r++) ppu.chr[r] = 0xff
+
+  ppu.writeVram(0x2000, 0)          // 左上にタイル 0 を置く
+  ppu.writeVram(0x23c0, 0)          // パレット 0
+  ppu.writeVram(0x3f00, 0x0f)       // 共通背景色 = 黒
+  ppu.writeVram(0x3f01, 0x30)       // パレット 0 の色 1 = 白
+
+  const frame = renderBackground(ppu)
+  assert.equal(frame[0], 0x30, '左上のピクセルは白')
+  assert.equal(frame[7], 0x30, '8 ピクセル目まで白')
+  assert.equal(frame[8], 0x0f, '9 ピクセル目は次のタイル（空）')
+  console.log('ok   タイル 1 個の描画')
+}
+
+// パレットが効く
+{
+  const ppu = makeTestPpu()
+  for (let r = 0; r < 8; r++) ppu.chr[r] = 0xff
+  ppu.writeVram(0x2000, 0)
+  ppu.writeVram(0x23c0, 0b01)        // 左上の区画はパレット 1
+  ppu.writeVram(0x3f05, 0x16)        // パレット 1 の色 1
+
+  const frame = renderBackground(ppu)
+  assert.equal(frame[0], 0x16, '属性テーブルでパレットが切り替わる')
+  console.log('ok   属性テーブルによるパレット切り替え')
+}
+
+// 色 0 は共通背景色
+{
+  const ppu = makeTestPpu()
+  ppu.writeVram(0x3f00, 0x0f)
+  ppu.writeVram(0x3f01, 0x30)
+  // タイル 0 は全部 0（何も書いていない）
+  const frame = renderBackground(ppu)
+  assert.equal(frame[0], 0x0f, '色 0 は $3F00')
+  console.log('ok   色 0 は共通背景色')
+}
+
+// $2007 の自動インクリメント
+{
+  const ppu = makeTestPpu()
+  ppu.writeRegister(0x00, 0x00)      // 増分 1
+  ppu.writeRegister(0x06, 0x20)
+  ppu.writeRegister(0x06, 0x00)      // $2000
+  ppu.writeRegister(0x07, 0xaa)
+  ppu.writeRegister(0x07, 0xbb)
+  assert.equal(ppu.readVram(0x2000), 0xaa)
+  assert.equal(ppu.readVram(0x2001), 0xbb, 'アドレスが 1 進む')
+
+  ppu.writeRegister(0x00, 0x04)      // 増分 32
+  ppu.writeRegister(0x06, 0x20); ppu.writeRegister(0x06, 0x00)
+  ppu.writeRegister(0x07, 0x11)
+  ppu.writeRegister(0x07, 0x22)
+  assert.equal(ppu.readVram(0x2020), 0x22, 'アドレスが 32 進む')
+  console.log('ok   $2007 の自動インクリメント')
+}
+
+// $2002 を読むと書き込みトグルがリセットされる
+{
+  const ppu = makeTestPpu()
+  ppu.writeRegister(0x06, 0x20)      // 1 回目
+  ppu.readRegister(0x02)             // ここでトグルがリセットされる
+  ppu.writeRegister(0x06, 0x21)      // また「1 回目」として扱われる
+  ppu.writeRegister(0x06, 0x00)
+  assert.equal(ppu.vramAddr, 0x2100, '$2002 の読み出しでトグルが戻る')
+  console.log('ok   $2002 の副作用')
+}
+
+console.log('\n全部通りました')
+```
+
+## 画面を出す
+
+Node.js なら PNG に書き出し、ブラウザなら Canvas に転送します。
+
+```ts
+// Canvas の場合
+const imageData = new ImageData(toRgba(frame), 256, 240)
+ctx.putImageData(imageData, 0, 0)
+```
+
+**タイトル画面が出れば、大きな節目です。** ここまで来ると、残りの作業が一気に楽しくなります。
+
+## 演習
+
+1. **スクロールを実装し、値を変えて動かしてみる**。`scrollX` を毎フレーム 1 ずつ増やすと、背景が流れます
+2. **縦の折り返しを正しく扱う**。`scrollY` が 240 を超えたときの挙動を確認してください
+3. **ネームテャブルを可視化する**。4 枚ぶんを並べて描画すると、ミラーリングの効果が目で見えます
+4. **`$2007` の読み出し遅延を実装する**。パレット領域が例外であることも含めて
+5. **1 スキャンラインごとに描画する**。画面の途中でスクロール量を変える演出（ステータスバーの固定）が再現できるようになります
+
+## 次回
+
+背景が出ました。次は **スプライト** です。背景とは別に管理される可動物体で、優先順位や 1 ラインあたりの個数制限といった独自の制約があります。

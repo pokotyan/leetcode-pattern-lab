@@ -3,10 +3,281 @@ title: nestest を通す
 description: 既存の検証 ROM とログを突き合わせ、1 命令ずつ答え合わせをする。非公式命令もここで拾う
 track: nes
 order: 6
-status: planned
+status: published
 goal: nestest のログと完全に一致する実行トレースが出る
 requires:
   - nes-05-interrupt
+basedOn:
+  - kind: reading
+    slug: performance-estimation
+    why: 「正しさをどう確かめるか」を設計する回。基準を持って突き合わせる、という考え方が中心にある
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 途中まで作っても何も起きない
+
+CPU は一通り実装しました。しかし、**本当に正しいかどうかが分かりません**。
+
+単体テストは通っています。しかし 151 のオペコード × 13 のモード × フラグの組み合わせを、すべて手で網羅するのは現実的ではありません。1 つでも間違っていれば、後で「画面が乱れる」「特定のゲームだけ動かない」という形で現れます。**そのとき、原因が CPU なのか PPU なのか分かりません。**
+
+そこで、**CPU だけを完全に検証してから先に進みます**。
+
+## nestest
+
+`nestest.nes` は、そのために作られた検証用の ROM です。
+
+- **すべての公式命令**と、主要な非公式命令を順に実行する
+- 各段階で結果を検証し、失敗したら記録する
+- **正解の実行ログ（`nestest.log`）が公開されている**
+
+ログはこういう形式です。
+
+```
+C000  4C F5 C5  JMP $C5F5                       A:00 X:00 Y:00 P:24 SP:FD CYC:  7
+C5F5  A2 00     LDX #$00                        A:00 X:00 Y:00 P:24 SP:FD CYC: 10
+C5F7  86 00     STX $00 = 00                    A:00 X:00 Y:00 P:26 SP:FD CYC: 13
+```
+
+| 欄 | 内容 |
+| --- | --- |
+| `C000` | 実行前の PC |
+| `4C F5 C5` | 命令のバイト列 |
+| `JMP $C5F5` | 逆アセンブル |
+| `A:00 X:00 Y:00 P:24 SP:FD` | 実行**前**のレジスタ |
+| `CYC: 7` | 実行**前**の累計サイクル数 |
+
+**同じ形式でログを出し、1 行ずつ比べれば、最初に食い違った行がバグの場所です。**
+
+<Callout type="tip" title="この構造が最も効率的なデバッグ">
+  「動かない」と「3245 行目の LDA $0300,X でフラグが違う」では、
+  調査にかかる時間が桁違いです。
+
+  **正解が手に入る問題は、必ず正解と突き合わせる。**
+  第 7 章で読んだ差分テストと同じ発想です。
+</Callout>
+
+## 自動モードで走らせる
+
+nestest には 2 つの動作モードがあります。
+
+- **通常モード**：`$C004` から開始。画面に結果を表示する（PPU が必要）
+- **自動モード**：`$C000` から開始。**画面を使わず、結果をメモリに書く**
+
+PPU がまだないので、自動モードを使います。
+
+```ts
+cpu.reset()
+cpu.pc = 0xc000       // リセットベクタを無視して、ここから始める
+cpu.cycles = 7        // リセットで消費するサイクル数
+```
+
+終了したら、結果は 2 つのアドレスに入ります。
+
+| アドレス | 内容 |
+| --- | --- |
+| `$0002` | 公式命令のエラーコード（0 なら成功） |
+| `$0003` | 非公式命令のエラーコード |
+
+## ログを出す
+
+比較のため、**まったく同じ書式**で出力する必要があります。
+
+```ts
+// src/nes/trace.ts
+import { MODES, type Mode } from './addressing'
+import { OPCODES } from './opcodes'
+import type { CPU } from './cpu'
+
+const hex = (n: number, digits: number) =>
+  n.toString(16).toUpperCase().padStart(digits, '0')
+
+export function trace(c: CPU): string {
+  const pc = c.pc
+  const opcode = c.bus.peek(pc)
+  const info = OPCODES[opcode]
+  const bytes = Array.from({ length: info.bytes }, (_, i) => c.bus.peek(pc + i))
+
+  const byteStr = bytes.map((b) => hex(b, 2)).join(' ').padEnd(8)
+  const asm = disassemble(c, pc, info).padEnd(31)
+
+  return (
+    `${hex(pc, 4)}  ${byteStr} ${asm}` +
+    `A:${hex(c.a, 2)} X:${hex(c.x, 2)} Y:${hex(c.y, 2)} ` +
+    `P:${hex(c.p, 2)} SP:${hex(c.s, 2)} ` +
+    `CYC:${String(c.cycles).padStart(3)}`
+  )
+}
+```
+
+**`peek` を使っていることが重要です。** 通常の `read` だと、PPU レジスタを読んだ瞬間に副作用が起きます。ログを出すだけで状態が変わってしまいます（第 4 回で触れた問題）。
+
+## 逆アセンブル部分が細かい
+
+nestest のログは、ただのニーモニックではありません。
+
+```
+STX $00 = 00           ← 参照先の現在の値まで書いてある
+LDA ($80),Y @ 0200 = 5A   ← 解決したアドレスと、その中身
+```
+
+| モード | 書式 |
+| --- | --- |
+| Immediate | `LDA #$44` |
+| Zero Page | `STX $00 = 00` |
+| Zero Page,X | `LDA $80,X @ 85 = 5A` |
+| Absolute | `LDA $0300 = 00` |
+| Absolute,X | `LDA $0300,X @ 0305 = 5A` |
+| Indirect,X | `LDA ($80,X) @ 85 = 0200 = 5A` |
+| Indirect,Y | `LDA ($80),Y = 0200 @ 0205 = 5A` |
+| Relative | `BNE $C75B`（飛び先の絶対アドレス） |
+
+**面倒ですが、ここを合わせないと比較になりません。** 一致しない原因が「CPU のバグ」なのか「ログの書式の違い」なのかが分からなくなります。
+
+<Callout type="warn" title="JMP と JSR は例外">
+  `JMP $C5F5` と `JSR $C5F5` は、**参照先の値を書きません**。
+  飛び先であって、読み書きする対象ではないからです。
+
+  こういう例外を 1 つずつ潰していくのが、この回の作業の実態です。
+</Callout>
+
+## 突き合わせる
+
+```ts
+// src/nes/nestest.check.ts
+import { readFileSync } from 'node:fs'
+import { strict as assert } from 'node:assert'
+
+const rom = parseINes(readFileSync('roms/nestest.nes'))
+const expected = readFileSync('roms/nestest.log', 'utf8').split('\n')
+
+const nes = new NES(rom)
+nes.cpu.reset()
+nes.cpu.pc = 0xc000
+nes.cpu.cycles = 7
+
+for (let line = 0; line < expected.length; line++) {
+  const want = expected[line]!.trimEnd()
+  if (!want) break
+
+  const got = trace(nes.cpu)
+  if (got !== want) {
+    console.error(`\n${line + 1} 行目で食い違いました`)
+    console.error(`期待: ${want}`)
+    console.error(`実際: ${got}`)
+    // 直前の 5 行も出すと、原因が追いやすい
+    process.exit(1)
+  }
+  nes.step()
+}
+
+// 結果コードを確認する
+assert.equal(nes.bus.peek(0x0002), 0x00, `公式命令のエラー: $${nes.bus.peek(0x0002).toString(16)}`)
+assert.equal(nes.bus.peek(0x0003), 0x00, `非公式命令のエラー: $${nes.bus.peek(0x0003).toString(16)}`)
+
+console.log(`ok   nestest 全 ${expected.length} 行が一致`)
+```
+
+## よくある食い違い
+
+実際に取り組むと、この順で詰まります。
+
+### 1 行目から合わない
+
+- リセット後の `P` が `$24` になっていない（U と I が立つ）
+- `SP` が `$FD` になっていない
+- `CYC` が 7 から始まっていない
+
+### 数十行で止まる
+
+- フラグの更新漏れ（特に `setZN` を呼び忘れている命令）
+- `TXS` で誤ってフラグを更新している
+
+### 数百行で止まる
+
+- ページまたぎのサイクル数
+- 分岐のサイクル数（成立で +1、ページまたぎでさらに +1）
+
+### 数千行で止まる
+
+- **非公式命令**（後述）
+- `JMP ($xxFF)` のバグ未実装
+- ゼロページの折り返し漏れ
+
+<Callout type="tip" title="止まった行の前後を見る">
+  食い違った行だけでなく、**その 10 行前から**表示すると原因が見えます。
+  フラグの違いは、実際に間違えた命令より後の行で顕在化することが多いためです。
+
+```
+実際に間違えた命令（フラグを立て損ねた）
+  ↓ 数命令後
+分岐命令が、そのフラグを見て違う方向へ飛ぶ  ← ここで初めてログがずれる
+```
+</Callout>
+
+## 非公式命令
+
+151 の公式命令に対し、オペコードは 256 通りあります。**残りの 105 個は、ドキュメントに載っていません。**
+
+しかし、何も起きないわけではありません。6502 のデコーダは、内部の制御信号を単純な規則で生成しているため、**未定義の組み合わせでも何かしらの動作をします**。
+
+| 命令 | 動作 |
+| --- | --- |
+| `LAX` | `LDA` と `LDX` を同時に行う |
+| `SAX` | A と X の AND をメモリに書く |
+| `DCP` | `DEC` してから `CMP` |
+| `ISC` | `INC` してから `SBC` |
+| `SLO` | `ASL` してから `ORA` |
+| `NOP`（複数種） | 何もしないが、**バイト数とサイクル数が違う** |
+| `JAM` / `KIL` | **CPU が停止する**（本当に固まる） |
+
+**これらに依存したゲームが実在します。** 命令数が減ってサイクルが稼げるので、速度が要る場面で意図的に使われました。
+
+nestest は非公式命令もテストします。完全に通したければ実装が必要です。
+
+<Callout type="note" title="ドキュメントにない挙動が仕様になる">
+  第 2 章で読んだ「ISA は契約」の、最も極端な例です。
+  仕様書に書かれていないどころか、**存在しないはずの命令**が、
+  実際のソフトウェアに使われ、事実上の仕様になってしまった。
+
+  後継の 65C02 ではこれらが `NOP` に統一され、
+  **互換性が壊れました**。
+</Callout>
+
+## 通ったら
+
+`$0002` と `$0003` が両方 `$00` になれば、**CPU は完成です**。
+
+ここから先に不具合が出たら、それは PPU か、バスか、タイミングの問題です。**CPU を疑わなくてよい**という状態になったことの価値は、非常に大きい。
+
+```
+ok   nestest 全 8991 行が一致
+ok   公式命令エラー: $00
+ok   非公式命令エラー: $00
+```
+
+## 他の検証 ROM
+
+nestest の先にも、目的別の検証 ROM があります。
+
+| ROM | 検証対象 |
+| --- | --- |
+| `blargg_instr_test` | 命令の網羅的な検証 |
+| `cpu_timing_test` | サイクル数の精度 |
+| `ppu_vbl_nmi` | VBlank と NMI のタイミング |
+| `sprite_hit_tests` | スプライト 0 ヒット |
+| `apu_test` | 音源 |
+
+**PPU を作った後は、これらが次の指標になります。**
+
+## 演習
+
+1. **食い違った行の前後を表示する**。直近 10 行をリングバッファに貯めておくと便利です
+2. **差分の統計を取る**。どのレジスタが、どの命令で食い違っているかを集計すると、原因の傾向が見えます
+3. **非公式命令を実装する**。まず `LAX`、`SAX`、`DCP`、`ISC` の 4 つから
+4. **`JAM` を実装する**。CPU が停止する状態を表現し、そこに入ったら報告してください
+5. **ログ出力を切り替えられるようにする**。本番では出さず、デバッグ時だけ有効にします（ログ生成は非常に重いため）
+
+## 次回
+
+CPU が終わりました。ここから **PPU**（Picture Processing Unit）に入ります。まずは、画面がどういうデータ構造でできているか。**画面は点の集まりではなく、タイルの並び**です。
