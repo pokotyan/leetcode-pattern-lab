@@ -1,0 +1,103 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro'
+import { BUILD_TRACKS } from '../../lib/curriculum'
+import { loadBuildSteps } from '../../lib/prereq'
+
+const base = import.meta.env.BASE_URL
+const { steps } = await loadBuildSteps()
+
+const byTrack = BUILD_TRACKS.map((track) => ({
+  track,
+  items: steps.filter((s) => s.data.track === track.id),
+}))
+const published = steps.filter((s) => s.data.status === 'published').length
+---
+
+<BaseLayout
+  title="作る | LeetCode Pattern Lab"
+  description="NAND から CPU、アセンブラからコンパイラ、そして NES エミュレータまでを手で組み上げる"
+>
+  <section class="mb-12">
+    <h1 class="mb-3 text-3xl font-bold leading-snug">作る</h1>
+    <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      読み物が「中で何が起きているか」を読むものなら、こちらは
+      <strong style="color: var(--fg)">実際に組んで動かす</strong>ためのものです。
+      1 回ぶん手を動かすと、動くものが 1 つ増えます。前の回の成果物が次の回の部品になるので、
+      上から順に進めてください。
+    </p>
+    <p class="mt-3 max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      コードはすべて TypeScript です。<code>npx tsx &lt;ファイル&gt;</code> だけで動く形にしてあり、
+      各回の最後に<strong style="color: var(--fg)">その回のぶんだけを確かめるテスト</strong>が付きます。
+      テストが通れば次へ進めます。
+    </p>
+    <dl class="mt-6 flex flex-wrap gap-8 text-sm">
+      <div>
+        <dt style="color: var(--fg-muted)">トラック</dt>
+        <dd class="m-0 text-2xl font-bold">{BUILD_TRACKS.length}</dd>
+      </div>
+      <div>
+        <dt style="color: var(--fg-muted)">公開済みの回</dt>
+        <dd class="m-0 text-2xl font-bold">{published}</dd>
+      </div>
+    </dl>
+  </section>
+
+  <div class="space-y-10">
+    {
+      byTrack.map(({ track, items }, i) => (
+        <section>
+          <h2 class="mb-1 text-lg font-bold">
+            <span class="mr-2 font-mono text-sm" style="color: var(--fg-muted)">
+              Track {i + 1}
+            </span>
+            {track.title}
+          </h2>
+          <p class="mb-2 text-sm" style="color: var(--fg-muted)">{track.summary}</p>
+          <p class="mb-4 text-sm font-bold" style="color: var(--ok)">到達点：{track.outcome}</p>
+          {items.length === 0 ? (
+            <p class="m-0 rounded-xl border border-dashed px-4 py-6 text-center text-sm" style="border-color: var(--border); color: var(--fg-muted)">
+              準備中
+            </p>
+          ) : (
+            <ol class="m-0 list-none space-y-2 p-0">
+              {items.map((s) => (
+                <li>
+                  {s.data.status === 'published' ? (
+                    <a
+                      href={`${base}build/${s.id}/`}
+                      class="flex gap-3 rounded-xl border px-4 py-3 no-underline transition-colors hover:border-[var(--accent)]"
+                      style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+                    >
+                      <span class="shrink-0 font-mono text-sm" style="color: var(--fg-muted)">
+                        {String(s.data.order).padStart(2, '0')}
+                      </span>
+                      <span class="min-w-0">
+                        <span class="block font-bold">{s.data.title}</span>
+                        <span class="mt-1 block text-xs leading-relaxed" style="color: var(--fg-muted)">
+                          {s.data.description}
+                        </span>
+                      </span>
+                    </a>
+                  ) : (
+                    <div
+                      class="flex gap-3 rounded-xl border border-dashed px-4 py-3"
+                      style="border-color: var(--border); color: var(--fg-muted)"
+                    >
+                      <span class="shrink-0 font-mono text-sm">
+                        {String(s.data.order).padStart(2, '0')}
+                      </span>
+                      <span class="min-w-0">
+                        <span class="block font-bold">{s.data.title}</span>
+                        <span class="mt-1 block text-xs leading-relaxed">{s.data.description}</span>
+                      </span>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      ))
+    }
+  </div>
+</BaseLayout>

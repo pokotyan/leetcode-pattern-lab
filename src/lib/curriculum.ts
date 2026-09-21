@@ -158,3 +158,84 @@ export const READING_SECTIONS: Section[] = [
 ]
 
 export const readingSectionById = new Map(READING_SECTIONS.map((s) => [s.id, s]))
+
+/**
+ * 作って学ぶトラック。/build のグルーピングに使う。
+ * 並び順がそのまま推奨の着手順で、後ろのトラックは前のトラックの成果物を土台にする。
+ */
+export type Track = Section & {
+  /** トラックを終えたときに手元に残るもの */
+  outcome: string
+}
+
+export const BUILD_TRACKS: Track[] = [
+  {
+    id: 'hardware',
+    title: '論理回路からコンピュータへ',
+    summary: 'NAND ひとつだけを出発点にして、加算器・ALU・レジスタ・RAM を作り、最後に CPU として動かす',
+    outcome: '自分で組んだ CPU の上で、自分で書いた機械語が走る',
+  },
+  {
+    id: 'toolchain',
+    title: 'アセンブラからコンパイラへ',
+    summary: '機械語を人が書ける形にし、スタックマシンを挟み、最後に高級言語を CPU まで落とす',
+    outcome: '自作言語で書いたプログラムが、自作 CPU の上で動く',
+  },
+  {
+    id: 'nes',
+    title: 'NES エミュレータ',
+    summary: '実在するハードウェアを相手にする。6502 の命令、バスとメモリマップ、PPU による描画',
+    outcome: '市販のカートリッジ ROM が画面に出て、コントローラで操作できる',
+  },
+]
+
+export const trackById = new Map(BUILD_TRACKS.map((t) => [t.id, t]))
+
+/**
+ * 低レイヤの読み物の章。/lowlevel のグルーピングに使う。
+ * 並び順がそのまま読む順で、後ろの章は前の章の用語を説明なしに使う。
+ */
+export const LOWLEVEL_CHAPTERS: Section[] = [
+  {
+    id: 'repr',
+    title: '第1章　数と、その表し方',
+    summary: 'すべての出発点。ビット、2 の補数、バイト順、浮動小数点。ここを曖昧にしたまま上に進むと、後で必ず戻ってくることになる',
+  },
+  {
+    id: 'cpu',
+    title: '第2章　命令を実行する機械',
+    summary: 'CPU が 1 命令を実行するまでに何をしているか。命令セットという約束、x86 と ARM、そして現代の CPU が裏でやっている大掛かりな仕掛け',
+  },
+  {
+    id: 'memory',
+    title: '第3章　記憶の階層',
+    summary: 'メモリは 1 種類ではない。速さと容量のどうしようもない trade-off と、その間を埋めるキャッシュ',
+  },
+  {
+    id: 'vm',
+    title: '第4章　アドレスの嘘',
+    summary: 'プログラムが見ているアドレスは実在しない。仮想メモリ、ページング、MMU、そしてセグメンテーションフォールト',
+  },
+  {
+    id: 'linking',
+    title: '第5章　プログラムが動き出すまで',
+    summary: 'ソースコードが実行可能ファイルになり、メモリに載り、最初の命令に到達するまでの全工程',
+  },
+  {
+    id: 'process',
+    title: '第6章　走っているものたち',
+    summary: 'プロセスとスレッドの違い、切り替えのコスト、誰がいつ CPU を取り上げるのか',
+  },
+  {
+    id: 'kernel',
+    title: '第7章　カーネルとの境界',
+    summary: 'ユーザ空間から外の世界に触るための唯一の窓口。システムコール、ファイルディスクリプタ、入出力',
+  },
+  {
+    id: 'around',
+    title: '第8章　その下と、その横',
+    summary: '電源投入から OS が立ち上がるまで、仮想化とコンテナ、そして実際に測るための道具',
+  },
+]
+
+export const chapterById = new Map(LOWLEVEL_CHAPTERS.map((c) => [c.id, c]))

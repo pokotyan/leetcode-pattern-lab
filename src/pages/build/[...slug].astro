@@ -1,0 +1,25 @@
+---
+import { render } from 'astro:content'
+import BuildLayout from '../../layouts/BuildLayout.astro'
+import { loadBuildSteps } from '../../lib/prereq'
+
+export async function getStaticPaths() {
+  const { steps } = await loadBuildSteps()
+  const published = steps.filter((s) => s.data.status === 'published')
+  return published.map((entry, i) => ({
+    params: { slug: entry.id },
+    props: {
+      entry,
+      prev: published[i - 1] && { id: published[i - 1]!.id, title: published[i - 1]!.data.title },
+      next: published[i + 1] && { id: published[i + 1]!.id, title: published[i + 1]!.data.title },
+    },
+  }))
+}
+
+const { entry, prev, next } = Astro.props
+const { Content, headings } = await render(entry)
+---
+
+<BuildLayout entry={entry} prev={prev} next={next} headings={headings}>
+  <Content />
+</BuildLayout>

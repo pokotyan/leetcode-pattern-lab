@@ -87,4 +87,64 @@ const reading = defineCollection({
   }),
 })
 
-export const collections = { articles, math, reading }
+/**
+ * 作って学ぶ（ハンズオン）。読み物が「仕組みを読む」のに対し、
+ * こちらは「1回ぶんの手を動かすと、動くものが1つ増える」形で積み上げる。
+ * requires は同じ build 内の前の回を指す。
+ */
+const build = defineCollection({
+  loader: glob({ base: 'src/content/build', pattern: '**/*.{md,mdx}' }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string(),
+    /** curriculum.ts の BUILD_TRACKS の id */
+    track: z.string(),
+    order: z.number(),
+    status: z.enum(['published', 'planned']).default('published'),
+    /** この回を終えたときに動くようになっているもの */
+    goal: z.string(),
+    /** 先にやっておく回の slug */
+    requires: z.array(z.string()).default([]),
+    /** 土台になっている本編の型 / 数学ノート / 読み物と、そこで何が効いているのか */
+    basedOn: z
+      .array(
+        z.object({
+          kind: z.enum(['article', 'math', 'reading']),
+          slug: z.string(),
+          why: z.string(),
+        }),
+      )
+      .default([]),
+  }),
+})
+
+/**
+ * 低レイヤの読み物。章立ての直線的な本として読む。
+ * build（作って学ぶ）の前段にあたり、handsOn で「この話を実際に作る回」へ橋を張る。
+ */
+const lowlevel = defineCollection({
+  loader: glob({ base: 'src/content/lowlevel', pattern: '**/*.{md,mdx}' }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string(),
+    /** curriculum.ts の LOWLEVEL_CHAPTERS の id */
+    chapter: z.string(),
+    order: z.number(),
+    status: z.enum(['published', 'planned']).default('published'),
+    /** この回で扱う用語。索引に出す */
+    topics: z.array(z.string()).default([]),
+    /** 先に読む回の slug */
+    requires: z.array(z.string()).default([]),
+    /** この話を実際に手で作る build の回 */
+    handsOn: z
+      .array(
+        z.object({
+          slug: z.string(),
+          why: z.string(),
+        }),
+      )
+      .default([]),
+  }),
+})
+
+export const collections = { articles, math, reading, build, lowlevel }

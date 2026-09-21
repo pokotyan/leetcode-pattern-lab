@@ -79,6 +79,31 @@ import ThreeSum from '../../components/sim/problems/ThreeSum'
 
 `status: planned` にすると、トップに「準備中」バッジが付き、記事上部に注記が出る。
 
+## 作って学ぶ（build）を追加する
+
+`src/content/build/<slug>.mdx` を作る。記事とは別コレクションで、トラック（`lib/curriculum.ts` の
+`BUILD_TRACKS`）ごとに 1 回ずつ積み上げる形になっている。
+
+```mdx
+---
+title: 回のタイトル
+description: 一行の説明
+track: hardware           # lib/curriculum.ts の Track id
+order: 4                  # トラック内の回の番号
+status: published         # published | planned
+goal: この回を終えたときに動くようになっているもの
+requires:
+  - hw-03-bus             # 先にやっておく回の slug
+basedOn:
+  - kind: math            # article | math | reading
+    slug: bit-tricks
+    why: ここで何が効いているのか
+---
+```
+
+`status: planned` の回はページを生成せず、`/build/` に予定として並ぶだけになる。
+`requires` / `basedOn` に存在しない slug を書くとビルドが止まる。
+
 ## ステップ実行を追加する
 
 各問題は「アルゴリズムを実行しながら1手ごとに `Frame` を積む」トレース関数と、
