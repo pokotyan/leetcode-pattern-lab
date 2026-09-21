@@ -3,10 +3,316 @@ title: CPU と PPU の歩調を合わせる
 description: 1 フレームの中で両者がどう噛み合っているか。ここがずれると画面が崩れる
 track: nes
 order: 10
-status: planned
+status: published
 goal: 実機と同じ速度でフレームが進み、画面が安定する
 requires:
   - nes-09-ppu-sprite
+basedOn:
+  - kind: reading
+    slug: performance-estimation
+    why: 速度を「だいたい」で済ませない。1 フレームの予算をサイクル単位で割り振る考え方
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 3 対 1
+
+ファミコンでは、**PPU は CPU の 3 倍の速度で動きます**。
+
+| | 周波数 | 1 フレームあたり |
+| --- | --- | --- |
+| CPU | 1.789773 MHz | 約 29,780 サイクル |
+| PPU | 5.369318 MHz | 89,342 サイクル |
+
+**1 CPU サイクル = 3 PPU サイクル**です。
+
+PPU の 1 サイクルが、画面の 1 ピクセルに対応します。
+
+```
+341 サイクル/スキャンライン × 262 スキャンライン = 89,342 サイクル/フレーム
+```
+
+<Callout type="note" title="341 と 262 という半端な数">
+  画面は 256 × 240 ピクセルですが、走査線はもっと長い。
+
+  横：256（可視）+ 85（水平帰線期間）= 341
+  縦：240（可視）+ 22（垂直帰線期間）= 262
+
+  ブラウン管が、右端から左端へ、下端から上端へ戻る時間です。
+  **この「何も描かない時間」が、ゲームにとっての作業時間**になります。
+</Callout>
+
+## 1 フレームの構造
+
+| スキャンライン | 名前 | 内容 |
+| --- | --- | --- |
+| 0〜239 | 可視スキャンライン | 画面を描く。VRAM に触れない |
+| 240 | ポストレンダ | 何もしない |
+| **241** | **VBlank 開始** | **ここで NMI が発生** |
+| 241〜260 | VBlank | ゲームが画面を更新できる |
+| 261 | プリレンダ | フラグをクリアし、次のフレームの準備 |
+
+**VBlank は 20 スキャンライン**あります。CPU サイクルに直すと、
+
+```
+20 × 341 ÷ 3 ≈ 2273 サイクル
+```
+
+**1 フレームの約 7.6% しかありません。** この間に、スプライトの転送（DMA で 513 サイクル）と、背景の書き換えを済ませる必要があります。
+
+<Callout type="warn" title="VBlank を超過するとどうなるか">
+  書き換えが VBlank 内に終わらないと、**描画中に VRAM を書き換える**ことになります。
+
+  画面にノイズが走ったり、上下で絵がずれたりします。
+  実機のゲームで、処理が重いときに画面が乱れるのはこれが原因です。
+
+  逆に、この性質を使って意図的に画面を分割する技法もあります。
+</Callout>
+
+## 同期の方式
+
+エミュレータで CPU と PPU をどう同期させるか。精度と速度のトレードオフがあります。
+
+### 1. フレーム単位
+
+```ts
+for (let i = 0; i < 29780; i++) cpu.step()
+ppu.renderFrame()
+nes.requestNmi()
+```
+
+最も速い。しかし、**フレームの途中でスクロールを変える演出が再現できません**。スプライト 0 ヒットも動きません。
+
+### 2. スキャンライン単位
+
+```ts
+for (let line = 0; line < 262; line++) {
+  const budget = Math.floor(341 / 3)          // 約 113 CPU サイクル
+  let used = 0
+  while (used < budget) used += cpu.step()
+
+  ppu.renderScanline(line)
+  if (line === 241) nes.requestNmi()
+}
+```
+
+**実用上、これで大半のゲームが動きます。** スプライト 0 ヒットも、画面分割も再現できます。
+
+### 3. サイクル単位
+
+```ts
+while (true) {
+  const cycles = cpu.step()
+  for (let i = 0; i < cycles * 3; i++) ppu.tick()
+}
+```
+
+最も正確。PPU がピクセル単位で状態を持ち、1 サイクルずつ進みます。**タイミングに厳しいゲームや、検証 ROM が通るようになります。**
+
+その代わり、実行速度は落ちます。1 秒間に 500 万回以上 `ppu.tick()` が呼ばれます。
+
+<Callout type="tip" title="段階的に精度を上げる">
+  最初からサイクル単位を目指すと、デバッグが困難になります。
+
+  **スキャンライン単位で作り、動くゲームを増やしてから、
+  必要な部分だけサイクル単位に上げる**のが現実的です。
+
+  これは第 8 章で読んだ「まず動かし、測ってから直す」と同じ順序です。
+</Callout>
+
+## スキャンライン単位の実装
+
+```ts
+// src/nes/nes.ts
+export class NES {
+  private cycleDebt = 0          // 端数を繰り越す
+
+  runFrame(): Uint8Array {
+    for (let line = 0; line < 262; line++) {
+      this.runScanline(line)
+    }
+    return this.ppu.frame
+  }
+
+  private runScanline(line: number) {
+    // 341 PPU サイクル = 113.67 CPU サイクル。端数を繰り越して累積誤差を防ぐ
+    this.cycleDebt += 341 / 3
+    const budget = Math.floor(this.cycleDebt)
+    this.cycleDebt -= budget
+
+    let used = 0
+    while (used < budget) {
+      if (this.nmiPending) {
+        this.nmiPending = false
+        used += nmi(this.cpu)
+      } else {
+        used += this.cpu.step()
+      }
+    }
+
+    if (line < 240) {
+      this.ppu.renderScanline(line)
+    } else if (line === 241) {
+      this.ppu.status |= 0x80                        // VBlank フラグ
+      if (this.ppu.control.nmiEnabled) this.nmiPending = true
+    } else if (line === 261) {
+      this.ppu.status &= ~(0x80 | 0x40 | 0x20)       // VBlank / スプライト0 / オーバーフロー
+    }
+  }
+}
+```
+
+**`cycleDebt` で端数を繰り越す**のが要点です。`341 / 3 = 113.67` を毎回切り捨てると、1 フレームで約 175 サイクルずれます。これが積み重なると、音がずれたり、処理が間に合わなくなったりします。
+
+## 実時間との同期
+
+エミュレータは実機より速く動きます。**意図的に遅くする**必要があります。
+
+```ts
+// ブラウザの場合
+function loop(timestamp: number) {
+  nes.runFrame()
+  drawToCanvas(nes.ppu.frame)
+  requestAnimationFrame(loop)
+}
+```
+
+`requestAnimationFrame` は通常 60Hz で呼ばれるので、NTSC の 60.0988 Hz にほぼ一致します。**画面の垂直同期に合わせる**という点で、実機と同じ構造です。
+
+より正確にやるなら、経過時間を測って調整します。
+
+```ts
+let accumulator = 0
+const FRAME_TIME = 1000 / 60.0988
+
+function loop(timestamp: number) {
+  accumulator += timestamp - lastTime
+  lastTime = timestamp
+
+  // 遅れていたら複数フレーム進める。ただし上限を設ける
+  let frames = 0
+  while (accumulator >= FRAME_TIME && frames < 3) {
+    nes.runFrame()
+    accumulator -= FRAME_TIME
+    frames++
+  }
+  if (frames === 0) return requestAnimationFrame(loop)   // まだ時間が来ていない
+
+  drawToCanvas(nes.ppu.frame)
+  requestAnimationFrame(loop)
+}
+```
+
+<Callout type="warn" title="遅れを取り戻そうとしすぎない">
+  タブが非表示になると、`requestAnimationFrame` が止まります。
+  復帰したときに「10 秒ぶん = 600 フレーム」を一気に実行すると、
+  **ブラウザが固まります**。
+
+  上限を設けて、**取り戻せない分は捨てる**のが正解です。
+  ゲームの時間が少しずれますが、固まるよりはるかにましです。
+
+  同じ問題が、ゲームエンジンの固定タイムステップ実装でも扱われます
+  （death spiral と呼ばれます）。
+</Callout>
+
+## 規格による違い
+
+| | NTSC（日本・北米） | PAL（欧州） |
+| --- | --- | --- |
+| フレームレート | 60.0988 Hz | 50.007 Hz |
+| スキャンライン | 262 | 312 |
+| CPU 周波数 | 1.7897 MHz | 1.6627 MHz |
+| PPU : CPU 比 | 3 : 1 | **3.2 : 1** |
+
+PAL は縦のラインが多く、フレームレートが低い。**同じゲームが欧州版では遅く動きます**。当時のゲームは、その差を補正していないものがほとんどでした。
+
+## 検証する
+
+タイミング関連の検証 ROM があります。
+
+| ROM | 検証対象 |
+| --- | --- |
+| `ppu_vbl_nmi` | VBlank フラグと NMI のタイミング |
+| `cpu_timing_test6` | 命令のサイクル数 |
+| `sprite_hit_tests` | スプライト 0 ヒットのタイミング |
+| `vbl_nmi_timing` | VBlank 開始の正確な位置 |
+
+**これらは非常に厳しい**です。スキャンライン単位の実装では通らないものが多く、サイクル単位が必要になります。
+
+<Callout type="tip" title="どこまで正確にするかを決める">
+  「実機と完全に同じ」を目指すと、際限がありません。
+
+  目的によって基準が変わります。
+  - **遊べればよい**：スキャンライン単位で十分
+  - **多くのゲームを動かす**：スプライト 0 ヒットをサイクル単位に
+  - **検証 ROM を全部通す**：全体をサイクル単位に
+
+  最初にどこを目指すか決めておくと、
+  「終わらない作業」に引きずり込まれずに済みます。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/nes/timing.check.ts
+import { strict as assert } from 'node:assert'
+
+// フレームあたりのサイクル数
+{
+  const nes = makeTestNes()
+  const before = nes.cpu.cycles
+  nes.runFrame()
+  const used = nes.cpu.cycles - before
+  assert.ok(Math.abs(used - 29780) < 20, `1 フレームは約 29780 サイクル（実際 ${used}）`)
+  console.log(`ok   1 フレーム = ${used} CPU サイクル`)
+}
+
+// 端数の繰り越し
+{
+  const nes = makeTestNes()
+  const before = nes.cpu.cycles
+  for (let i = 0; i < 60; i++) nes.runFrame()
+  const used = nes.cpu.cycles - before
+  const expected = 29780 * 60
+  assert.ok(Math.abs(used - expected) < 100, `60 フレームで累積誤差が小さい（${used} vs ${expected}）`)
+  console.log('ok   端数の繰り越しで累積誤差が出ない')
+}
+
+// VBlank フラグの立ち下がり
+{
+  const nes = makeTestNes()
+  nes.runToScanline(241)
+  assert.notEqual(nes.ppu.status & 0x80, 0, '241 行目で VBlank フラグが立つ')
+
+  nes.runToScanline(261)
+  assert.equal(nes.ppu.status & 0x80, 0, 'プリレンダでクリアされる')
+  console.log('ok   VBlank フラグのタイミング')
+}
+
+// NMI が有効なときだけ発生する
+{
+  const nes = makeTestNes()
+  nes.ppu.writeRegister(0x00, 0x00)        // NMI 無効
+  nes.runFrame()
+  assert.equal(nes.nmiCount, 0)
+
+  nes.ppu.writeRegister(0x00, 0x80)        // NMI 有効
+  nes.runFrame()
+  assert.equal(nes.nmiCount, 1, '1 フレームに 1 回')
+  console.log('ok   NMI の発生')
+}
+
+console.log('\n全部通りました')
+```
+
+## 演習
+
+1. **サイクル単位の PPU に書き換える**。`ppu.tick()` を 1 ピクセルずつ進める形にします
+2. **フレームレートを表示する**。実測の FPS を画面に出してください
+3. **PAL モードを実装する**。スキャンライン数と比率を切り替えられるようにします
+4. **コマ送りを実装する**。1 フレーム / 1 スキャンライン / 1 命令ずつ進められると、デバッグが劇的に楽になります
+5. **VBlank の残りサイクル数を表示する**。ゲームが VBlank をどれだけ使っているか可視化してください
+
+## 次回
+
+**コントローラ**です。ボタンの状態を 1 ビットずつ読み出す、独特な仕組みを実装します。ここまで来ると、**実際に操作できるようになります**。

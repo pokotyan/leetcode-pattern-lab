@@ -3,10 +3,416 @@ title: 音を鳴らす
 description: 矩形波、三角波、ノイズ。単純な波形の組み合わせで作られた音源
 track: nes
 order: 13
-status: planned
+status: published
 goal: ゲームの BGM と効果音が鳴る
 requires:
   - nes-12-mapper
+basedOn:
+  - kind: math
+    slug: series-estimation
+    why: 周期とサンプリングレートの関係。1 サンプルあたりの進み幅を割り算で決める場面が続く
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 5 つのチャンネル
+
+ファミコンの音源（APU）は、5 つの独立したチャンネルを持ちます。
+
+| チャンネル | 波形 | 主な用途 |
+| --- | --- | --- |
+| **矩形波 1** | 矩形波（デューティ比 4 種） | メロディ |
+| **矩形波 2** | 同上 | ハーモニー |
+| **三角波** | 三角波 | ベース |
+| **ノイズ** | 疑似乱数 | ドラム、効果音 |
+| **DMC** | 1 ビット PCM | サンプリング音声 |
+
+**それぞれが別の回路**で、同時に鳴らして混ぜます。
+
+「ファミコンの音」と呼ばれる独特の響きは、この構成から来ています。矩形波 2 本しかないので、和音が作れません。だから**高速にアルペジオを鳴らして和音に聞かせる**という技法が生まれました。
+
+## 矩形波
+
+最も基本的な波形です。**一定周期で 0 と 1 を切り替える**だけ。
+
+```
+ ┌──┐  ┌──┐  ┌──┐
+ │  │  │  │  │  │
+─┘  └──┘  └──┘  └──
+```
+
+**デューティ比**（1 になっている時間の割合）を 4 段階から選べます。
+
+| 設定 | デューティ比 | 8 ステップのパターン |
+| --- | --- | --- |
+| 0 | 12.5% | `0 1 0 0 0 0 0 0` |
+| 1 | 25% | `0 1 1 0 0 0 0 0` |
+| 2 | 50% | `0 1 1 1 1 0 0 0` |
+| 3 | 75%（25% の反転） | `1 0 0 1 1 1 1 1` |
+
+デューティ比が変わると**音色が変わります**。12.5% は細く鋭い音、50% は太く丸い音になります。
+
+```ts
+// src/nes/apu/pulse.ts
+const DUTY_TABLE = [
+  [0, 1, 0, 0, 0, 0, 0, 0],
+  [0, 1, 1, 0, 0, 0, 0, 0],
+  [0, 1, 1, 1, 1, 0, 0, 0],
+  [1, 0, 0, 1, 1, 1, 1, 1],
+]
+
+export class Pulse {
+  duty = 0
+  timerPeriod = 0       // 周期（小さいほど高い音）
+  private timer = 0
+  private step = 0
+  volume = 0
+  enabled = false
+
+  /** APU のクロックごとに呼ぶ */
+  tick() {
+    if (this.timer === 0) {
+      this.timer = this.timerPeriod
+      this.step = (this.step + 1) & 7        // 8 ステップで 1 周
+    } else {
+      this.timer--
+    }
+  }
+
+  output(): number {
+    if (!this.enabled || this.timerPeriod < 8) return 0    // 周期が短すぎると鳴らない
+    return DUTY_TABLE[this.duty]![this.step]! * this.volume
+  }
+}
+```
+
+<Callout type="note" title="周期が 8 未満だと鳴らない">
+  実機の仕様です。周期が短すぎると可聴域を超えるので、
+  ハードウェアが出力を止めます。
+
+  この制限を実装しないと、**本来無音のはずの場面でノイズが鳴ります**。
+</Callout>
+
+## 周波数の計算
+
+`timerPeriod` から実際の周波数を求めます。
+
+```
+周波数 = CPU周波数 ÷ (16 × (timerPeriod + 1))
+```
+
+たとえば A4（440Hz）を出したいなら、
+
+```
+timerPeriod = 1789773 ÷ (16 × 440) - 1 ≈ 253
+```
+
+**ゲームは音符ごとにこの値を表として持っています**。「ド」「レ」「ミ」に対応する `timerPeriod` の一覧です。
+
+## エンベロープとスイープ
+
+矩形波には、音を加工する仕組みが 2 つ付いています。
+
+**エンベロープ**：音量を時間とともに減衰させる。
+
+```ts
+tickEnvelope() {
+  if (this.envelopeStart) {
+    this.envelopeVolume = 15
+    this.envelopeCounter = this.envelopePeriod
+    this.envelopeStart = false
+    return
+  }
+  if (this.envelopeCounter > 0) { this.envelopeCounter--; return }
+
+  this.envelopeCounter = this.envelopePeriod
+  if (this.envelopeVolume > 0) this.envelopeVolume--
+  else if (this.envelopeLoop) this.envelopeVolume = 15
+}
+```
+
+減衰があるだけで、「ピー」という音が「ポン」という打楽器的な音になります。
+
+**スイープ**：周波数を時間とともに変化させる。
+
+上昇させれば「ヒュー」という上がり音、下降させれば効果音になります。**マリオのジャンプ音**がこれです。
+
+## 三角波
+
+```
+    /\    /\
+   /  \  /  \
+  /    \/    \
+```
+
+**音量の調整ができません。** 鳴っているか、いないかの 2 択です。
+
+出力は 32 段階（15 → 0 → 15 の往復）で、これが三角形を作ります。
+
+```ts
+const TRIANGLE_TABLE = [
+  15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+]
+```
+
+矩形波より柔らかい音になるので、**ベースラインに使われます**。
+
+<Callout type="tip" title="音量が変えられないことへの対処">
+  三角波の音量を下げたいとき、ゲームは**チャンネルを高速で止めたり鳴らしたりします**。
+  平均的な音量が下がって聞こえる、という仕組みです。
+
+  現代の PWM（パルス幅変調）と同じ発想です。
+  **制約に対して、時間方向の工夫で対処する**という定石です。
+</Callout>
+
+## ノイズ
+
+疑似乱数で 0 と 1 を切り替えます。ドラムや爆発音に使います。
+
+生成には **線形帰還シフトレジスタ**（LFSR）を使います。
+
+```ts
+export class Noise {
+  private shift = 1                // 0 にしてはいけない
+  mode = false                     // false = 長周期、true = 短周期
+
+  tick() {
+    const bit = this.mode ? 6 : 1
+    const feedback = (this.shift & 1) ^ ((this.shift >> bit) & 1)
+    this.shift = (this.shift >> 1) | (feedback << 14)
+  }
+
+  output(): number {
+    return (this.shift & 1) === 0 ? this.volume : 0
+  }
+}
+```
+
+**15 ビットのレジスタを、特定の 2 ビットの XOR で帰還させる**だけで、32767 周期の疑似乱数列ができます。
+
+モードを切り替えると周期が 93 に短くなり、**金属的な音**になります。同じ回路で 2 種類の音色が出せる、という工夫です。
+
+<Callout type="note" title="LFSR は暗号やテストにも使われる">
+  同じ仕組みが、疑似乱数生成、巡回冗長検査（CRC）、
+  通信の符号化（拡散符号）にも使われています。
+
+  **少ないゲート数で、長い周期の系列を作れる**という性質が共通して効いています。
+</Callout>
+
+## DMC
+
+1 ビットの PCM データを再生します。音声サンプルを鳴らせますが、**メモリを大量に消費する**ため、使うゲームは限られます。
+
+また、DMC が DMA でメモリを読むとき、**CPU が数サイクル止まります**。これが原因で、コントローラの読み取りが乱れるという有名な問題（DMC DMA によるコントローラ読み取りの破損）があります。
+
+## ミキシング
+
+5 チャンネルの出力を混ぜます。単純な足し算ではなく、**非線形**です。
+
+```ts
+export function mix(p1: number, p2: number, tri: number, noise: number, dmc: number): number {
+  const pulseOut = p1 + p2 === 0 ? 0 : 95.88 / (8128 / (p1 + p2) + 100)
+  const tndOut = (tri || noise || dmc) === 0 ? 0
+    : 159.79 / (1 / (tri / 8227 + noise / 12241 + dmc / 22638) + 100)
+  return pulseOut + tndOut
+}
+```
+
+**この式は実機のアナログ回路の測定値から導かれたもの**です。抵抗で混ぜているので、単純な加算にはなりません。
+
+線形加算でも音は出ますが、**音量バランスが実機と変わります**。
+
+## 出力する
+
+APU は 1.79MHz で動きますが、音声出力は 44.1kHz です。**約 40 サンプルに 1 つだけ取り出します**。
+
+```ts
+// src/nes/apu/apu.ts
+export class APU {
+  private sampleCounter = 0
+  private readonly cyclesPerSample = 1789773 / 44100      // ≈ 40.6
+  readonly buffer: number[] = []
+
+  tick() {
+    this.pulse1.tick()
+    this.pulse2.tick()
+    this.triangle.tick()
+    this.noise.tick()
+
+    this.sampleCounter++
+    if (this.sampleCounter >= this.cyclesPerSample) {
+      this.sampleCounter -= this.cyclesPerSample          // 端数を繰り越す
+      this.buffer.push(mix(
+        this.pulse1.output(), this.pulse2.output(),
+        this.triangle.output(), this.noise.output(), this.dmc.output(),
+      ))
+    }
+  }
+}
+```
+
+**端数の繰り越し**が、ここでも効いてきます。第 10 回のフレームタイミングと同じで、切り捨てると累積してピッチがずれます。
+
+ブラウザでは Web Audio API に流します。
+
+```ts
+const ctx = new AudioContext({ sampleRate: 44100 })
+const node = ctx.createScriptProcessor(2048, 0, 1)
+
+node.onaudioprocess = (e) => {
+  const out = e.outputBuffer.getChannelData(0)
+  for (let i = 0; i < out.length; i++) {
+    out[i] = apu.buffer.shift() ?? 0
+  }
+}
+node.connect(ctx.destination)
+```
+
+<Callout type="warn" title="バッファの管理が難しい">
+  エミュレータの生成速度と、音声出力の消費速度が一致しません。
+
+  - **バッファが空になる**：音が途切れる（ブツブツ鳴る）
+  - **バッファが溜まりすぎる**：音が遅れる
+
+  対策は、バッファの量を監視して、
+  **多すぎたら少し間引き、少なすぎたら少し引き伸ばす**という動的な調整です。
+  エミュレータの音声実装で、最も手間がかかる部分です。
+</Callout>
+
+## フレームカウンタ
+
+エンベロープやスイープを更新するタイミングを作る仕組みです。1 秒間に約 240 回（4 ステップモード）または 192 回（5 ステップモード）動きます。
+
+| ステップ | エンベロープ | 長さカウンタ / スイープ |
+| --- | --- | --- |
+| 1 | ○ | |
+| 2 | ○ | ○ |
+| 3 | ○ | |
+| 4 | ○ | ○（+ IRQ） |
+
+**4 ステップモードでは IRQ が発生します。** 音楽のテンポを取るために使うゲームがあります。
+
+## テストを書く
+
+```ts
+// src/nes/apu/apu.check.ts
+import { strict as assert } from 'node:assert'
+import { Pulse } from './pulse'
+import { Noise } from './noise'
+
+// 矩形波のデューティ比
+{
+  const p = new Pulse()
+  p.enabled = true
+  p.volume = 15
+  p.timerPeriod = 100
+  p.duty = 2                     // 50%
+
+  const samples: number[] = []
+  for (let i = 0; i < 8; i++) {
+    samples.push(p.output())
+    for (let j = 0; j <= 100; j++) p.tick()
+  }
+  const high = samples.filter((s) => s > 0).length
+  assert.equal(high, 4, 'デューティ 50% なら 8 ステップ中 4 つが高い')
+  console.log('ok   矩形波のデューティ比')
+}
+
+// 周期が短すぎると鳴らない
+{
+  const p = new Pulse()
+  p.enabled = true; p.volume = 15; p.timerPeriod = 7
+  assert.equal(p.output(), 0, '周期 8 未満は無音')
+  p.timerPeriod = 8
+  console.log('ok   周期の下限')
+}
+
+// ノイズの周期
+{
+  const n = new Noise()
+  n.mode = false
+  const start = (n as any).shift
+  let period = 0
+  do { n.tick(); period++ } while ((n as any).shift !== start && period < 40000)
+  assert.equal(period, 32767, '長周期モードは 32767')
+
+  const n2 = new Noise()
+  n2.mode = true
+  const start2 = (n2 as any).shift
+  let p2 = 0
+  do { n2.tick(); p2++ } while ((n2 as any).shift !== start2 && p2 < 1000)
+  assert.equal(p2, 93, '短周期モードは 93')
+  console.log('ok   LFSR の周期（32767 と 93）')
+}
+
+// エンベロープの減衰
+{
+  const p = new Pulse()
+  p.setEnvelope({ period: 0, loop: false })
+  p.startEnvelope()
+  p.tickEnvelope()
+  assert.equal(p.envelopeVolume, 15)
+  for (let i = 0; i < 15; i++) p.tickEnvelope()
+  assert.equal(p.envelopeVolume, 0, '15 ステップで 0 まで下がる')
+  p.tickEnvelope()
+  assert.equal(p.envelopeVolume, 0, 'ループしない設定では 0 のまま')
+  console.log('ok   エンベロープ')
+}
+
+console.log('\n全部通りました')
+```
+
+**LFSR の周期テストが効きます。** 32767 と 93 という具体的な数字は、実装が正しいときにしか出ません。ビット位置を 1 つ間違えただけで、まったく違う周期になります。
+
+## Track 3 を終えて
+
+```
+6502 コア → バス → 割り込み → nestest
+  ↓
+PPU（パターン → 背景 → スプライト）
+  ↓
+タイミング → 入力 → マッパー → APU
+```
+
+**市販のカートリッジが、自分の書いたコードの上で動いています。**
+
+<Callout type="tip" title="ここから先に進むなら">
+  | 方向 | 内容 |
+  | --- | --- |
+  | 精度 | サイクル単位の PPU、検証 ROM の全通過 |
+  | 対応範囲 | マッパーを増やす、PAL 対応 |
+  | 機能 | セーブステート、巻き戻し、ネット対戦 |
+  | 性能 | WebAssembly 化、動的再コンパイル |
+  | 別の機械 | ゲームボーイ、メガドライブ、PC-98 |
+
+  ゲームボーイは 6502 ではなく Z80 系ですが、
+  **構造は驚くほど似ています**。ここまで作った経験がそのまま使えます。
+</Callout>
+
+## 3 つのトラックを終えて
+
+```
+Track 1   NAND ひとつ → ゲート → ALU → CPU → コンピュータ → 6502 の回路
+Track 2   機械語 → アセンブラ → VM → コンパイラ → インタプリタ
+Track 3   6502 のエミュレーション → PPU → 実際のゲーム
+```
+
+Track 1 では**自分で設計し**、Track 2 では**その上に層を積み**、Track 3 では**他人が設計したものを再現しました**。
+
+設計する側と、再現する側の両方を経験すると、見え方が変わります。
+
+- 命令セットの形は、回路の都合で決まっている
+- 中間層を挟むと、問題が分割される
+- 仕様に書かれていない挙動が、事実上の仕様になる
+- 制約への対処が、そのまま作品の特徴になる
+
+**低レイヤに魔法はありませんでした。** 制約があり、それに対する判断があり、判断が積み重なって今の形になっている。それだけです。
+
+## 演習
+
+1. **矩形波 1 本でメロディを鳴らす**。音階の `timerPeriod` 表を作り、簡単な曲を再生してください
+2. **スイープでジャンプ音を作る**。周波数を上昇させるだけで、あの音になります
+3. **波形を可視化する**。生成したサンプルをグラフに描いてみてください
+4. **バッファの動的調整を実装する**。溜まり具合に応じて、生成速度を微調整します
+5. **DMC を実装する**。1 ビット PCM の再生と、CPU を止める挙動まで

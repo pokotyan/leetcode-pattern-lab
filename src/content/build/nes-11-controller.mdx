@@ -3,10 +3,329 @@ title: コントローラ入力
 description: ボタンの状態を 1 ビットずつ読み出す仕組みと、キーボードとの対応づけ
 track: nes
 order: 11
-status: planned
+status: published
 goal: キー入力でゲーム内のキャラクタが動く
 requires:
   - nes-10-timing
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 8 ビットを 1 本の線で送る
+
+コントローラには 8 つのボタンがあります。
+
+```
+A  B  Select  Start  ↑  ↓  ←  →
+```
+
+素直に考えれば 8 本の線を引けばよさそうですが、**実際には 1 本しかありません**。
+
+理由はコストです。コネクタのピン数を減らすと、コネクタもケーブルも安くなります。
+
+そこで、**8 回読み出して 1 ビットずつ取り出す**という方式が使われます。
+
+## シフトレジスタ
+
+コントローラの中には、8 ビットのシフトレジスタが入っています。
+
+```
+1. $4016 に 1 を書く    → 今のボタンの状態をレジスタに取り込む（ラッチ）
+2. $4016 に 0 を書く    → 取り込みを止める
+3. $4016 を読む         → 1 ビット目（A ボタン）が返る。レジスタが 1 つシフト
+4. $4016 を読む         → 2 ビット目（B ボタン）
+   ... 8 回繰り返す
+```
+
+**読むたびに状態が変わります。** 第 4 回で触れた「読み出しに副作用がある」領域です。
+
+```ts
+// src/nes/controller.ts
+export const BUTTON = {
+  A: 0, B: 1, SELECT: 2, START: 3,
+  UP: 4, DOWN: 5, LEFT: 6, RIGHT: 7,
+} as const
+
+export class Controller {
+  /** 現在押されているボタン。ビットが立っていれば押されている */
+  private buttons = 0
+  private shift = 0
+  private strobe = false
+
+  press(button: number) { this.buttons |= 1 << button }
+  release(button: number) { this.buttons &= ~(1 << button) }
+
+  write(value: number) {
+    this.strobe = (value & 1) !== 0
+    if (this.strobe) this.shift = this.buttons      // ラッチし続ける
+  }
+
+  read(): number {
+    if (this.strobe) {
+      // ストローブ中は、常に A ボタンの状態が返る
+      return this.buttons & 1
+    }
+    const bit = this.shift & 1
+    this.shift = (this.shift >> 1) | 0x80            // 上位に 1 を詰める
+    return bit
+  }
+}
+```
+
+<Callout type="warn" title="9 回目以降は 1 が返る">
+  8 回読み切った後も読み続けると、**すべて 1 が返ります**。
+  シフトの上位に 1 を詰めているのはそのためです。
+
+  これは「もうデータがない」ことを示すハードウェアの仕様で、
+  4 人プレイ用のアダプタがこれを利用して自分の存在を知らせます。
+
+  実装を省いても大半のゲームは動きますが、
+  一部のゲームは 9 回目以降の値を見ています。
+</Callout>
+
+## ゲーム側の読み出しコード
+
+典型的な形です。
+
+```asm
+ReadController:
+    LDA #$01
+    STA $4016        ; ラッチ
+    LDA #$00
+    STA $4016        ; ラッチ解除
+
+    LDX #$08
+Loop:
+    LDA $4016        ; 1 ビット読む
+    LSR A            ; bit0 を C フラグへ
+    ROL buttons      ; buttons を左シフトし、C を bit0 に入れる
+    DEX
+    BNE Loop
+    RTS
+```
+
+**`LSR` と `ROL` で 1 ビットずつ積み上げる**のが定石です。第 3 回で見た「ローテートは C フラグを 9 ビット目として使う」が、そのまま応用されています。
+
+## 上下同時入力
+
+**十字キーは、上下または左右を同時に押せてしまいます**。実機のハードウェアは電気的にそれを防いでいません。
+
+しかし、ゲームは同時押しを想定していません。想定外の挙動（壁抜けなど）が起きることがあります。
+
+エミュレータでは、**キーボードで簡単に同時押しできてしまう**ので、防ぐ実装を入れることがあります。
+
+```ts
+press(button: number) {
+  this.buttons |= 1 << button
+  // 上下・左右の同時押しを禁止する（任意）
+  if (button === BUTTON.UP) this.release(BUTTON.DOWN)
+  if (button === BUTTON.DOWN) this.release(BUTTON.UP)
+  if (button === BUTTON.LEFT) this.release(BUTTON.RIGHT)
+  if (button === BUTTON.RIGHT) this.release(BUTTON.LEFT)
+}
+```
+
+<Callout type="tip" title="どちらが正しいのか">
+  実機に忠実なら、同時押しを許すべきです。
+  遊びやすさを優先するなら、防ぐべきです。
+
+  **エミュレータには「忠実さ」と「使いやすさ」の対立が常にあります。**
+  設定で切り替えられるようにするのが、実用的な落としどころです。
+</Callout>
+
+## バスにつなぐ
+
+```ts
+// Bus の read / write に追加する
+read(addr: number): number {
+  ...
+  if (addr === 0x4016) return this.controller1.read() | 0x40   // 開放バスの影響
+  if (addr === 0x4017) return this.controller2.read() | 0x40
+  ...
+}
+
+write(addr: number, value: number) {
+  ...
+  if (addr === 0x4016) {
+    this.controller1.write(value)
+    this.controller2.write(value)      // 1 つの書き込みで両方に届く
+    return
+  }
+  ...
+}
+```
+
+**書き込みは 1 回で両方のコントローラに届きます。** 読み出しだけがアドレスで分かれます。
+
+`| 0x40` は、**未接続のビットが直前にバスに乗っていた値を返す**という現象（オープンバス）への対処です。`$4016` の上位ビットは何も駆動していないので、実機では直前の値が残ります。多くの場合 `$40` になります。
+
+## キーボードと対応づける
+
+```ts
+// src/nes/input.ts
+const KEY_MAP: Record<string, number> = {
+  'KeyZ': BUTTON.A,
+  'KeyX': BUTTON.B,
+  'ShiftRight': BUTTON.SELECT,
+  'Enter': BUTTON.START,
+  'ArrowUp': BUTTON.UP,
+  'ArrowDown': BUTTON.DOWN,
+  'ArrowLeft': BUTTON.LEFT,
+  'ArrowRight': BUTTON.RIGHT,
+}
+
+export function bindKeyboard(controller: Controller) {
+  window.addEventListener('keydown', (e) => {
+    const button = KEY_MAP[e.code]
+    if (button !== undefined) {
+      controller.press(button)
+      e.preventDefault()          // 矢印キーでページがスクロールしないように
+    }
+  })
+
+  window.addEventListener('keyup', (e) => {
+    const button = KEY_MAP[e.code]
+    if (button !== undefined) controller.release(button)
+  })
+}
+```
+
+**`e.code` を使う**のが要点です。`e.key` はキーボードのレイアウトによって変わりますが、`e.code` は物理的な位置を表すので、配列が違っても同じ位置のキーが使えます。
+
+## ゲームパッドにも対応する
+
+```ts
+export function pollGamepad(controller: Controller) {
+  const pads = navigator.getGamepads()
+  const pad = pads[0]
+  if (!pad) return
+
+  const set = (button: number, pressed: boolean) =>
+    pressed ? controller.press(button) : controller.release(button)
+
+  set(BUTTON.A, pad.buttons[0]!.pressed)
+  set(BUTTON.B, pad.buttons[1]!.pressed)
+  set(BUTTON.SELECT, pad.buttons[8]!.pressed)
+  set(BUTTON.START, pad.buttons[9]!.pressed)
+  set(BUTTON.UP, pad.buttons[12]!.pressed || pad.axes[1]! < -0.5)
+  set(BUTTON.DOWN, pad.buttons[13]!.pressed || pad.axes[1]! > 0.5)
+  set(BUTTON.LEFT, pad.buttons[14]!.pressed || pad.axes[0]! < -0.5)
+  set(BUTTON.RIGHT, pad.buttons[15]!.pressed || pad.axes[0]! > 0.5)
+}
+```
+
+**ゲームパッドはイベントではなくポーリングです。** 毎フレーム状態を読みに行きます。第 2 章で見た「ポーリングと割り込み」の、両方が同じアプリケーションに出てくる例です。
+
+## 遅延を減らす
+
+入力の遅延は、体感に直結します。減らす工夫です。
+
+**1. フレームの直前に読む。** イベントで受け取った状態を、`runFrame()` の直前に反映します。
+
+**2. 途中の入力を取りこぼさない。** 1 フレームの間にキーを押して離すと、`keydown` と `keyup` が両方処理され、押されていないことになります。「このフレーム中に押されたか」を別に記録しておくと取りこぼしません。
+
+```ts
+private pressedThisFrame = 0
+
+press(button: number) {
+  this.buttons |= 1 << button
+  this.pressedThisFrame |= 1 << button
+}
+
+/** フレームの開始時に呼ぶ */
+beginFrame() {
+  this.buttons |= this.pressedThisFrame
+  this.pressedThisFrame = 0
+}
+```
+
+## テストを書く
+
+```ts
+// src/nes/controller.check.ts
+import { strict as assert } from 'node:assert'
+import { BUTTON, Controller } from './controller'
+
+// 1 ビットずつ読める
+{
+  const c = new Controller()
+  c.press(BUTTON.A)
+  c.press(BUTTON.START)
+
+  c.write(1); c.write(0)          // ラッチ
+
+  assert.equal(c.read(), 1, '1 回目 = A')
+  assert.equal(c.read(), 0, '2 回目 = B')
+  assert.equal(c.read(), 0, '3 回目 = Select')
+  assert.equal(c.read(), 1, '4 回目 = Start')
+  assert.equal(c.read(), 0, '5 回目 = 上')
+  console.log('ok   ボタンの並び順')
+}
+
+// 9 回目以降は 1
+{
+  const c = new Controller()
+  c.write(1); c.write(0)
+  for (let i = 0; i < 8; i++) c.read()
+  assert.equal(c.read(), 1, '9 回目')
+  assert.equal(c.read(), 1, '10 回目')
+  console.log('ok   読み切った後は 1 が返る')
+}
+
+// ラッチしないと前の状態のまま
+{
+  const c = new Controller()
+  c.write(1); c.write(0)
+  c.press(BUTTON.A)                // ラッチ後に押した
+  assert.equal(c.read(), 0, 'ラッチ時点の状態が返る')
+
+  c.write(1); c.write(0)           // 改めてラッチ
+  assert.equal(c.read(), 1, '今度は押されている')
+  console.log('ok   ラッチのタイミング')
+}
+
+// ストローブ中は A の状態が返り続ける
+{
+  const c = new Controller()
+  c.write(1)                        // ストローブを立てたまま
+  assert.equal(c.read(), 0)
+  c.press(BUTTON.A)
+  assert.equal(c.read(), 1, 'ストローブ中は現在の A が返る')
+  assert.equal(c.read(), 1, '何度読んでも同じ')
+  console.log('ok   ストローブ中の挙動')
+}
+
+console.log('\n全部通りました')
+```
+
+## 動かしてみる
+
+ここまでできれば、**NROM のゲームは実際に遊べます**。
+
+```ts
+const nes = new NES(parseINes(romData))
+bindKeyboard(nes.controller1)
+
+function loop() {
+  nes.controller1.beginFrame()
+  pollGamepad(nes.controller1)
+  nes.runFrame()
+  ctx.putImageData(new ImageData(toRgba(nes.ppu.frame), 256, 240), 0, 0)
+  requestAnimationFrame(loop)
+}
+loop()
+```
+
+**自分で書いたコードの上で、市販のゲームが動く。** ここが Track 3 の最大の到達点です。
+
+## 演習
+
+1. **2 人目のコントローラを実装する**。`$4017` 側です
+2. **キーコンフィグを作る**。キーの割り当てを変更できるようにしてください
+3. **入力の記録と再生を作る**。毎フレームのボタン状態を記録すれば、プレイをそのまま再現できます（TAS の原理です）
+4. **連射機能を追加する**。一定フレームごとに自動で押し離しを繰り返します
+5. **入力遅延を測る**。ボタンを押してから画面が変わるまでのフレーム数を数えてください
+
+## 次回
+
+NROM のゲームは動くようになりましたが、**多くのゲームは動きません**。ROM の容量が足りないためです。次は、カートリッジ側でバンクを切り替える **マッパー** を実装します。

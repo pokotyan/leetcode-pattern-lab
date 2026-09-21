@@ -3,10 +3,358 @@ title: マッパー：容量の壁を越える
 description: ROM の容量が足りないとき、カートリッジ側が切り替えを担当する。代表的なマッパーを実装する
 track: nes
 order: 12
-status: planned
+status: published
 goal: 複数のマッパーに対応し、対応 ROM が動く
 requires:
   - nes-11-controller
+basedOn:
+  - kind: reading
+    slug: db-index
+    why: 限られた窓から大きなデータを見る。バンク切り替えは、ページング以前の最も素朴な解法
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 32KB の壁
+
+CPU から見えるカートリッジの領域は `$8000`〜`$FFFF` の **32KB** です。アドレスが 16 ビットしかないので、これ以上は見えません。
+
+しかし、ゲームは大きくなります。スーパーマリオ 3 は 384KB、ファイナルファンタジー 3 は 512KB あります。
+
+**どうやって 32KB の窓から 512KB を見るのか。**
+
+## 答え：窓を切り替える
+
+**カートリッジ側に回路を載せて、どの部分を窓に映すかを切り替えます**。
+
+```
+        カートリッジの ROM（512KB）
+  ┌────┬────┬────┬────┬────┬────┬────┬────┐
+  │ B0 │ B1 │ B2 │ B3 │ B4 │ B5 │ B6 │ B7 │ ...
+  └────┴────┴────┴────┴────┴────┴────┴────┘
+           ▲              ▲
+           │              │
+      ┌────┴────┐    ┌────┴────┐
+      │ $8000-  │    │ $C000-  │     CPU から見える 32KB
+      │  $BFFF  │    │  $FFFF  │
+      └─────────┘    └─────────┘
+```
+
+この切り替え回路を **マッパー** と呼びます。**ゲームごとに違うチップが載っています**。
+
+<Callout type="tip" title="これは仮想メモリの原始的な形">
+  第 4 章で読んだページングと、発想は同じです。
+
+  「限られたアドレス空間から、より大きな実体を参照する」という問題に対して、
+  **対応表を持って切り替える**という解を取っている。
+
+  違いは、切り替えを OS がやるか（ページング）、
+  カートリッジの回路がやるか（マッパー）だけです。
+  そして、マッパーには権限の検査も、プロセスの分離もありません。
+</Callout>
+
+## どうやって切り替えを指示するのか
+
+専用の命令はありません。**ROM の領域に「書き込む」**ことで指示します。
+
+```asm
+LDA #$03
+STA $8000      ; ROM のはずの場所に書き込む
+```
+
+ROM なので値は変わりません。しかし、**カートリッジの回路がその書き込みを検出し、バンクを切り替えます**。
+
+第 1 トラックで見たメモリマップド I/O と同じ仕組みです。「アドレスに意味を持たせる」という設計が、ここでも使われています。
+
+## マッパー 0：NROM
+
+切り替えなし。ROM が 16KB か 32KB のもの。
+
+```ts
+export class NROM implements Mapper {
+  constructor(private prg: Uint8Array, private chr: Uint8Array) {}
+
+  readPrg(addr: number): number {
+    return this.prg[(addr - 0x8000) % this.prg.length]!
+  }
+
+  writePrg() { /* 何もしない */ }
+
+  readChr(addr: number): number { return this.chr[addr & 0x1fff]! }
+  writeChr() { /* CHR ROM なら書けない */ }
+}
+```
+
+初期のゲーム（マリオブラザーズ、ドンキーコング、初代スーパーマリオ）がこれです。
+
+## マッパー 2：UxROM
+
+**最も単純な切り替え**です。全体の約 10% のゲームが使っています。
+
+```
+$8000〜$BFFF : 切り替え可能な 16KB バンク
+$C000〜$FFFF : 常に最後のバンク（固定）
+```
+
+**後半が固定なのが要点です。** リセットベクタと割り込みベクタは `$FFFA`〜`$FFFF` にあるので、ここが切り替わると起動できません。**必ず存在する場所**が必要です。
+
+```ts
+export class UxROM implements Mapper {
+  private bank = 0
+
+  constructor(private prg: Uint8Array, private chr: Uint8Array) {}
+
+  readPrg(addr: number): number {
+    if (addr < 0xc000) {
+      // 切り替え可能な前半
+      return this.prg[this.bank * 0x4000 + (addr - 0x8000)]!
+    }
+    // 固定の後半 = 最後のバンク
+    const lastBank = (this.prg.length >> 14) - 1
+    return this.prg[lastBank * 0x4000 + (addr - 0xc000)]!
+  }
+
+  writePrg(_addr: number, value: number) {
+    this.bank = value & 0x0f          // 書き込んだ値がバンク番号になる
+  }
+
+  readChr(addr: number): number { return this.chr[addr & 0x1fff]! }
+  writeChr(addr: number, value: number) { this.chr[addr & 0x1fff] = value }
+}
+```
+
+<Callout type="warn" title="バンク切り替えのコードは固定領域に置く">
+  もし切り替え可能な領域で `STA $8000` を実行すると、
+  **その次の命令が別のバンクから読まれます**。
+
+  ゲームは、切り替えの処理を固定領域（`$C000` 以降）に置くか、
+  切り替え後も同じ位置に同じコードがあるように配置します。
+
+  これは、第 4 章で読んだ「実行中のコードが載っているページをアンマップしてはいけない」
+  という制約の、最も直接的な形です。
+</Callout>
+
+## マッパー 1：MMC1
+
+より複雑です。全体の約 28% のゲームが使います（ゼルダの伝説、メトロイド、ファイナルファンタジー）。
+
+特徴は、**1 ビットずつ 5 回書き込んでレジスタを設定する**ことです。
+
+```
+書き込むデータの bit0 を、内部のシフトレジスタに 5 回積む
+5 回目で、書き込んだアドレスに応じたレジスタに反映される
+```
+
+```ts
+export class MMC1 implements Mapper {
+  private shift = 0x10          // bit4 に 1 を置いておき、5 回シフトで検出する
+  private control = 0x0c
+  private prgBank = 0
+  private chrBank0 = 0
+  private chrBank1 = 0
+
+  writePrg(addr: number, value: number) {
+    // bit7 が立っていたらリセット
+    if (value & 0x80) {
+      this.shift = 0x10
+      this.control |= 0x0c
+      return
+    }
+
+    const complete = (this.shift & 1) !== 0       // 最初に置いた 1 が降りてきた
+    this.shift = (this.shift >> 1) | ((value & 1) << 4)
+
+    if (complete) {
+      const data = this.shift & 0x1f   // ※ 実装によっては別途保持した値を使う
+      const reg = (addr >> 13) & 3
+      if (reg === 0) this.control = data
+      else if (reg === 1) this.chrBank0 = data
+      else if (reg === 2) this.chrBank1 = data
+      else this.prgBank = data
+      this.shift = 0x10
+    }
+  }
+}
+```
+
+**なぜ 1 ビットずつなのか。** チップのピン数を減らすためです。データバス全体を繋がず、1 本だけ接続すれば済みます。コントローラと同じ発想です。
+
+MMC1 はさらに、**ミラーリングの切り替え**もできます。ゲーム中に縦スクロールと横スクロールを切り替える、といったことが可能になります。
+
+<Callout type="note" title="連続書き込みの落とし穴">
+  `INC $8000` のような **read-modify-write 命令**は、
+  6502 の仕様上、**同じアドレスに 2 回書き込みます**（元の値と新しい値）。
+
+  MMC1 はこれを 2 回の書き込みとして受け取るので、シフトレジスタがずれます。
+  実機では、2 回目の書き込みが無視される仕組みがあります。
+
+  **こういう細部を再現しないと、特定のゲームだけが起動しません。**
+</Callout>
+
+## マッパー 4：MMC3
+
+最も高機能で、約 24% のゲームが使います（スーパーマリオ 3、ロックマン 3〜6）。
+
+主な機能です。
+
+| 機能 | 内容 |
+| --- | --- |
+| PRG バンク切り替え | 8KB 単位で 4 箇所 |
+| CHR バンク切り替え | 1KB / 2KB 単位で細かく |
+| **スキャンライン IRQ** | **指定したスキャンラインで割り込みを発生させる** |
+
+**スキャンライン IRQ が決定的に重要です。**
+
+これがあると、画面の途中で正確に割り込みをかけられます。スプライト 0 ヒットを使った画面分割よりも柔軟で、**複数箇所での分割**や、**任意のタイミングでのバンク切り替え**ができます。
+
+スーパーマリオ 3 のステータスバーが画面下部に固定されているのは、この機能によるものです。
+
+```ts
+/** PPU の A12 が 0→1 に変化するのを検出してカウントする */
+tickIrq() {
+  if (this.irqCounter === 0) {
+    this.irqCounter = this.irqLatch
+  } else {
+    this.irqCounter--
+  }
+  if (this.irqCounter === 0 && this.irqEnabled) {
+    this.irqPending = true
+  }
+}
+```
+
+**カウントのきっかけが「PPU のアドレス線 A12 の立ち上がり」**という、極めてハードウェア寄りの仕組みです。パターンテーブルの切り替え（`$0000` 側と `$1000` 側）がスキャンラインごとに起きることを利用しています。
+
+<Callout type="warn" title="ここはハードウェアを知らないと実装できない">
+  「スキャンラインごとに割り込む」という機能なのに、
+  実装は「PPU のアドレス線の変化を数える」です。
+
+  仕様書を読んでも意図が分かりません。
+  **回路図を見るか、実機の挙動を測るかしないと再現できない**部分です。
+
+  Track 1 で回路を組んだ経験が、こういう場面で効いてきます。
+</Callout>
+
+## 抽象化する
+
+マッパーごとに違う実装を、共通のインタフェースにまとめます。
+
+```ts
+// src/nes/mapper.ts
+export interface Mapper {
+  readPrg(addr: number): number
+  writePrg(addr: number, value: number): void
+  readChr(addr: number): number
+  writeChr(addr: number, value: number): void
+  mirroring(): 'horizontal' | 'vertical' | 'single0' | 'single1' | 'four'
+  /** スキャンラインごとに呼ばれる。IRQ を要求するなら true */
+  tickScanline?(): boolean
+}
+
+export function createMapper(rom: Rom): Mapper {
+  switch (rom.mapper) {
+    case 0: return new NROM(rom)
+    case 1: return new MMC1(rom)
+    case 2: return new UxROM(rom)
+    case 3: return new CNROM(rom)
+    case 4: return new MMC3(rom)
+    case 7: return new AxROM(rom)
+    default:
+      throw new Error(`未対応のマッパーです: ${rom.mapper}`)
+  }
+}
+```
+
+**この 6 種類で、市販ゲームの約 85% をカバーできます。**
+
+| マッパー | 名前 | 割合 | 代表作 |
+| --- | --- | --- | --- |
+| 1 | MMC1 | 28% | ゼルダの伝説、メトロイド |
+| 4 | MMC3 | 24% | スーパーマリオ 3、ロックマン 3 |
+| 0 | NROM | 10% | スーパーマリオ、ドンキーコング |
+| 2 | UxROM | 10% | 魂斗羅、キャッスルヴァニア |
+| 3 | CNROM | 6% | 初期の小規模作品 |
+| 7 | AxROM | 3% | バトルトード |
+
+<Callout type="tip" title="数字を知ってから優先順位を決める">
+  マッパーは 200 種類以上登録されています。全部を実装するのは非現実的です。
+
+  しかし、**上位 6 種類で 85%** です。
+  0 → 2 → 1 → 4 の順に実装すれば、労力に対して動くゲームの数が最も増えます。
+
+  第 8 章で読んだ「測ってから直す」と同じで、
+  **分布を知ってから優先順位を決める**のが効率的です。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/nes/mapper.check.ts
+import { strict as assert } from 'node:assert'
+
+// UxROM のバンク切り替え
+{
+  const prg = new Uint8Array(0x4000 * 4)      // 4 バンク（64KB）
+  for (let b = 0; b < 4; b++) prg[b * 0x4000] = 0xa0 + b   // 各バンクの先頭に目印
+
+  const m = new UxROM({ prg, chr: new Uint8Array(0x2000) })
+
+  assert.equal(m.readPrg(0x8000), 0xa0, '初期状態はバンク 0')
+  assert.equal(m.readPrg(0xc000), 0xa3, '後半は常に最後のバンク')
+
+  m.writePrg(0x8000, 2)
+  assert.equal(m.readPrg(0x8000), 0xa2, 'バンク 2 に切り替わった')
+  assert.equal(m.readPrg(0xc000), 0xa3, '後半は変わらない')
+  console.log('ok   UxROM のバンク切り替え')
+}
+
+// リセットベクタが常に読めること
+{
+  const prg = new Uint8Array(0x4000 * 4)
+  prg[0x4000 * 3 + 0x3ffc] = 0x00        // 最後のバンクの $FFFC
+  prg[0x4000 * 3 + 0x3ffd] = 0xc0
+
+  const m = new UxROM({ prg, chr: new Uint8Array(0x2000) })
+  for (const bank of [0, 1, 2, 3]) {
+    m.writePrg(0x8000, bank)
+    assert.equal(m.readPrg(0xfffc), 0x00, `バンク ${bank} でもベクタが読める`)
+    assert.equal(m.readPrg(0xfffd), 0xc0)
+  }
+  console.log('ok   どのバンクでもリセットベクタが読める')
+}
+
+// NROM の 16KB ミラーリング
+{
+  const prg = new Uint8Array(0x4000)
+  prg[0] = 0xaa
+  prg[0x3fff] = 0xbb
+  const m = new NROM({ prg, chr: new Uint8Array(0x2000) })
+
+  assert.equal(m.readPrg(0x8000), 0xaa)
+  assert.equal(m.readPrg(0xc000), 0xaa, '16KB ROM はミラーされる')
+  assert.equal(m.readPrg(0xffff), 0xbb)
+  console.log('ok   NROM のミラーリング')
+}
+
+// 未対応マッパーは明確に報告する
+{
+  assert.throws(() => createMapper({ mapper: 99 } as any), /未対応のマッパー/)
+  console.log('ok   未対応マッパーの報告')
+}
+
+console.log('\n全部通りました')
+```
+
+**「どのバンクでもリセットベクタが読める」テストが最重要です。** ここが壊れていると、ROM を読み込んだ瞬間に見当違いの場所へ飛び、原因不明で固まります。
+
+## 演習
+
+1. **CNROM（マッパー 3）を実装する**。CHR バンクだけを切り替える、最も単純なものです
+2. **MMC1 を実装する**。5 回書き込みのシフトレジスタと、ミラーリングの切り替えまで
+3. **対応マッパーの一覧を表示する**。ROM を読み込んだとき、対応していればその旨、していなければ番号を表示してください
+4. **バンク切り替えのログを取る**。いつ、どのバンクに切り替わったかを記録すると、挙動の理解に役立ちます
+5. **セーブデータに対応する**。`$6000`〜`$7FFF` の RAM を、ファイルに保存・復元してください
+
+## 次回
+
+**Track 3 の最終回**です。音を鳴らします。矩形波、三角波、ノイズ。単純な波形の組み合わせで、あの音が作られていた仕組みを見ます。
