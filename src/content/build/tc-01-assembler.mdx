@@ -3,10 +3,378 @@ title: アセンブラ：人が書ける機械語
 description: 記号を数値に置き換えるだけの変換器。ラベルの前方参照をどう解くかが唯一の難所
 track: toolchain
 order: 1
-status: planned
+status: published
 goal: アセンブリで書いたプログラムを機械語に変換し、自作 CPU で走らせられる
 requires:
   - hw-11-computer
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 記号からアドレスへの対応表。ハッシュテーブルの最も素直な使い方が、そのままシンボルテーブルになる
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 手で書くのは限界
+
+Track 1 の最後で、こういうものを手で書きました。
+
+```
+0000000000000000
+1111110000010000
+0000000000000001
+1111000010010000
+```
+
+読めません。1 ビット間違えても気づけません。命令を 1 つ挿入したら、**すべてのジャンプ先アドレスを計算し直す**必要があります。
+
+アセンブリならこう書けます。
+
+```asm
+@0
+D=M
+@1
+D=D+M
+```
+
+**この変換を自動化します。** それがアセンブラです。
+
+## 変換は 3 種類しかない
+
+アセンブラがやることは、突き詰めると 3 つです。
+
+| 入力 | 出力 |
+| --- | --- |
+| `@100` | `0` + 100 の 15 ビット表現 |
+| `D=D+M` | `111` + a + comp + dest + jump のビット列 |
+| `@LOOP` | `0` + **LOOP が何行目かを調べた結果** |
+
+最初の 2 つは**表を引くだけ**です。難しいのは 3 つめ、**記号（シンボル）の解決**です。
+
+## 前方参照という問題
+
+```asm
+@END        ; END はまだ出てきていない
+0;JMP
+...
+(END)       ; ここで初めて定義される
+```
+
+`@END` を読んだ時点では、`END` がどのアドレスかまだ分かりません。ファイルの先頭から順に変換していく方式では、この行を処理できません。
+
+解決策は 2 つあります。
+
+**1. 2 回読む（2 パス）。** 1 回目でラベルの位置だけを記録し、2 回目で実際に変換する。
+
+**2. 穴を空けておいて、後で埋める（バックパッチ）。** 未解決の場所を記録しておき、最後に埋める。
+
+アセンブラでは **2 パス** が単純で確実です。
+
+<Callout type="tip" title="この構造はあちこちに出てくる">
+  「先に全体を見てから、もう一度処理する」という 2 パスの構造は、
+  リンカ（第 5 章）、コンパイラの型検査、参照解決など、
+  **前方参照を許す仕組みすべて**に現れます。
+
+  逆に、1 パスで済ませたい場合は「使う前に宣言せよ」という規則を課します。
+  C のヘッダファイルや、Pascal の前方宣言がそれです。
+  **言語の規則は、処理系の都合から来ていることがあります。**
+</Callout>
+
+## シンボルの 3 種類
+
+`@xxx` の `xxx` には 3 通りあります。
+
+| 形 | 例 | 意味 |
+| --- | --- | --- |
+| 数値 | `@100` | そのまま 100 |
+| **ラベル** | `@LOOP` | `(LOOP)` がある**命令の位置** |
+| **変数** | `@counter` | 自動的に割り当てられる**RAM のアドレス** |
+
+ラベルと変数は、どちらも `@名前` の形で区別がつきません。**判定規則はこうです。**
+
+> `(名前)` として定義されていればラベル。そうでなければ変数。
+
+変数には、RAM の 16 番地から順に自動で割り当てます。0〜15 は予約済みだからです。
+
+```
+@i          ; 初出。16 番地を割り当てる
+@sum        ; 初出。17 番地
+@i          ; 既出。16 番地
+```
+
+<Callout type="note" title="定義済みシンボル">
+  最初から決まっているものがあります。
+
+  | 名前 | 値 | 用途 |
+  | --- | --- | --- |
+  | `R0`〜`R15` | 0〜15 | 汎用に使える RAM |
+  | `SP` | 0 | スタックポインタ（Track 2 の後半で使う） |
+  | `LCL` / `ARG` / `THIS` / `THAT` | 1〜4 | 関数呼び出し用 |
+  | `SCREEN` | 16384 | 画面の先頭 |
+  | `KBD` | 24576 | キーボード |
+
+  `@SCREEN` と書けば 16384 になります。数字を覚える必要がありません。
+</Callout>
+
+## 実装する
+
+### 表を用意する
+
+```ts
+// src/asm/tables.ts
+export const COMP: Record<string, string> = {
+  '0': '101010', '1': '111111', '-1': '111010',
+  'D': '001100', 'A': '110000',
+  '!D': '001101', '!A': '110001',
+  '-D': '001111', '-A': '110011',
+  'D+1': '011111', 'A+1': '110111',
+  'D-1': '001110', 'A-1': '110010',
+  'D+A': '000010', 'A+D': '000010',
+  'D-A': '010011', 'A-D': '000111',
+  'D&A': '000000', 'D|A': '010101',
+}
+
+export const DEST: Record<string, string> = {
+  '': '000', 'M': '001', 'D': '010', 'MD': '011',
+  'A': '100', 'AM': '101', 'AD': '110', 'AMD': '111',
+}
+
+export const JUMP: Record<string, string> = {
+  '': '000', 'JGT': '001', 'JEQ': '010', 'JGE': '011',
+  'JLT': '100', 'JNE': '101', 'JLE': '110', 'JMP': '111',
+}
+```
+
+**`COMP` に `M` が入っていない**ことに注目してください。`M` を含む式は、`M` を `A` に置き換えて同じ表を引き、`a` ビットを 1 にします。第 9 回で見た「A と M で cccccc が同じ」がここで効きます。
+
+### 前処理
+
+コメントと空白を落とします。
+
+```ts
+// src/asm/index.ts
+const clean = (source: string): string[] =>
+  source
+    .split('\n')
+    .map((line) => line.split('//')[0]!.trim())     // コメントを落とす
+    .filter((line) => line.length > 0)              // 空行を落とす
+```
+
+### 1 パス目：ラベルを集める
+
+```ts
+const collectLabels = (lines: string[], symbols: Record<string, number>) => {
+  let address = 0
+  for (const line of lines) {
+    if (line.startsWith('(')) {
+      symbols[line.slice(1, -1)] = address          // 次の命令の位置を指す
+    } else {
+      address++                                      // ラベルは命令ではないので数えない
+    }
+  }
+}
+```
+
+**ラベル行ではアドレスを increment しない**ことが要点です。ラベルは機械語を 1 語も生成しないので、位置を占めません。
+
+### 2 パス目：変換する
+
+```ts
+export function assemble(source: string): number[] {
+  const lines = clean(source)
+
+  const symbols: Record<string, number> = {
+    SP: 0, LCL: 1, ARG: 2, THIS: 3, THAT: 4,
+    SCREEN: 16384, KBD: 24576,
+  }
+  for (let i = 0; i < 16; i++) symbols[`R${i}`] = i
+
+  collectLabels(lines, symbols)
+
+  let nextVariable = 16
+  const output: number[] = []
+
+  for (const line of lines) {
+    if (line.startsWith('(')) continue              // ラベルは出力しない
+
+    if (line.startsWith('@')) {
+      const operand = line.slice(1)
+      let value: number
+      if (/^\d+$/.test(operand)) {
+        value = Number(operand)
+      } else {
+        if (!(operand in symbols)) symbols[operand] = nextVariable++
+        value = symbols[operand]!
+      }
+      output.push(value & 0x7fff)
+    } else {
+      output.push(encodeC(line))
+    }
+  }
+  return output
+}
+
+function encodeC(line: string): number {
+  let dest = '', jump = '', comp = line
+
+  if (comp.includes(';')) [comp, jump] = comp.split(';') as [string, string]
+  if (comp.includes('=')) [dest, comp] = comp.split('=') as [string, string]
+
+  comp = comp.trim()
+  const a = comp.includes('M') ? '1' : '0'
+  const c = COMP[comp.replace(/M/g, 'A')]
+  if (!c) throw new Error(`知らない計算式です: ${comp}`)
+
+  const d = DEST[dest.trim()]
+  if (!d) throw new Error(`知らない代入先です: ${dest}`)
+
+  const j = JUMP[jump.trim()]
+  if (!j) throw new Error(`知らないジャンプ条件です: ${jump}`)
+
+  return parseInt(`111${a}${c}${d}${j}`, 2)
+}
+```
+
+**100 行もありません。** アセンブラがコンパイラよりはるかに単純なのは、**構文解析が不要**だからです。1 行が 1 命令に対応し、文法に入れ子がありません。
+
+<Callout type="warn" title="エラーメッセージは行番号を出すべき">
+  上の実装は、どの行でエラーが起きたかを教えてくれません。
+  実際に書くときは、行番号と元のソース行を添えてください。
+
+  **変換器にとって、エラーメッセージの質は機能そのものです。**
+  これは次回以降のコンパイラで、さらに切実になります。
+</Callout>
+
+## 走らせる
+
+Track 1 で作ったコンピュータに、そのまま流し込めます。
+
+```ts
+// src/asm/asm.check.ts
+import { strict as assert } from 'node:assert'
+import { assemble } from './index'
+import { run } from '../run'
+
+const SOURCE = `
+// RAM[0] + RAM[1] を RAM[2] に入れる
+@0
+D=M
+@1
+D=D+M
+@2
+M=D
+(END)
+@END
+0;JMP
+`
+
+const program = assemble(SOURCE)
+
+// 手でアセンブルした結果と一致することを確かめる
+assert.deepEqual(program, [
+  0b0000000000000000,
+  0b1111110000010000,
+  0b0000000000000001,
+  0b1111000010010000,
+  0b0000000000000010,
+  0b1110001100001000,
+  0b0000000000000110,   // (END) は 6 番地
+  0b1110101010000111,
+])
+console.log('ok   手でアセンブルした結果と一致')
+
+const ram = run(program, { 0: 12, 1: 30 }, 100)
+assert.equal(ram[2], 42)
+console.log('ok   自作 CPU で走った: RAM[2] =', ram[2])
+```
+
+**`(END)` が 6 番地になっている**ことを確認してください。ラベル行が位置を占めないので、`@END` の位置がそのまま 6 です。
+
+## 変数とループを使う
+
+```ts
+const SUM = `
+// 1 から RAM[0] までの合計を RAM[1] に入れる
+@0
+D=M
+@n
+M=D            // n = RAM[0]
+@sum
+M=0
+
+(LOOP)
+@n
+D=M
+@END
+D;JLE          // n <= 0 なら終わり
+@sum
+D=M
+@n
+D=D+M          // D = sum + n
+@sum
+M=D
+@n
+M=M-1
+@LOOP
+0;JMP
+
+(END)
+@sum
+D=M
+@1
+M=D
+(HALT)
+@HALT
+0;JMP
+`
+
+for (const n of [1, 5, 10, 100]) {
+  const ram = run(assemble(SUM), { 0: n }, 20000)
+  assert.equal(ram[1], (n * (n + 1)) / 2, `1..${n} の合計`)
+}
+console.log('ok   変数とループ')
+
+// 変数が 16 番地から割り当てられていることを確かめる
+const prog = assemble('@foo\n@bar\n@foo\n')
+assert.deepEqual(prog, [16, 17, 16])
+console.log('ok   変数の自動割り当て')
+```
+
+**`@foo` が 2 回とも 16 になる**ことが、シンボルテーブルが機能している証拠です。
+
+## 逆アセンブラも書ける
+
+変換は一方向とは限りません。表を逆に引けば、機械語からアセンブリに戻せます。
+
+```ts
+export function disassemble(word: number): string {
+  const b = word.toString(2).padStart(16, '0')
+  if (b[0] === '0') return `@${parseInt(b.slice(1), 2)}`
+
+  const a = b[3]
+  const comp = Object.entries(COMP).find(([, v]) => v === b.slice(4, 10))?.[0] ?? '?'
+  const dest = Object.entries(DEST).find(([, v]) => v === b.slice(10, 13))?.[0] ?? '?'
+  const jump = Object.entries(JUMP).find(([, v]) => v === b.slice(13, 16))?.[0] ?? '?'
+
+  const expr = a === '1' ? comp.replace(/A/g, 'M') : comp
+  return (dest ? `${dest}=` : '') + expr + (jump ? `;${jump}` : '')
+}
+```
+
+**完全には戻りません。** シンボル名は機械語に残っていないので、`@END` は `@6` になります。**情報が落ちている**からです。
+
+第 5 章で読んだ「strip するとスタックトレースが読めなくなる」のと同じ理由です。デバッグ情報とは、この落ちた情報を別に保存したものです。
+
+## 演習
+
+1. **エラーに行番号を付ける**。知らない式に出会ったとき、何行目かを表示してください
+2. **逆アセンブラを完成させる**。プログラム全体を逆アセンブルし、元のソースと見比べてください
+3. **未使用のラベルを警告する**。定義されているが `@` で参照されていないラベルを検出します
+4. **マクロを実装する**。`PUSH D` と書いたら複数命令に展開される、という仕組みを足してください。プリプロセッサの最小版です
+5. **アセンブリで掛け算を書く**。`RAM[0] * RAM[1]` を `RAM[2]` に入れるプログラムを、アセンブラを使って書いてください
+
+## 次回
+
+アセンブリで書けるようになりましたが、まだ**レジスタを直接扱う**必要があります。`sum = sum + n` を書くのに 6 行かかりました。
+
+次は、**スタックマシン**という中間の層を挟みます。「値を積んで、演算して、結果を積む」というだけの単純な機械を定義すると、高級言語からの変換が劇的に楽になります。

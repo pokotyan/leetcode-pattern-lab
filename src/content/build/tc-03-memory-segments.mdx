@@ -3,10 +3,352 @@ title: 変数の置き場所を決める
 description: 局所変数、引数、静的変数、オブジェクトのフィールド。どれも結局はメモリ上の番地になる
 track: toolchain
 order: 3
-status: planned
+status: published
 goal: 8 種類のメモリセグメントを扱える VM 変換器が動く
 requires:
   - tc-02-stack-machine
+basedOn:
+  - kind: reading
+    slug: consistent-hashing
+    why: 「どこに置くか」を決める規則を、使う側が知らなくても済むようにする。層を分ける発想が共通する
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 変数はどこにあるのか
+
+高級言語ではこう書きます。
+
+```
+int sum = 0;        // 局所変数
+foo(a, b);          // 引数
+static int count;   // 静的変数
+this.x              // オブジェクトのフィールド
+arr[i]              // 配列の要素
+```
+
+見た目はどれも「変数」ですが、**寿命と置き場所が違います**。
+
+| 種類 | 寿命 | 置き場所 |
+| --- | --- | --- |
+| 局所変数 | 関数の呼び出しごと | スタックフレーム |
+| 引数 | 同上 | スタックフレーム（呼び出し側が置く） |
+| 静的変数 | プログラム全体 | 固定のアドレス |
+| フィールド | オブジェクトごと | ヒープ上のオブジェクト内 |
+
+VM のレベルでは、これらを **セグメント** として区別します。
+
+## 8 つのセグメント
+
+```
+push  <セグメント>  <番号>
+pop   <セグメント>  <番号>
+```
+
+| セグメント | 中身 | 実装 |
+| --- | --- | --- |
+| `constant` | 定数 | 番号そのものが値（pop できない） |
+| `local` | 局所変数 | `RAM[LCL + 番号]` |
+| `argument` | 引数 | `RAM[ARG + 番号]` |
+| `this` | オブジェクトのフィールド | `RAM[THIS + 番号]` |
+| `that` | 配列の要素 | `RAM[THAT + 番号]` |
+| `static` | 静的変数 | ファイルごとに固有のシンボル |
+| `temp` | 一時領域 | `RAM[5 + 番号]`（固定） |
+| `pointer` | `this` / `that` 自体 | `RAM[3 + 番号]`（固定） |
+
+**`LCL`、`ARG`、`THIS`、`THAT` は、それぞれ `RAM[1]`〜`RAM[4]` に入っているポインタ**です。
+
+```
+RAM[1] = LCL  = 400     → 局所変数は RAM[400] から並んでいる
+RAM[2] = ARG  = 380     → 引数は RAM[380] から
+RAM[3] = THIS = 3000    → オブジェクトは RAM[3000] から
+RAM[4] = THAT = 5000    → 配列は RAM[5000] から
+```
+
+<Callout type="tip" title="ポインタが固定アドレスに置いてある">
+  「変数の置き場所」を指すポインタ自体を、**固定の番地に置く**。
+  これで、どの関数からでも同じ方法でアクセスできます。
+
+  第 5 章で読んだスタックフレームと同じ構造です。
+  x86 の `rbp` がフレームの基準を指し、局所変数を `[rbp-8]` で参照するのと、
+  ここで `LCL + 0` を使うのは同じことです。
+  **違いは、基準がレジスタにあるかメモリにあるかだけ**です。
+</Callout>
+
+## 2 種類のセグメント
+
+実装の観点では、セグメントは 2 つに分かれます。
+
+**ポインタ経由**（`local` / `argument` / `this` / `that`）
+
+```
+実際のアドレス = RAM[基準ポインタ] + 番号
+```
+
+**固定アドレス**（`temp` / `pointer` / `static`）
+
+```
+実際のアドレス = 決まった値 + 番号
+```
+
+固定のほうが単純で、生成されるコードも短くなります。
+
+## push を実装する
+
+### ポインタ経由
+
+`push local 2` は「`RAM[LCL + 2]` の値を積む」です。
+
+```asm
+@LCL
+D=M          // D = LCL の値（基準アドレス）
+@2
+A=D+A        // A = LCL + 2
+D=M          // D = その中身
+@SP          // 以下、積む
+A=M
+M=D
+@SP
+M=M+1
+```
+
+`A=D+A` が要点です。**アドレスを計算して、そのアドレスに行く**。第 9 回で見た「A が値としてもアドレスとしても使える」がここで効いています。
+
+### 固定アドレス
+
+`push temp 3` は `RAM[8]` を積むだけです。
+
+```asm
+@8
+D=M
+@SP
+A=M
+M=D
+@SP
+M=M+1
+```
+
+アドレス計算が要らないので 2 命令短くなります。
+
+## pop を実装する
+
+pop は push より厄介です。**アドレスを計算してから値を取り出す**必要がありますが、計算に使える汎用レジスタが D しかありません。
+
+```
+1. アドレスを計算する    → D を使う
+2. スタックから値を取る   → D を使う（1 の結果が消える）
+```
+
+**衝突します。**
+
+解決策は、計算したアドレスを**どこかに退避する**ことです。`R13`〜`R15` が、この用途のために予約されています。
+
+```asm
+@LCL
+D=M
+@2
+D=D+A        // D = LCL + 2（書き込み先）
+@R13
+M=D          // R13 に退避
+
+@SP
+AM=M-1
+D=M          // D = 取り出した値
+
+@R13
+A=M          // A = 退避しておいた書き込み先
+M=D          // 書く
+```
+
+<Callout type="warn" title="レジスタが足りないという問題が、ここで初めて出てくる">
+  第 2 章で読んだ「コンパイラの最も難しい仕事はレジスタ割り当て」の、最小版です。
+
+  Hack には汎用レジスタが A と D の 2 本しかなく、A はアドレス指定に使われるので、
+  **自由に使えるのは実質 D だけ**。値を 2 つ同時に持てません。
+
+  だから RAM の一部を「レジスタの代わり」として使います。
+  これを**スピル**（あふれ）と呼びます。
+  実際のコンパイラも、レジスタが足りなくなると同じことをします。
+</Callout>
+
+## static の扱い
+
+静的変数は、**ファイルごとに別**でなければなりません。`Foo.vm` の `static 0` と `Bar.vm` の `static 0` は違う変数です。
+
+そこで、**シンボル名にファイル名を埋め込みます**。
+
+```asm
+@Foo.0       // Foo.vm の static 0
+```
+
+アセンブラは、知らないシンボルを見ると 16 番地から順に割り当てます（第 1 回）。だから、**静的変数の実際のアドレスはアセンブラが決めます**。VM トランスレータは名前を作るだけです。
+
+**層の分担がきれいに出ている箇所**です。VM トランスレータは「別の変数である」ことだけを保証し、「どこに置くか」はアセンブラに任せています。
+
+## pointer の意味
+
+`pointer 0` は `THIS` 自体、`pointer 1` は `THAT` 自体を指します。
+
+```
+pop pointer 0     →  THIS = スタックから取り出した値
+```
+
+つまり、**オブジェクトの先頭アドレスを設定する**操作です。
+
+```
+// obj.x = 5 に相当する VM コード
+push <obj のアドレス>
+pop pointer 0        // THIS = obj
+push constant 5
+pop this 0           // obj の 0 番目のフィールド = 5
+```
+
+配列も同じです。
+
+```
+// arr[3] = 7
+push <arr のアドレス>
+push constant 3
+add
+pop pointer 1        // THAT = arr + 3
+push constant 7
+pop that 0           // その場所に書く
+```
+
+<Callout type="note" title="配列アクセスが 2 段階になる理由">
+  `THAT` を設定してから `that 0` を使う、という 2 段構えです。
+  `that 3` と直接書けないのは、**添字が実行時に決まる**からです。
+
+  `arr[i]` の `i` は変数なので、命令の中に埋め込めません。
+  だから、アドレスを計算してポインタに入れ、そのポインタ経由で読み書きします。
+
+  機械語のレベルでも同じです。第 2 章で見た
+  `mov eax, [ebx+ecx*4]` は、この 2 段階を 1 命令にまとめたものです。
+</Callout>
+
+## 実装する
+
+```ts
+// src/vm/segments.ts
+const POINTER_SEG: Record<string, string> = {
+  local: 'LCL', argument: 'ARG', this: 'THIS', that: 'THAT',
+}
+
+export function pushCode(seg: string, index: string, className: string): string {
+  const PUSH_D = '@SP\nA=M\nM=D\n@SP\nM=M+1'
+
+  if (seg === 'constant') return `@${index}\nD=A\n${PUSH_D}`
+  if (seg in POINTER_SEG) return `@${POINTER_SEG[seg]}\nD=M\n@${index}\nA=D+A\nD=M\n${PUSH_D}`
+  if (seg === 'temp') return `@${5 + Number(index)}\nD=M\n${PUSH_D}`
+  if (seg === 'pointer') return `@${3 + Number(index)}\nD=M\n${PUSH_D}`
+  if (seg === 'static') return `@${className}.${index}\nD=M\n${PUSH_D}`
+  throw new Error(`知らないセグメント: ${seg}`)
+}
+
+export function popCode(seg: string, index: string, className: string): string {
+  const POP_D = '@SP\nAM=M-1\nD=M'
+
+  if (seg in POINTER_SEG) {
+    return [
+      `@${POINTER_SEG[seg]}`, 'D=M', `@${index}`, 'D=D+A',
+      '@R13', 'M=D',                    // 書き込み先を退避
+      POP_D,
+      '@R13', 'A=M', 'M=D',
+    ].join('\n')
+  }
+  if (seg === 'temp') return `${POP_D}\n@${5 + Number(index)}\nM=D`
+  if (seg === 'pointer') return `${POP_D}\n@${3 + Number(index)}\nM=D`
+  if (seg === 'static') return `${POP_D}\n@${className}.${index}\nM=D`
+  if (seg === 'constant') throw new Error('constant には pop できません')
+  throw new Error(`知らないセグメント: ${seg}`)
+}
+```
+
+## テストを書く
+
+セグメントのテストでは、**実際に書かれた RAM の番地**を確認します。
+
+```ts
+// src/vm/segments.check.ts
+import { strict as assert } from 'node:assert'
+import { assemble } from '../asm/index'
+import { run } from '../run'
+import { translate } from './translate'
+
+/** LCL などを好きな値に設定してから VM コードを走らせる */
+function runWith(setup: Record<string, number>, vmCode: string) {
+  const init = Object.entries(setup)
+    .map(([sym, v]) => `@${v}\nD=A\n@${sym}\nM=D`)
+    .join('\n')
+  const asm = [init, translate(vmCode.split('\n')), '(HALT)', '@HALT', '0;JMP'].join('\n')
+  return run(assemble(asm), {}, 200000)
+}
+
+// temp は RAM[5] から
+{
+  const ram = runWith({ SP: 256 }, 'push constant 42\npop temp 0')
+  assert.equal(ram[5], 42, 'temp 0 は RAM[5]')
+}
+{
+  const ram = runWith({ SP: 256 }, 'push constant 7\npop temp 3')
+  assert.equal(ram[8], 7, 'temp 3 は RAM[8]')
+}
+console.log('ok   temp')
+
+// local は LCL 経由
+{
+  const ram = runWith({ SP: 256, LCL: 300 }, 'push constant 42\npop local 0')
+  assert.equal(ram[300], 42, 'local 0 は RAM[LCL+0]')
+}
+{
+  const ram = runWith({ SP: 256, LCL: 300 }, 'push constant 99\npop local 5')
+  assert.equal(ram[305], 99, 'local 5 は RAM[LCL+5]')
+}
+console.log('ok   local')
+
+// 書いたものが読み戻せる
+{
+  const ram = runWith({ SP: 256, LCL: 300, ARG: 400 }, `
+push constant 10
+pop local 0
+push constant 32
+pop argument 2
+push local 0
+push argument 2
+add
+`)
+  assert.equal(ram[300], 10)
+  assert.equal(ram[402], 32)
+  assert.equal(ram[ram[0]! - 1], 42, '読み戻して足すと 42')
+}
+console.log('ok   push と pop が対応している')
+
+// pointer を設定して this 経由で書く
+{
+  const ram = runWith({ SP: 256 }, `
+push constant 3000
+pop pointer 0
+push constant 55
+pop this 2
+`)
+  assert.equal(ram[3], 3000, 'pointer 0 は THIS 自体')
+  assert.equal(ram[3002], 55, 'this 2 は RAM[THIS+2]')
+}
+console.log('ok   pointer と this')
+
+console.log('\n全部通りました')
+```
+
+**`pop local 5` が `RAM[305]` に書かれることを確認する**のが要点です。オフセットの計算を間違えると、隣の変数を壊します。そして、そのバグは「1 つの変数しか使わないテスト」では見つかりません。
+
+## 演習
+
+1. **`pop constant 0` がエラーになることを確かめる**。定数には書き込めません
+2. **`R13` の代わりに `R14` を使ってみる**。どちらでも動くはずです。**なぜ 3 本も予約されているのか**考えてください
+3. **static が別ファイルで衝突しないことを確かめる**。`className` を変えて 2 回変換し、生成されたシンボルが違うことを確認します
+4. **生成コードの長さを比べる**。`push temp 0` と `push local 0` で、命令数がどれだけ違うか数えてください
+5. **配列アクセスを VM コードで書く**。`arr[i] = arr[j] + 1` に相当するコードを、`that` と `pointer` で書いてください
+
+## 次回
+
+**関数呼び出し**です。呼び出すとき、引数をどこに置き、戻り先をどう覚え、呼ばれた側の局所変数をどこに作るか。第 5 章で読んだスタックフレームを、今度は**自分で組み立てます**。

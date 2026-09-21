@@ -3,10 +3,386 @@ title: 関数呼び出しとコールスタック
 description: 戻り先、引数、局所変数。呼び出しのたびに積まれるものの正体を、自分で積んで確かめる
 track: toolchain
 order: 4
-status: planned
+status: published
 goal: 再帰関数が正しく動き、スタックの中身を 1 フレームずつ説明できる
 requires:
   - tc-03-memory-segments
+basedOn:
+  - kind: article
+    slug: stack-basics
+    why: 呼び出しの入れ子が、そのままスタックの深さになる。後入れ先出しが必然である理由が見える
+  - kind: article
+    slug: backtracking
+    why: 再帰の各段が独立した状態を持つ。その「各段」が、ここで組み立てるフレームそのもの
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 何を覚えておく必要があるか
+
+`f()` が `g()` を呼ぶとき、`g` が終わったら `f` の続きに戻らなければなりません。そのために覚えておくべきものは、
+
+1. **戻り先のアドレス**
+2. **`f` の局所変数の位置**（`LCL`）
+3. **`f` の引数の位置**（`ARG`）
+4. **`f` の `THIS` / `THAT`**
+
+そして `g` が終わったら、これらを元に戻します。
+
+呼び出しが入れ子になれば、この記録も入れ子になります。**最後に呼んだものが最初に戻る**ので、スタックが適切です。これが **コールスタック** です。
+
+## フレームの形
+
+呼び出し中のスタックの様子です。
+
+```
+        ┌─────────────────┐
+        │  呼び出し元のもの   │
+        ├─────────────────┤
+ ARG ──▶│  引数 0           │
+        │  引数 1           │
+        │  ...             │
+        ├─────────────────┤
+        │  戻り先アドレス     │
+        │  保存した LCL      │
+        │  保存した ARG      │  ← このまとまりを「保存領域」と呼ぶ
+        │  保存した THIS     │
+        │  保存した THAT     │
+        ├─────────────────┤
+ LCL ──▶│  局所変数 0        │
+        │  局所変数 1        │
+        ├─────────────────┤
+  SP ──▶│  （作業用スタック）  │
+        │                 │
+        └─────────────────┘
+```
+
+**引数が保存領域より下（先に積まれる）**ことが重要です。呼び出す側が先に引数を積み、それから保存領域を積むからです。
+
+<Callout type="tip" title="ARG の求め方">
+  引数は保存領域の下にあります。保存領域は 5 語（戻り先 + 4 つのポインタ）なので、
+
+```
+ARG = SP - 5 - 引数の個数
+```
+  呼び出し側が、保存領域を積み終わった時点でこれを計算します。
+  **引数の個数を知っているのは呼び出し側だけ**なので、ここでやるしかありません。
+</Callout>
+
+## call の手順
+
+`call f n`（引数 n 個で f を呼ぶ）を展開します。**呼び出し側の処理**です。
+
+```
+1. 戻り先アドレス（ラベル）を積む
+2. LCL を積む
+3. ARG を積む
+4. THIS を積む
+5. THAT を積む
+6. ARG = SP - 5 - n
+7. LCL = SP
+8. f へジャンプ
+9. (戻り先ラベル)
+```
+
+アセンブリにするとこうなります。
+
+```asm
+@RET_0
+D=A
+@SP
+A=M
+M=D
+@SP
+M=M+1            // 戻り先を積む
+
+@LCL             // 以下、4 つのポインタを同じ形で積む
+D=M
+@SP
+A=M
+M=D
+@SP
+M=M+1
+... （ARG, THIS, THAT も同様）
+
+@SP
+D=M
+@5
+D=D-A
+@n
+D=D-A
+@ARG
+M=D              // ARG = SP - 5 - n
+
+@SP
+D=M
+@LCL
+M=D              // LCL = SP
+
+@f
+0;JMP
+
+(RET_0)
+```
+
+**1 つの `call` が、50 命令ほどに展開されます。**
+
+<Callout type="warn" title="関数呼び出しは安くない">
+  第 6 章で「システムコールは関数呼び出しの 100 倍」と書きましたが、
+  その関数呼び出し自体も、**単純な計算の数十倍**のコストがあります。
+
+  実際の CPU では、引数をレジスタで渡すことでこれを大幅に削減しています
+  （第 5 章の呼び出し規約）。それでも、インライン展開が有効な最適化であり続けるのは、
+  この定型処理を丸ごと消せるからです。
+</Callout>
+
+## function の手順
+
+**呼ばれた側**が最初にすることです。
+
+```
+1. (関数名) ラベルを置く
+2. 局所変数の個数ぶん、0 を積む
+```
+
+```asm
+(f)
+@SP
+A=M
+M=0
+@SP
+M=M+1        // 局所変数 1 個ぶん
+... （個数ぶん繰り返す）
+```
+
+**局所変数は 0 で初期化されます。** `LCL` はすでに呼び出し側が設定済みなので、ここで積んだものがそのまま `local 0`、`local 1` になります。
+
+## return の手順
+
+最も複雑です。**スタックを巻き戻しながら、保存したものを復元します。**
+
+```
+1. FRAME = LCL              （作業用に退避）
+2. RET = RAM[FRAME - 5]     （戻り先アドレスを先に取り出す）
+3. RAM[ARG] = pop()         （戻り値を引数 0 の位置に置く）
+4. SP = ARG + 1
+5. THAT = RAM[FRAME - 1]
+6. THIS = RAM[FRAME - 2]
+7. ARG  = RAM[FRAME - 3]
+8. LCL  = RAM[FRAME - 4]
+9. RET へジャンプ
+```
+
+<Callout type="warn" title="手順 2 を手順 3 より先にやる理由">
+  引数が 0 個の関数では、`ARG` が保存領域の先頭（戻り先アドレスの位置）と一致します。
+  すると手順 3 で戻り値を書いたときに、**戻り先アドレスを上書きしてしまいます**。
+
+  だから、**先に戻り先を別の場所に退避しておく**必要があります。
+  この順序を間違えると、「引数のある関数は動くが、引数のない関数だけが暴走する」
+  という症状になります。
+
+  実際に踏みやすい落とし穴です。
+</Callout>
+
+**戻り値を `RAM[ARG]` に置く**のも要点です。呼び出し側から見ると、積んだ引数の一番下の位置です。`SP = ARG + 1` とすることで、**引数が消えて戻り値だけが残った**状態になります。
+
+```
+呼び出し前:  [... , 引数0, 引数1]
+戻った後:    [... , 戻り値]
+```
+
+## 実装する
+
+```ts
+// src/vm/function.ts
+const PUSH_D = '@SP\nA=M\nM=D\n@SP\nM=M+1'
+const POP_D = '@SP\nAM=M-1\nD=M'
+
+let callCounter = 0
+
+export function callCode(fnName: string, argCount: string): string {
+  const ret = `RET_${callCounter++}`
+  const saves = ['LCL', 'ARG', 'THIS', 'THAT']
+    .map((s) => `@${s}\nD=M\n${PUSH_D}`)
+    .join('\n')
+
+  return [
+    `@${ret}`, 'D=A', PUSH_D,           // 戻り先
+    saves,                               // 4 つのポインタ
+    '@SP', 'D=M', `@${5 + Number(argCount)}`, 'D=D-A', '@ARG', 'M=D',
+    '@SP', 'D=M', '@LCL', 'M=D',
+    `@${fnName}`, '0;JMP',
+    `(${ret})`,
+  ].join('\n')
+}
+
+export function functionCode(fnName: string, localCount: string): string {
+  const locals = Array.from({ length: Number(localCount) }, () => `@0\nD=A\n${PUSH_D}`)
+  return [`(${fnName})`, ...locals].join('\n')
+}
+
+export function returnCode(): string {
+  const restore = ['THAT', 'THIS', 'ARG', 'LCL'].map(
+    (sym, i) => `@R13\nD=M\n@${i + 1}\nA=D-A\nD=M\n@${sym}\nM=D`,
+  )
+
+  return [
+    '@LCL', 'D=M', '@R13', 'M=D',                    // FRAME = LCL
+    '@5', 'A=D-A', 'D=M', '@R14', 'M=D',             // RET = RAM[FRAME-5]
+    POP_D, '@ARG', 'A=M', 'M=D',                     // RAM[ARG] = 戻り値
+    '@ARG', 'D=M+1', '@SP', 'M=D',                   // SP = ARG + 1
+    ...restore,
+    '@R14', 'A=M', '0;JMP',                          // 戻る
+  ].join('\n')
+}
+```
+
+`@5 / A=D-A` の時点で `D` にはまだ `LCL` の値が入っているので、`A = LCL - 5` になります。**直前の `D=M` を使い回している**、という細かい節約です。
+
+## 分岐命令も追加する
+
+関数の中でループを書くには、ラベルとジャンプが要ります。
+
+```ts
+export function labelCode(fn: string, label: string) { return `(${fn}$${label})` }
+export function gotoCode(fn: string, label: string) { return `@${fn}$${label}\n0;JMP` }
+export function ifGotoCode(fn: string, label: string) {
+  return `${POP_D}\n@${fn}$${label}\nD;JNE`
+}
+```
+
+**ラベルに関数名を接頭辞として付けます。** 別の関数で同じラベル名を使っても衝突しません。
+
+`if-goto` は「スタックから取り出した値が 0 でなければ飛ぶ」です。第 2 回で真を -1 にしたので、**真ならジャンプ**します。
+
+## ブートストラップ
+
+最初に実行されるコードです。
+
+```asm
+@256
+D=A
+@SP
+M=D              // SP = 256
+（call Main.main 0 の展開）
+(HALT)
+@HALT
+0;JMP
+```
+
+第 8 章で読んだ起動シーケンスと同じ構造です。**最初の 1 行がどこから始まるかを決め、最初の関数を呼ぶ。**
+
+## 走らせる
+
+```ts
+// src/vm/function.check.ts
+import { strict as assert } from 'node:assert'
+import { assemble } from '../asm/index'
+import { run } from '../run'
+import { translate } from './translate'
+
+function runProgram(functions: string, cycles = 5_000_000): number {
+  const asm = [
+    '@256', 'D=A', '@SP', 'M=D',
+    translate(['call Main.main 0']),
+    '(HALT)', '@HALT', '0;JMP',
+    translate(functions.split('\n')),
+  ].join('\n')
+  const ram = run(assemble(asm), {}, cycles)
+  return ram[ram[0]! - 1]!
+}
+
+// 引数を足して返すだけ
+assert.equal(runProgram(`
+function Main.main 0
+push constant 3
+push constant 4
+call Main.add 2
+return
+function Main.add 0
+push argument 0
+push argument 1
+add
+return
+`), 7)
+console.log('ok   関数呼び出しと return')
+
+// 再帰：階乗
+assert.equal(runProgram(`
+function Main.main 0
+push constant 5
+call Main.fact 1
+return
+
+function Main.fact 0
+push argument 0
+push constant 1
+gt
+if-goto REC
+push constant 1
+return
+label REC
+push argument 0
+push argument 0
+push constant 1
+sub
+call Main.fact 1
+call Main.mul 2
+return
+
+function Main.mul 2
+push constant 0
+pop local 0
+push argument 1
+pop local 1
+label LOOP
+push local 1
+push constant 0
+gt
+if-goto BODY
+push local 0
+return
+label BODY
+push local 0
+push argument 0
+add
+pop local 0
+push local 1
+push constant 1
+sub
+pop local 1
+goto LOOP
+`), 120)
+console.log('ok   再帰（5! = 120）')
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/vm/function.check.ts
+```
+
+**5! = 120 が、NAND から組んだ CPU の上で計算されました。**
+
+再帰が動くということは、フレームの積み方と巻き戻し方が正しいということです。1 箇所でも間違っていれば、深い再帰のどこかで必ず壊れます。
+
+<Callout type="note" title="スタックオーバーフローもここで起きる">
+  再帰が深くなると、フレームがどんどん積まれます。
+  Hack の RAM は 16K 語なので、数百段も再帰すれば画面領域に到達します。
+
+  **境界を検査する仕組みがありません。** 第 4 章で読んだ
+  「MMU がガードページを置いて検出する」ような仕組みは、このコンピュータにはありません。
+  黙って別の領域を壊します。
+</Callout>
+
+## 演習
+
+1. **スタックの中身を表示する**。実行を途中で止めて、`RAM[256]` から `SP` までを表示し、フレームの境界を目で確認してください
+2. **`return` の手順 2 と 3 を入れ替える**。引数 0 個の関数がどう壊れるか観察してください
+3. **相互再帰を書く**。`isEven` と `isOdd` が互いを呼ぶ形です
+4. **呼び出しのコストを測る**。`Main.add` を呼ぶのに何サイクルかかるか数え、インライン展開した場合と比べてください
+5. **フィボナッチ数列を書く**。再帰版と繰り返し版の両方を書き、サイクル数を比べてください
+
+## 次回
+
+ここまでで、VM のコードは手で書いていました。次からは、**それを自動生成する**側に回ります。まずは高級言語のソースコードを、意味のある単位に切り分けるところから始めます。

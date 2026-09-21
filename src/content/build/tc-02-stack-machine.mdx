@@ -3,10 +3,344 @@ title: スタックマシンという中間地点
 description: 高級言語と機械語の間に、計算をスタックだけで表す層を挟む。なぜ挟むと楽になるのか
 track: toolchain
 order: 2
-status: planned
+status: published
 goal: 算術・論理命令だけの VM 変換器が動き、出力が CPU 上で正しい答えを出す
 requires:
   - tc-01-assembler
+basedOn:
+  - kind: article
+    slug: stack-basics
+    why: 後入れ先出しという性質だけで式の評価ができる。その仕組みがそのまま機械の設計になる
+  - kind: article
+    slug: monotonic-stack
+    why: スタックに積んで畳む、という操作の型。VM の演算命令はこれを機械語に落としたもの
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## なぜ直接コンパイルしないのか
+
+`(a + b) * (c - d)` を機械語にしたい。直接やろうとすると、こういう問題にぶつかります。
+
+- 中間結果をどのレジスタに置くか
+- レジスタが足りなくなったらどこに退避するか
+- 式が深く入れ子になったらどうするか
+
+**レジスタの管理が、式の構造と絡み合います。** しかも、対象の CPU が変わればレジスタの本数も変わり、全部やり直しです。
+
+そこで、**間に 1 枚挟みます**。
+
+```
+高級言語  ──▶  スタックマシンの命令  ──▶  機械語
+          (1)                      (2)
+```
+
+(1) は「式をスタック操作に直す」だけ。レジスタのことを一切考えません。
+(2) は「スタック操作を機械語に直す」だけ。式の構造を一切考えません。
+
+**問題が 2 つに分かれ、それぞれが単純になりました。**
+
+<Callout type="tip" title="これは一般的な手法">
+  | システム | 中間層 |
+  | --- | --- |
+  | Java | JVM バイトコード |
+  | .NET | CIL |
+  | Python | バイトコード（`.pyc`） |
+  | WebAssembly | Wasm 自体がスタックマシン |
+  | LLVM を使う言語 | LLVM IR（こちらはレジスタ型） |
+
+  中間層を挟むと、**言語が m 個、CPU が n 個あるとき、必要な変換器が m×n から m+n に減ります**。
+  これが、中間表現を置く最大の実利です。
+</Callout>
+
+## スタックマシンの動き
+
+命令は 2 種類だけです。
+
+- **積む**（push）：値をスタックの先端に置く
+- **演算する**（add など）：先端から必要な数だけ取り出し、計算して、結果を積む
+
+`(3 + 4) * 5` を計算してみます。
+
+```
+push 3        スタック: [3]
+push 4        スタック: [3, 4]
+add           スタック: [7]           ← 4 と 3 を取り出し、7 を積む
+push 5        スタック: [7, 5]
+mul           スタック: [35]
+```
+
+**最後に残った 1 個が答えです。**
+
+ここには変数もレジスタも出てきません。**値の置き場所を考える必要がない**。これがスタックマシンの利点です。
+
+<Callout type="note" title="逆ポーランド記法">
+  `push 3 / push 4 / add` は、`3 4 +` と書くのと同じです。
+  演算子を後ろに置くこの記法を**逆ポーランド記法**と呼びます。
+
+  括弧が要らないのが特徴です。`(3+4)*5` は `3 4 + 5 *`、
+  `3+(4*5)` は `3 4 5 * +`。**順序だけで構造が決まります。**
+
+  第 4 回で作る構文解析は、逆に「括弧つきの式から、この順序を導く」処理になります。
+</Callout>
+
+## 命令セットを決める
+
+この回で扱うのは、算術と論理だけです。
+
+| 命令 | 動作 |
+| --- | --- |
+| `push constant n` | 定数 n を積む |
+| `add` | 上の 2 つを足す |
+| `sub` | 下から上を引く（`y - x` ではなく `x - y`） |
+| `neg` | 上の 1 つの符号を反転 |
+| `eq` / `gt` / `lt` | 比較。真なら **-1**、偽なら **0** を積む |
+| `and` / `or` | ビット演算 |
+| `not` | ビット反転 |
+
+<Callout type="warn" title="真を -1 で表す">
+  `true` が 1 ではなく **-1**（全ビット 1）なのには理由があります。
+
+  `not` がそのままビット反転として使えるからです。
+  1 を反転すると -2 になってしまいますが、-1 を反転すると 0 になります。
+  **論理演算とビット演算を同じ命令で兼用できます。**
+
+  第 1 章で見た 2 の補数の性質が、ここでも効いています。
+</Callout>
+
+## スタックをメモリ上に作る
+
+CPU にはスタック用の特別な機構がありません。**RAM の一部をスタックとして使います**。
+
+- `RAM[0]`（`SP`）に、**スタックの先端の「次」のアドレス**を入れておく
+- スタックは `RAM[256]` から上へ伸びる
+
+```
+RAM[0]  = 258      ← SP
+RAM[256] = 7       ← スタックの中身
+RAM[257] = 5       ← 先端
+RAM[258] = ?       ← SP が指す場所（まだ空）
+```
+
+`SP` が「次に書く場所」を指すので、
+
+- **積む**：`RAM[SP] = 値` してから `SP++`
+- **取り出す**：`SP--` してから `RAM[SP]` を読む
+
+## アセンブリに変換する
+
+### push constant n
+
+```asm
+@n
+D=A          // D = n
+@SP
+A=M          // A = SP（書き込む場所）
+M=D          // そこに値を書く
+@SP
+M=M+1        // SP++
+```
+
+5 命令です。**VM の 1 命令が、機械語の複数命令に展開されます。**
+
+### add
+
+```asm
+@SP
+AM=M-1       // SP-- と同時に、A を新しい先端に向ける
+D=M          // D = 取り出した値（2 番目のオペランド）
+@SP
+A=M-1        // 1 つ下（1 番目のオペランド）を指す
+M=D+M        // そこに足した結果を書く
+```
+
+**2 つ取り出して 1 つ積む、のではなく、1 つ取り出して残りの 1 つを書き換えています。** 結果としてスタックは 1 つ減ります。無駄な書き込みを省いた形です。
+
+<Callout type="warn" title="AM=M-1 という命令">
+  A と M の両方に書き込みます。このとき **M は書き換え前の A が指す場所**です。
+
+  ```
+  AM=M-1    →  RAM[SP] = SP-1、かつ A = SP-1
+  ```
+  `@SP` なので A は 0、つまり `RAM[0] = RAM[0] - 1`（SP をデクリメント）を行い、
+  同時に A にその値（新しい先端のアドレス）が入ります。
+
+  **1 命令で 2 つのことをしています。** レジスタが少ない CPU では、
+  こういう兼用が効いてきます。
+  自作 CPU の実装で、M の書き込み先を「書き換え後の A」にしてしまうと、
+  この命令だけが壊れます。
+</Callout>
+
+### 比較（eq / gt / lt）
+
+比較は結果が真偽値なので、**分岐が必要**です。
+
+```asm
+@SP
+AM=M-1
+D=M          // D = 2 番目
+@SP
+A=M-1
+D=M-D        // D = 1 番目 - 2 番目
+@TRUE_0
+D;JEQ        // 等しければ TRUE へ
+@SP
+A=M-1
+M=0          // 偽
+@END_0
+0;JMP
+(TRUE_0)
+@SP
+A=M-1
+M=-1         // 真
+(END_0)
+```
+
+**ラベルに通し番号が要ります。** 同じ `eq` が複数回出てきたとき、ラベルが衝突するからです。
+
+## 実装する
+
+```ts
+// src/vm/translate.ts
+const PUSH_D = ['@SP', 'A=M', 'M=D', '@SP', 'M=M+1'].join('\n')
+const POP_D = ['@SP', 'AM=M-1', 'D=M'].join('\n')
+
+let labelCounter = 0
+
+export function translate(lines: string[]): string {
+  const out: string[] = []
+
+  for (const raw of lines) {
+    const line = raw.split('//')[0]!.trim()
+    if (!line) continue
+
+    const [op, arg1, arg2] = line.split(/\s+/)
+
+    switch (op) {
+      case 'push':
+        if (arg1 === 'constant') out.push(`@${arg2}\nD=A\n${PUSH_D}`)
+        else throw new Error(`未対応のセグメント: ${arg1}`)
+        break
+
+      case 'add': out.push(`${POP_D}\n@SP\nA=M-1\nM=D+M`); break
+      case 'sub': out.push(`${POP_D}\n@SP\nA=M-1\nM=M-D`); break
+      case 'and': out.push(`${POP_D}\n@SP\nA=M-1\nM=D&M`); break
+      case 'or':  out.push(`${POP_D}\n@SP\nA=M-1\nM=D|M`); break
+      case 'neg': out.push('@SP\nA=M-1\nM=-M'); break
+      case 'not': out.push('@SP\nA=M-1\nM=!M'); break
+
+      case 'eq': case 'gt': case 'lt': {
+        const jump = { eq: 'JEQ', gt: 'JGT', lt: 'JLT' }[op]
+        const id = labelCounter++
+        out.push([
+          POP_D,
+          '@SP', 'A=M-1', 'D=M-D',
+          `@TRUE${id}`, `D;${jump}`,
+          '@SP', 'A=M-1', 'M=0',
+          `@END${id}`, '0;JMP',
+          `(TRUE${id})`,
+          '@SP', 'A=M-1', 'M=-1',
+          `(END${id})`,
+        ].join('\n'))
+        break
+      }
+
+      default: throw new Error(`知らない命令です: ${line}`)
+    }
+  }
+  return out.join('\n')
+}
+
+/** SP を 256 に初期化してから、変換結果を続ける */
+export const withBootstrap = (vmCode: string): string =>
+  ['@256', 'D=A', '@SP', 'M=D', translate(vmCode.split('\n')), '(HALT)', '@HALT', '0;JMP'].join('\n')
+```
+
+**`sub` で `M=M-D` としている**ことに注意してください。`D` が後に積まれたほう（2 番目のオペランド）、`M` が先に積まれたほう（1 番目）です。引く順番を間違えると符号が逆になります。
+
+## 走らせる
+
+Track 2 の第 1 回で作ったアセンブラと、Track 1 の CPU につなぎます。
+
+```ts
+// src/vm/vm.check.ts
+import { strict as assert } from 'node:assert'
+import { assemble } from '../asm/index'
+import { run } from '../run'
+import { withBootstrap } from './translate'
+
+/** VM コードを走らせ、スタックの先端を返す */
+function runVM(vmCode: string): number {
+  const ram = run(assemble(withBootstrap(vmCode)), {}, 200000)
+  return ram[ram[0]! - 1]!
+}
+
+assert.equal(runVM('push constant 7\npush constant 8\nadd'), 15)
+assert.equal(runVM('push constant 20\npush constant 7\nsub'), 13)
+assert.equal(runVM('push constant 5\nneg'), -5)
+
+assert.equal(runVM('push constant 3\npush constant 3\neq'), -1, '等しい → 真')
+assert.equal(runVM('push constant 3\npush constant 4\neq'), 0,  '違う → 偽')
+assert.equal(runVM('push constant 5\npush constant 3\ngt'), -1)
+assert.equal(runVM('push constant 5\npush constant 3\nlt'), 0)
+
+assert.equal(runVM('push constant 12\npush constant 10\nand'), 8)
+assert.equal(runVM('push constant 12\npush constant 10\nor'), 14)
+assert.equal(runVM('push constant 0\nnot'), -1)
+
+console.log('ok   算術・論理 10 種')
+
+// (3 + 4) * 5 を、掛け算なしで（5 回足す）
+assert.equal(runVM(`
+push constant 3
+push constant 4
+add
+push constant 3
+push constant 4
+add
+add
+`), 14)
+console.log('ok   式の入れ子')
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/vm/vm.check.ts
+```
+
+**Track 1 で NAND から組んだ CPU の上で、VM のコードが走っています。**
+
+## 層が積み上がった
+
+```
+VM コード          push constant 7 / push constant 8 / add
+   ↓ translate
+アセンブリ         @7 / D=A / @SP / A=M / M=D / ...
+   ↓ assemble
+機械語             0000000000000111 / 1110110000010000 / ...
+   ↓ CPU
+回路               NAND と DFF
+```
+
+**4 層です。** 各層は、すぐ下の層しか知りません。VM トランスレータは回路を知らず、CPU は VM を知りません。
+
+<Callout type="tip" title="層を分けると、どこを差し替えても他が壊れない">
+  CPU を 6502 に変えたければ、`translate` の出力を 6502 のアセンブリにするだけです。
+  VM より上は 1 行も変わりません。
+
+  第 2 章で読んだ「ISA は契約」という話と、同じ構造がここにもあります。
+  **層の境界が契約になっている**限り、中身は自由に変えられます。
+</Callout>
+
+## 演習
+
+1. **`push constant` の展開を短くする**。5 命令から減らせないか考えてください
+2. **`mul` を追加する**。掛け算命令はないので、繰り返し加算のループを生成します
+3. **生成されたアセンブリの行数を数える**。VM 命令 1 つあたり平均何行になるか測ってください
+4. **スタックの中身を表示する**。実行後に `RAM[256]` から `RAM[SP-1]` まで出力する関数を書いてください
+5. **`sub` の引く順序を逆にしてみる**。どういうテストがそれを検出するか考えてください
+
+## 次回
+
+定数しか扱えていません。次は、**変数を置く場所**を決めます。局所変数、引数、オブジェクトのフィールド。どれも結局はメモリ上の番地ですが、**誰がどこを使うか**の約束が必要になります。
