@@ -3,10 +3,347 @@ title: CPU を組む
 description: 命令を取ってきて、意味を読み取り、ALU に流し、結果をどこかに書く。これまでの部品を 1 枚に配線する
 track: hardware
 order: 10
-status: planned
+status: published
 goal: 自分で書いた機械語のプログラムが、自分で組んだ CPU の上で走る
 requires:
   - hw-09-machine-language
+basedOn:
+  - kind: reading
+    slug: performance-estimation
+    why: 1 命令あたりのサイクル数という見積もりの単位が、ここで具体的な回路として見える
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 新しい部品は作らない
+
+この回で作るのは**配線だけ**です。ALU も、レジスタも、PC も、Mux も、すでにあります。
+
+やることは 3 つです。
+
+1. 命令のビットを切り出して、各部品の制御線につなぐ
+2. どの値をどの部品に入れるかを Mux で選ぶ
+3. 出力を外に出す
+
+## 入出力を決める
+
+CPU の外から見える端子です。
+
+| 向き | 名前 | 内容 |
+| --- | --- | --- |
+| 入力 | `inM` | RAM[A] の値 |
+| 入力 | `instruction` | 実行する命令 |
+| 入力 | `reset` | 1 なら PC を 0 に戻す |
+| 出力 | `outM` | メモリに書く値 |
+| 出力 | `writeM` | 1 なら書き込む |
+| 出力 | `addressM` | メモリのアドレス（= A の値） |
+| 出力 | `pc` | 次に読む命令のアドレス |
+
+**CPU 自身はメモリを持ちません。** アドレスと値と「書け」という信号を出すだけです。メモリは外側にあり、次回つなぎます。
+
+## 配線を 1 つずつ決める
+
+### A レジスタ
+
+A に書き込まれるのは 2 通りです。
+
+- **A 命令のとき**：命令そのもの（先頭ビットが 0 なので、15 ビットの値がそのまま入る）
+- **C 命令で d1 が立っているとき**：ALU の出力
+
+```ts
+const isC = instruction[15]!                       // 先頭ビットが 1 なら C 命令
+const isA = not(isC)
+
+const aIn = mux16(instruction, aluOut, isC)        // A 命令なら命令そのもの
+const loadA = or(isA, and(isC, instruction[5]!))   // A 命令、または d1 が立っている
+```
+
+<Callout type="tip" title="A 命令の値をそのまま使える理由">
+  A 命令は `0vvvvvvvvvvvvvvv` です。先頭ビットが 0 なので、
+  **16 ビットの値としてそのまま読むと、ちょうど 15 ビットの値になります**。
+
+  切り出す回路が要りません。**命令の形式を、配線が楽になるように決めてある**わけです。
+  これが「命令セットの設計が CPU の設計」という意味です。
+</Callout>
+
+### D レジスタ
+
+C 命令で `d2` が立っているときだけ、ALU の出力を書きます。
+
+```ts
+const loadD = and(isC, instruction[4]!)
+```
+
+### ALU の入力
+
+`x` は常に D レジスタ。`y` は `a` ビットで A か M かを選びます。
+
+```ts
+const y = mux16(A.out, inM, and(isC, instruction[12]!))
+const [aluOut, zr, ng] = alu(
+  D.out, y,
+  instruction[11]!, instruction[10]!, instruction[9]!,
+  instruction[8]!,  instruction[7]!,  instruction[6]!,
+)
+```
+
+制御線の 6 ビットを**そのまま ALU に渡している**ことに注目してください。デコードらしいデコードをしていません。命令の中に ALU の制御線をそのまま埋め込む形式にしたからです。
+
+<Callout type="warn" title="a ビットに isC を掛けている">
+  A 命令のときは `instruction[12]` が値の一部であって、a ビットではありません。
+  `and(isC, ...)` を挟まないと、**A 命令を実行しただけでメモリを読みに行ってしまいます**。
+
+  同じ理由で、`d1`〜`d3` と `j1`〜`j3` にもすべて `isC` を掛けます。
+  ここを忘れると、A 命令が実行されるたびにメモリに書き込みが起き、
+  「時々メモリが壊れる」という追いにくいバグになります。
+</Callout>
+
+### メモリへの書き込み
+
+```ts
+const writeM = and(isC, instruction[3]!)       // d3
+const outM = aluOut
+const addressM = A.out
+```
+
+### ジャンプの判定
+
+ALU のフラグと `jjj` を突き合わせます。
+
+```ts
+const j1 = instruction[2]!, j2 = instruction[1]!, j3 = instruction[0]!
+const positive = and(not(ng), not(zr))          // 0 より大きい
+const jump = and(
+  isC,
+  or(or(and(j1, ng), and(j2, zr)), and(j3, positive)),
+)
+```
+
+「`out < 0` なら飛ぶ」「`= 0` なら飛ぶ」「`> 0` なら飛ぶ」の**論理和**です。前回見たとおり、3 つのフラグを立てれば無条件ジャンプになります。
+
+### PC
+
+```ts
+pc.set(A.out, jump, not(jump), reset)
+```
+
+**ジャンプしないなら必ず `inc`** です。`load` と `inc` のどちらかが必ず立ちます。ジャンプ先は常に A レジスタの値です。
+
+## 全部つなぐ
+
+```ts
+// src/cpu.ts
+import type { Bit } from './bit'
+import { alu } from './alu'
+import { mux16 } from './bus'
+import { and, not, or } from './gates'
+import { PC } from './pc'
+import { Register } from './register'
+import type { Word } from './word'
+
+export type CpuOut = {
+  outM: Word
+  writeM: Bit
+  addressM: Word
+  pc: Word
+}
+
+export class CPU {
+  readonly A = new Register()
+  readonly D = new Register()
+  readonly pc = new PC()
+
+  step(inM: Word, instruction: Word, reset: Bit): CpuOut {
+    const i = instruction
+    const isC = i[15]!
+    const isA = not(isC)
+
+    // --- ALU ---
+    const y = mux16(this.A.out, inM, and(isC, i[12]!))
+    const [aluOut, zr, ng] = alu(this.D.out, y, i[11]!, i[10]!, i[9]!, i[8]!, i[7]!, i[6]!)
+
+    // --- 書き込み先 ---
+    const d1 = and(isC, i[5]!)
+    const d2 = and(isC, i[4]!)
+    const d3 = and(isC, i[3]!)
+
+    const addressM = this.A.out          // A が書き換わる前の値を使う
+    this.A.set(mux16(i, aluOut, isC), or(isA, d1))
+    this.D.set(aluOut, d2)
+
+    // --- ジャンプ ---
+    const jump = and(
+      isC,
+      or(
+        or(and(i[2]!, ng), and(i[1]!, zr)),
+        and(i[0]!, and(not(ng), not(zr))),
+      ),
+    )
+    this.pc.set(this.A.out, jump, not(jump), reset)
+
+    return { outM: aluOut, writeM: d3, addressM, pc: this.pc.out }
+  }
+}
+```
+
+**これで CPU は完成です。** 100 行もありません。
+
+<Callout type="warn" title="addressM をいつの A から取るか">
+  `addressM` に `this.A.out` を使っていますが、これは **`this.A.set` を呼ぶ前の値**です。
+  `set` はクロックが来るまで出力を変えないので、どちらの順で書いても同じ値になります。
+
+  ただし、**外側のループで RAM のアドレスをいつ読むか**は重大です。
+  次の節で扱います。ここを間違えると、1 サイクルずれた場所を読み書きします。
+</Callout>
+
+## 動かすための外枠
+
+CPU 単体では動きません。命令を供給する ROM と、データを置く RAM が要ります。
+
+```ts
+// src/run.ts
+import { clock } from './dff'
+import { CPU } from './cpu'
+import { fromWord, toWord } from './word'
+
+export function run(program: number[], ramInit: Record<number, number> = {}, cycles = 10000) {
+  const cpu = new CPU()
+  const ram = new Array(32768).fill(0)
+  for (const [k, v] of Object.entries(ramInit)) ram[Number(k)] = v
+
+  for (let t = 0; t < cycles; t++) {
+    // 1. 今の PC が指す命令を ROM から読む
+    const pcValue = fromWord(cpu.pc.out) & 0x7fff
+    const instruction = toWord(program[pcValue] ?? 0)
+
+    // 2. 今の A が指すメモリの値を読む（組み合わせ回路なので、この時点の A）
+    const addr = fromWord(cpu.A.out) & 0x7fff
+    const inM = toWord(ram[addr] ?? 0)
+
+    // 3. CPU を 1 サイクル分動かす
+    const out = cpu.step(inM, instruction, 0)
+
+    // 4. 書き込み指示があれば、同じアドレスに書く
+    if (out.writeM) ram[addr] = fromWord(out.outM)
+
+    // 5. クロックを進めて、レジスタと PC を確定させる
+    clock()
+  }
+  return ram
+}
+```
+
+<Callout type="warn" title="ここが最大のハマりどころ">
+  手順 2 で読むアドレスと、手順 4 で書くアドレスは、**同じ `addr`** でなければなりません。
+  どちらも「このサイクルの A レジスタの値」です。
+
+  `cpu.step` の戻り値の `addressM` を手順 2 に使うと、**1 サイクル前の A** を使うことになり、
+  1 命令ずれたメモリを読みます。
+  症状は「`D=M` が前の命令のアドレスを読む」で、
+  **加算プログラムの答えが `12 + 30 = 24`（= 12 × 2）になる**、といった形で現れます。
+
+  実機では A レジスタの出力が配線でメモリに直結しており、時間的なずれが存在しません。
+  ソフトウェアで書き下すときに、この「同時性」を自分で守る必要があります。
+</Callout>
+
+## 走らせてみる
+
+前回手でアセンブルしたプログラムです。
+
+```ts
+// src/cpu.check.ts
+import { strict as assert } from 'node:assert'
+import { run } from './run'
+
+const ADD = [
+  0b0000000000000000,   // @0
+  0b1111110000010000,   // D=M
+  0b0000000000000001,   // @1
+  0b1111000010010000,   // D=D+M
+  0b0000000000000010,   // @2
+  0b1110001100001000,   // M=D
+  0b0000000000000110,   // @END
+  0b1110101010000111,   // 0;JMP
+]
+
+const ram = run(ADD, { 0: 12, 1: 30 }, 100)
+assert.equal(ram[2], 42, `RAM[2] は 42 のはずが ${ram[2]}`)
+console.log('ok   RAM[0] + RAM[1] → RAM[2] =', ram[2])
+```
+
+```bash
+npx tsx src/cpu.check.ts
+```
+
+```
+ok   RAM[0] + RAM[1] → RAM[2] = 42
+```
+
+**NAND と DFF だけで組んだ回路の上で、自分で書いた機械語が動きました。**
+
+## もっと複雑なものを走らせる
+
+条件分岐とループが正しく動くかを確かめます。1 から n までの合計を計算するプログラムです。
+
+```asm
+@0
+D=M
+@16        ; 変数 n を RAM[16] に置く
+M=D
+@17        ; 変数 sum を RAM[17] に置く
+M=0
+(LOOP)
+@16
+D=M
+@END
+D;JLE      ; n ≤ 0 なら終わり
+@17
+D=M        ; D = sum
+@16
+D=D+M      ; D = sum + n
+@17
+M=D        ; sum = D
+@16
+M=M-1      ; n = n - 1
+@LOOP
+0;JMP
+(END)
+@17
+D=M
+@1
+M=D        ; RAM[1] = sum
+(HALT)
+@HALT
+0;JMP
+```
+
+```ts
+for (const n of [1, 5, 10, 100]) {
+  const ram = run(SUM_PROGRAM, { 0: n }, 20000)
+  assert.equal(ram[1], (n * (n + 1)) / 2, `1..${n} の合計`)
+}
+console.log('ok   ループと分岐')
+```
+
+**ジャンプ、条件分岐、ループ、変数の読み書きが、すべて動いています。**
+
+<Callout type="tip" title="1 命令 = 1 サイクル">
+  この CPU では、**どの命令もちょうど 1 サイクルで完了します**。
+  フェッチ、デコード、実行、書き戻しが同じサイクル内で行われるからです。
+
+  第 2 章で読んだパイプラインは、これを分割して重ねる工夫でした。
+  この CPU にはパイプラインがないので、1 サイクルが長い（信号が全部の回路を通り抜ける時間）代わりに、
+  ハザードも分岐予測も必要ありません。**単純さと速度を交換しています。**
+</Callout>
+
+## 演習
+
+1. **`instruction[12]` の `and(isC, ...)` を外してみる**。加算プログラムがどう壊れるか観察してください
+2. **`jump` の `and(isC, ...)` を外してみる**。A 命令がジャンプ命令として解釈される様子が見られます
+3. **実行トレースを出す**。毎サイクル、PC・A・D・命令を表示するようにして、プログラムの動きを 1 手ずつ追ってください
+4. **サイクル数を数える**。合計プログラムが n に対して何サイクルかかるか測り、計算量を確かめてください
+5. **かけ算を書く**。Hack にかけ算命令はありません。足し算の繰り返しで実装してください
+
+## 次回
+
+CPU に ROM と RAM をつなぎ、メモリの一部を**画面とキーボード**に割り当てます。メモリマップド I/O という仕組みで、「特定の番地に書くと画面に点が出る」という状態を作ります。これで、コンピュータとして完成します。

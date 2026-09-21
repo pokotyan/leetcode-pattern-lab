@@ -3,10 +3,372 @@ title: 6502 の命令デコードとサイクル
 description: 1 命令が複数サイクルに分かれる理由と、アドレッシングモードがサイクル数を変える仕組みを回路で見る
 track: hardware
 order: 13
-status: planned
+status: published
 goal: 数命令ぶんのデコーダが動き、サイクル単位で動作を追えるようになる
 requires:
   - hw-12-6502-datapath
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## Hack との決定的な違い
+
+Hack の CPU では、1 命令が 1 サイクルで完了しました。命令のビットが、そのまま制御線だったからです。
+
+6502 は違います。
+
+- 命令は**可変長**（1〜3 バイト）。まず 1 バイト読まないと、あと何バイト要るか分からない
+- **内部バスに同時に 1 つしか出せない**ので、転送を順番に行う必要がある
+- メモリアクセスは **1 サイクルに 1 回**だけ
+
+結果として、1 命令が **2〜7 サイクル**に分かれます。
+
+## サイクルごとに何をするか
+
+`LDA $1234`（Absolute）を例に取ります。3 バイトの命令で、4 サイクルかかります。
+
+| サイクル | メモリアクセス | 内部の動き |
+| --- | --- | --- |
+| 1 | PC が指すバイトを読む（オペコード `$AD`） | PC++ |
+| 2 | PC が指すバイトを読む（アドレス下位 `$34`） | 一時レジスタに保持、PC++ |
+| 3 | PC が指すバイトを読む（アドレス上位 `$12`） | 一時レジスタに保持、PC++ |
+| 4 | `$1234` を読む | 読んだ値を A に入れ、N と Z を更新 |
+
+**毎サイクル、必ず 1 回メモリにアクセスしています。** 6502 はこれを徹底しており、何もすることがないサイクルでも「無意味な読み込み」を行います。
+
+<Callout type="note" title="無駄な読み込みには意味がある">
+  メモリアクセスの回数を毎サイクル 1 回に固定すると、**タイミングが完全に予測可能**になります。
+  メモリ側の回路も単純になります。
+
+  そして、この「無駄な読み込み」が**副作用を起こす**ことがあります。
+  第 3 章で見たメモリマップド I/O では、読むだけで状態が変わるレジスタがあるためです。
+  正確なエミュレータは、この余分な読み込みまで再現する必要があります。
+</Callout>
+
+## サイクル数の一覧
+
+同じ `LDA` でも、アドレッシングモードでサイクル数が変わります。
+
+| 命令 | サイクル | 理由 |
+| --- | --- | --- |
+| `LDA #$42` | 2 | 値が命令に埋まっている。メモリを追加で読まない |
+| `LDA $10` | 3 | ゼロページ。アドレスが 1 バイトで済む |
+| `LDA $10,X` | 4 | ゼロページ + 加算に 1 サイクル |
+| `LDA $1234` | 4 | アドレスが 2 バイト |
+| `LDA $1234,X` | 4 または **5** | **ページをまたぐと +1** |
+| `LDA ($10,X)` | 6 | 間接参照のために 2 バイト読む必要がある |
+| `LDA ($10),Y` | 5 または **6** | 間接 + ページまたぎ |
+
+ゼロページが速いのは、**アドレスの上位バイトを読む必要がない**からです。1 バイト短く、1 サイクル速い。だから 6502 のプログラムは、よく使う変数をゼロページに置きます。
+
+## デコーダを作る
+
+オペコード 1 バイト（256 通り）から、「どの命令か」「どのアドレッシングモードか」「何サイクルか」を引きます。
+
+```ts
+// src/nes/opcodes.ts
+export type Mode =
+  | 'imp' | 'acc' | 'imm' | 'zp' | 'zpx' | 'zpy'
+  | 'abs' | 'absx' | 'absy' | 'ind' | 'indx' | 'indy' | 'rel'
+
+export type OpInfo = {
+  name: string
+  mode: Mode
+  bytes: number
+  cycles: number
+  /** ページをまたぐと 1 サイクル増えるか */
+  pageCross?: boolean
+}
+
+export const OPCODES: Record<number, OpInfo> = {
+  0xa9: { name: 'LDA', mode: 'imm',  bytes: 2, cycles: 2 },
+  0xa5: { name: 'LDA', mode: 'zp',   bytes: 2, cycles: 3 },
+  0xb5: { name: 'LDA', mode: 'zpx',  bytes: 2, cycles: 4 },
+  0xad: { name: 'LDA', mode: 'abs',  bytes: 3, cycles: 4 },
+  0xbd: { name: 'LDA', mode: 'absx', bytes: 3, cycles: 4, pageCross: true },
+  0xb9: { name: 'LDA', mode: 'absy', bytes: 3, cycles: 4, pageCross: true },
+  0xa1: { name: 'LDA', mode: 'indx', bytes: 2, cycles: 6 },
+  0xb1: { name: 'LDA', mode: 'indy', bytes: 2, cycles: 5, pageCross: true },
+
+  0x85: { name: 'STA', mode: 'zp',   bytes: 2, cycles: 3 },
+  0x8d: { name: 'STA', mode: 'abs',  bytes: 3, cycles: 4 },
+  0x9d: { name: 'STA', mode: 'absx', bytes: 3, cycles: 5 },   // 書き込みは常に +1
+
+  0xaa: { name: 'TAX', mode: 'imp',  bytes: 1, cycles: 2 },
+  0xe8: { name: 'INX', mode: 'imp',  bytes: 1, cycles: 2 },
+  0x69: { name: 'ADC', mode: 'imm',  bytes: 2, cycles: 2 },
+  0x4c: { name: 'JMP', mode: 'abs',  bytes: 3, cycles: 3 },
+  0xd0: { name: 'BNE', mode: 'rel',  bytes: 2, cycles: 2, pageCross: true },
+  0xea: { name: 'NOP', mode: 'imp',  bytes: 1, cycles: 2 },
+}
+```
+
+<Callout type="warn" title="書き込みは常に最大サイクル">
+  `LDA $1234,X` は 4 または 5 サイクルですが、`STA $1234,X` は**常に 5** です。
+
+  読み込みなら「ページをまたがなければ、上位バイトを直さなくても正しい値が読めた」
+  という賭けが成立します。外れたときだけやり直せばいい。
+
+  書き込みでは賭けられません。**間違った場所に書いてしまったら取り返しがつかない**ので、
+  常にアドレスを確定させてから書きます。
+
+  第 2 章で読んだ投機実行と、まったく同じ構図です。
+  読みは投機できるが、書きは投機できない。
+</Callout>
+
+## オペコードには規則性がある
+
+256 通りをすべて表に書くのは大変ですが、6502 のオペコードには構造があります。
+
+```
+  オペコード = aaabbbcc
+  ┌────┬────┬────┐
+  │ aaa│ bbb│ cc │
+  └────┴────┴────┘
+    命令  モード  グループ
+```
+
+`cc = 01` のグループ（`ORA`, `AND`, `EOR`, `ADC`, `STA`, `LDA`, `CMP`, `SBC`）では、
+
+| bbb | モード |
+| --- | --- |
+| 000 | (zp,X) |
+| 001 | zp |
+| 010 | #imm |
+| 011 | abs |
+| 100 | (zp),Y |
+| 101 | zp,X |
+| 110 | abs,Y |
+| 111 | abs,X |
+
+`LDA` は `aaa = 101`、`cc = 01` なので、
+
+```
+LDA #imm   = 101 010 01 = 0xA9   ✓
+LDA zp     = 101 001 01 = 0xA5   ✓
+LDA abs    = 101 011 01 = 0xAD   ✓
+```
+
+表と一致します。
+
+<Callout type="tip" title="この規則性が、デコーダの回路を小さくする">
+  もしオペコードがばらばらなら、256 通りの巨大な対応表を回路で作る必要があります。
+  規則的に割り当てると、**ビットを切り出して別々の小さなデコーダに渡す**だけで済みます。
+
+  第 9 回で Hack の命令形式を「配線が楽になるように決めた」のと同じ発想です。
+  ただし 6502 では、後から追加された命令が規則から外れており、完全ではありません。
+  **設計は途中で継ぎ足されると、必ず例外ができます。**
+</Callout>
+
+## サイクル単位で実行する
+
+サイクル数を数えながら命令を実行する形を作ります。
+
+```ts
+// src/nes/step.ts
+import { OPCODES } from './opcodes'
+
+export type Machine = {
+  a: number; x: number; y: number; pc: number
+  flags: { n: 0 | 1; z: 0 | 1; c: 0 | 1; v: 0 | 1 }
+  mem: Uint8Array
+  cycles: number
+}
+
+const read = (m: Machine, addr: number) => m.mem[addr & 0xffff]!
+const read16 = (m: Machine, addr: number) =>
+  read(m, addr) | (read(m, addr + 1) << 8)          // リトルエンディアン
+
+/** オペランドのアドレスと、追加サイクルの有無を返す */
+function resolve(m: Machine, info: (typeof OPCODES)[number]) {
+  const operand = m.pc + 1
+  switch (info.mode) {
+    case 'imm': return { addr: operand, extra: false }
+    case 'zp':  return { addr: read(m, operand), extra: false }
+    case 'zpx': return { addr: (read(m, operand) + m.x) & 0xff, extra: false }
+    case 'abs': return { addr: read16(m, operand), extra: false }
+    case 'absx': {
+      const base = read16(m, operand)
+      const addr = (base + m.x) & 0xffff
+      return { addr, extra: (base & 0xff00) !== (addr & 0xff00) }
+    }
+    case 'indy': {
+      const zp = read(m, operand)
+      const base = read(m, zp) | (read(m, (zp + 1) & 0xff) << 8)   // ゼロページで折り返す
+      const addr = (base + m.y) & 0xffff
+      return { addr, extra: (base & 0xff00) !== (addr & 0xff00) }
+    }
+    default: return { addr: 0, extra: false }
+  }
+}
+
+export function step(m: Machine) {
+  const opcode = read(m, m.pc)
+  const info = OPCODES[opcode]
+  if (!info) throw new Error(`未実装のオペコード: $${opcode.toString(16)}`)
+
+  const { addr, extra } = resolve(m, info)
+  let cycles = info.cycles + (info.pageCross && extra ? 1 : 0)
+  m.pc += info.bytes
+
+  switch (info.name) {
+    case 'LDA': setA(m, read(m, addr)); break
+    case 'STA': m.mem[addr] = m.a; break
+    case 'TAX': m.x = m.a; setNZ(m, m.x); break
+    case 'INX': m.x = (m.x + 1) & 0xff; setNZ(m, m.x); break
+    case 'JMP': m.pc = addr; break
+    case 'NOP': break
+    case 'BNE': {
+      if (m.flags.z === 0) {
+        const offset = (read(m, addr) << 24) >> 24        // 符号付き 8 ビット
+        const target = (m.pc + offset) & 0xffff
+        cycles += 1 + ((m.pc & 0xff00) !== (target & 0xff00) ? 1 : 0)
+        m.pc = target
+      }
+      break
+    }
+  }
+
+  m.cycles += cycles
+  return cycles
+}
+
+const setNZ = (m: Machine, v: number) => {
+  m.flags.z = v === 0 ? 1 : 0
+  m.flags.n = ((v >> 7) & 1) as 0 | 1
+}
+const setA = (m: Machine, v: number) => { m.a = v & 0xff; setNZ(m, m.a) }
+```
+
+<Callout type="warn" title="indy のゼロページ折り返し">
+  `read(m, (zp + 1) & 0xff)` の `& 0xff` を忘れると、`($FF),Y` のときに
+  `$0100` から上位バイトを読んでしまいます。正しくは `$0000` です。
+
+  **ゼロページのポインタは、ゼロページの中で折り返します。**
+  これも実機の仕様であり、依存しているソフトウェアがあります。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/nes/step.check.ts
+import { strict as assert } from 'node:assert'
+import { step, type Machine } from './step'
+
+const make = (bytes: number[], at = 0x8000): Machine => {
+  const mem = new Uint8Array(0x10000)
+  bytes.forEach((b, i) => { mem[at + i] = b })
+  return { a: 0, x: 0, y: 0, pc: at, flags: { n: 0, z: 0, c: 0, v: 0 }, mem, cycles: 0 }
+}
+
+// LDA #$42 → A = 0x42、2 サイクル
+{
+  const m = make([0xa9, 0x42])
+  assert.equal(step(m), 2)
+  assert.equal(m.a, 0x42)
+  assert.equal(m.flags.z, 0)
+  assert.equal(m.flags.n, 0)
+}
+
+// LDA #$00 → Z が立つ
+{
+  const m = make([0xa9, 0x00])
+  step(m)
+  assert.equal(m.flags.z, 1)
+}
+
+// LDA #$80 → N が立つ
+{
+  const m = make([0xa9, 0x80])
+  step(m)
+  assert.equal(m.flags.n, 1)
+}
+console.log('ok   LDA とフラグ')
+
+// LDA $1234,X：ページをまたがない → 4 サイクル
+{
+  const m = make([0xbd, 0x00, 0x20])       // LDA $2000,X
+  m.x = 0x10
+  m.mem[0x2010] = 0x77
+  assert.equal(step(m), 4, 'ページ内なら 4 サイクル')
+  assert.equal(m.a, 0x77)
+}
+
+// LDA $20F0,X：ページをまたぐ → 5 サイクル
+{
+  const m = make([0xbd, 0xf0, 0x20])       // LDA $20F0,X
+  m.x = 0x20
+  m.mem[0x2110] = 0x88
+  assert.equal(step(m), 5, 'ページをまたぐと 5 サイクル')
+  assert.equal(m.a, 0x88)
+}
+console.log('ok   ページ境界で 1 サイクル増える')
+
+// STA $1234,X は常に 5 サイクル
+{
+  const m = make([0x9d, 0x00, 0x20])
+  m.a = 0x99; m.x = 0x10
+  assert.equal(step(m), 5, '書き込みは常に 5')
+  assert.equal(m.mem[0x2010], 0x99)
+}
+console.log('ok   書き込みは投機しない')
+
+// ($10),Y のゼロページ折り返し
+{
+  const m = make([0xb1, 0xff])             // LDA ($FF),Y
+  m.mem[0x00ff] = 0x34
+  m.mem[0x0000] = 0x12                     // $0100 ではなく $0000 から上位を読む
+  m.y = 0
+  m.mem[0x1234] = 0x5a
+  step(m)
+  assert.equal(m.a, 0x5a, 'ゼロページで折り返している')
+}
+console.log('ok   ゼロページの折り返し')
+
+// ループ：X を 10 回インクリメントする
+{
+  const m = make([
+    0xa2, 0x00,        // LDX #$00   ← このテストでは直接 x を操作する
+  ])
+  m.x = 0
+  const loop = make([0xe8, 0xd0, 0xfd])    // INX / BNE -3
+  loop.x = 0xf6                             // -10
+  let total = 0
+  while (loop.x !== 0) total += step(loop)
+  assert.equal(loop.x, 0)
+  console.log(`ok   ループが ${total} サイクルで終了`)
+}
+
+console.log('\n全部通りました')
+```
+
+## Track 1 を終えて
+
+2 つの CPU を組みました。
+
+**Hack** は、命令セットを配線しやすいように設計した結果、極端に単純になりました。1 命令 1 サイクル、命令は 2 種類、アドレッシングは実質 2 種類。
+
+**6502** は、限られたトランジスタで実用的な性能を出すために、複雑さを受け入れました。可変長命令、可変サイクル、13 のアドレッシングモード、ハードウェアのバグ。
+
+<Callout type="note" title="どちらが良いという話ではない">
+  Hack は「理解するための設計」、6502 は「1975 年に売るための設計」です。
+  制約が違えば、最適な答えも違います。
+
+  第 2 章で読んだ CISC と RISC の論争も、根は同じです。
+  **メモリが高価な時代の最適解と、トランジスタが安い時代の最適解は違う。**
+
+  設計を評価するときは、まず**その設計が置かれていた制約**を見る必要があります。
+</Callout>
+
+## 演習
+
+1. **オペコードの規則性を使ってデコーダを書く**。`aaabbbcc` を切り出して、表を引かずにモードを判定してください
+2. **分岐命令のサイクル数を正確にする**。6502 の分岐は「飛ばないなら 2、飛ぶなら 3、ページをまたぐなら 4」です
+3. **ADC を実装する**。前回作った `addFlags` を使います。`SBC` も同じ回路で作れることを確かめてください
+4. **未実装オペコードを数える**。256 通りのうち、公式命令は 151 個です。残りは何をするか調べてみてください（Track 3 で扱います）
+
+## 次のトラックへ
+
+CPU ができました。しかし、**機械語を手で書くのは限界**があります。
+
+次のトラック「アセンブラからコンパイラへ」では、人が書ける形から機械語への変換器を作ります。まずアセンブラ、次にスタックマシン、最後に高級言語のコンパイラです。

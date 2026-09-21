@@ -3,10 +3,373 @@ title: コンピュータにする
 description: CPU に ROM と RAM をつなぎ、メモリの一部を画面とキーボードに割り当てる
 track: hardware
 order: 11
-status: planned
+status: published
 goal: 画面に点が打てて、キー入力が読めるコンピュータが動く
 requires:
   - hw-10-cpu
+basedOn:
+  - kind: reading
+    slug: browser-internals
+    why: 表示するものをメモリ上の状態として持ち、それを画面に反映する、という構造は共通している
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 足りないもの
+
+CPU は完成しましたが、まだ外の世界がありません。
+
+- 命令をどこから読むのか（**ROM**）
+- データをどこに置くのか（**RAM**）
+- 画面とキーボードはどこにあるのか
+
+最後の点が今回の中心です。
+
+## メモリマップド I/O
+
+画面に点を打ちたい。素朴に考えると「画面に出力する命令」を作ることになります。しかし、**命令を増やさずに済ませる方法**があります。
+
+> **アドレス空間の一部を、メモリではなく画面に割り当てる。**
+
+その番地に書き込むと、画面のドットが変わる。読むと、キーボードの状態が返る。CPU は自分がメモリを触っているつもりのまま、外の世界とやり取りできます。
+
+これを **メモリマップド I/O** と呼びます。
+
+<Callout type="tip" title="実機でも同じ">
+  ファミコンでは `$2000`〜`$2007` が PPU（画像処理装置）のレジスタです。
+  ここに書き込むと画面の設定が変わります。
+
+  PC でも、グラフィックカードのメモリがアドレス空間にマップされます。
+  第 4 章で読んだ「32 ビット環境で 4GB 積んでも 3.2GB しか使えない」現象は、
+  この割り当てで番地が消費されるためでした。
+
+  **「特別な命令を作らず、アドレスに意味を持たせる」**という設計は、今も主流です。
+</Callout>
+
+## アドレスの割り当て
+
+Hack コンピュータのデータ用アドレス空間（15 ビット、32768 語）を、こう分けます。
+
+| アドレス | 用途 | 大きさ |
+| --- | --- | --- |
+| 0 〜 16383 | **通常の RAM** | 16K 語 |
+| 16384 〜 24575 | **画面** | 8K 語 |
+| 24576 | **キーボード** | 1 語 |
+| 24577 〜 32767 | 未使用 | |
+
+### 画面
+
+256 × 512 ドットの白黒画面です。**1 ビットが 1 ドット**に対応します。
+
+```
+256 行 × 512 列 = 131072 ドット
+131072 ÷ 16 ビット = 8192 語
+```
+
+行 `r`、列 `c` のドットは、
+
+```
+アドレス = 16384 + r * 32 + (c / 16 の整数部)
+ビット位置 = c % 16
+```
+
+にあります。1 ドットだけ変えたいときは、**その語を読み、目的のビットだけ変えて、書き戻す**必要があります。第 1 章で触れた「ビットには直接アドレスが振られていない」がそのまま出てきます。
+
+### キーボード
+
+`24576` を読むと、今押されているキーの文字コードが返ります。押されていなければ 0 です。
+
+**キーを押した瞬間ではなく、押されている状態**が読めます。つまり、ポーリングで見に行く方式です（第 2 章で見た 2 方式のうちの片方）。Hack には割り込みがありません。
+
+## Memory：アドレスで行き先を振り分ける
+
+CPU から見ると 1 つのメモリですが、内部ではアドレスによって行き先が変わります。
+
+```ts
+// src/memory.ts
+import type { Bit } from './bit'
+import { RAM16K } from './ram16k'
+import { Screen } from './screen'
+import { Keyboard } from './keyboard'
+import { fromWord, toWord, type Word } from './word'
+
+export class Memory {
+  readonly ram = new RAM16K()
+  readonly screen = new Screen()
+  readonly keyboard = new Keyboard()
+
+  private route(addr: number) {
+    if (addr < 16384) return { kind: 'ram' as const, index: addr }
+    if (addr < 24576) return { kind: 'screen' as const, index: addr - 16384 }
+    return { kind: 'keyboard' as const, index: 0 }
+  }
+
+  out(address: Word): Word {
+    const r = this.route(fromWord(address) & 0x7fff)
+    if (r.kind === 'ram') return this.ram.out(address)
+    if (r.kind === 'screen') return toWord(this.screen.get(r.index))
+    return toWord(this.keyboard.value)
+  }
+
+  set(w: Word, load: Bit, address: Word) {
+    if (load === 0) return
+    const r = this.route(fromWord(address) & 0x7fff)
+    if (r.kind === 'ram') this.ram.set(w, 1, address)
+    else if (r.kind === 'screen') this.screen.set(r.index, fromWord(w))
+    // キーボードは読み取り専用。書き込みは無視する
+  }
+
+  commit() {
+    this.ram.commit()
+  }
+}
+```
+
+**実体は「アドレスの上位ビットを見て DMux で振り分ける」回路**です。第 7 回で RAM を入れ子にしたときと同じ構造で、行き先が RAM ではなく別のデバイスになっているだけです。
+
+<Callout type="note" title="キーボードへの書き込みは黙って無視される">
+  読み取り専用の領域に書き込んだらどうなるか。エラーを出す仕組みがないので、
+  **何も起きません**。
+
+  実機でも同様で、割り当てられていない領域への書き込みは無視されるか、
+  予測できない動作をします。第 4 章で見た「MMU が権限を検査する」ような仕組みは、
+  このコンピュータにはありません。
+</Callout>
+
+## 画面とキーボード
+
+```ts
+// src/screen.ts
+export class Screen {
+  readonly words = new Int32Array(8192)     // 256 × 512 ドット
+
+  get(index: number): number {
+    return this.words[index] ?? 0
+  }
+
+  set(index: number, value: number) {
+    this.words[index] = value
+  }
+
+  /** 行 r、列 c のドットを読む */
+  getPixel(r: number, c: number): 0 | 1 {
+    const word = this.words[r * 32 + (c >> 4)]!
+    return ((word >> (c & 15)) & 1) as 0 | 1
+  }
+
+  /** 端末に表示する（縦横を間引いている） */
+  render(rows = 32, cols = 64): string {
+    const lines: string[] = []
+    for (let r = 0; r < rows; r++) {
+      let line = ''
+      for (let c = 0; c < cols; c++) {
+        line += this.getPixel(r * (256 / rows), c * (512 / cols)) ? '#' : '.'
+      }
+      lines.push(line)
+    }
+    return lines.join('\n')
+  }
+}
+```
+
+```ts
+// src/keyboard.ts
+export class Keyboard {
+  /** 今押されているキーの文字コード。押されていなければ 0 */
+  value = 0
+}
+```
+
+## Computer：全部つなぐ
+
+```ts
+// src/computer.ts
+import { CPU } from './cpu'
+import { clock } from './dff'
+import { Memory } from './memory'
+import { fromWord, toWord } from './word'
+
+export class Computer {
+  readonly cpu = new CPU()
+  readonly memory = new Memory()
+  private rom: number[]
+
+  constructor(program: number[]) {
+    this.rom = program
+  }
+
+  /** 1 サイクル進める */
+  tick(reset: 0 | 1 = 0) {
+    const pcValue = fromWord(this.cpu.pc.out) & 0x7fff
+    const instruction = toWord(this.rom[pcValue] ?? 0)
+
+    const address = this.cpu.A.out
+    const inM = this.memory.out(address)
+
+    const out = this.cpu.step(inM, instruction, reset)
+    this.memory.set(out.outM, out.writeM, address)
+
+    clock()
+    this.memory.commit()
+  }
+
+  run(cycles: number) {
+    for (let i = 0; i < cycles; i++) this.tick()
+  }
+}
+```
+
+前回の `run` とほぼ同じですが、RAM の代わりに `Memory` を使っています。**CPU 側のコードは 1 行も変わっていません。** CPU はメモリの中身が RAM なのか画面なのかを知りません。
+
+## 画面に描いてみる
+
+一番上の行を黒く塗るプログラムです。
+
+```asm
+@16384      ; 画面の先頭アドレス
+D=A
+@ptr
+M=D         ; ptr = 16384
+
+@32
+D=A
+@count
+M=D         ; count = 32（1 行 = 32 語）
+
+(LOOP)
+@count
+D=M
+@END
+D;JEQ       ; count が 0 なら終わり
+
+@ptr
+A=M         ; A = ptr（アドレスとして使う）
+M=-1        ; その語を全ビット 1 にする
+
+@ptr
+M=M+1       ; ptr++
+@count
+M=M-1       ; count--
+@LOOP
+0;JMP
+
+(END)
+@END
+0;JMP
+```
+
+<Callout type="tip" title="A=M というイディオム">
+  `@ptr` で A に「ptr という変数のアドレス」を入れ、
+  `A=M` で「その中身（= 書き込みたいアドレス）」を A に入れ直しています。
+
+  **ポインタの間接参照**です。A レジスタが値としてもアドレスとしても使えることが、
+  ここで効いています。`*ptr = -1` を 2 命令で実現しています。
+</Callout>
+
+```ts
+// src/computer.check.ts
+import { strict as assert } from 'node:assert'
+import { Computer } from './computer'
+
+const computer = new Computer(FILL_TOP_ROW)
+computer.run(500)
+
+// 1 行目が塗られている
+for (let c = 0; c < 512; c++) {
+  assert.equal(computer.memory.screen.getPixel(0, c), 1, `(0, ${c}) が塗られていない`)
+}
+// 2 行目は塗られていない
+for (let c = 0; c < 512; c++) {
+  assert.equal(computer.memory.screen.getPixel(1, c), 0)
+}
+console.log('ok   画面の 1 行目が塗られた')
+console.log(computer.memory.screen.render(8, 64))
+```
+
+```
+ok   画面の 1 行目が塗られた
+################################################################
+................................................................
+................................................................
+................................................................
+```
+
+## キー入力に反応させる
+
+キーが押されている間だけ画面を塗るプログラムです。
+
+```asm
+(MAIN)
+@24576      ; キーボード
+D=M
+@BLACK
+D;JNE       ; 何か押されていたら黒
+@WHITE
+0;JMP
+
+(BLACK)
+@color
+M=-1
+@DRAW
+0;JMP
+
+(WHITE)
+@color
+M=0
+(DRAW)
+  ...（画面全体を color で塗る）
+@MAIN
+0;JMP
+```
+
+```ts
+const computer = new Computer(KEY_DEMO)
+computer.memory.keyboard.value = 0
+computer.run(10000)
+assert.equal(computer.memory.screen.getPixel(0, 0), 0)
+
+computer.memory.keyboard.value = 65     // 'A' を押した
+computer.run(10000)
+assert.equal(computer.memory.screen.getPixel(0, 0), 1)
+console.log('ok   キー入力に反応した')
+```
+
+**入力を受け取り、状態を変え、出力する。** 汎用コンピュータの条件が揃いました。
+
+## Track 1 の到達点
+
+第 1 回から積み上げてきたものを、もう一度並べます。
+
+```
+NAND ────┬─ NOT / AND / OR / XOR
+         ├─ Mux / DMux
+         ├─ 16 ビットバス
+         ├─ 加算器 → ALU
+         └─┐
+DFF ───────┴─ レジスタ → RAM → PC
+                      │
+                      └─ CPU ─ Computer（ROM + RAM + 画面 + キーボード）
+```
+
+**部品は NAND と DFF の 2 つだけ**です。それ以外は、すべてこの 2 つの組み合わせです。
+
+<Callout type="note" title="ここで一度立ち止まる価値がある">
+  「コンピュータはトランジスタでできている」と聞いても、普通は実感が湧きません。
+  しかし今、あなたは NAND から画面に点を打つところまでを、隙間なく辿りました。
+
+  **どこにも魔法はありませんでした。**
+  選ぶ回路があり、足し算があり、1 サイクル遅らせる素子があり、
+  それらをつなぐ約束（命令セット）があっただけです。
+</Callout>
+
+## 演習
+
+1. **矩形を描く**。画面の一部に四角形を塗るプログラムを書いてください。ビット単位の書き込みが必要です
+2. **キーコードによって色を変える**。押されたキーの値で塗り方を変えます
+3. **画面をスクロールさせる**。各行を 1 つ上にコピーする処理を書いてください
+4. **サイクル数を測る**。画面全体を塗るのに何サイクルかかるか。1 秒間に 60 回繰り返せるなら、クロックは何 Hz 必要か計算してください
+5. **未使用領域への書き込み**を試して、何も起きないことを確かめてください
+
+## 次回
+
+ここからは **もうひとつの CPU** です。実在した 6502 を、同じ部品で組み直します。8 ビットのレジスタ構成、ステータスフラグ、そして Hack にはなかった複雑なアドレス計算の経路を見ていきます。Track 3 の NES エミュレータへの橋渡しになります。
