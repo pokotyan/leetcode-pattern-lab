@@ -55,6 +55,42 @@ const byLevel = LEVELS.map((lv) => ({
     </a>
   </section>
 
+  <section class="mb-14">
+    <h2 class="mb-1 text-xl font-bold">もうひとつの入口：コンピュータの下のほうへ</h2>
+    <p class="mb-5 max-w-2xl text-sm leading-relaxed" style="color: var(--fg-muted)">
+      アルゴリズムとは別に、その下で動いている仕組みそのものを扱う 2 つの区画がある。
+      まず<strong style="color: var(--fg)">読んで概観を掴み</strong>、次に<strong
+        style="color: var(--fg)">実際に組んで動かす</strong
+      >、という順で並べてある。
+    </p>
+    <div class="grid gap-4 sm:grid-cols-2">
+      <a
+        href={`${base}lowlevel/`}
+        class="flex flex-col rounded-xl border px-5 py-4 no-underline transition-colors hover:border-[var(--accent)]"
+        style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+      >
+        <span class="text-xs font-bold" style="color: var(--accent)">STEP 1 ・ 読む</span>
+        <span class="mt-1 text-lg font-bold">低レイヤ</span>
+        <span class="mt-2 text-xs leading-relaxed" style="color: var(--fg-muted)">
+          CPU、キャッシュ、仮想メモリ、プロセスとスレッド、リンク、システムコール。
+          名前は知っているのに説明できないものを、8 章 42 回で上から順につなぎ直す。
+        </span>
+      </a>
+      <a
+        href={`${base}build/`}
+        class="flex flex-col rounded-xl border px-5 py-4 no-underline transition-colors hover:border-[var(--ok)]"
+        style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+      >
+        <span class="text-xs font-bold" style="color: var(--ok)">STEP 2 ・ 作る</span>
+        <span class="mt-1 text-lg font-bold">作る</span>
+        <span class="mt-2 text-xs leading-relaxed" style="color: var(--fg-muted)">
+          NAND ひとつから CPU を組み、その上で動く言語を作り、最後に NES エミュレータを書く。
+          1 回ぶん手を動かすと、動くものが 1 つ増える。
+        </span>
+      </a>
+    </div>
+  </section>
+
   <div class="space-y-16">
     {
       byLevel.map((lv) => (

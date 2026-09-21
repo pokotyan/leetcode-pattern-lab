@@ -30,6 +30,11 @@ const published = steps.filter((s) => s.data.status === 'published').length
       各回の最後に<strong style="color: var(--fg)">その回のぶんだけを確かめるテスト</strong>が付きます。
       テストが通れば次へ進めます。
     </p>
+    <p class="mt-4 max-w-2xl rounded-xl border px-4 py-3 text-sm leading-relaxed" style="border-color: var(--accent); background: var(--accent-soft)">
+      先に<a href={`${base}lowlevel/`} class="font-bold" style="color: var(--accent)">低レイヤ</a
+      >を読んでおくと、ここで出てくる用語の説明を省けます。
+      逆に、作りながら分からなくなったらそちらへ戻れるよう、各回に対応を書いてあります。
+    </p>
     <dl class="mt-6 flex flex-wrap gap-8 text-sm">
       <div>
         <dt style="color: var(--fg-muted)">トラック</dt>
