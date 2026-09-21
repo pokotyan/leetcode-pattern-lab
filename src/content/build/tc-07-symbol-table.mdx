@@ -3,10 +3,297 @@ title: 名前と場所を対応づける
 description: 同じ名前がスコープによって別物を指す。その対応表をどう持ち、どう引くか
 track: toolchain
 order: 7
-status: planned
+status: published
 goal: 変数の種類と番号が正しく解決され、スコープの入れ子が扱える
 requires:
   - tc-06-parser
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 名前から情報を O(1) で引く。スコープの入れ子は、その表を重ねることで表現する
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 名前だけでは足りない
+
+構文木には `{ type: 'Variable', name: 'x' }` としか書かれていません。しかし VM コードを出すには、**どのセグメントの何番か**を知る必要があります。
+
+```
+push local 0        ← x が局所変数の 0 番なら
+push argument 2     ← x が引数の 2 番なら
+```
+
+この対応を持つのが **シンボルテーブル** です。
+
+## 何を記録するか
+
+| 項目 | 例 |
+| --- | --- |
+| 名前 | `x` |
+| 種類 | 局所変数 / 引数 |
+| 番号 | そのセグメント内での位置 |
+
+Mini では型がないので、型情報は持ちません。実際の言語では型も記録し、それが次の段階（意味解析）で使われます。
+
+```ts
+// src/mini/symbols.ts
+export type Kind = 'local' | 'argument'
+export type Entry = { kind: Kind; index: number }
+
+export class SymbolTable {
+  private table = new Map<string, Entry>()
+  private counts: Record<Kind, number> = { local: 0, argument: 0 }
+
+  define(name: string, kind: Kind): Entry {
+    if (this.table.has(name)) {
+      throw new Error(`${name} は既に宣言されています`)
+    }
+    const entry = { kind, index: this.counts[kind]++ }
+    this.table.set(name, entry)
+    return entry
+  }
+
+  lookup(name: string): Entry {
+    const entry = this.table.get(name)
+    if (!entry) throw new Error(`未定義の変数です: ${name}`)
+    return entry
+  }
+
+  count(kind: Kind): number {
+    return this.counts[kind]
+  }
+}
+```
+
+**番号は宣言した順に自動で振られます。** 第 1 回のアセンブラが変数に 16 番地から順に割り当てたのと同じ考え方です。
+
+## 引数は関数ごとにリセットする
+
+シンボルテーブルは**関数ごとに新しく作ります**。
+
+```ts
+for (const fn of ast.functions) {
+  const symbols = new SymbolTable()
+  fn.params.forEach((p) => symbols.define(p, 'argument'))
+  // 本体の var 宣言を集める
+  ...
+}
+```
+
+関数 `f` の `x` と関数 `g` の `x` は別物なので、当然の処理です。
+
+## 局所変数の個数を先に知る必要がある
+
+VM の `function` 命令は、**局所変数の個数を引数に取ります**。
+
+```
+function Mini.main 3        ← 局所変数が 3 個
+```
+
+つまり、本体のコードを生成する前に、**本体を全部見て `var` を数えておく**必要があります。
+
+第 1 回のアセンブラと同じ **2 パス** です。
+
+```ts
+function collectVars(stmts: Node[], symbols: SymbolTable) {
+  for (const s of stmts) {
+    if (s.type === 'VarDecl') symbols.define(s.name, 'local')
+    if (s.type === 'If') {
+      collectVars(s.then, symbols)
+      if (s.else) collectVars(s.else, symbols)
+    }
+    if (s.type === 'While') collectVars(s.body, symbols)
+  }
+}
+```
+
+**ブロックの中まで再帰的に探します。** `if` の中で宣言された変数も、関数の局所変数として場所を確保する必要があるからです。
+
+<Callout type="warn" title="Mini のスコープは「関数全体」">
+  この実装では、`if` の中で宣言した変数が、**`if` を抜けた後も見えます**。
+
+```
+if (a) { var t; t = 1; }
+t = 2;              // Mini では通ってしまう
+```
+  C のブロックスコープとは違う挙動です。**JavaScript の `var` と同じ**、
+  関数スコープの動作になっています。
+
+  これは意図した割り切りです。ブロックスコープを実装するには、
+  次に説明する「表を重ねる」仕組みが必要になります。
+</Callout>
+
+## ブロックスコープを実装するなら
+
+入れ子のスコープを正しく扱うには、**表を積み重ねます**。
+
+```ts
+export class ScopedTable {
+  private scopes: Map<string, Entry>[] = [new Map()]
+
+  enterScope() { this.scopes.push(new Map()) }
+  exitScope() { this.scopes.pop() }
+
+  define(name: string, entry: Entry) {
+    this.scopes[this.scopes.length - 1]!.set(name, entry)
+  }
+
+  lookup(name: string): Entry | undefined {
+    // 内側から外側へ向かって探す
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      const found = this.scopes[i]!.get(name)
+      if (found) return found
+    }
+    return undefined
+  }
+}
+```
+
+**内側から外側へ探す**のが要点です。内側で同じ名前を宣言すると、外側のものが隠れます（**シャドーイング**）。
+
+```
+var x;          // 外側の x
+if (a) {
+  var x;        // 内側の x。ここでは外側が見えない
+  x = 1;        // 内側の x に代入
+}
+x = 2;          // 外側の x に代入
+```
+
+この「内側から順に探す」構造は、**スコープチェーン** と呼ばれます。JavaScript のクロージャも、実行時に同じ形の探索を行っています。
+
+<Callout type="tip" title="宣言の位置と、使える範囲">
+  「ブロックの入口で全部の宣言を集める」か「宣言された行より後だけで使える」かも、
+  言語ごとの選択です。
+
+  - C、Rust、JavaScript の `let`：宣言より後だけ
+  - JavaScript の `var`：関数の先頭に巻き上げられる（hoisting）
+  - Go の `:=`：宣言より後だけ
+
+  **巻き上げは、実装の都合が言語の仕様として見えてしまった例**とも言えます。
+</Callout>
+
+## 使う側から見る
+
+コード生成（次回）では、こう使います。
+
+```ts
+case 'Variable': {
+  const v = symbols.lookup(node.name)
+  out.push(`push ${v.kind} ${v.index}`)
+  break
+}
+
+case 'Assign': {
+  generate(node.value)                      // 右辺を評価してスタックに積む
+  const v = symbols.lookup(node.name)
+  out.push(`pop ${v.kind} ${v.index}`)      // それを変数に入れる
+  break
+}
+```
+
+**表を引いて、セグメント名と番号を埋めるだけ**になりました。木の構造と、名前の解決が、きれいに分かれています。
+
+## エラーを出す
+
+シンボルテーブルは、**最初のエラー検出の場所**でもあります。
+
+| エラー | 検出方法 |
+| --- | --- |
+| 未定義の変数 | `lookup` が見つからない |
+| 二重宣言 | `define` で既にある |
+| 引数の個数が合わない | 関数の表を別に持って照合する |
+
+```ts
+export class FunctionTable {
+  private table = new Map<string, number>()      // 名前 → 引数の個数
+
+  define(name: string, paramCount: number) {
+    if (this.table.has(name)) throw new Error(`関数 ${name} が二重に定義されています`)
+    this.table.set(name, paramCount)
+  }
+
+  check(name: string, argCount: number) {
+    const expected = this.table.get(name)
+    if (expected === undefined) throw new Error(`未定義の関数です: ${name}`)
+    if (expected !== argCount) {
+      throw new Error(`${name} は引数 ${expected} 個ですが、${argCount} 個渡されています`)
+    }
+  }
+}
+```
+
+**関数の表も 2 パスで作ります。** 先に全関数の宣言を集めておかないと、後ろで定義された関数を呼べません。相互再帰が書けなくなります。
+
+<Callout type="note" title="ここが「意味解析」の入口">
+  字句解析は文字の並び、構文解析は構造を見ます。
+  どちらも「意味」は見ていません。`x + 1` が正しいかどうかは、
+  **`x` が存在するか**を知らないと判断できません。
+
+  シンボルテーブルを使った検査が、**意味解析**の最も基本的な部分です。
+  型のある言語では、ここに型検査が加わります。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/mini/symbols.check.ts
+import { strict as assert } from 'node:assert'
+import { FunctionTable, SymbolTable } from './symbols'
+
+// 番号が順に振られる
+{
+  const t = new SymbolTable()
+  assert.deepEqual(t.define('a', 'argument'), { kind: 'argument', index: 0 })
+  assert.deepEqual(t.define('b', 'argument'), { kind: 'argument', index: 1 })
+  assert.deepEqual(t.define('x', 'local'), { kind: 'local', index: 0 })
+  assert.deepEqual(t.define('y', 'local'), { kind: 'local', index: 1 })
+  assert.equal(t.count('local'), 2)
+  assert.equal(t.count('argument'), 2)
+  console.log('ok   種類ごとに独立して番号が振られる')
+}
+
+// 引ける
+{
+  const t = new SymbolTable()
+  t.define('n', 'argument')
+  t.define('sum', 'local')
+  assert.deepEqual(t.lookup('n'), { kind: 'argument', index: 0 })
+  assert.deepEqual(t.lookup('sum'), { kind: 'local', index: 0 })
+  console.log('ok   名前から場所を引ける')
+}
+
+// エラー
+{
+  const t = new SymbolTable()
+  t.define('x', 'local')
+  assert.throws(() => t.define('x', 'local'), /既に宣言/)
+  assert.throws(() => t.lookup('y'), /未定義/)
+  console.log('ok   二重宣言と未定義を検出する')
+}
+
+// 関数の表
+{
+  const f = new FunctionTable()
+  f.define('add', 2)
+  f.check('add', 2)
+  assert.throws(() => f.check('add', 3), /引数 2 個/)
+  assert.throws(() => f.check('sub', 1), /未定義の関数/)
+  console.log('ok   引数の個数を検査する')
+}
+
+console.log('\n全部通りました')
+```
+
+## 演習
+
+1. **`ScopedTable` を完成させ、シャドーイングを確かめる**。内側と外側で同じ名前を宣言し、それぞれ別の番号が振られることを確認してください
+2. **未使用の変数を警告する**。`lookup` されなかった変数を報告します
+3. **型を追加する**。`var x: int;` のように型を書けるようにし、シンボルテーブルに記録してください
+4. **エラーに行番号を付ける**。構文木のノードに行番号を持たせ、`未定義の変数です: x (5 行目)` と出せるようにします
+5. **グローバル変数を追加する**。`static` セグメントを使って、関数をまたいで共有される変数を実装してください
+
+## 次回
+
+いよいよ **コード生成** です。構文木を歩きながら VM コードを吐き出します。式の評価順、代入、条件分岐、ループ。**木の形が、そのまま命令の並びになります。**

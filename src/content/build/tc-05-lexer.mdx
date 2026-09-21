@@ -1,12 +1,299 @@
 ---
 title: 字句解析：文字列を単語に割る
-description: ソースコードを、意味のある最小の単位に切り分ける。コメントと文字列リテラルの扱いが山場
+description: ソースコードを、意味のある最小の単位に切り分ける。コメントと数字の境目が山場
 track: toolchain
 order: 5
-status: planned
+status: published
 goal: 任意のソースをトークン列に変換し、その結果を目で確認できる
 requires:
   - tc-04-function-call
+basedOn:
+  - kind: article
+    slug: string-matching
+    why: 文字列を先頭から走査して、パターンに合う最長の部分を取る。その素直な適用がここにある
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 作る言語を決める
+
+ここから、高級言語を作ります。名前を **Mini** とします。
+
+```
+function fact(n) {
+  if (n <= 1) { return 1; }
+  return n * fact(n - 1);
+}
+
+function main() {
+  var x;
+  x = fact(5);
+  return x;
+}
+```
+
+必要なものだけに絞ります。
+
+- 整数だけ（文字列も小数もない）
+- 関数と再帰
+- `var` による局所変数の宣言
+- `if` / `else` / `while` / `return`
+- 四則演算と比較
+
+**これで、前回まで手で書いていた VM コードが自動生成できるようになります。**
+
+## 最初の仕事
+
+コンパイラの最初の段階は、**文字の並びを、意味のある単位に切り分ける**ことです。この単位を **トークン** と呼びます。
+
+```
+"x = 1 + 20;"
+
+  ↓
+
+[ident "x"] [symbol "="] [number 1] [symbol "+"] [number 20] [symbol ";"]
+```
+
+**空白が消え、数字が数値になり、種類が付きます。**
+
+この段階を **字句解析**（lexical analysis）と呼び、担当するプログラムを **レキサ**（あるいはスキャナ、トークナイザ）と呼びます。
+
+<Callout type="tip" title="なぜ分けるのか">
+  構文解析（次回）を「トークンの並び」に対して書けるようになります。
+  「`if` の次は `(` が来る」と書けばよく、
+  「`i` の次が `f` で、その次が空白か `(` で……」と書かなくて済みます。
+
+  **文字レベルの面倒（空白、コメント、数字の桁）を、ここで全部吸収します。**
+</Callout>
+
+## トークンの種類
+
+Mini では 4 種類です。
+
+| 種類 | 例 |
+| --- | --- |
+| `number` | `0`, `42`, `1000` |
+| `ident` | `x`, `sum`, `fact` |
+| `keyword` | `function`, `var`, `if`, `else`, `while`, `return` |
+| `symbol` | `+`, `-`, `*`, `/`, `(`, `)`, `{`, `}`, `;`, `,`, `=`, `==`, `!=`, `<`, `>`, `<=`, `>=` |
+
+**キーワードと識別子は、切り出し方が同じ**です。どちらも英字で始まる英数字の並び。切り出してから、キーワードの一覧に載っているかどうかで種類を決めます。
+
+## 実装
+
+```ts
+// src/mini/lexer.ts
+export type Token = {
+  type: 'number' | 'ident' | 'keyword' | 'symbol' | 'eof'
+  value: string | number
+  line: number
+}
+
+const KEYWORDS = new Set(['function', 'var', 'if', 'else', 'while', 'return'])
+
+// 長いものを先に置く。'==' を '=' より先に試す必要がある
+const SYMBOLS = [
+  '==', '!=', '<=', '>=',
+  '(', ')', '{', '}', ';', ',',
+  '+', '-', '*', '/', '<', '>', '=',
+]
+
+export function tokenize(source: string): Token[] {
+  const tokens: Token[] = []
+  let i = 0
+  let line = 1
+
+  while (i < source.length) {
+    const c = source[i]!
+
+    // 改行（行番号を数えるため、空白より先に判定する）
+    if (c === '\n') { line++; i++; continue }
+
+    // 空白
+    if (/\s/.test(c)) { i++; continue }
+
+    // 行コメント
+    if (c === '/' && source[i + 1] === '/') {
+      while (i < source.length && source[i] !== '\n') i++
+      continue
+    }
+
+    // 数値
+    if (/[0-9]/.test(c)) {
+      let j = i
+      while (j < source.length && /[0-9]/.test(source[j]!)) j++
+      tokens.push({ type: 'number', value: Number(source.slice(i, j)), line })
+      i = j
+      continue
+    }
+
+    // 識別子またはキーワード
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i
+      while (j < source.length && /[A-Za-z0-9_]/.test(source[j]!)) j++
+      const word = source.slice(i, j)
+      tokens.push({ type: KEYWORDS.has(word) ? 'keyword' : 'ident', value: word, line })
+      i = j
+      continue
+    }
+
+    // 記号
+    const symbol = SYMBOLS.find((s) => source.startsWith(s, i))
+    if (symbol) {
+      tokens.push({ type: 'symbol', value: symbol, line })
+      i += symbol.length
+      continue
+    }
+
+    throw new Error(`${line} 行目: 読めない文字です "${c}"`)
+  }
+
+  tokens.push({ type: 'eof', value: '', line })
+  return tokens
+}
+```
+
+## 3 つの落とし穴
+
+### 1. 記号は長いものから試す
+
+`SYMBOLS` の並び順が重要です。`'='` を先に試すと、`==` が `=` 2 つに割れてしまいます。
+
+これを **最長一致** と呼びます。字句解析の基本原則です。
+
+同じ理由で、`<=` は `<` より先になければなりません。
+
+<Callout type="warn" title="最長一致が裏目に出ることもある">
+  C++ では長く、`vector<vector<int>>` の `>>` が
+  **右シフト演算子として解釈される**という問題がありました。
+  C++11 でようやく特別扱いされるようになりました。
+
+  最長一致は単純で高速ですが、文脈を見ないので、こういう衝突が起きます。
+</Callout>
+
+### 2. 識別子と数値の境目
+
+`123abc` はどうなるか。上の実装では、`123` という数値と `abc` という識別子に割れます。エラーになりません。
+
+**構文解析の段階でエラーになります。** 数値の後に識別子が来る文法がないからです。
+
+字句解析でエラーにする設計もありえます。どちらが良いかは、エラーメッセージの分かりやすさで決めます。「`123abc` は不正な数値です」と言えたほうが親切です。
+
+### 3. 行番号を数える場所
+
+改行の判定を、一般の空白より**先に**書く必要があります。逆にすると、`\s` が改行にも一致してしまい、行番号が増えません。
+
+**エラーメッセージに行番号が出ないコンパイラは使い物になりません。** ここは手を抜けない部分です。
+
+## テストを書く
+
+```ts
+// src/mini/lexer.check.ts
+import { strict as assert } from 'node:assert'
+import { tokenize } from './lexer'
+
+const values = (src: string) => tokenize(src).slice(0, -1).map((t) => t.value)
+const types = (src: string) => tokenize(src).slice(0, -1).map((t) => t.type)
+
+// 基本
+assert.deepEqual(values('var x;'), ['var', 'x', ';'])
+assert.deepEqual(types('var x;'), ['keyword', 'ident', 'symbol'])
+console.log('ok   キーワードと識別子の区別')
+
+// 数値は数になっている
+assert.deepEqual(values('42 + 100'), [42, '+', 100])
+assert.equal(typeof tokenize('42')[0]!.value, 'number')
+console.log('ok   数値の変換')
+
+// 最長一致
+assert.deepEqual(values('a == b'), ['a', '==', 'b'])
+assert.deepEqual(values('a = b'), ['a', '=', 'b'])
+assert.deepEqual(values('a <= b'), ['a', '<=', 'b'])
+assert.deepEqual(values('a < b'), ['a', '<', 'b'])
+console.log('ok   最長一致（== と = を取り違えない）')
+
+// 空白の扱い
+assert.deepEqual(values('x=1;'), ['x', '=', 1, ';'])
+assert.deepEqual(values('  x   =  1 ;  '), ['x', '=', 1, ';'])
+console.log('ok   空白は自由')
+
+// コメント
+assert.deepEqual(values('x = 1; // これはコメント\ny = 2;'), ['x', '=', 1, ';', 'y', '=', 2, ';'])
+console.log('ok   コメントを飛ばす')
+
+// 行番号
+{
+  const tokens = tokenize('a;\nb;\n\nc;')
+  assert.equal(tokens[0]!.line, 1)
+  assert.equal(tokens[2]!.line, 2)
+  assert.equal(tokens[4]!.line, 4)
+  console.log('ok   行番号')
+}
+
+// エラー
+assert.throws(() => tokenize('x @ y'), /読めない文字/)
+console.log('ok   知らない文字でエラー')
+
+// 実際のプログラム
+{
+  const tokens = tokenize(`
+function fact(n) {
+  if (n <= 1) { return 1; }
+  return n * fact(n - 1);
+}
+`)
+  console.log(`\nトークン数: ${tokens.length}`)
+  console.log(tokens.slice(0, 12).map((t) => `${t.type}(${t.value})`).join(' '))
+}
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/mini/lexer.check.ts
+```
+
+```
+ok   キーワードと識別子の区別
+ok   数値の変換
+ok   最長一致（== と = を取り違えない）
+...
+トークン数: 32
+keyword(function) ident(fact) symbol(() ident(n) symbol()) symbol({) keyword(if) ...
+```
+
+## なぜ正規表現 1 本で書かないのか
+
+「正規表現で全部のトークンを一度にマッチさせればいい」と考えるかもしれません。実際、そういう実装もあります。
+
+```ts
+const TOKEN_RE = /(\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*\/(){};,<>=])|(\s+)/g
+```
+
+短く書けますが、
+
+- どの選択肢に一致したかを調べるコードが結局必要
+- エラー位置が分かりにくい
+- 状態を持つもの（複数行コメント、文字列のエスケープ）が扱いにくい
+
+**言語が育つと、手書きのループのほうが管理しやすくなります。** 実際、多くの本格的なコンパイラのレキサは手書きです。
+
+<Callout type="note" title="レキサ生成器">
+  `lex` / `flex` のように、トークンの定義から自動的にレキサを生成する道具があります。
+  内部では、正規表現を**有限オートマトン**に変換し、それを状態遷移表として実装します。
+
+  1 文字ずつ読んで状態を移す、という形になるので極めて高速です。
+  第 4 章で読んだ文字列照合と、根は同じ仕組みです。
+</Callout>
+
+## 演習
+
+1. **ブロックコメント `/* ... */` を実装する**。入れ子を許すかどうかで実装が変わります
+2. **16 進数リテラル `0x1F` を追加する**。数値の判定を拡張します
+3. **列と行の両方を記録する**。エラーメッセージで `3 行 12 列目` と出せるようにしてください
+4. **トークンの元の位置を保持する**。エラー時にソースの該当行を表示できるようにします
+5. **`123abc` をエラーにする**。数値の直後に識別子の文字が来たら、その場で報告してください
+
+## 次回
+
+トークンの並びができました。次は、そこから**構造**を取り出します。`1 + 2 * 3` が `1 + (2 * 3)` であることを、どうやって機械に分からせるか。**再帰下降**という書き方を使うと、文法がそのまま関数の呼び出し関係になります。

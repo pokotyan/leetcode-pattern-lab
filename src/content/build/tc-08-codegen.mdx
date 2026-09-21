@@ -3,10 +3,400 @@ title: コード生成：木を降りながら命令を吐く
 description: 式の評価順、代入、条件分岐、ループ。構文木の形がそのまま命令の並びになる
 track: toolchain
 order: 8
-status: planned
+status: published
 goal: 自作言語で書いたプログラムが、VM を経て自作 CPU 上で動く
 requires:
   - tc-07-symbol-table
+basedOn:
+  - kind: article
+    slug: tree-traversal
+    why: 帰りがけ順（後行順）で木を歩くと、そのまま逆ポーランド記法になる。ここが最も効く場面
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 木を後ろから読むと、命令の並びになる
+
+`1 + 2 * 3` の木です。
+
+```
+      +
+     / \
+    1   *
+       / \
+      2   3
+```
+
+これを **帰りがけ順**（子を先に処理して、最後に自分）でたどります。
+
+```
+1 を訪問   → push constant 1
+2 を訪問   → push constant 2
+3 を訪問   → push constant 3
+* を訪問   → call Runtime.mul 2
++ を訪問   → add
+```
+
+**そのまま正しい VM コードになりました。**
+
+理由は単純です。スタックマシンは「オペランドを積んでから演算する」形なので、**子を先に処理して親を後に処理する順序**と完全に一致します。第 2 回で触れた逆ポーランド記法が、木の走査順として現れています。
+
+<Callout type="tip" title="木の走査順と記法の対応">
+  | 走査順 | 得られる記法 |
+  | --- | --- |
+  | 行きがけ（自分 → 子） | 前置記法（Lisp の `(+ 1 (* 2 3))`） |
+  | 通りがけ（左 → 自分 → 右） | 中置記法（普通の `1 + 2 * 3`。括弧が必要） |
+  | **帰りがけ（子 → 自分）** | **後置記法（逆ポーランド）** |
+
+  スタックマシン向けのコード生成が簡単なのは、**帰りがけ順そのもの**だからです。
+</Callout>
+
+## 式の生成
+
+```ts
+// src/mini/codegen.ts
+function genExpr(e: Node) {
+  switch (e.type) {
+    case 'Number':
+      out.push(`push constant ${e.value}`)
+      break
+
+    case 'Variable': {
+      const v = symbols.lookup(e.name)
+      out.push(`push ${v.kind} ${v.index}`)
+      break
+    }
+
+    case 'Unary':
+      genExpr(e.operand)
+      out.push('neg')
+      break
+
+    case 'Binary':
+      genExpr(e.left)                  // 左の子
+      genExpr(e.right)                 // 右の子
+      out.push(opcodeFor(e.op))        // 自分
+      break
+
+    case 'Call':
+      e.args.forEach(genExpr)          // 引数を左から順に積む
+      out.push(`call Mini.${e.name} ${e.args.length}`)
+      break
+  }
+}
+```
+
+**`Binary` の 3 行が、帰りがけ順そのもの**です。
+
+## 演算子の対応
+
+VM にない演算は、既存の命令を組み合わせて作ります。
+
+```ts
+function opcodeFor(op: string): string {
+  switch (op) {
+    case '+': return 'add'
+    case '-': return 'sub'
+    case '<': return 'lt'
+    case '>': return 'gt'
+    case '==': return 'eq'
+    case '!=': return 'eq\nnot'          // 等しくない = 等しいの否定
+    case '<=': return 'gt\nnot'          // 以下 = より大きいの否定
+    case '>=': return 'lt\nnot'
+    case '*': return 'call Runtime.mul 2'
+    case '/': return 'call Runtime.div 2'
+    default: throw new Error(`未対応の演算子: ${op}`)
+  }
+}
+```
+
+**`!=` を `eq` と `not` の 2 命令にしている**のがポイントです。VM に専用命令を増やさずに済みます。第 2 回で「真を -1（全ビット 1）にした」おかげで、`not` がそのまま論理否定として働きます。
+
+### 掛け算と割り算
+
+CPU に乗算命令がないので、**ライブラリ関数として VM コードで書きます**。
+
+```
+function Runtime.mul 3
+  local 0 = 0（結果）
+  local 1 = argument 0（足す値）
+  local 2 = argument 1（回数）
+  while (local 2 > 0) {
+    local 0 = local 0 + local 1
+    local 2 = local 2 - 1
+  }
+  return local 0
+```
+
+繰り返し加算です。**遅い**（n 回のループ）ですが、正しく動きます。
+
+<Callout type="note" title="ランタイムライブラリという層">
+  言語の機能なのに、コンパイラが命令を出すのではなく**関数呼び出しに変換する**。
+  この関数群を **ランタイムライブラリ** と呼びます。
+
+  実際の言語でも、割り算、浮動小数点演算、文字列操作、メモリ確保などが
+  ランタイムで提供されます。
+  C で `-lm` が必要だったり、Go のバイナリが大きかったりするのは、これが理由です。
+
+  **どこまでを命令にして、どこからを関数にするか**は、
+  ハードウェアのコストとの相談で決まります。
+</Callout>
+
+## 代入
+
+```ts
+case 'Assign': {
+  genExpr(s.value)                          // 右辺を評価して積む
+  const v = symbols.lookup(s.name)
+  out.push(`pop ${v.kind} ${v.index}`)      // それを変数に入れる
+  break
+}
+```
+
+**右辺を先に評価します。** 左辺は「どこに入れるか」でしかないので、式ではありません。
+
+## if 文
+
+条件が真なら then、偽なら else。VM には `if-goto`（真なら飛ぶ）しかないので、ラベルを組み合わせます。
+
+```ts
+case 'If': {
+  const id = labelId++
+  genExpr(s.cond)
+  out.push(
+    `if-goto IF_TRUE${id}`,
+    `goto IF_FALSE${id}`,
+    `label IF_TRUE${id}`,
+  )
+  genBlock(s.then)
+  out.push(`goto IF_END${id}`, `label IF_FALSE${id}`)
+  if (s.else) genBlock(s.else)
+  out.push(`label IF_END${id}`)
+  break
+}
+```
+
+生成されるコードの形です。
+
+```
+（条件を評価）
+if-goto IF_TRUE0
+goto IF_FALSE0
+label IF_TRUE0
+  （then の中身）
+goto IF_END0
+label IF_FALSE0
+  （else の中身）
+label IF_END0
+```
+
+<Callout type="warn" title="ラベルに通し番号が必須">
+  `if` が入れ子になったり、複数回出てきたりすると、同じラベル名が衝突します。
+  `labelId++` で一意にするのは、生成器の基本的な作法です。
+
+  さらに、**関数をまたいでも衝突しないように**、
+  VM の `label` 命令は関数名を接頭辞に付けています（第 4 回）。二重の対策です。
+</Callout>
+
+## while 文
+
+```ts
+case 'While': {
+  const id = labelId++
+  out.push(`label WHILE_TOP${id}`)
+  genExpr(s.cond)
+  out.push('not', `if-goto WHILE_END${id}`)     // 条件が偽なら抜ける
+  genBlock(s.body)
+  out.push(`goto WHILE_TOP${id}`, `label WHILE_END${id}`)
+  break
+}
+```
+
+**`not` を挟んで、「偽なら抜ける」に変換している**のが工夫です。`if-goto` は真のときに飛ぶので、そのままでは「真なら抜ける」になってしまいます。
+
+## 関数全体
+
+```ts
+export function generate(ast: Node): string {
+  const out: string[] = []
+  let labelId = 0
+
+  for (const fn of ast.functions) {
+    const symbols = new SymbolTable()
+    fn.params.forEach((p: string) => symbols.define(p, 'argument'))
+    collectVars(fn.body, symbols)                 // 局所変数を数える（第 7 回）
+
+    out.push(`function Mini.${fn.name} ${symbols.count('local')}`)
+    genBlock(fn.body)
+    out.push('push constant 0', 'return')         // return がない場合の保険
+  }
+  return out.join('\n')
+}
+```
+
+最後の `push constant 0 / return` は、**`return` を書き忘れた関数**のためです。これがないと、関数の末尾から次の関数の先頭に落ちていきます。
+
+## 全部つなぐ
+
+```ts
+// src/mini/compile.ts
+import { assemble } from '../asm/index'
+import { translate } from '../vm/translate'
+import { tokenize } from './lexer'
+import { parse } from './parser'
+import { generate } from './codegen'
+import { RUNTIME } from './runtime'
+
+export function compile(source: string): number[] {
+  const ast = parse(tokenize(source))
+  const vm = generate(ast) + '\n' + RUNTIME
+
+  const asm = [
+    '@256', 'D=A', '@SP', 'M=D',              // SP を初期化
+    translate(['call Mini.main 0']),           // main を呼ぶ
+    '(HALT)', '@HALT', '0;JMP',
+    translate(vm.split('\n')),
+  ].join('\n')
+
+  return assemble(asm)
+}
+```
+
+**5 つの段階が 1 本の線になりました。**
+
+```
+Mini のソース
+  ↓ tokenize      トークン列
+  ↓ parse         構文木
+  ↓ generate      VM コード
+  ↓ translate     アセンブリ
+  ↓ assemble      機械語
+  ↓ CPU           NAND と DFF
+```
+
+## 走らせる
+
+```ts
+// src/mini/compile.check.ts
+import { strict as assert } from 'node:assert'
+import { compile } from './compile'
+import { run } from '../run'
+
+function exec(source: string, cycles = 20_000_000): number {
+  const ram = run(compile(source), {}, cycles)
+  return ram[ram[0]! - 1]!
+}
+
+assert.equal(exec('function main(){ return 1 + 2 * 3; }'), 7)
+assert.equal(exec('function main(){ return (1 + 2) * 3; }'), 9)
+console.log('ok   優先順位が実行結果に出る')
+
+assert.equal(exec('function main(){ var x; x = 10; x = x - 3; return x; }'), 7)
+console.log('ok   変数と代入')
+
+assert.equal(exec('function main(){ if (1 < 2) { return 100; } else { return 200; } }'), 100)
+assert.equal(exec('function main(){ if (2 < 1) { return 100; } else { return 200; } }'), 200)
+console.log('ok   if / else')
+
+assert.equal(exec(`
+function main(){
+  var i; var sum;
+  i = 1; sum = 0;
+  while (i <= 10) { sum = sum + i; i = i + 1; }
+  return sum;
+}`), 55)
+console.log('ok   while ループ（1..10 の合計 = 55）')
+
+assert.equal(exec(`
+function fact(n){ if (n <= 1) { return 1; } return n * fact(n - 1); }
+function main(){ return fact(5); }`), 120)
+console.log('ok   再帰（5! = 120）')
+
+assert.equal(exec(`
+function fib(n){ if (n < 2) { return n; } return fib(n-1) + fib(n-2); }
+function main(){ return fib(10); }`, 200_000_000), 55)
+console.log('ok   二重再帰（fib(10) = 55）')
+
+assert.equal(exec('function main(){ return 100 / 7; }'), 14)
+console.log('ok   割り算（ランタイム関数）')
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/mini/compile.check.ts
+```
+
+```
+ok   優先順位が実行結果に出る
+ok   変数と代入
+ok   if / else
+ok   while ループ（1..10 の合計 = 55）
+ok   再帰（5! = 120）
+ok   二重再帰（fib(10) = 55）
+ok   割り算（ランタイム関数）
+
+全部通りました
+```
+
+<Callout type="tip" title="ここで一度立ち止まる">
+  `fib(10) = 55` という 1 行の結果に、これまでのすべてが含まれています。
+
+  NAND ゲートが加算器になり、ALU になり、CPU になり、
+  機械語が定義され、アセンブラが記号を解き、
+  VM がスタックを管理し、コンパイラが木を歩いた結果です。
+
+  **どこにも既製品を使っていません。**
+</Callout>
+
+## 最適化を少しだけ
+
+生成されたコードには、明らかな無駄があります。
+
+```
+push constant 2
+push constant 3
+add                 ← 定数同士なので、コンパイル時に 5 にできる
+```
+
+**定数畳み込み**（constant folding）です。
+
+```ts
+case 'Binary': {
+  // 両辺が定数なら、その場で計算してしまう
+  if (e.left.type === 'Number' && e.right.type === 'Number' && e.op === '+') {
+    out.push(`push constant ${e.left.value + e.right.value}`)
+    break
+  }
+  genExpr(e.left); genExpr(e.right); out.push(opcodeFor(e.op))
+  break
+}
+```
+
+他にも、
+
+- `x * 1` → `x`（恒等元の除去）
+- `x * 2` → `x + x`（強度削減）
+- 到達しないコードの削除
+- 同じ式を 2 回計算しない（共通部分式の除去）
+
+<Callout type="warn" title="最適化はテストの後で">
+  最適化を入れると、**バグが入っても結果が正しく見えることがあります**。
+  そして、どの最適化が原因かの切り分けが難しくなります。
+
+  先に最適化なしの版を作り、テストを通し、
+  **その後で最適化を 1 つずつ足して、毎回テストを回す**。
+  この順序を守らないと、後で手がつけられなくなります。
+</Callout>
+
+## 演習
+
+1. **定数畳み込みを実装する**。全演算子に対応させ、テストが通り続けることを確認してください
+2. **生成コードの行数を測る**。`fib` のコンパイル結果が VM 命令で何行、アセンブリで何行、機械語で何語になるか数えてください
+3. **`for` 文を追加する**。`while` に変換するだけで実装できます（構文糖衣）
+4. **掛け算を速くする**。繰り返し加算をシフトと加算に変えると、O(n) が O(log n) になります
+5. **エラーメッセージを整える**。未定義の変数を使ったとき、行番号とソース行を表示してください
+
+## 次回
+
+Track 2 の最終回です。同じ構文木を、**命令に変換せずその場で実行する**とどうなるか。インタプリタとコンパイラの分かれ目がどこにあるのかを見ます。

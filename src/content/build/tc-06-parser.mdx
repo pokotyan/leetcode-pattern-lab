@@ -3,10 +3,422 @@ title: 構文解析：単語を木にする
 description: 再帰下降という書き方ひとつで、文法をそのまま関数の呼び出し関係に写し取る
 track: toolchain
 order: 6
-status: planned
+status: published
 goal: ソースコードから構文木が作れ、構造を出力して確認できる
 requires:
   - tc-05-lexer
+basedOn:
+  - kind: article
+    slug: tree-traversal
+    why: 構文木は木そのもの。この後のコード生成は、この木を帰りがけ順に歩く処理になる
+  - kind: article
+    slug: backtracking
+    why: 文法の選択肢を順に試す構造。再帰で「1 段ぶんの判断」を書けば全体が動く
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 並びから構造へ
+
+トークンの並びは、まだ一次元です。
+
+```
+1  +  2  *  3
+```
+
+しかし意味は木です。
+
+```
+      +
+     / \
+    1   *
+       / \
+      2   3
+```
+
+**`*` のほうが `+` より内側にある**（先に計算される）ことを、構造として表現する必要があります。これが **構文解析** で、作られるものが **構文木**（AST、抽象構文木）です。
+
+## 文法を書き下す
+
+まず、言語の形を規則として書きます。
+
+```
+program    := function*
+function   := 'function' ident '(' params ')' block
+block      := '{' statement* '}'
+
+statement  := 'var' ident ';'
+            | ident '=' expr ';'
+            | 'if' '(' expr ')' block ('else' block)?
+            | 'while' '(' expr ')' block
+            | 'return' expr? ';'
+            | expr ';'
+
+expr       := equality
+equality   := comparison (('==' | '!=') comparison)*
+comparison := addition (('<' | '>' | '<=' | '>=') addition)*
+addition   := multiplication (('+' | '-') multiplication)*
+multiplication := unary (('*' | '/') unary)*
+unary      := '-' unary | primary
+primary    := number | ident | ident '(' args ')' | '(' expr ')'
+```
+
+**式の規則が何段にも分かれている**ことに注目してください。これが優先順位を表現しています。
+
+<Callout type="tip" title="優先順位は「入れ子の深さ」で表す">
+  `addition` は `multiplication` を呼びます。つまり、
+  **足し算の項の中身が掛け算**という構造になります。
+
+```
+1 + 2 * 3
+  → addition が「1」と「2 * 3」を足す形で解析する
+```
+  優先順位の高い演算ほど、規則の**下のほう**（深いほう）に置きます。
+  それだけで、`*` が `+` より先に結合します。
+</Callout>
+
+## 再帰下降
+
+文法の規則 1 つを、関数 1 つに対応させます。これが **再帰下降** です。
+
+```
+addition := multiplication (('+' | '-') multiplication)*
+```
+
+がそのまま、
+
+```ts
+function addition() {
+  let left = multiplication()
+  while (check('+') || check('-')) {
+    const op = next().value
+    left = { type: 'Binary', op, left, right: multiplication() }
+  }
+  return left
+}
+```
+
+になります。**文法を読めば実装が書け、実装を読めば文法が分かります。**
+
+<Callout type="note" title="なぜ左辺を積み上げるのか">
+  `1 - 2 - 3` は `(1 - 2) - 3` であって `1 - (2 - 3)` ではありません（**左結合**）。
+
+  上のループでは、新しい `Binary` の `left` に**それまでの結果**を入れています。
+  だから左から順に畳まれ、左結合になります。
+
+  右結合にしたければ（`2 ^ 3 ^ 4` の `^` など）、ループではなく**再帰**で書きます。
+
+```ts
+function power() {
+  const base = primary()
+  if (check('^')) { next(); return { type: 'Binary', op: '^', left: base, right: power() } }
+  return base
+}
+```
+</Callout>
+
+## 実装
+
+規則が似た形なので、優先順位の表を作ってまとめられます。
+
+```ts
+// src/mini/parser.ts
+import type { Token } from './lexer'
+
+export type Node = any     // 学習用に緩く。実運用では判別可能な union にする
+
+export function parse(tokens: Token[]): Node {
+  let p = 0
+  const peek = () => tokens[p]!
+  const next = () => tokens[p++]!
+  const check = (v: string) => peek().value === v
+  const expect = (v: string) => {
+    if (!check(v)) {
+      throw new Error(`${peek().line} 行目: "${v}" が必要ですが "${peek().value}" でした`)
+    }
+    return next()
+  }
+
+  // --- 宣言 ---
+  function program() {
+    const functions = []
+    while (peek().type !== 'eof') functions.push(fnDecl())
+    return { type: 'Program', functions }
+  }
+
+  function fnDecl() {
+    expect('function')
+    const name = next().value as string
+    expect('(')
+    const params: string[] = []
+    if (!check(')')) {
+      params.push(next().value as string)
+      while (check(',')) { next(); params.push(next().value as string) }
+    }
+    expect(')')
+    return { type: 'Function', name, params, body: block() }
+  }
+
+  function block() {
+    expect('{')
+    const stmts = []
+    while (!check('}')) stmts.push(statement())
+    expect('}')
+    return stmts
+  }
+
+  // --- 文 ---
+  function statement(): Node {
+    if (check('var')) {
+      next()
+      const name = next().value as string
+      expect(';')
+      return { type: 'VarDecl', name }
+    }
+    if (check('if')) {
+      next(); expect('(')
+      const cond = expr()
+      expect(')')
+      const then = block()
+      let els = null
+      if (check('else')) { next(); els = block() }
+      return { type: 'If', cond, then, else: els }
+    }
+    if (check('while')) {
+      next(); expect('(')
+      const cond = expr()
+      expect(')')
+      return { type: 'While', cond, body: block() }
+    }
+    if (check('return')) {
+      next()
+      const value = check(';') ? null : expr()
+      expect(';')
+      return { type: 'Return', value }
+    }
+    // 代入か、ただの式か
+    if (peek().type === 'ident' && tokens[p + 1]!.value === '=') {
+      const name = next().value as string
+      next()                                  // '='
+      const value = expr()
+      expect(';')
+      return { type: 'Assign', name, value }
+    }
+    const e = expr()
+    expect(';')
+    return { type: 'ExprStatement', expr: e }
+  }
+
+  // --- 式 ---
+  const LEVELS = [
+    ['==', '!='],
+    ['<', '>', '<=', '>='],
+    ['+', '-'],
+    ['*', '/'],
+  ]
+
+  function expr(level = 0): Node {
+    if (level === LEVELS.length) return unary()
+    let left = expr(level + 1)
+    while (LEVELS[level]!.includes(peek().value as string)) {
+      const op = next().value as string
+      left = { type: 'Binary', op, left, right: expr(level + 1) }
+    }
+    return left
+  }
+
+  function unary(): Node {
+    if (check('-')) { next(); return { type: 'Unary', op: '-', operand: unary() } }
+    return primary()
+  }
+
+  function primary(): Node {
+    const t = peek()
+    if (t.type === 'number') { next(); return { type: 'Number', value: t.value } }
+    if (check('(')) { next(); const e = expr(); expect(')'); return e }
+    if (t.type === 'ident') {
+      next()
+      if (check('(')) {
+        next()
+        const args = []
+        if (!check(')')) {
+          args.push(expr())
+          while (check(',')) { next(); args.push(expr()) }
+        }
+        expect(')')
+        return { type: 'Call', name: t.value, args }
+      }
+      return { type: 'Variable', name: t.value }
+    }
+    throw new Error(`${t.line} 行目: 式が必要ですが "${t.value}" でした`)
+  }
+
+  return program()
+}
+```
+
+**`expr(level)` が優先順位の表を使って自分自身を呼ぶ**形になっています。段を 1 つ足したければ、`LEVELS` に 1 行足すだけです。
+
+<Callout type="warn" title="1 トークン先読みで代入を判定する">
+```ts
+if (peek().type === 'ident' && tokens[p + 1].value === '=') { ... }
+```
+  `x` を見た時点では、それが代入の左辺なのか式の一部なのか分かりません。
+  **次のトークンが `=` かどうか**で決めています。
+
+  このように「k 個先まで見れば決められる」文法を **LL(k)** と呼びます。
+  Mini は LL(2) です。
+
+  先読みでは決められない文法（C の `a * b;` が掛け算なのかポインタ宣言なのか、など）
+  では、もっと強力な手法か、意味解析の情報が必要になります。
+</Callout>
+
+## 括弧が消える
+
+`(1 + 2) * 3` を解析すると、`primary` の中で `'('` を見つけて `expr()` を呼び、`')'` を確認して**中身の木をそのまま返します**。
+
+```ts
+if (check('(')) { next(); const e = expr(); expect(')'); return e }
+```
+
+**括弧のノードは作られません。** 括弧の役割は「解析の順序を変える」ことであり、その結果は木の形として保存されているからです。
+
+これが **抽象**構文木と呼ばれる理由です。ソースの見た目をそのまま写すのではなく、意味に必要な構造だけを残します。
+
+## テストを書く
+
+```ts
+// src/mini/parser.check.ts
+import { strict as assert } from 'node:assert'
+import { tokenize } from './lexer'
+import { parse } from './parser'
+
+const parseExpr = (src: string) =>
+  parse(tokenize(`function f(){ return ${src}; }`)).functions[0].body[0].value
+
+// 優先順位
+{
+  const e = parseExpr('1 + 2 * 3')
+  assert.equal(e.op, '+', 'トップは +')
+  assert.equal(e.right.op, '*', '* が内側')
+  assert.equal(e.left.value, 1)
+}
+{
+  const e = parseExpr('1 * 2 + 3')
+  assert.equal(e.op, '+')
+  assert.equal(e.left.op, '*')
+}
+console.log('ok   * が + より強く結合する')
+
+// 括弧
+{
+  const e = parseExpr('(1 + 2) * 3')
+  assert.equal(e.op, '*')
+  assert.equal(e.left.op, '+', '括弧の中身が左側の木になっている')
+}
+console.log('ok   括弧で順序が変わる')
+
+// 左結合
+{
+  const e = parseExpr('1 - 2 - 3')
+  assert.equal(e.op, '-')
+  assert.equal(e.left.op, '-', '(1-2)-3 の形')
+  assert.equal(e.right.value, 3)
+}
+console.log('ok   左結合')
+
+// 比較は算術より弱い
+{
+  const e = parseExpr('1 + 2 < 3 * 4')
+  assert.equal(e.op, '<')
+  assert.equal(e.left.op, '+')
+  assert.equal(e.right.op, '*')
+}
+console.log('ok   比較 < 算術 の優先順位')
+
+// 単項マイナス
+{
+  const e = parseExpr('-1 + 2')
+  assert.equal(e.op, '+')
+  assert.equal(e.left.type, 'Unary')
+}
+console.log('ok   単項マイナス')
+
+// 関数呼び出し
+{
+  const e = parseExpr('f(1, g(2))')
+  assert.equal(e.type, 'Call')
+  assert.equal(e.args.length, 2)
+  assert.equal(e.args[1].type, 'Call', '引数の中の呼び出し')
+}
+console.log('ok   関数呼び出しの入れ子')
+
+// 文
+{
+  const ast = parse(tokenize(`
+function fact(n) {
+  if (n <= 1) { return 1; }
+  return n * fact(n - 1);
+}
+`))
+  const fn = ast.functions[0]
+  assert.equal(fn.name, 'fact')
+  assert.deepEqual(fn.params, ['n'])
+  assert.equal(fn.body[0].type, 'If')
+  assert.equal(fn.body[1].type, 'Return')
+}
+console.log('ok   関数定義と文')
+
+// エラーメッセージに行番号が出る
+assert.throws(() => parse(tokenize('function f() {\n  return 1\n}')), /2 行目/)
+console.log('ok   エラーに行番号が出る')
+
+console.log('\n全部通りました')
+```
+
+## 木を見る
+
+デバッグには、木を目で見られると助かります。
+
+```ts
+export function show(node: Node, indent = 0): string {
+  const pad = '  '.repeat(indent)
+  switch (node.type) {
+    case 'Number': return `${pad}${node.value}`
+    case 'Variable': return `${pad}${node.name}`
+    case 'Binary':
+      return [`${pad}${node.op}`, show(node.left, indent + 1), show(node.right, indent + 1)].join('\n')
+    case 'Unary':
+      return [`${pad}${node.op}(単項)`, show(node.operand, indent + 1)].join('\n')
+    case 'Call':
+      return [`${pad}${node.name}()`, ...node.args.map((a: Node) => show(a, indent + 1))].join('\n')
+    default: return `${pad}${node.type}`
+  }
+}
+
+console.log(show(parseExpr('1 + 2 * (3 - 4)')))
+```
+
+```
++
+  1
+  *
+    2
+    -
+      3
+      4
+```
+
+**式の構造が目に見えます。** 優先順位や結合の実装を疑ったときは、まずこれを出してください。
+
+## 演習
+
+1. **`%`（剰余）を追加する**。`*` と同じ優先順位です。`LEVELS` に 1 文字足すだけで済むはずです
+2. **右結合の演算子を追加する**。`**`（べき乗）を実装し、`2 ** 3 ** 2` が `2 ** (3 ** 2)` になることを確かめてください
+3. **`else if` を書けるようにする**。`else` の後に `block` ではなく `statement` を許せば、自然に書けます
+4. **エラーからの回復**。`;` が抜けていたときに、そこで止まらず次の文から解析を続ける仕組みを作ってください。実用的なコンパイラは、1 回の実行で複数のエラーを報告します
+5. **ぶら下がり `else` 問題を調べる**。`if (a) if (b) x; else y;` の `else` はどちらの `if` に付くか。Mini ではブロックが必須なので起きませんが、なぜそう決めたのか考えてください
+
+## 次回
+
+木ができました。次は、**変数の名前を場所に結びつけます**。`x` がどのセグメントの何番なのか。同じ名前がスコープによって別のものを指す、という問題を扱います。

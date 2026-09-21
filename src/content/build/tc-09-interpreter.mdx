@@ -3,10 +3,349 @@ title: コンパイルせずに動かす
 description: 同じ構文木を、命令に変換せずその場で評価する。インタプリタとコンパイラの分かれ目はどこか
 track: toolchain
 order: 9
-status: planned
+status: published
 goal: 同じソースをコンパイルでも実行でも動かせるようになる
 requires:
   - tc-08-codegen
+basedOn:
+  - kind: article
+    slug: tree-traversal
+    why: コード生成と同じ木を、同じ順序で歩く。違いは「命令を出す」か「値を返す」かだけ
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 命令を出さずに、答えを出す
+
+前回のコード生成はこうでした。
+
+```ts
+case 'Binary':
+  genExpr(e.left)
+  genExpr(e.right)
+  out.push('add')
+```
+
+インタプリタはこうです。
+
+```ts
+case 'Binary':
+  return evalExpr(e.left) + evalExpr(e.right)
+```
+
+**構造がまったく同じです。** 違いは、
+
+| | コンパイラ | インタプリタ |
+| --- | --- | --- |
+| 木を歩く | する | する |
+| 各ノードで | **命令を出す** | **値を計算する** |
+| 結果 | 命令の並び | 答えそのもの |
+
+後で実行するための手順書を書くのか、その場でやってしまうのか。**それだけの違い**です。
+
+<Callout type="tip" title="同じ木を使い回せる">
+  字句解析と構文解析は、両者でまったく同じものが使えます。
+  違うのは最後の段階だけ。
+
+  実際、多くの言語処理系が両方を持っています。
+  開発中はインタプリタで素早く回し、本番はコンパイルする、という使い分けです。
+</Callout>
+
+## 実装する
+
+```ts
+// src/mini/interpreter.ts
+import type { Node } from './parser'
+
+type Env = Map<string, number>
+
+export class Interpreter {
+  private functions = new Map<string, Node>()
+
+  constructor(ast: Node) {
+    for (const fn of ast.functions) this.functions.set(fn.name, fn)
+  }
+
+  run(entry = 'main'): number {
+    return this.call(entry, [])
+  }
+
+  private call(name: string, args: number[]): number {
+    const fn = this.functions.get(name)
+    if (!fn) throw new Error(`未定義の関数です: ${name}`)
+    if (fn.params.length !== args.length) {
+      throw new Error(`${name} は引数 ${fn.params.length} 個ですが ${args.length} 個渡されました`)
+    }
+
+    // 呼び出しごとに新しい環境を作る。これが「フレーム」にあたる
+    const env: Env = new Map()
+    fn.params.forEach((p: string, i: number) => env.set(p, args[i]!))
+
+    try {
+      this.execBlock(fn.body, env)
+    } catch (e) {
+      if (e instanceof ReturnSignal) return e.value
+      throw e
+    }
+    return 0
+  }
+
+  private execBlock(stmts: Node[], env: Env) {
+    for (const s of stmts) this.exec(s, env)
+  }
+
+  private exec(s: Node, env: Env) {
+    switch (s.type) {
+      case 'VarDecl':
+        env.set(s.name, 0)
+        break
+
+      case 'Assign': {
+        const value = this.evalExpr(s.value, env)
+        if (!env.has(s.name)) throw new Error(`未定義の変数です: ${s.name}`)
+        env.set(s.name, value)
+        break
+      }
+
+      case 'If':
+        if (this.evalExpr(s.cond, env) !== 0) this.execBlock(s.then, env)
+        else if (s.else) this.execBlock(s.else, env)
+        break
+
+      case 'While':
+        while (this.evalExpr(s.cond, env) !== 0) this.execBlock(s.body, env)
+        break
+
+      case 'Return':
+        throw new ReturnSignal(s.value ? this.evalExpr(s.value, env) : 0)
+
+      case 'ExprStatement':
+        this.evalExpr(s.expr, env)
+        break
+    }
+  }
+
+  private evalExpr(e: Node, env: Env): number {
+    switch (e.type) {
+      case 'Number': return e.value
+
+      case 'Variable': {
+        if (!env.has(e.name)) throw new Error(`未定義の変数です: ${e.name}`)
+        return env.get(e.name)!
+      }
+
+      case 'Unary': return -this.evalExpr(e.operand, env) | 0
+
+      case 'Call':
+        return this.call(e.name, e.args.map((a: Node) => this.evalExpr(a, env)))
+
+      case 'Binary': {
+        const l = this.evalExpr(e.left, env)
+        const r = this.evalExpr(e.right, env)
+        const bool = (b: boolean) => (b ? -1 : 0)      // VM と同じく真は -1
+        switch (e.op) {
+          case '+': return (l + r) | 0
+          case '-': return (l - r) | 0
+          case '*': return Math.imul(l, r)
+          case '/': return (l / r) | 0                 // 0 方向に丸める
+          case '<': return bool(l < r)
+          case '>': return bool(l > r)
+          case '<=': return bool(l <= r)
+          case '>=': return bool(l >= r)
+          case '==': return bool(l === r)
+          case '!=': return bool(l !== r)
+          default: throw new Error(`未対応の演算子: ${e.op}`)
+        }
+      }
+    }
+    throw new Error(`未対応のノードです: ${e.type}`)
+  }
+}
+
+/** return を「その場で関数を抜ける」ために例外として投げる */
+class ReturnSignal extends Error {
+  constructor(readonly value: number) { super('return') }
+}
+```
+
+<Callout type="warn" title="return を例外で実装する">
+  `return` は、ブロックの途中から関数の外まで一気に抜ける必要があります。
+  ループの中、`if` の中、さらにその入れ子の中からでも。
+
+  木を歩く構造では、これを素直に書けません。そこで**例外**を使います。
+  ホスト言語（TypeScript）のスタック巻き戻しに任せてしまう、という手です。
+
+  同じ手法は、`break` と `continue` にも使えます。
+  ただし**例外は遅い**ので、性能が要るなら戻り値でシグナルを返す方式に変えます。
+</Callout>
+
+## 環境がフレームになる
+
+`call` の中で `new Map()` を作っています。これが**スタックフレーム**にあたります。
+
+- 呼び出しごとに新しい環境
+- 引数はそこに入る
+- 局所変数もそこに入る
+- 関数を抜けると捨てられる
+
+第 4 回で手作業で組み立てたフレームを、**ホスト言語のオブジェクトとガベージコレクションに任せている**わけです。
+
+再帰も自然に動きます。`this.call` が再帰的に呼ばれ、そのたびに新しい `Map` ができます。**ホスト言語のコールスタックが、そのままインタプリタのコールスタックになります。**
+
+<Callout type="warn" title="だからスタックオーバーフローが伝播する">
+  Mini のプログラムが深く再帰すると、TypeScript のスタックが溢れます。
+  `RangeError: Maximum call stack size exceeded` が出ます。
+
+  **インタプリタの実装方式が、言語の制約になって現れています。**
+  Python の再帰上限が 1000 程度なのも、同じ理由です（CPython はさらに独自の上限を設けています）。
+
+  これを避けるには、明示的なスタックを持つ方式（バイトコード仮想機械）にします。
+  第 2 回で作ったスタックマシンが、まさにそれです。
+</Callout>
+
+## 走らせる
+
+```ts
+// src/mini/interpreter.check.ts
+import { strict as assert } from 'node:assert'
+import { tokenize } from './lexer'
+import { parse } from './parser'
+import { Interpreter } from './interpreter'
+import { compile } from './compile'
+import { run } from '../run'
+
+const interpret = (src: string) => new Interpreter(parse(tokenize(src))).run()
+const execute = (src: string, cycles = 20_000_000) => {
+  const ram = run(compile(src), {}, cycles)
+  return ram[ram[0]! - 1]!
+}
+
+const PROGRAMS = [
+  'function main(){ return 1 + 2 * 3; }',
+  'function main(){ return (1 + 2) * 3; }',
+  'function main(){ var x; x = 10; x = x - 3; return x; }',
+  'function main(){ if (1 < 2) { return 100; } else { return 200; } }',
+  `function main(){
+     var i; var sum;
+     i = 1; sum = 0;
+     while (i <= 10) { sum = sum + i; i = i + 1; }
+     return sum;
+   }`,
+  `function fact(n){ if (n <= 1) { return 1; } return n * fact(n - 1); }
+   function main(){ return fact(5); }`,
+  'function main(){ return 100 / 7; }',
+]
+
+// 同じプログラムが、両方で同じ答えを出す
+for (const src of PROGRAMS) {
+  const a = interpret(src)
+  const b = execute(src)
+  assert.equal(a, b, `結果が食い違う:\n${src}\nインタプリタ=${a} コンパイル=${b}`)
+  console.log(`ok   一致 (${a})  ${src.split('\n')[0]!.slice(0, 40)}...`)
+}
+
+// 速度を比べる
+{
+  const src = `
+function fib(n){ if (n < 2) { return n; } return fib(n-1) + fib(n-2); }
+function main(){ return fib(18); }`
+
+  const t0 = Date.now()
+  const a = interpret(src)
+  const t1 = Date.now()
+  console.log(`\nインタプリタ: fib(18) = ${a}  (${t1 - t0} ms)`)
+  console.log('（コンパイル版は自作 CPU を 1 サイクルずつ回すので、桁違いに時間がかかります）')
+}
+
+console.log('\n全部通りました')
+```
+
+**同じソースが両方で同じ答えを返す**ことが、この回で最も確かめたいことです。片方にバグがあれば、必ず食い違います。
+
+<Callout type="tip" title="2 つの実装を突き合わせるテスト">
+  これは **差分テスト**（differential testing）という手法です。
+  同じ仕様の 2 つの実装を用意し、大量の入力で結果を比べる。
+
+  片方だけを検証するより、はるかに多くのバグが見つかります。
+  実際のコンパイラでは、「最適化あり」と「最適化なし」の結果を比べる形で使われます。
+  この 2 つが食い違えば、最適化のバグです。
+</Callout>
+
+## 速度の差はどこから来るのか
+
+インタプリタは、**実行のたびに木を歩き直します**。
+
+```
+fib(18) を計算する
+  → fib(17) と fib(16) を呼ぶ
+    → そのたびに、if 文のノードを見て、比較のノードを見て、...
+```
+
+同じノードを何万回も解釈します。1 ノードごとに `switch` があり、オブジェクトのプロパティアクセスがあります。
+
+コンパイル済みなら、**解釈は 1 回だけ**。あとは機械語が直接走ります。
+
+| 方式 | 相対的な速度 |
+| --- | --- |
+| 木を歩くインタプリタ | 1 |
+| バイトコードのインタプリタ | 3〜10 |
+| JIT コンパイル | 10〜100 |
+| 事前コンパイル | 20〜200 |
+
+段階的に速くする方法があります。
+
+**バイトコード方式**：木を 1 回だけ歩いて、平坦な命令列に変換する。あとはその配列をループで回す。ノードを辿るコストが消えます。Python と Ruby がこの方式です。
+
+**JIT**：実行時に、よく実行される部分だけを機械語にコンパイルする。起動が速く、ホットな部分は速い。JavaScript と Java がこの方式です。
+
+<Callout type="note" title="なぜ JIT が事前コンパイルより速いことがあるのか">
+  実行時には、**事前には分からない情報**が手に入ります。
+
+  - この変数には実際には整数しか入っていない
+  - この分岐はほぼ常に成立する
+  - この関数呼び出し先は常に同じ
+
+  これらを前提にコードを特殊化できます。
+  前提が崩れたら、**元の一般的なコードに戻します**（脱最適化）。
+
+  第 2 章で読んだ投機実行と同じ発想が、ソフトウェアの層でも使われています。
+</Callout>
+
+## Track 2 を終えて
+
+```
+Mini のソース
+  ├─ tokenize → parse ─┬─ generate → translate → assemble → 自作 CPU
+  │                    │
+  └────────────────────┴─ Interpreter（その場で評価）
+```
+
+**前半は共通、後半で分岐する**構造になりました。
+
+そして、Track 1 の NAND から数えると、層はこれだけ積み上がっています。
+
+```
+NAND / DFF
+  → ゲート → ALU / レジスタ → CPU
+  → 機械語 → アセンブラ
+  → VM → コンパイラ
+  → Mini 言語
+```
+
+**9 層です。** 各層は隣の層しか知りません。
+
+## 演習
+
+1. **`break` と `continue` を実装する**。`return` と同じく例外を使います
+2. **バイトコード方式に変える**。木を平坦な命令配列に変換し、ループで回す形にしてください。速度を比べます
+3. **トレースを出す**。評価しているノードを順に表示し、デバッガの原型を作ってください
+4. **差分テストを自動化する**。ランダムな式を生成し、インタプリタとコンパイル版で結果を比べ続けるプログラムを書いてください
+5. **REPL を作る**。1 行入力するたびに評価して結果を返す対話環境です
+
+## 次のトラックへ
+
+自分で設計した機械の上で、自分で設計した言語が動くようになりました。
+
+次のトラック「NES エミュレータ」では、向きが変わります。**自分で決められない仕様**を相手にします。1983 年に決まった仕様を、そのとおりに再現する。バグまで含めて。
+
+そこでは、Track 1 で 6502 を回路として見た経験と、Track 2 で命令を解釈する経験の両方が効いてきます。
