@@ -3,10 +3,218 @@ title: 次に何をするかを覚えておく
 description: リセット・ジャンプ・インクリメントの 3 つの動きを 1 つの部品にまとめたプログラムカウンタ
 track: hardware
 order: 8
-status: planned
+status: published
 goal: 3 つの制御線の優先順位が正しく働く PC が動く
 requires:
   - hw-07-ram
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 小さいが、決定的に重要な部品
+
+**プログラムカウンタ**（PC）は、「次に実行する命令のアドレス」を保持するレジスタです。
+
+必要な動作は 3 つだけです。
+
+| 制御線 | 動作 | 対応するもの |
+| --- | --- | --- |
+| **reset** | 0 に戻す | 電源投入、リセットボタン |
+| **load** | 指定した値にする | **ジャンプ、関数呼び出し** |
+| **inc** | 1 増やす | 通常の逐次実行 |
+
+第 2 章で読んだ「分岐とは PC に別の値を書くこと」が、ここで具体的な形になります。
+
+**`if` も `for` も `while` も関数呼び出しも、機械語のレベルでは `load` で PC に値を書く操作**でしかありません。
+
+## 優先順位を決める
+
+3 本が同時に 1 になったら、どれを優先するか。順序は次のとおりです。
+
+```
+reset  >  load  >  inc  >  何もしない（保持）
+```
+
+リセットは最優先です。何が起きていても 0 に戻らなければ、復旧できません。
+
+ジャンプはインクリメントより優先です。両方が立っているとき「ジャンプ先の次」に飛んでしまっては困ります。
+
+## Mux を重ねるだけで優先順位が作れる
+
+優先順位を実装するのに、特別な仕組みは要りません。**Mux を優先度の低い順に重ねる**だけです。
+
+```ts
+// src/pc.ts
+import type { Bit } from './bit'
+import { inc16 } from './adder'
+import { mux16 } from './bus'
+import { Register } from './register'
+import { toWord, type Word } from './word'
+
+const ZERO = toWord(0)
+
+export class PC {
+  private reg = new Register()
+
+  get out(): Word {
+    return this.reg.out
+  }
+
+  set(w: Word, load: Bit, inc: Bit, reset: Bit) {
+    let next = this.reg.out                        // 既定：保持
+    next = mux16(next, inc16(next), inc)           // inc が立てば +1
+    next = mux16(next, w, load)                    // load が立てば w（inc を上書き）
+    next = mux16(next, ZERO, reset)                // reset が立てば 0（全部を上書き）
+    this.reg.set(next, 1)                          // 常に書き込む
+  }
+}
+```
+
+**後に書いた Mux が、前の結果を上書きします。** だから、優先度の低いものから順に並べれば、そのまま優先順位になります。
+
+`this.reg.set(next, 1)` で `load` が常に 1 なのは、「何もしない」場合も `next` に今の値が入っているからです。**保持も、今の値を書き込むことで実現しています。**
+
+<Callout type="tip" title="優先順位付きの選択は、Mux の重ね合わせ">
+  ソフトウェアの `if / else if / else` は、上から順に条件を調べ、
+  最初に成立したところで止まります。
+
+  回路では逆で、**全部の候補を計算しておき、優先度の高いものが後から上書きする**。
+  「止まる」という概念がないので、この形になります。
+
+  この構造は、命令のデコードでも、割り込みの優先度判定でも、同じように出てきます。
+</Callout>
+
+## 動かしてみる
+
+```ts
+import { clock } from './dff'
+import { PC } from './pc'
+import { fromWord, toWord } from './word'
+
+const pc = new PC()
+const ZERO = toWord(0)
+
+pc.set(ZERO, 0, 1, 0); clock()      // inc
+console.log(fromWord(pc.out))        // 1
+
+pc.set(ZERO, 0, 1, 0); clock()      // inc
+console.log(fromWord(pc.out))        // 2
+
+pc.set(toWord(100), 1, 1, 0); clock()   // load と inc が同時
+console.log(fromWord(pc.out))        // 100  ← load が勝つ
+
+pc.set(ZERO, 0, 1, 0); clock()      // inc
+console.log(fromWord(pc.out))        // 101
+
+pc.set(toWord(55), 1, 1, 1); clock()    // 全部立っている
+console.log(fromWord(pc.out))        // 0    ← reset が勝つ
+```
+
+## テストを書く
+
+優先順位のテストが本体です。**制御線の組み合わせ 8 通りすべて**を確かめます。
+
+```ts
+// src/pc.check.ts
+import { strict as assert } from 'node:assert'
+import { clock } from './dff'
+import { PC } from './pc'
+import { fromWord, toWord } from './word'
+
+const ZERO = toWord(0)
+
+// 基本の動き
+{
+  const pc = new PC()
+  assert.equal(fromWord(pc.out), 0, '初期値は 0')
+
+  pc.set(ZERO, 0, 0, 0); clock()
+  assert.equal(fromWord(pc.out), 0, '何もしなければ保持')
+
+  for (let i = 1; i <= 5; i++) {
+    pc.set(ZERO, 0, 1, 0); clock()
+    assert.equal(fromWord(pc.out), i, `inc で ${i}`)
+  }
+
+  pc.set(toWord(1000), 1, 0, 0); clock()
+  assert.equal(fromWord(pc.out), 1000, 'load でジャンプ')
+
+  pc.set(ZERO, 0, 0, 1); clock()
+  assert.equal(fromWord(pc.out), 0, 'reset で 0')
+  console.log('ok   PC の基本動作')
+}
+
+// 優先順位：8 通りすべて
+{
+  const expected = (cur: number, load: number, inc: number, reset: number) =>
+    reset ? 0 : load ? 1000 : inc ? cur + 1 : cur
+
+  for (let reset = 0; reset < 2; reset++) {
+    for (let load = 0; load < 2; load++) {
+      for (let inc = 0; inc < 2; inc++) {
+        const pc = new PC()
+        pc.set(toWord(500), 1, 0, 0); clock()        // まず 500 にしておく
+
+        pc.set(toWord(1000), load as any, inc as any, reset as any)
+        clock()
+
+        const want = expected(500, load, inc, reset)
+        assert.equal(
+          fromWord(pc.out), want,
+          `load=${load} inc=${inc} reset=${reset} なら ${want}`,
+        )
+      }
+    }
+  }
+  console.log('ok   優先順位（8 通り）')
+}
+
+// 負の値やオーバーフローでも壊れない
+{
+  const pc = new PC()
+  pc.set(toWord(32767), 1, 0, 0); clock()
+  pc.set(ZERO, 0, 1, 0); clock()
+  assert.equal(fromWord(pc.out), -32768, 'inc で一周する')
+  console.log('ok   オーバーフロー')
+}
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/pc.check.ts
+```
+
+## ここまでで揃ったもの
+
+第 1 章の「コンピュータの部品」が、これで全部そろいました。
+
+| 部品 | 役割 |
+| --- | --- |
+| ALU | 計算する |
+| Register | 値を覚える |
+| RAM | 大量に覚える |
+| PC | どこを実行中かを覚える |
+| Mux / DMux | 選ぶ、振り分ける |
+
+<Callout type="note" title="残っているのは「つなぎ方」だけ">
+  部品は完成しました。しかし、まだコンピュータではありません。
+
+  **これらをどうつなぐか**、そして **何を基準につなぎ方を切り替えるか** が決まっていないからです。
+  その基準になるのが、次回決める**命令**です。
+
+  ここから順序が逆転します。
+  これまでは「部品を作る」話でしたが、次回は
+  **「作った部品で何ができるか」を、命令の形に翻訳する**という設計の話になります。
+</Callout>
+
+## 演習
+
+1. **デクリメント付きの PC を作る**。`dec` 制御線を足し、優先順位のどこに入れるか自分で決めてください
+2. **相対ジャンプを作る**。`load` が「絶対アドレスを入れる」のに対し、「現在値に加算する」形を追加します。実際の CPU にはどちらもあります
+3. **優先順位を変えてみる**。Mux の順番を入れ替えて `inc` を最優先にすると、どんな不都合が起きるか考えてください
+4. **リセット後の 1 命令目**。実機では、リセット直後に PC が指すアドレスに何が置かれているべきか。第 8 章で読んだ起動シーケンスと突き合わせてください
+
+## 次回
+
+いよいよ **命令セット** を設計します。ここまでに作った部品で何ができるかを洗い出し、それを 16 ビットのビット列として表現する方法を決めます。**ここで決めたことが、次の回で作る CPU の配線をすべて決定します。**

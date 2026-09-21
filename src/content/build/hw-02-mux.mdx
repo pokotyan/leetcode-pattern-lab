@@ -3,10 +3,281 @@ title: 選ぶ回路
 description: 2 つの入力のうちどちらを通すかを、もう 1 本の信号で決める。分岐もレジスタの書き込み制御も、根はここにある
 track: hardware
 order: 2
-status: planned
-goal: Mux / DMux が真理値表で検証でき、制御信号という考え方が手に入る
+status: published
+goal: Mux / DMux とその多入力版が真理値表で検証でき、「制御信号」という考え方が手に入る
 requires:
   - hw-01-nand
+basedOn:
+  - kind: math
+    slug: bit-tricks
+    why: 選択をビット演算で書くときの発想。マスクを作って足し合わせる形がそのまま回路になる
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## この回でやること
+
+前回、NAND だけで NOT / AND / OR / XOR を作りました。これらは**計算する**回路です。
+
+今回作るのは、**選ぶ**回路です。
+
+```
+a ─┐
+   ├─▶ どちらかを出力
+b ─┘
+   ↑
+  sel（どちらを選ぶかを決める信号）
+```
+
+地味に見えますが、これが無いと何も作れません。
+
+- `if` 文（条件によって別の値を使う）
+- レジスタへの書き込み制御（今回は書くのか、前の値を保つのか）
+- 命令のデコード（この命令はどの演算をするのか）
+- メモリのアドレス選択（どのセルを読むのか）
+
+**CPU の中で最も数多く使われる部品**です。
+
+## Mux：2 つのうち 1 つを選ぶ
+
+**マルチプレクサ**（Mux）は、3 本の入力を取ります。`a`、`b`、そして `sel`。
+
+| sel | 出力 |
+| --- | --- |
+| 0 | a |
+| 1 | b |
+
+真理値表を全部書くとこうです。
+
+| a | b | sel | out |
+| --- | --- | --- | --- |
+| 0 | 0 | 0 | 0 |
+| 0 | 0 | 1 | 0 |
+| 0 | 1 | 0 | 0 |
+| 0 | 1 | 1 | 1 |
+| 1 | 0 | 0 | 1 |
+| 1 | 0 | 1 | 0 |
+| 1 | 1 | 0 | 1 |
+| 1 | 1 | 1 | 1 |
+
+`sel` が 0 の行では `out` が `a` と一致し、1 の行では `b` と一致していることを確認してください。
+
+## 素直に作る
+
+言葉をそのまま式にします。
+
+> **「sel が 0 で、かつ a が 1」か、「sel が 1 で、かつ b が 1」のとき 1**
+
+```ts
+// src/mux.ts
+import type { Bit } from './bit'
+import { and, not, or } from './gates'
+
+export const mux = (a: Bit, b: Bit, sel: Bit): Bit =>
+  or(and(a, not(sel)), and(b, sel))
+```
+
+これで正しく動きます。NAND を数えると 9 個です。
+
+## 短くする
+
+もっと短い組み方があります。
+
+```ts
+import { nand } from './bit'
+
+export const mux = (a: Bit, b: Bit, sel: Bit): Bit => {
+  const ns = nand(sel, sel)                  // not sel
+  return nand(nand(a, ns), nand(b, sel))
+}
+```
+
+**NAND 4 個**です。なぜこれで合うのか、`sel` の値ごとに追います。
+
+**sel = 0 のとき**
+
+```
+ns = nand(0, 0) = 1
+nand(a, ns) = nand(a, 1) = not a
+nand(b, sel) = nand(b, 0) = 1
+out = nand(not a, 1) = not(not a) = a        ✓
+```
+
+**sel = 1 のとき**
+
+```
+ns = nand(1, 1) = 0
+nand(a, ns) = nand(a, 0) = 1
+nand(b, sel) = nand(b, 1) = not b
+out = nand(1, not b) = not(not b) = b        ✓
+```
+
+<Callout type="tip" title="nand(x, 1) = not x、nand(x, 0) = 1">
+  この 2 つは、これから何度も使う道具になります。
+  NAND の片方の入力を固定すると、「そのまま反転して通す」か「常に 1 を出す」かの
+  **ゲートになる**、という見方です。
+  つまり NAND は、片側の入力で**通すか塞ぐかを制御できるスイッチ**でもあります。
+</Callout>
+
+## DMux：1 つを 2 つのうち 1 つに振り分ける
+
+**デマルチプレクサ**（DMux）は Mux の逆です。1 本の入力を、`sel` に応じてどちらかの出力に流します。**選ばれなかったほうには 0 が出ます。**
+
+| sel | a | b |
+| --- | --- | --- |
+| 0 | in | 0 |
+| 1 | 0 | in |
+
+```ts
+// src/mux.ts（追記）
+export const dmux = (input: Bit, sel: Bit): [Bit, Bit] => [
+  and(input, not(sel)),
+  and(input, sel),
+]
+```
+
+Mux が「どの入力を採用するか」を決めるのに対し、DMux は「**どこへ書き込むか**」を決めます。RAM でアドレスからセルを選ぶときに、これを使います。
+
+## 入力を増やす
+
+選択肢を 4 つ、8 つに増やしたい場合があります。ここで、**部品を階層的に組む**という考え方が出てきます。
+
+4 入力の Mux は、2 入力の Mux を 3 個組み合わせて作れます。
+
+```
+a ─┐
+   ├─ mux(sel[0]) ─┐
+b ─┘               │
+                   ├─ mux(sel[1]) ─▶ out
+c ─┐               │
+   ├─ mux(sel[0]) ─┘
+d ─┘
+```
+
+下位のビットで「a と b のどちらか」「c と d のどちらか」を決め、上位のビットで「その 2 つのどちらか」を決めます。
+
+```ts
+export const mux4way = (a: Bit, b: Bit, c: Bit, d: Bit, sel: [Bit, Bit]): Bit =>
+  mux(mux(a, b, sel[0]), mux(c, d, sel[0]), sel[1])
+```
+
+`sel` は 2 ビットで、`sel[0]` が下位です。`sel = [0,0]` なら a、`[1,0]` なら b、`[0,1]` なら c、`[1,1]` なら d が選ばれます。
+
+<Callout type="warn" title="ビットの並び順を最初に決めておく">
+  この連載では、**配列の添字 0 を最下位ビット（LSB）**とします。
+  `sel[0]` が 1 の位、`sel[1]` が 2 の位です。
+
+  人間が読むときは左が上位なので、表示するときだけ逆順にします。
+  この約束を途中で変えると、原因の分からないバグが大量に出ます。
+  **今ここで決めて、最後まで守ります。**
+</Callout>
+
+同じ要領で 8 入力も作れます。
+
+```ts
+export const mux8way = (
+  a: Bit, b: Bit, c: Bit, d: Bit, e: Bit, f: Bit, g: Bit, h: Bit,
+  sel: [Bit, Bit, Bit],
+): Bit =>
+  mux(
+    mux4way(a, b, c, d, [sel[0], sel[1]]),
+    mux4way(e, f, g, h, [sel[0], sel[1]]),
+    sel[2],
+  )
+```
+
+DMux も同じように広げられます。
+
+```ts
+export const dmux4way = (input: Bit, sel: [Bit, Bit]): [Bit, Bit, Bit, Bit] => {
+  const [ab, cd] = dmux(input, sel[1])
+  const [a, b] = dmux(ab, sel[0])
+  const [c, d] = dmux(cd, sel[0])
+  return [a, b, c, d]
+}
+```
+
+<Callout type="tip" title="同じ部品を入れ子にして大きくする">
+  これがハードウェア設計の基本的な進め方です。
+  2 入力のものを作り、それを組み合わせて 4 入力にし、さらに組み合わせて 8 入力にする。
+
+  この後に作る RAM も、まったく同じ構造で 8 語 → 64 語 → 512 語 → 16K 語と広げます。
+  「1 段ぶんの構造を正しく作れば、あとは同じことの繰り返し」という形に持ち込むのが、
+  設計の勘所です。
+</Callout>
+
+## テストを書く
+
+前回の `truthTable` は入力が全部 `Bit` の関数を想定していました。Mux も DMux も同じ形なので、そのまま使えます。
+
+入力の順番は `00, 01, 10, 11, ...` で、**左が第 1 引数**です。`mux(a, b, sel)` なら `a` が最上位の桁として動きます。
+
+```ts
+// src/mux.check.ts
+import { dmux, dmux4way, mux, mux4way } from './mux'
+import { expectTable, truthTable } from './testkit'
+import { strict as assert } from 'node:assert'
+
+// a b sel の 8 通り。表の out 列を上から読んだもの
+expectTable('MUX', mux, 3, '00011011')
+
+// DMux は出力が 2 本あるので、片方ずつ確かめる
+expectTable('DMUX.a', (i, s) => dmux(i, s)[0], 2, '0010')
+expectTable('DMUX.b', (i, s) => dmux(i, s)[1], 2, '0001')
+
+// 4 入力版は、選択ビットごとに正しい入力が出るかを直接確かめる
+for (const [sel, expected] of [
+  [[0, 0], 1], [[1, 0], 2], [[0, 1], 3], [[1, 1], 4],
+] as const) {
+  const got = mux4way(1 as any, 2 as any, 3 as any, 4 as any, sel as any)
+  assert.equal(got, expected, `MUX4WAY sel=${sel} で ${expected} が出るはず`)
+}
+console.log('ok   MUX4WAY')
+
+// DMux4Way は、選んだ場所にだけ 1 が立つ
+for (let s0 = 0; s0 < 2; s0++) {
+  for (let s1 = 0; s1 < 2; s1++) {
+    const out = dmux4way(1, [s0, s1] as any)
+    const idx = s1 * 2 + s0
+    assert.deepEqual(out.map((b, i) => (i === idx ? 1 : 0)), out)
+  }
+}
+console.log('ok   DMUX4WAY')
+console.log('\n全部通りました')
+```
+
+`mux4way` に `1, 2, 3, 4` を渡しているのは**型としては反則**ですが、「どの入力が選ばれたか」を確かめるにはこれが手っ取り早い。回路としての正しさは `mux` のテストで押さえてあるので、ここでは**配線が合っているか**だけを見ています。
+
+```bash
+npx tsx src/mux.check.ts
+```
+
+```
+ok   MUX    00011011
+ok   DMUX.a 0010
+ok   DMUX.b 0001
+ok   MUX4WAY
+ok   DMUX4WAY
+
+全部通りました
+```
+
+## 演習
+
+1. **Mux を NAND の個数で比べる**。素直な実装（9 個）と短い実装（4 個）が、同じ真理値表になることを確かめてください
+2. **DMux8Way を作る**。`dmux4way` と同じ考え方で、8 方向に振り分けます
+3. **Mux が「条件分岐」であることを確かめる**。`sel` を条件、`a` を else の値、`b` を then の値と読み替えると、`sel ? b : a` そのものです。**回路には分岐が存在せず、両方を計算して片方を捨てている**ことを意識してください
+4. **なぜ両方計算するのか考える**。CPU の条件付き move 命令（`cmov`）が分岐予測ミスを避けられるのは、まさにこの構造だからです
+
+<Callout type="note" title="回路に「実行しない」は無い">
+  ソフトウェアの `if` は、条件によって片方の処理を**実行しません**。
+  回路の Mux は、**両方とも常に計算していて、出力だけを選んでいます**。
+
+  この違いは、性能にも安全性にも関わります。
+  「実行時間が入力によって変わらない」という性質は、
+  暗号処理でタイミング攻撃を防ぐために意図的に利用されます。
+</Callout>
+
+## 次回
+
+1 ビットの部品が揃いました。次は、これを 16 個並べて**16 ビットの値**を扱えるようにします。あわせて、「16 ビットのどこかに 1 が立っているか」を判定する回路を作ります。これは後で、CPU がジャンプするかどうかを決めるのに使います。

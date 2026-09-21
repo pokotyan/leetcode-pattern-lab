@@ -3,10 +3,253 @@ title: 足し算を作る
 description: 繰り上がりを次の桁へ渡すだけで加算になる。半加算器から 16 ビット加算器、そしてインクリメンタまで
 track: hardware
 order: 4
-status: planned
+status: published
 goal: 16 ビットの加算器が動き、負数を 2 の補数で扱えるようになる
 requires:
   - hw-03-bus
+basedOn:
+  - kind: math
+    slug: bit-tricks
+    why: 2 の補数と、桁の繰り上がりをビット演算として捉える見方
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 筆算をそのまま回路にする
+
+2 進数の足し算は、10 進数の筆算と同じです。
+
+```
+    1 0 1 1       11
+  + 0 1 1 0     +  6
+  ─────────     ────
+    1 0 0 0 1     17
+```
+
+各桁でやっていることは、
+
+1. その桁の 2 つの数字と、**下の桁からの繰り上がり**を足す
+2. 結果の 1 の位をその桁に書く
+3. 繰り上がりがあれば、上の桁に渡す
+
+これをそのまま部品にします。
+
+## 半加算器
+
+まず、繰り上がりの入力がない単純な形から作ります。**半加算器**（Half Adder）です。
+
+| a | b | sum | carry |
+| --- | --- | --- | --- |
+| 0 | 0 | 0 | 0 |
+| 0 | 1 | 1 | 0 |
+| 1 | 0 | 1 | 0 |
+| 1 | 1 | **0** | **1** |
+
+最後の行を見てください。1 + 1 = 2 なので、**その桁は 0 で、上に 1 繰り上がる**。
+
+この 2 つの列を、既に作った部品と見比べます。
+
+- `sum` の列 `0110` は **XOR**
+- `carry` の列 `0001` は **AND**
+
+```ts
+// src/adder.ts
+import type { Bit } from './bit'
+import { and, or, xor } from './gates'
+
+/** 繰り上がり入力なしの加算。[sum, carry] を返す */
+export const halfAdder = (a: Bit, b: Bit): [Bit, Bit] => [xor(a, b), and(a, b)]
+```
+
+**足し算の本体が XOR と AND だけで書けました。** これは偶然ではなく、「繰り上がりを無視した 2 進の足し算 = XOR」「繰り上がりが起きる条件 = 両方 1 = AND」という、そのままの対応です。
+
+## 全加算器
+
+実際の桁には、下から繰り上がりが入ってきます。入力が 3 本になったものが **全加算器**（Full Adder）です。
+
+| a | b | c | sum | carry |
+| --- | --- | --- | --- | --- |
+| 0 | 0 | 0 | 0 | 0 |
+| 0 | 0 | 1 | 1 | 0 |
+| 0 | 1 | 0 | 1 | 0 |
+| 0 | 1 | 1 | 0 | 1 |
+| 1 | 0 | 0 | 1 | 0 |
+| 1 | 0 | 1 | 0 | 1 |
+| 1 | 1 | 0 | 0 | 1 |
+| 1 | 1 | 1 | 1 | 1 |
+
+**3 本のうち 1 が奇数個なら sum が 1、2 個以上なら carry が 1** になっています。
+
+半加算器を 2 個使って作れます。
+
+```ts
+export const fullAdder = (a: Bit, b: Bit, c: Bit): [Bit, Bit] => {
+  const [s1, c1] = halfAdder(a, b)      // まず a と b を足す
+  const [s2, c2] = halfAdder(s1, c)     // その結果に c を足す
+  return [s2, or(c1, c2)]               // 繰り上がりは、どちらかで起きれば起きる
+}
+```
+
+繰り上がりが `or` なのは、**c1 と c2 が同時に 1 になることはない**からです。`c1` が 1 のとき `s1` は 0 なので、2 回目の半加算器で繰り上がりは起きません。
+
+## 16 ビットに広げる
+
+あとは、全加算器を 16 個つないで、繰り上がりを順に渡していくだけです。
+
+```ts
+import { WIDTH, type Word } from './word'
+
+export const add16 = (a: Word, b: Word): Word => {
+  const out: Bit[] = []
+  let carry: Bit = 0
+  for (let i = 0; i < WIDTH; i++) {
+    const [s, c] = fullAdder(a[i]!, b[i]!, carry)
+    out.push(s)
+    carry = c                            // 次の桁へ渡す
+  }
+  return out                             // 最上位からはみ出した carry は捨てる
+}
+```
+
+この構造を **リップルキャリー加算器**（波及桁上げ加算器）と呼びます。繰り上がりが下から上へ波のように伝わっていくためです。
+
+<Callout type="warn" title="最後の carry を捨てている">
+  16 ビットからはみ出した繰り上がりは、`out` に入れずに捨てています。
+  これが第 1 章で見た**オーバーフロー**です。
+
+  32767 + 1 を計算すると -32768 になります。エラーにはなりません。
+  Hack コンピュータではオーバーフローを検出しない、という設計上の割り切りです。
+  実際の CPU は、この捨てた carry をフラグとして残します。
+</Callout>
+
+## 引き算はどうするのか
+
+**作りません。** 第 1 章で見たとおり、2 の補数を使えば引き算は足し算です。
+
+```
+a - b  =  a + (-b)  =  a + (not b) + 1
+```
+
+必要なのは、`not16`（作った）と、1 を足す仕組みだけです。
+
+<Callout type="tip" title="これが 2 の補数を採用する最大の理由">
+  符号付き絶対値表現なら、符号を見て場合分けし、大小を比べ、引き算用の回路を別に持つ必要がありました。
+  2 の補数なら、**加算器 1 つで足し算も引き算も、符号付きも符号なしも全部できます**。
+
+  回路の面積と遅延が、そのまま半分以下になります。
+  「変な表現だ」と感じる 2 の補数が、実は最も素直な設計だった、ということです。
+</Callout>
+
+## インクリメンタ
+
+1 を足す回路は、加算器で作れます。
+
+```ts
+import { toWord } from './word'
+const ONE = toWord(1)
+export const inc16 = (a: Word): Word => add16(a, ONE)
+```
+
+これで十分ですが、**専用に作るともっと安い**ことも知っておく価値があります。片方の入力が定数 1 だと分かっているので、全加算器の代わりに半加算器で済みます。
+
+```ts
+export const inc16Cheap = (a: Word): Word => {
+  const out: Bit[] = []
+  let carry: Bit = 1                     // 最初の桁に 1 を足す、という形で始める
+  for (let i = 0; i < WIDTH; i++) {
+    const [s, c] = halfAdder(a[i]!, carry)
+    out.push(s)
+    carry = c
+  }
+  return out
+}
+```
+
+インクリメンタは、次々回で作る**プログラムカウンタ**で使います。「次の命令へ進む」が、この回路です。
+
+## 遅延の問題
+
+リップルキャリー加算器には弱点があります。**最上位の桁の結果が確定するのに、16 段ぶんの遅延がかかります**。
+
+```
+桁 0 の carry が決まる → 桁 1 が計算できる → 桁 2 が計算できる → ...
+```
+
+64 ビットなら 64 段です。これがクロック周波数の上限を直接縛ります。
+
+実際の CPU では、**桁上げ先読み加算器**（Carry Lookahead Adder）が使われます。「この桁で繰り上がりが発生するか」と「下からの繰り上がりをそのまま上に通すか」を各桁で並行に計算し、繰り上がりを一度にまとめて求めます。遅延が O(n) から O(log n) に下がる代わりに、ゲート数が大幅に増えます。
+
+<Callout type="note" title="面積と速度の交換">
+  ここでも同じ構図が出てきます。前回の Or8Way を木にしたのと同じで、
+  **並列にできる形に書き換えると、部品は増えるが速くなる**。
+
+  この連載ではリップルキャリーのまま進めます。動作は同じで、速度だけが違うからです。
+  まず動かし、それから速くする、という順序です。
+</Callout>
+
+## テストを書く
+
+JavaScript の `+` を答え合わせに使います。
+
+```ts
+// src/adder.check.ts
+import { strict as assert } from 'node:assert'
+import { add16, fullAdder, halfAdder, inc16, inc16Cheap } from './adder'
+import { not16 } from './bus'
+import { expectTable } from './testkit'
+import { fromWord, toWord } from './word'
+
+// 1 ビットの加算器は全列挙できる
+expectTable('HALF.sum',   (a, b) => halfAdder(a, b)[0], 2, '0110')
+expectTable('HALF.carry', (a, b) => halfAdder(a, b)[1], 2, '0001')
+expectTable('FULL.sum',   (a, b, c) => fullAdder(a, b, c)[0], 3, '01101001')
+expectTable('FULL.carry', (a, b, c) => fullAdder(a, b, c)[1], 3, '00010111')
+
+// 16 ビットは代表的な値で
+const wrap = (n: number) => (n << 16) >> 16      // 16 ビットに収める
+const cases = [0, 1, -1, 2, 100, -100, 32767, -32768, 12345, -12345]
+
+for (const a of cases) {
+  for (const b of cases) {
+    const got = fromWord(add16(toWord(a), toWord(b)))
+    assert.equal(got, wrap(a + b), `ADD16(${a}, ${b})`)
+  }
+  assert.equal(fromWord(inc16(toWord(a))), wrap(a + 1), `INC16(${a})`)
+  assert.equal(fromWord(inc16Cheap(toWord(a))), wrap(a + 1), `INC16CHEAP(${a})`)
+}
+console.log('ok   ADD16 / INC16')
+
+// 引き算が足し算でできることを確かめる
+const sub = (a: number, b: number) =>
+  fromWord(add16(add16(toWord(a), not16(toWord(b))), toWord(1)))
+for (const a of cases) {
+  for (const b of cases) {
+    assert.equal(sub(a, b), wrap(a - b), `SUB(${a}, ${b})`)
+  }
+}
+console.log('ok   SUB（a + not b + 1）')
+
+// オーバーフローは一周する
+assert.equal(fromWord(add16(toWord(32767), toWord(1))), -32768)
+assert.equal(fromWord(add16(toWord(-32768), toWord(-1))), 32767)
+console.log('ok   OVERFLOW（一周する）')
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/adder.check.ts
+```
+
+**`sub` のテストが通ることが、この回で最も確かめたかったことです。** 引き算の回路を 1 つも作っていないのに、引き算ができています。
+
+## 演習
+
+1. **`-x` を計算する関数を書く**。`not16` して `inc16` するだけです。`-(-32768)` がどうなるか確かめてください（第 1 章の「範囲が非対称」がここで出ます）
+2. **繰り上がりを出力する加算器を作る**。`add16WithCarry` として、はみ出した carry も返すようにします
+3. **オーバーフロー判定を作る**。符号付きのオーバーフローは「入力の符号が同じで、出力の符号が違う」ときに起きます。これを回路で判定してください
+4. **加算器の遅延を数える**。`add16` で、最上位ビットの結果が出るまでに何個の NAND を通るか数えてください
+
+## 次回
+
+計算部分の総仕上げです。加算器を核にして、**6 本の制御線の組み合わせだけで 18 種類の演算をこなす ALU** を作ります。減算も、論理演算も、定数の出力も、すべて同じ回路で行います。

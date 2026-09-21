@@ -1,12 +1,250 @@
 ---
 title: 16 本の線をまとめて扱う
-description: 1 ビットの部品を 16 個並べて 16 ビットのバスにする。「全ビットが 0 か」を判定する回路もここで作る
+description: 1 ビットの部品を 16 個並べてバスにする。「全ビットが 0 か」を判定する回路もここで作る
 track: hardware
 order: 3
-status: planned
+status: published
 goal: 16 ビット版の Not / And / Or / Mux と、Or8Way による零判定が動く
 requires:
   - hw-02-mux
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 束ねるだけ
+
+16 ビットの値を扱いたい。とはいえ、新しい原理は要りません。**1 ビットの部品を 16 個並べるだけ**です。
+
+```
+a15 ─┐          a1 ─┐   a0 ─┐
+     ├─ not     ... ├─ not  ├─ not
+                              │
+out15            out1      out0
+```
+
+実際の回路でも、16 本の線が束になって走っているだけです。この束を **バス** と呼びます。
+
+## 型を用意する
+
+まず、16 ビットの値を表す型を決めます。
+
+```ts
+// src/word.ts
+import type { Bit } from './bit'
+
+export const WIDTH = 16
+
+/** 16 ビットの値。添字 0 が最下位ビット（LSB） */
+export type Word = Bit[]
+
+/** 数値から Word へ。負数は 2 の補数として入る */
+export const toWord = (n: number): Word =>
+  Array.from({ length: WIDTH }, (_, i) => ((n >> i) & 1) as Bit)
+
+/** Word から数値へ。16 ビットの符号付きとして読む */
+export const fromWord = (w: Word): number => {
+  let v = 0
+  for (let i = 0; i < WIDTH; i++) v |= w[i]! << i
+  return (v << 16) >> 16          // 上位を符号で埋める
+}
+
+/** 人間が読む向き（左が MSB）の文字列にする */
+export const showWord = (w: Word): string => [...w].reverse().join('')
+
+export const ZERO: Word = toWord(0)
+```
+
+<Callout type="warn" title="fromWord の最後の 2 行">
+  `(v << 16) >> 16` は、**符号拡張**をしています。
+
+  JavaScript のビット演算は 32 ビットで行われるので、
+  16 ビットの値をそのまま読むと、負の数も正の大きな値として出てきます。
+  16 ビット左にずらしてから算術右シフトで戻すと、
+  16 ビット目が符号ビットとして上位に引き伸ばされます。
+
+  第 1 章の「算術右シフトは MSB を引き伸ばす」がそのまま効いています。
+</Callout>
+
+## 16 ビット版のゲート
+
+あとは、1 ビットの部品を 16 回呼ぶだけです。
+
+```ts
+// src/bus.ts
+import type { Bit } from './bit'
+import { and, not, or } from './gates'
+import { mux } from './mux'
+import { WIDTH, type Word } from './word'
+
+const map1 = (a: Word, f: (x: Bit) => Bit): Word =>
+  Array.from({ length: WIDTH }, (_, i) => f(a[i]!))
+
+const map2 = (a: Word, b: Word, f: (x: Bit, y: Bit) => Bit): Word =>
+  Array.from({ length: WIDTH }, (_, i) => f(a[i]!, b[i]!))
+
+export const not16 = (a: Word): Word => map1(a, not)
+export const and16 = (a: Word, b: Word): Word => map2(a, b, and)
+export const or16 = (a: Word, b: Word): Word => map2(a, b, or)
+
+export const mux16 = (a: Word, b: Word, sel: Bit): Word =>
+  Array.from({ length: WIDTH }, (_, i) => mux(a[i]!, b[i]!, sel))
+```
+
+`mux16` で `sel` が 1 本だけであることに注意してください。**16 ビットまとめて、どちらかの側を選びます**。ビットごとに別々に選ぶわけではありません。
+
+<Callout type="note" title="map1 / map2 は回路ではない">
+  `Array.from` は回路ではなく、「同じ部品を 16 個並べる」という**記述の省略**です。
+  実物では、not ゲートが物理的に 16 個並んでいます。
+
+  ここで `for` を使っているのは、ハードウェアの繰り返しを書き下す手間を省いているだけで、
+  第 1 回で禁止した「論理の計算に TypeScript の演算子を使う」には当たりません。
+  境界は、**信号の値そのものを TypeScript の演算で決めていないか**です。
+</Callout>
+
+## 多ビットの Mux を広げる
+
+4 入力・8 入力の Mux も、16 ビット版を作っておきます。使うのは CPU と RAM です。
+
+```ts
+export const mux4way16 = (a: Word, b: Word, c: Word, d: Word, sel: [Bit, Bit]): Word =>
+  mux16(mux16(a, b, sel[0]), mux16(c, d, sel[0]), sel[1])
+
+export const mux8way16 = (
+  a: Word, b: Word, c: Word, d: Word, e: Word, f: Word, g: Word, h: Word,
+  sel: [Bit, Bit, Bit],
+): Word =>
+  mux16(
+    mux4way16(a, b, c, d, [sel[0], sel[1]]),
+    mux4way16(e, f, g, h, [sel[0], sel[1]]),
+    sel[2],
+  )
+```
+
+前回の `mux4way` とまったく同じ構造です。1 ビット版を 16 ビット版に置き換えただけです。
+
+## 「どこかに 1 が立っているか」
+
+もう 1 つ、性質の違う部品を作ります。
+
+**Or8Way** は、8 本の入力のうち**どれか 1 本でも 1 なら 1** を返します。
+
+```ts
+export const or8way = (a: Bit[]): Bit => {
+  let acc = a[0]!
+  for (let i = 1; i < 8; i++) acc = or(acc, a[i]!)
+  return acc
+}
+```
+
+これまでの部品と違い、**入力が 8 本で出力が 1 本**です。情報が減る方向の回路です。
+
+用途は **零判定** です。「16 ビットの値が 0 かどうか」を知りたいとき、全ビットの OR を取って、その結果を反転すれば分かります。
+
+```ts
+export const isZero16 = (w: Word): Bit =>
+  not(or(or8way(w.slice(0, 8)), or8way(w.slice(8, 16))))
+```
+
+<Callout type="tip" title="この判定が CPU の分岐を決める">
+  「計算結果が 0 か」「負か」という判定が、条件分岐の材料になります。
+  第 5 回で作る ALU は、計算結果と一緒に**この 2 つのフラグを出力します**。
+  そして第 10 回の CPU で、そのフラグを見てジャンプするかどうかを決めます。
+
+  `if (x == 0)` という 1 行が、最終的にここに行き着きます。
+</Callout>
+
+## 木にすると速い
+
+上の `or8way` は、8 個の OR を数珠つなぎにしています。信号は 7 段の OR を順に通り抜けるので、遅延は 7 段ぶんです。
+
+2 個ずつペアにして木の形にすると、3 段で済みます。
+
+```
+a0 a1  a2 a3  a4 a5  a6 a7
+ └─┬─┘  └─┬─┘  └─┬─┘  └─┬─┘     1 段目
+   └───┬──┘      └───┬──┘        2 段目
+       └──────┬──────┘           3 段目
+```
+
+```ts
+export const or8wayTree = (a: Bit[]): Bit =>
+  or(
+    or(or(a[0]!, a[1]!), or(a[2]!, a[3]!)),
+    or(or(a[4]!, a[5]!), or(a[6]!, a[7]!)),
+  )
+```
+
+**ゲートの個数は同じ 7 個ですが、遅延が 7 段から 3 段に減ります。** n 入力なら、数珠つなぎが n-1 段、木なら log₂n 段です。
+
+実物では、この段数がそのままクロック周波数の上限に効いてきます。
+
+## テストを書く
+
+16 ビットの部品は、真理値表が 2³² 行になるので全列挙できません。**代表的な値で確かめます**。
+
+```ts
+// src/bus.check.ts
+import { strict as assert } from 'node:assert'
+import { and16, isZero16, mux16, not16, or16, or8way } from './bus'
+import { fromWord, showWord, toWord } from './word'
+
+const check = (label: string, got: number, want: number) => {
+  assert.equal(got, want, `${label}: 期待 ${want} / 実際 ${got}`)
+  console.log(`ok   ${label.padEnd(18)} ${want}`)
+}
+
+// JavaScript のビット演算を「正解」として突き合わせる
+const cases = [0, 1, -1, 32767, -32768, 0x1234, -12345]
+for (const n of cases) {
+  check(`NOT16(${n})`, fromWord(not16(toWord(n))), (~n << 16) >> 16)
+}
+for (const a of cases) {
+  for (const b of cases) {
+    check(`AND16(${a},${b})`, fromWord(and16(toWord(a), toWord(b))), ((a & b) << 16) >> 16)
+    check(`OR16(${a},${b})`, fromWord(or16(toWord(a), toWord(b))), ((a | b) << 16) >> 16)
+  }
+}
+
+// Mux16 は 16 ビットまとめて切り替わる
+check('MUX16(sel=0)', fromWord(mux16(toWord(111), toWord(222), 0)), 111)
+check('MUX16(sel=1)', fromWord(mux16(toWord(111), toWord(222), 1)), 222)
+
+// 零判定
+assert.equal(isZero16(toWord(0)), 1)
+assert.equal(isZero16(toWord(1)), 0)
+assert.equal(isZero16(toWord(-1)), 0)
+assert.equal(isZero16(toWord(-32768)), 0)      // MSB だけ 1 でも 0 ではない
+console.log('ok   IS_ZERO16')
+
+// 表示の向きを確かめる。左が MSB
+assert.equal(showWord(toWord(1)),  '0000000000000001')
+assert.equal(showWord(toWord(-1)), '1111111111111111')
+assert.equal(showWord(toWord(-32768)), '1000000000000000')
+console.log('ok   SHOW_WORD')
+
+console.log('\n全部通りました')
+```
+
+<Callout type="tip" title="「正解」を別の方法で用意する">
+  ここでは、JavaScript の `&` `|` `~` を**答え合わせの相手**として使っています。
+  回路の中では禁止していますが、テストの期待値を作るぶんには構いません。
+
+  **同じロジックを 2 回書いて比べても意味がありません**が、
+  まったく別の経路で求めた答えと一致すれば、信頼できます。
+  この後の加算器や ALU でも、同じやり方で検証します。
+</Callout>
+
+```bash
+npx tsx src/bus.check.ts
+```
+
+## 演習
+
+1. **`or8wayTree` と `or8way` が同じ結果を返すことを確かめる**。入力 256 通りすべてで一致するはずです
+2. **`isZero16` を木の形で書き直す**。遅延が何段から何段になるか数えてください
+3. **`fromWord` の符号拡張を外してみる**。`(v << 16) >> 16` を `v` にすると、`-1` がどう表示されるか確かめてください
+4. **16 ビット版の XOR を作る**。`xor16` を追加し、`a ^ b` と一致することを確認してください
+
+## 次回
+
+いよいよ計算です。次は**加算器**を作ります。繰り上がりを次の桁に渡していくだけで足し算になる、という単純な仕掛けです。そして第 1 章で見た 2 の補数のおかげで、**引き算のための回路は要りません**。

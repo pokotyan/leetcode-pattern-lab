@@ -3,10 +3,288 @@ title: アドレスで選ぶ記憶
 description: レジスタを並べ、アドレスから 1 本だけを選ぶ。8 語から 16K 語へ、同じ構造を入れ子にして広げる
 track: hardware
 order: 7
-status: planned
+status: published
 goal: RAM8 から RAM16K までが、読み書きのテストを通る
 requires:
   - hw-06-register
+basedOn:
+  - kind: reading
+    slug: db-index
+    why: 多段の索引で目的の 1 件に辿り着く構造。RAM のアドレス分解とまったく同じ形をしている
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 必要なもの
+
+レジスタを 8 個並べます。やりたいことは 2 つです。
+
+- **読む**：アドレスで指定した 1 個の出力を選ぶ
+- **書く**：アドレスで指定した 1 個だけに `load` を届ける
+
+読む側は **Mux8Way16**、書く側は **DMux8Way** です。どちらも第 2 回・第 3 回で作りました。
+
+```
+書き込み                          読み出し
+  load ─┐                          reg0 ─┐
+        ├─ DMux8Way ─▶ 各 reg の load    ├─ Mux8Way16 ─▶ out
+  addr ─┘                          ...   │
+                                   reg7 ─┘
+                                          ▲
+                                        addr
+```
+
+**DMux は「選ばれなかったほうに 0 を出す」**のでした。つまり、選ばれなかったレジスタの `load` は 0 になり、値が保持されます。**書き込みたい 1 個だけに 1 が届きます。**
+
+## RAM8
+
+```ts
+// src/ram.ts
+import type { Bit } from './bit'
+import { mux8way16 } from './bus'
+import { dmux8way } from './mux'
+import { Register } from './register'
+import type { Word } from './word'
+
+export type Addr3 = [Bit, Bit, Bit]
+
+export class RAM8 {
+  private regs = Array.from({ length: 8 }, () => new Register())
+
+  /** addr の位置に load=1 なら w を書く */
+  set(w: Word, load: Bit, addr: Addr3) {
+    const loads = dmux8way(load, addr)
+    for (let i = 0; i < 8; i++) this.regs[i]!.set(w, loads[i]!)
+  }
+
+  /** addr の位置の値を読む */
+  out(addr: Addr3): Word {
+    return mux8way16(
+      this.regs[0]!.out, this.regs[1]!.out, this.regs[2]!.out, this.regs[3]!.out,
+      this.regs[4]!.out, this.regs[5]!.out, this.regs[6]!.out, this.regs[7]!.out,
+      addr,
+    )
+  }
+}
+```
+
+<Callout type="warn" title="読み出しは組み合わせ回路">
+  `out(addr)` にはクロックが関係ありません。アドレスを変えれば**即座に**出力が変わります。
+
+  一方、書き込みはクロックが来るまで反映されません。
+  **読みは非同期、書きは同期**、という非対称性です。
+
+  これは意図的な設計です。「今のアドレスの値を読んで、それを使って計算し、
+  その結果を同じサイクルの終わりに書き戻す」ということが 1 サイクルでできます。
+</Callout>
+
+## 入れ子にして広げる
+
+64 語の RAM が欲しい。素直に考えると、レジスタを 64 個並べ、6 ビットのアドレスで選ぶ Mux64Way16 を作ることになります。しかし、**64 入力の Mux を作るのは大変**です。
+
+そこで、**RAM8 を 8 個並べます**。
+
+```
+6 ビットのアドレス
+┌──────────┬──────────┐
+│  上位 3   │  下位 3   │
+└──────────┴──────────┘
+      ↓          ↓
+ どの RAM8 か  その中のどれか
+```
+
+```ts
+export type Addr6 = [Bit, Bit, Bit, Bit, Bit, Bit]
+
+export class RAM64 {
+  private banks = Array.from({ length: 8 }, () => new RAM8())
+
+  set(w: Word, load: Bit, addr: Addr6) {
+    const lo = addr.slice(0, 3) as Addr3          // 下位 3 ビット
+    const hi = addr.slice(3, 6) as Addr3          // 上位 3 ビット
+    const loads = dmux8way(load, hi)               // どの RAM8 に届けるか
+    for (let i = 0; i < 8; i++) this.banks[i]!.set(w, loads[i]!, lo)
+  }
+
+  out(addr: Addr6): Word {
+    const lo = addr.slice(0, 3) as Addr3
+    const hi = addr.slice(3, 6) as Addr3
+    return mux8way16(
+      this.banks[0]!.out(lo), this.banks[1]!.out(lo),
+      this.banks[2]!.out(lo), this.banks[3]!.out(lo),
+      this.banks[4]!.out(lo), this.banks[5]!.out(lo),
+      this.banks[6]!.out(lo), this.banks[7]!.out(lo),
+      hi,
+    )
+  }
+}
+```
+
+**RAM8 のコードとほぼ同じ形です。** `Register` が `RAM8` に置き換わり、アドレスを上位と下位に分けただけ。
+
+この構造をそのまま繰り返せば、いくらでも大きくできます。
+
+| 名前 | 容量 | 中身 | アドレス幅 |
+| --- | --- | --- | --- |
+| RAM8 | 8 語 | Register × 8 | 3 |
+| RAM64 | 64 語 | RAM8 × 8 | 6 |
+| RAM512 | 512 語 | RAM64 × 8 | 9 |
+| RAM4K | 4096 語 | RAM512 × 8 | 12 |
+| RAM16K | 16384 語 | **RAM4K × 4** | 14 |
+
+RAM16K だけ 4 個なのは、16384 = 4096 × 4 だからです。ここは Mux4Way16 / DMux4Way を使います。
+
+<Callout type="tip" title="アドレスを上位と下位に分けるという構造">
+  これは RAM に限った話ではありません。
+
+  - **ページテーブル**：仮想アドレスを 9 ビットずつに分け、多段の表を引く
+  - **B 木の索引**：キーの上位から順に辿って、目的のページに到達する
+  - **IP のルーティング**：アドレスの上位から順に、より細かい経路を選ぶ
+
+  いずれも「**1 段ぶんの選択を、同じ形で何段も重ねる**」という同じ構造です。
+  第 4 章で読んだページングの多段テーブルが、ここで回路として現れています。
+</Callout>
+
+## 実用上の妥協
+
+RAM16K を忠実に作ると、レジスタが 16384 個、DFF が 262144 個になります。TypeScript のオブジェクトとしては動きますが、**クロックのたびに 26 万個をたどる**ので、プログラムを実行するには遅すぎます。
+
+そこで、**RAM16K だけは配列で実装します**。
+
+```ts
+// src/ram16k.ts
+import type { Bit } from './bit'
+import { toWord, type Word } from './word'
+
+const ADDR_BITS = 14
+
+const addrToIndex = (addr: Bit[]): number => {
+  let n = 0
+  for (let i = 0; i < ADDR_BITS; i++) n |= addr[i]! << i
+  return n
+}
+
+/**
+ * RAM4K を 4 個組み合わせた構造と等価だが、
+ * 実行速度のため内部を配列にしてある。外から見た振る舞いは同じ。
+ */
+export class RAM16K {
+  private cells: Word[] = Array.from({ length: 1 << ADDR_BITS }, () => toWord(0))
+  private pending: { index: number; value: Word } | null = null
+
+  set(w: Word, load: Bit, addr: Bit[]) {
+    this.pending = load === 1 ? { index: addrToIndex(addr), value: w } : null
+  }
+
+  out(addr: Bit[]): Word {
+    return this.cells[addrToIndex(addr)]!
+  }
+
+  commit() {
+    if (this.pending) this.cells[this.pending.index] = this.pending.value
+    this.pending = null
+  }
+}
+```
+
+<Callout type="warn" title="ここは正直に妥協している">
+  これは**回路ではありません**。第 1 回で決めたルールを、ここだけ外しています。
+
+  ただし、**外から見た振る舞いは RAM4K × 4 とまったく同じ**です。
+  読みは非同期、書きはクロックで確定、同時に書けるのは 1 箇所だけ。
+
+  第 2 章で読んだ「ISA が同じなら中身は何でもよい」という話の、小さな実例です。
+  構造を理解するために RAM8 と RAM64 を手で組み、
+  速度が要る部分は等価な実装に置き換える、という分担にします。
+
+  **RAM8 と RAM64 のテストが通っていることが、この妥協の根拠です。**
+  同じ構造の繰り返しであることは、その 2 段で確認できています。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/ram.check.ts
+import { strict as assert } from 'node:assert'
+import { clock } from './dff'
+import { RAM64, RAM8, type Addr3, type Addr6 } from './ram'
+import { fromWord, toWord } from './word'
+
+const a3 = (n: number): Addr3 => [n & 1, (n >> 1) & 1, (n >> 2) & 1] as Addr3
+const a6 = (n: number): Addr6 =>
+  Array.from({ length: 6 }, (_, i) => (n >> i) & 1) as Addr6
+
+// --- RAM8 ---
+const ram8 = new RAM8()
+
+// 全アドレスが 0 から始まる
+for (let i = 0; i < 8; i++) assert.equal(fromWord(ram8.out(a3(i))), 0)
+
+// 1 箇所ずつ書き、他が壊れないことを確かめる
+for (let i = 0; i < 8; i++) {
+  ram8.set(toWord(i * 11 + 1), 1, a3(i))
+  clock()
+}
+for (let i = 0; i < 8; i++) {
+  assert.equal(fromWord(ram8.out(a3(i))), i * 11 + 1, `RAM8[${i}]`)
+}
+
+// load=0 では書かれない
+ram8.set(toWord(999), 0, a3(3))
+clock()
+assert.equal(fromWord(ram8.out(a3(3))), 34)
+console.log('ok   RAM8')
+
+// --- RAM64 ---
+const ram64 = new RAM64()
+for (const addr of [0, 1, 7, 8, 9, 31, 32, 63]) {
+  ram64.set(toWord(addr * 7 - 100), 1, a6(addr))
+  clock()
+}
+for (const addr of [0, 1, 7, 8, 9, 31, 32, 63]) {
+  assert.equal(fromWord(ram64.out(a6(addr))), addr * 7 - 100, `RAM64[${addr}]`)
+}
+
+// 書いていないアドレスは 0 のまま
+for (const addr of [2, 10, 40, 62]) {
+  assert.equal(fromWord(ram64.out(a6(addr))), 0, `RAM64[${addr}] は未書き込み`)
+}
+console.log('ok   RAM64')
+
+// 読み出しが非同期であることを確かめる
+ram64.set(toWord(1234), 1, a6(5))
+assert.equal(fromWord(ram64.out(a6(5))), 0, 'クロック前は書かれていない')
+clock()
+assert.equal(fromWord(ram64.out(a6(5))), 1234)
+console.log('ok   書きは同期、読みは非同期')
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/ram.check.ts
+```
+
+**「1 箇所書いても他が壊れない」というテストが要です。** アドレスの分解を間違えると、別の場所を壊したり、複数箇所に同時に書いたりします。そして、そのバグは「たまたま書いた場所を読み返す」だけのテストでは見つかりません。
+
+## 演習
+
+1. **RAM512 を作る**。`RAM64` を 8 個並べるだけです。アドレスは 9 ビット
+2. **アドレスの上位と下位を入れ替えてみる**。`lo` と `hi` を逆にすると、どのアドレスがどこに保存されるか確かめてください。**動きはするが、配置が変わる**はずです
+3. **同時に 2 箇所書こうとしてみる**。`set` を 2 回呼んでから `clock()` すると、どうなるか。実物ではポートが 1 つしかないので不可能です
+4. **デュアルポート RAM を考える**。2 つのアドレスを同時に読める RAM を作るには何が必要か。書き込みを 2 箇所同時にするには何が問題になるか
+
+<Callout type="tip" title="実機の RAM は SRAM ではなく DRAM">
+  ここで作ったのは、レジスタ（フリップフロップ）を並べた **SRAM** に相当します。
+  実際のメインメモリは DRAM で、構造がまったく違います。
+
+  第 3 章で読んだとおり、DRAM は 1 ビットをコンデンサ 1 個で保持し、
+  行を開いてから列を選ぶという 2 段階でアクセスします。
+  面積あたりの容量は桁違いですが、遅く、リフレッシュが必要です。
+
+  CPU の中のレジスタやキャッシュは、ここで作ったのと同じ方式です。
+</Callout>
+
+## 次回
+
+記憶ができました。次は、**次に実行する命令の場所を覚えておく**専用のレジスタを作ります。リセット・ジャンプ・インクリメントという 3 つの動きを 1 つにまとめた部品です。

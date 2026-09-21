@@ -3,10 +3,287 @@ title: 時間を持たせる
 description: ここまでの回路には記憶がない。1 サイクル遅らせる素子を足して、値を保持するレジスタを作る
 track: hardware
 order: 6
-status: planned
+status: published
 goal: 1 ビットの記憶素子から 16 ビットレジスタまでが、クロックを進めながら検証できる
 requires:
   - hw-05-alu
+basedOn:
+  - kind: reading
+    slug: browser-internals
+    why: 状態を持つものと持たないものを分けて考える、という発想はここでも同じ形で出てくる
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 記憶がない
+
+これまで作った回路は、すべて **組み合わせ回路** です。出力は入力だけで決まり、過去は一切影響しません。
+
+```
+add16(a, b)     // a と b が同じなら、いつ呼んでも同じ答え
+```
+
+これでは、計算結果を次の計算で使うことができません。**コンピュータには記憶が要ります。**
+
+## 自分の出力を自分に戻す
+
+記憶を作る原理は、**出力を入力に戻す**ことです。
+
+```
+     ┌──────────┐
+  ──▶│          │──┬──▶ out
+     │          │  │
+     └──────────┘  │
+          ▲        │
+          └────────┘
+```
+
+こうすると、一度 1 になった値が自分自身を維持し続けます。これが記憶です。
+
+実際、NAND を 2 個交差させるだけで、1 ビットを保持する回路（**SR ラッチ**）ができます。
+
+```
+S ──┬─ nand ──┬──▶ Q
+    │    ╳    │
+R ──┴─ nand ──┴──▶ !Q
+```
+
+ただし、この回路をそのまま TypeScript の関数として書くことはできません。**関数の戻り値が自分の引数になっている**という循環になり、無限再帰します。
+
+現実の回路では、信号が線を伝わるのに時間がかかるため、この循環が「1 周ぶん遅れて安定する」という形で成立します。**時間が回路の一部**なのです。
+
+<Callout type="warn" title="ここだけは NAND から作らない">
+  この連載では、**1 サイクル遅らせる素子（DFF）を基本部品として与えられたもの**とします。
+  nand2tetris も同じ扱いです。
+
+  理由は、DFF の動作が「ゲートの組み合わせ」ではなく「**時間の経過**」に依存しているからです。
+  静的な真理値表では表せません。
+
+  つまり、これから使う部品は **NAND と DFF の 2 つ**になります。
+  ここで 1 つだけ増えます。そして、これ以降はもう増えません。
+</Callout>
+
+## DFF：1 サイクル遅らせる
+
+**D フリップフロップ**（DFF）の動作は 1 行です。
+
+> **今の出力は、1 サイクル前の入力である。**
+
+```
+out(t) = in(t-1)
+```
+
+TypeScript では、状態を持つオブジェクトとして表現します。ポイントは、**入力を受け取る操作と、出力が変わる瞬間を分ける**ことです。
+
+```ts
+// src/dff.ts
+import type { Bit } from './bit'
+
+const all: DFF[] = []
+
+export class DFF {
+  private state: Bit = 0
+  private next: Bit = 0
+
+  constructor() {
+    all.push(this)        // クロックを一斉に進めるために登録しておく
+  }
+
+  /** 今の出力。クロックが来るまで変わらない */
+  get out(): Bit {
+    return this.state
+  }
+
+  /** 次に取り込む値を与える。この時点では出力は変わらない */
+  set(d: Bit) {
+    this.next = d
+  }
+
+  commit() {
+    this.state = this.next
+  }
+}
+
+/** クロックを 1 回進める。すべての DFF が同時に値を確定させる */
+export const clock = () => {
+  for (const d of all) d.commit()
+}
+```
+
+<Callout type="tip" title="なぜ set と commit を分けるのか">
+  回路では、クロックの立ち上がりの瞬間に**すべての DFF が一斉に**値を確定させます。
+  順番に 1 個ずつ更新すると、更新済みの DFF の出力を未更新の DFF が読んでしまい、
+  **1 サイクルで 2 段進んでしまいます**。
+
+  `set` で全員の次の値を決めてから、`commit` で一斉に確定させる。
+  この 2 段階が、クロック同期の本質です。
+</Callout>
+
+## 1 ビットレジスタ
+
+DFF は毎サイクル入力を取り込んでしまいます。値を**保持したい**ときは、入力を取り込ませないようにする必要があります。
+
+ここで Mux が効いてきます。
+
+> **load が 1 なら新しい値、0 なら今の自分の値を入力に戻す。**
+
+```ts
+// src/register.ts
+import type { Bit } from './bit'
+import { DFF } from './dff'
+import { mux } from './mux'
+
+export class BitRegister {
+  private dff = new DFF()
+
+  get out(): Bit {
+    return this.dff.out
+  }
+
+  set(input: Bit, load: Bit) {
+    this.dff.set(mux(this.dff.out, input, load))
+    //           ↑ load=0 なら今の値がそのまま戻る = 保持
+  }
+}
+```
+
+**`load = 0` のとき、出力が入力に戻ります。** これが「覚えている」という状態です。
+
+第 2 回で作った Mux が、ここで記憶の制御に使われました。「選ぶ回路が無いと何も作れない」と書いたのは、このことです。
+
+## 16 ビットレジスタ
+
+1 ビットのものを 16 個並べるだけです。
+
+```ts
+import { WIDTH, type Word } from './word'
+
+export class Register {
+  private bits = Array.from({ length: WIDTH }, () => new BitRegister())
+
+  get out(): Word {
+    return this.bits.map((b) => b.out)
+  }
+
+  set(w: Word, load: Bit) {
+    for (let i = 0; i < WIDTH; i++) this.bits[i]!.set(w[i]!, load)
+  }
+}
+```
+
+`load` が 1 本しかないことに注意してください。**16 ビットまとめて書くか、まとめて保持するか**のどちらかです。
+
+## 使い方
+
+```ts
+import { clock } from './dff'
+import { Register } from './register'
+import { fromWord, toWord } from './word'
+
+const r = new Register()
+
+r.set(toWord(42), 1)
+console.log(fromWord(r.out))     // 0   ← まだ変わっていない
+clock()
+console.log(fromWord(r.out))     // 42  ← クロックで確定した
+
+r.set(toWord(99), 0)             // load = 0
+clock()
+console.log(fromWord(r.out))     // 42  ← 保持された
+```
+
+**`set` した直後には値が変わらない**ことが、組み合わせ回路との決定的な違いです。
+
+<Callout type="note" title="この 1 サイクルの遅れが、すべてを可能にする">
+  出力が即座に変わらないからこそ、出力を入力に戻しても発振しません。
+  そして、「今の値を使って次の値を計算する」という形が書けます。
+
+```
+次の PC = 今の PC + 1
+次の合計 = 今の合計 + 新しい値
+```
+  ループも、状態遷移も、すべてこの形です。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/register.check.ts
+import { strict as assert } from 'node:assert'
+import { clock } from './dff'
+import { BitRegister, Register } from './register'
+import { fromWord, toWord } from './word'
+
+// 1 ビット
+const b = new BitRegister()
+assert.equal(b.out, 0, '初期値は 0')
+b.set(1, 1); assert.equal(b.out, 0, 'クロック前は変わらない')
+clock();     assert.equal(b.out, 1, 'クロックで確定する')
+b.set(0, 0); clock(); assert.equal(b.out, 1, 'load=0 なら保持')
+b.set(0, 1); clock(); assert.equal(b.out, 0, 'load=1 なら書き換わる')
+console.log('ok   BitRegister')
+
+// 16 ビット
+const r = new Register()
+for (const v of [42, -7, 32767, -32768, 0]) {
+  r.set(toWord(v), 1)
+  clock()
+  assert.equal(fromWord(r.out), v, `Register に ${v} を書く`)
+
+  r.set(toWord(12345), 0)     // load=0 で上書きを試みる
+  clock()
+  assert.equal(fromWord(r.out), v, `${v} が保持される`)
+}
+console.log('ok   Register')
+
+// 独立していることを確かめる
+const r1 = new Register(), r2 = new Register()
+r1.set(toWord(1), 1); r2.set(toWord(2), 1); clock()
+assert.equal(fromWord(r1.out), 1)
+assert.equal(fromWord(r2.out), 2)
+console.log('ok   複数のレジスタが独立している')
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/register.check.ts
+```
+
+## カウンタを作ってみる
+
+記憶ができたので、**前回の値を使う回路**が書けます。
+
+```ts
+import { inc16 } from './adder'
+
+const counter = new Register()
+for (let i = 0; i < 5; i++) {
+  counter.set(inc16(counter.out), 1)      // 今の値 + 1 を、次の値にする
+  clock()
+  console.log(fromWord(counter.out))      // 1, 2, 3, 4, 5
+}
+```
+
+**`counter.out` を読んで `counter.set` に渡す**という循環が、ここでは問題なく動きます。`out` はクロックが来るまで変わらないからです。
+
+これが第 8 回で作るプログラムカウンタの原型です。
+
+## 演習
+
+1. **`clock()` を呼ばずに `set` を 3 回続ける**と何が起きるか確かめてください。最後に渡した値だけが有効になるはずです
+2. **2 つのレジスタの値を交換する**。一時変数を使わずに、`a.set(b.out, 1)` と `b.set(a.out, 1)` を同じサイクルで呼んでから `clock()` します。**なぜこれで動くのか**を、`set` と `commit` の分離から説明してください
+3. **8 ビット版のレジスタを作る**。幅を変えても構造がまったく同じであることを確かめます
+4. **シフトレジスタを作る**。4 個のレジスタを直列につなぎ、1 サイクルごとに値が隣へ移っていく回路です
+
+<Callout type="tip" title="演習 2 が本質的">
+  ソフトウェアでは `a = b; b = a;` と書くと両方が `b` になります。
+  回路では、**同じサイクルで両方が同時に読まれ、同時に書かれる**ので、正しく交換されます。
+
+  この違いが、ハードウェア記述言語（Verilog の `<=` と `=`）でも
+  ノンブロッキング代入とブロッキング代入という形で現れます。
+</Callout>
+
+## 次回
+
+レジスタが 1 個できました。次は、これを**大量に並べてアドレスで選ぶ**仕組みを作ります。8 語の RAM から始めて、同じ構造を入れ子にして 16K 語まで広げます。
