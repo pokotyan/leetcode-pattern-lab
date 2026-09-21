@@ -1,30 +1,26 @@
 ---
-title: ブロッキングと多重化
+title: 1 万本の接続を捌く
 description: 1 万本の接続をどう捌くか。select から epoll へ、そしてイベントループの下で起きていること
 chapter: kernel
-order: 3
+order: 4
 status: published
 topics:
-  - ブロッキング / ノンブロッキング
   - select / poll / epoll
   - C10K 問題
   - イベントループ
   - 非同期 I/O
 requires:
-  - ll-36-fd
+  - ll-38-blocking-async
 ---
 
 import Callout from '../../components/Callout.astro'
 
-## 待つとはどういうことか
+## 1 つの流れで 1 つしか待てない
 
-```c
-ssize_t n = read(fd, buf, size);
-```
+前回見たとおり、ブロッキングな `read` は、データが来るまで戻りません。
+書き方は自然ですが、**1 つの実行の流れで 1 つの fd しか待てません**。
 
-データがまだ来ていないとき、この行は**戻ってきません**。プロセスは待機状態になり、スケジューラの対象から外れます。データが届くと、カーネルが起こしてくれます。
-
-これが **ブロッキング I/O** です。書き方は自然ですが、**1 つの実行の流れで 1 つの fd しか待てません**。
+接続が 1 万本あるサーバでは、これが直接の壁になります。
 
 ## 素朴な解決とその限界
 

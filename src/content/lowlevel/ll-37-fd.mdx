@@ -11,7 +11,7 @@ topics:
   - パイプ
   - ulimit
 requires:
-  - ll-35-syscall
+  - ll-36-syscall
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -200,4 +200,5 @@ fd 表はプロセス全体で共有されるので、全スレッドから同�
 - fd の上限は有限。`EMFILE` はサーバ障害の定番
 - `O_CLOEXEC` を付けて、意図しない引き継ぎを防ぐ
 
-次は、多数の fd を同時に扱う方法を見ます。
+次は、その fd を「待つ」ときの言葉を整理します。ブロッキング、ノンブロッキング、同期、非同期。
+4 つの言葉が混乱する理由から入ります。
