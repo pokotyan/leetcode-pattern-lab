@@ -3,10 +3,385 @@ title: 命令を実装する
 description: 転送・演算・分岐・スタック操作。公式 151 命令を、グループごとにまとめて片付ける
 track: nes
 order: 3
-status: planned
+status: published
 goal: 公式命令がすべて実装され、命令単位のテストが通る
 requires:
   - nes-02-addressing
+basedOn:
+  - kind: math
+    slug: bit-tricks
+    why: シフト、ローテート、ビットテスト。桁をまたぐ操作とフラグの関係がここで全部出る
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 56 種類、151 のオペコード
+
+命令の種類は 56。それぞれが複数のアドレッシングモードを持つので、オペコードは 151 個です。
+
+グループに分けると、手に負える量になります。
+
+| グループ | 命令 | 個数 |
+| --- | --- | --- |
+| 転送 | `LDA` `LDX` `LDY` `STA` `STX` `STY` `TAX` `TAY` `TXA` `TYA` `TSX` `TXS` | 12 |
+| 算術 | `ADC` `SBC` `INC` `DEC` `INX` `DEX` `INY` `DEY` | 8 |
+| 論理 | `AND` `ORA` `EOR` `BIT` | 4 |
+| シフト | `ASL` `LSR` `ROL` `ROR` | 4 |
+| 比較 | `CMP` `CPX` `CPY` | 3 |
+| 分岐 | `BCC` `BCS` `BEQ` `BNE` `BMI` `BPL` `BVC` `BVS` | 8 |
+| ジャンプ | `JMP` `JSR` `RTS` | 3 |
+| スタック | `PHA` `PLA` `PHP` `PLP` | 4 |
+| フラグ | `CLC` `SEC` `CLI` `SEI` `CLV` `CLD` `SED` | 7 |
+| 割り込み | `BRK` `RTI` | 2 |
+| その他 | `NOP` | 1 |
+
+## 転送
+
+最も単純です。**値を読んで、レジスタに入れて、Z と N を更新する。**
+
+```ts
+const lda = (c: CPU, addr: number) => { c.a = c.bus.read(addr); c.setZN(c.a) }
+const ldx = (c: CPU, addr: number) => { c.x = c.bus.read(addr); c.setZN(c.x) }
+const sta = (c: CPU, addr: number) => { c.bus.write(addr, c.a) }        // フラグは変わらない
+const tax = (c: CPU) => { c.x = c.a; c.setZN(c.x) }
+```
+
+<Callout type="warn" title="TXS だけフラグを更新しない">
+```ts
+const txs = (c: CPU) => { c.s = c.x }          // setZN を呼ばない
+const tsx = (c: CPU) => { c.s; c.x = c.s; c.setZN(c.x) }   // こちらは更新する
+```
+  `TXS`（X をスタックポインタへ）は、**例外的にフラグを変えません**。
+  スタックポインタの設定でフラグが変わると不都合だからです。
+
+  こういう例外が、資料を読まないと分からない箇所です。
+  そして、間違えても大半のプログラムは動いてしまいます。
+</Callout>
+
+## 算術：ADC が全体の要
+
+`ADC`（キャリー付き加算）は、6502 で最も気を使う命令です。
+
+```ts
+export function adc(c: CPU, value: number) {
+  const sum = c.a + value + c.getFlag(F.C)
+  const result = sum & 0xff
+
+  c.setFlag(F.C, sum > 0xff)                                  // 符号なしのあふれ
+  c.setFlag(F.V, (~(c.a ^ value) & (c.a ^ result) & 0x80) !== 0)  // 符号付きのあふれ
+
+  c.a = result
+  c.setZN(result)
+}
+```
+
+**C と V は別物です。** 第 1 章で見たとおり、
+
+- **C**：9 ビット目が立ったか（符号なしとして 255 を超えた）
+- **V**：符号が壊れたか（正 + 正 = 負、または 負 + 負 = 正）
+
+V の式は「入力の符号が同じ（`~(a^v)`）」かつ「入力と結果の符号が違う（`a^result`）」を bit7 で見ています。
+
+### SBC は ADC で書ける
+
+```ts
+export const sbc = (c: CPU, value: number) => adc(c, value ^ 0xff)
+```
+
+**1 行です。**
+
+理由は 2 の補数です。
+
+```
+a - v = a + (-v) = a + (~v + 1)
+```
+
+そして `C` フラグが「借りがない」ことを表すので、C = 1 のときに +1 されます。つまり `a + ~v + C` がそのまま引き算になります。
+
+<Callout type="tip" title="だから C の意味が「借りの否定」になっている">
+  減算の前に `SEC`（C を 1 にする）を書くのが 6502 の作法です。
+  「借りなし」から始める、という意味になります。
+
+  Track 1 の第 4 回で「引き算の回路は作らない」と書いたのと、まったく同じ話です。
+  **加算器 1 つで両方できる**という性質が、命令セットの設計にまで影響しています。
+</Callout>
+
+## 比較
+
+`CMP` は「引き算をして、結果を捨て、フラグだけ残す」命令です。
+
+```ts
+const compare = (c: CPU, reg: number, value: number) => {
+  const diff = (reg - value) & 0xff
+  c.setFlag(F.C, reg >= value)        // 符号なしで大きいか等しい
+  c.setZN(diff)
+}
+```
+
+**V は更新しません。** 符号なしの比較として設計されているためです。
+
+| 条件 | 判定 |
+| --- | --- |
+| `reg == value` | Z = 1 |
+| `reg != value` | Z = 0 |
+| `reg >= value`（符号なし） | C = 1 |
+| `reg < value`（符号なし） | C = 0 |
+
+## シフトとローテート
+
+```ts
+const asl = (c: CPU, v: number) => {              // 左シフト
+  c.setFlag(F.C, (v & 0x80) !== 0)                // はみ出すビットが C へ
+  const r = (v << 1) & 0xff
+  c.setZN(r)
+  return r
+}
+
+const lsr = (c: CPU, v: number) => {              // 論理右シフト
+  c.setFlag(F.C, (v & 0x01) !== 0)
+  const r = v >> 1                                 // 上位は 0 で埋まる
+  c.setZN(r)
+  return r
+}
+
+const rol = (c: CPU, v: number) => {              // 左ローテート（C を経由する）
+  const carry = c.getFlag(F.C)
+  c.setFlag(F.C, (v & 0x80) !== 0)
+  const r = ((v << 1) | carry) & 0xff
+  c.setZN(r)
+  return r
+}
+
+const ror = (c: CPU, v: number) => {
+  const carry = c.getFlag(F.C)
+  c.setFlag(F.C, (v & 0x01) !== 0)
+  const r = (v >> 1) | (carry << 7)
+  c.setZN(r)
+  return r
+}
+```
+
+**ローテートは C フラグを 9 ビット目として使います。** 8 ビット + C で 9 ビットの環になっています。
+
+多バイトのシフトを実装するときに効きます。下位バイトを `ASL` してから上位バイトを `ROL` すれば、はみ出したビットが繋がります。
+
+<Callout type="note" title="右シフトが LSR だけで ASR がない">
+  6502 には**算術右シフトがありません**。符号を保つ右シフトは、
+  `CMP #$80` で bit7 を C に入れてから `ROR` する、という 2 命令で書きます。
+
+  命令を減らすための割り切りです。第 2 章で読んだ RISC の発想と同じで、
+  「組み合わせで作れるものは命令にしない」。
+</Callout>
+
+## 分岐
+
+8 つの分岐命令は、**どのフラグをどちらの値で見るか**だけが違います。
+
+```ts
+const branch = (c: CPU, addr: number, condition: boolean): number => {
+  if (!condition) return 0                       // 追加サイクルなし
+
+  let extra = 1
+  if ((c.pc & 0xff00) !== (addr & 0xff00)) extra = 2    // ページをまたぐとさらに +1
+  c.pc = addr
+  return extra
+}
+
+// 使い方
+case 'BNE': cycles += branch(c, addr, c.getFlag(F.Z) === 0); break
+case 'BEQ': cycles += branch(c, addr, c.getFlag(F.Z) === 1); break
+case 'BCC': cycles += branch(c, addr, c.getFlag(F.C) === 0); break
+case 'BMI': cycles += branch(c, addr, c.getFlag(F.N) === 1); break
+```
+
+**分岐しなければ 2 サイクル、分岐すれば 3、ページをまたげば 4。** このサイクル数が正確でないと、画面のタイミングがずれます。
+
+## JSR と RTS
+
+サブルーチン呼び出しです。ここに 6502 らしい癖があります。
+
+```ts
+const jsr = (c: CPU, addr: number) => {
+  c.push16((c.pc - 1) & 0xffff)      // 「戻り先の 1 つ前」を積む
+  c.pc = addr
+}
+
+const rts = (c: CPU) => {
+  c.pc = (c.pop16() + 1) & 0xffff    // 取り出して +1
+}
+```
+
+**戻り先の 1 つ手前を積み、戻るときに +1 する。**
+
+奇妙に見えますが、これはハードウェアの都合です。`JSR` の実行時点で PC は「最後のオペランドバイト」を指しています。それをそのまま積むほうが、回路が 1 段少なくて済みます。
+
+<Callout type="warn" title="この癖が実際に使われている">
+  スタックに積まれているのが「戻り先 - 1」であることを利用して、
+  **ジャンプテーブル**を実装するテクニックがあります。
+
+```asm
+JSR dispatch    ; 呼ぶと、戻り先-1 が積まれる
+.word target1   ; データがコードの直後に置いてある
+.word target2
+```
+  `dispatch` の中でスタックから値を取り出すと、
+  データテーブルの位置が分かる、という手法です。
+
+  **実装の都合が、プログラミング技法になってしまっている**例です。
+</Callout>
+
+## スタック命令
+
+```ts
+const php = (c: CPU) => c.push(c.p | F.B | F.U)     // B を立てて積む
+const plp = (c: CPU) => { c.p = (c.pop() & ~F.B) | F.U }   // B を落とし、U を立てる
+const pha = (c: CPU) => c.push(c.a)
+const pla = (c: CPU) => { c.a = c.pop(); c.setZN(c.a) }
+```
+
+**B フラグの扱いが特殊です。** B は実際のレジスタには存在せず、「スタックに積むときだけ立つ」ビットです。
+
+| 操作 | B の値 |
+| --- | --- |
+| `PHP` | 1 |
+| `BRK` による割り込み | 1 |
+| `IRQ` / `NMI` による割り込み | **0** |
+| `PLP` | 無視される（レジスタには入らない） |
+
+割り込みハンドラは、この B を見て「ソフトウェア割り込み（BRK）かハードウェア割り込みか」を区別します。
+
+## BIT
+
+見慣れない命令です。
+
+```ts
+const bit = (c: CPU, value: number) => {
+  c.setFlag(F.Z, (c.a & value) === 0)      // AND した結果が 0 か
+  c.setFlag(F.N, (value & 0x80) !== 0)     // メモリの bit7 をそのまま N へ
+  c.setFlag(F.V, (value & 0x40) !== 0)     // メモリの bit6 をそのまま V へ
+}
+```
+
+**A は変わりません。** 「特定のビットが立っているか」を調べるための命令です。
+
+さらに、**bit7 と bit6 をフラグに直接コピーする**という妙な機能があります。これは、ハードウェアのステータスレジスタを読むときに便利なように作られたものです。実際、PPU のステータスレジスタは bit7 に VBlank フラグを持っており、`BIT $2002` で調べるのが定石です。
+
+## ディスパッチ
+
+オペコードから命令とモードを引いて、実行します。
+
+```ts
+// src/nes/execute.ts
+export function step(c: CPU): number {
+  const opcode = c.bus.read(c.pc++)
+  const info = OPCODES[opcode]
+  if (!info) throw new Error(`未実装のオペコード: $${opcode.toString(16).padStart(2, '0')}`)
+
+  const { addr, extra } = MODES[info.mode](c)
+  let cycles = info.cycles + (info.pageCross ? extra : 0)
+
+  switch (info.name) {
+    case 'LDA': c.a = c.bus.read(addr); c.setZN(c.a); break
+    case 'STA': c.bus.write(addr, c.a); break
+    case 'ADC': adc(c, c.bus.read(addr)); break
+    case 'SBC': sbc(c, c.bus.read(addr)); break
+    case 'CMP': compare(c, c.a, c.bus.read(addr)); break
+    case 'BNE': cycles += branch(c, addr, c.getFlag(F.Z) === 0); break
+    case 'JSR': jsr(c, addr); break
+    case 'RTS': rts(c); break
+    // ... 残り
+    default: throw new Error(`未実装の命令: ${info.name}`)
+  }
+
+  c.cycles += cycles
+  return cycles
+}
+```
+
+<Callout type="tip" title="switch か、関数の表か">
+  `switch` は書きやすく、V8 が効率的にコンパイルしてくれます。
+  一方、オペコードごとの関数を配列に入れておく方式なら、分岐が 1 回で済みます。
+
+```ts
+const HANDLERS: ((c: CPU, addr: number) => number)[] = new Array(256)
+HANDLERS[0xa9] = (c, addr) => { c.a = c.bus.read(addr); c.setZN(c.a); return 2 }
+```
+  速度が必要になったら試す価値がありますが、**最初は読みやすさを優先すべき**です。
+  正しく動くようになってから測って、必要なら変える。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/nes/instructions.check.ts
+import { strict as assert } from 'node:assert'
+import { Bus } from './bus'
+import { CPU, F } from './cpu'
+import { adc, sbc, compare } from './alu'
+
+const make = () => new CPU(new Bus())
+
+// ADC の 8 パターン（C と V の全組み合わせ）
+{
+  const c = make()
+  const t = (a: number, v: number, want: number, wc: 0 | 1, wv: 0 | 1) => {
+    c.a = a; c.setFlag(F.C, false)
+    adc(c, v)
+    assert.equal(c.a, want, `$${a.toString(16)} + $${v.toString(16)}`)
+    assert.equal(c.getFlag(F.C), wc, `C for ${a}+${v}`)
+    assert.equal(c.getFlag(F.V), wv, `V for ${a}+${v}`)
+  }
+  t(0x50, 0x10, 0x60, 0, 0)   // 正 + 正 = 正
+  t(0x50, 0x50, 0xa0, 0, 1)   // 正 + 正 = 負 → V
+  t(0x50, 0x90, 0xe0, 0, 0)   // 正 + 負
+  t(0x50, 0xd0, 0x20, 1, 0)   // 正 + 負 → C
+  t(0xd0, 0x10, 0xe0, 0, 0)
+  t(0xd0, 0x50, 0x20, 1, 0)
+  t(0xd0, 0x90, 0x60, 1, 1)   // 負 + 負 = 正 → V
+  t(0xd0, 0xd0, 0xa0, 1, 0)
+  console.log('ok   ADC の C と V（8 パターン）')
+}
+
+// SBC
+{
+  const c = make()
+  c.a = 0x50; c.setFlag(F.C, true); sbc(c, 0x10)
+  assert.equal(c.a, 0x40)
+  assert.equal(c.getFlag(F.C), 1, '借りなし')
+
+  c.a = 0x50; c.setFlag(F.C, true); sbc(c, 0x60)
+  assert.equal(c.a, 0xf0)
+  assert.equal(c.getFlag(F.C), 0, '借りあり')
+  console.log('ok   SBC（ADC の 1 行で実装）')
+}
+
+// CMP
+{
+  const c = make()
+  c.a = 0x50
+  compare(c, c.a, 0x40); assert.equal(c.getFlag(F.C), 1); assert.equal(c.getFlag(F.Z), 0)
+  compare(c, c.a, 0x50); assert.equal(c.getFlag(F.C), 1); assert.equal(c.getFlag(F.Z), 1)
+  compare(c, c.a, 0x60); assert.equal(c.getFlag(F.C), 0); assert.equal(c.getFlag(F.N), 1)
+  console.log('ok   CMP')
+}
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/nes/instructions.check.ts
+```
+
+**ADC の 8 パターンが、この回で最も重要なテスト**です。C と V の両方が絡む組み合わせを網羅しています。ここが合っていれば、算術系はほぼ大丈夫です。
+
+## 演習
+
+1. **151 オペコードの表を完成させる**。資料を見ながら、名前・モード・バイト数・サイクル数を埋めてください
+2. **シフト系をテストする**。`ROL` と `ROR` で、C を経由してビットが 1 周することを確かめてください
+3. **`BIT` をテストする**。A が変わらないこと、bit6 と bit7 がフラグにコピーされることを確認します
+4. **`JSR` / `RTS` の往復をテストする**。スタックに積まれた値が「戻り先 - 1」であることを確かめてください
+5. **未実装オペコードの一覧を出す**。256 通りのうち、まだ実装していないものを列挙してください
+
+## 次回
+
+CPU の命令が揃いました。次は **バスとメモリマップ**です。ここまでは 64KB のフラットな RAM を仮定していましたが、実際のファミコンでは、アドレスによって行き先が違います。そして ROM ファイルを読み込みます。

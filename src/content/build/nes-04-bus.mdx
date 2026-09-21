@@ -3,10 +3,331 @@ title: バスとメモリマップ
 description: CPU から見えるアドレス空間は、実はあちこちに配線されている。ミラーリングという厄介ごと
 track: nes
 order: 4
-status: planned
+status: published
 goal: ROM を読み込み、CPU がメモリ越しに正しい値を読める
 requires:
   - nes-03-instructions
+basedOn:
+  - kind: reading
+    slug: consistent-hashing
+    why: アドレスから行き先を決める規則。範囲で分けて振り分ける、という最も単純な形がここにある
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 64KB の中身
+
+CPU から見えるアドレス空間は 16 ビット、64KB です。その内訳です。
+
+| アドレス | 大きさ | 中身 |
+| --- | --- | --- |
+| `$0000`〜`$07FF` | 2KB | **内蔵 RAM** |
+| `$0800`〜`$1FFF` | 6KB | 内蔵 RAM の**ミラー**（3 回繰り返し） |
+| `$2000`〜`$2007` | 8 バイト | **PPU のレジスタ** |
+| `$2008`〜`$3FFF` | 8KB | PPU レジスタの**ミラー**（1024 回繰り返し） |
+| `$4000`〜`$4017` | 24 バイト | APU とコントローラ |
+| `$4018`〜`$401F` | 8 バイト | テスト用（通常は未使用） |
+| `$4020`〜`$FFFF` | 約 49KB | **カートリッジ**（PRG ROM、必要なら RAM） |
+
+**RAM が 2KB しかありません。** 現代の感覚では信じがたい量です。
+
+## ミラーリングとは何か
+
+`$0000` と `$0800` と `$1000` と `$1800` は、**同じ場所を指します**。
+
+```ts
+bus.write(0x0000, 42)
+bus.read(0x0800)      // → 42
+```
+
+なぜこうなっているのか。**配線を減らすため**です。
+
+RAM は 2KB なので、アドレス線は 11 本（2¹¹ = 2048）あれば足ります。$0000〜$1FFF の範囲を RAM に割り当てるとき、上位のアドレス線（A11、A12）を**どこにも繋がない**と、その分は無視されます。結果として、同じ場所が繰り返し現れます。
+
+```
+CPU のアドレス: 0001 1000 0000 0000  ($1800)
+RAM が見ている:      0 0000 0000 0000  (下位 11 ビットだけ)
+```
+
+**意図した機能ではなく、配線を省いた結果**です。しかしゲームはこれを前提に書かれているので、再現する必要があります。
+
+<Callout type="tip" title="ミラーリングはマスクで表現できる">
+```ts
+if (addr < 0x2000) return this.ram[addr & 0x07ff]     // 下位 11 ビットだけ使う
+if (addr < 0x4000) return this.ppu.readRegister(addr & 0x0007)   // 下位 3 ビット
+```
+  `& 0x07ff` の 1 つで、4 回の繰り返しが表現できます。
+  **アドレスの上位ビットを捨てる = ミラーリング**です。
+</Callout>
+
+## バスを書き直す
+
+第 1 回では 64KB のフラットな配列でした。本物に差し替えます。
+
+```ts
+// src/nes/bus.ts
+import type { Cartridge } from './cartridge'
+import type { PPU } from './ppu'
+
+export class Bus {
+  private ram = new Uint8Array(0x0800)      // 2KB だけ
+
+  constructor(
+    readonly cart: Cartridge,
+    readonly ppu: PPU,
+  ) {}
+
+  read(addr: number): number {
+    addr &= 0xffff
+
+    if (addr < 0x2000) return this.ram[addr & 0x07ff]!
+    if (addr < 0x4000) return this.ppu.readRegister(addr & 0x0007)
+    if (addr === 0x4016) return this.controller1.read()
+    if (addr === 0x4017) return this.controller2.read()
+    if (addr < 0x4020) return 0                        // APU の多くは読めない
+    return this.cart.readPrg(addr)
+  }
+
+  write(addr: number, value: number) {
+    addr &= 0xffff
+    value &= 0xff
+
+    if (addr < 0x2000) { this.ram[addr & 0x07ff] = value; return }
+    if (addr < 0x4000) { this.ppu.writeRegister(addr & 0x0007, value); return }
+    if (addr === 0x4014) { this.oamDma(value); return }     // DMA（後述）
+    if (addr === 0x4016) { this.controller1.write(value); this.controller2.write(value); return }
+    if (addr < 0x4020) { this.apu.write(addr, value); return }
+    this.cart.writePrg(addr, value)                          // マッパーのレジスタ
+  }
+
+  read16(addr: number): number {
+    return this.read(addr) | (this.read((addr + 1) & 0xffff) << 8)
+  }
+}
+```
+
+**読むだけで副作用がある領域があります。** `$2002`（PPU のステータス）を読むと、VBlank フラグがクリアされます。だから、デバッグ用にメモリを覗くときは、**副作用のない読み出し**を別に用意する必要があります。
+
+<Callout type="warn" title="デバッガが状態を変えてしまう問題">
+```ts
+/** デバッグ表示用。副作用を起こさない */
+peek(addr: number): number { ... }
+```
+  これを用意せずにデバッガを作ると、**表示した瞬間にゲームの挙動が変わります**。
+  「デバッガを付けると再現しない」という、最も厄介なバグの原因になります。
+
+  第 7 章で読んだ観測の話と同じで、**観測が対象を変える**のを避ける必要があります。
+</Callout>
+
+## iNES 形式の ROM
+
+ファミコンの ROM ファイルは、**iNES 形式**が標準です。
+
+```
+オフセット  大きさ   内容
+0          4       "NES" + $1A（マジックナンバー）
+4          1       PRG ROM のサイズ（16KB 単位）
+5          1       CHR ROM のサイズ（8KB 単位）
+6          1       フラグ 6
+7          1       フラグ 7
+8-15       8       拡張（多くは 0）
+16         ...     PRG ROM 本体
+           ...     CHR ROM 本体
+```
+
+**フラグ 6** の中身です。
+
+| ビット | 意味 |
+| --- | --- |
+| 0 | ネームテーブルのミラーリング（0 = 水平、1 = 垂直） |
+| 1 | バッテリーバックアップの有無 |
+| 2 | トレーナー（512 バイト）の有無 |
+| 3 | 4 画面ミラーリング |
+| 4-7 | **マッパー番号の下位 4 ビット** |
+
+マッパー番号は、フラグ 6 の上位 4 ビットと、フラグ 7 の上位 4 ビットを合わせた 8 ビットです。
+
+```ts
+// src/nes/ines.ts
+export type Rom = {
+  prg: Uint8Array
+  chr: Uint8Array
+  mapper: number
+  mirroring: 'horizontal' | 'vertical' | 'four-screen'
+  hasBattery: boolean
+}
+
+export function parseINes(data: Uint8Array): Rom {
+  if (data[0] !== 0x4e || data[1] !== 0x45 || data[2] !== 0x53 || data[3] !== 0x1a) {
+    throw new Error('iNES 形式ではありません（マジックナンバーが違います）')
+  }
+
+  const prgBanks = data[4]!
+  const chrBanks = data[5]!
+  const flags6 = data[6]!
+  const flags7 = data[7]!
+
+  const hasTrainer = (flags6 & 0x04) !== 0
+  let offset = 16 + (hasTrainer ? 512 : 0)
+
+  const prgSize = prgBanks * 16384
+  const chrSize = chrBanks * 8192
+
+  const prg = data.slice(offset, offset + prgSize)
+  offset += prgSize
+  // CHR が 0 バンクなら、RAM として 8KB 確保する
+  const chr = chrSize > 0 ? data.slice(offset, offset + chrSize) : new Uint8Array(8192)
+
+  return {
+    prg,
+    chr,
+    mapper: (flags7 & 0xf0) | (flags6 >> 4),
+    mirroring: (flags6 & 0x08) ? 'four-screen' : (flags6 & 0x01) ? 'vertical' : 'horizontal',
+    hasBattery: (flags6 & 0x02) !== 0,
+  }
+}
+```
+
+<Callout type="note" title="CHR ROM と CHR RAM">
+  **PRG** はプログラム（CPU が読む）、**CHR** はキャラクタ（PPU が読む絵のデータ）です。
+
+  CHR のバンク数が 0 の ROM があります。この場合、**絵を ROM に持たず、
+  実行時に RAM へ書き込む**方式です。RAM として 8KB 確保します。
+  アニメーションを多用するゲームで使われました。
+</Callout>
+
+## 最も単純なマッパー：NROM
+
+マッパー 0（NROM）は、バンク切り替えをしません。最初に作るならこれです。
+
+```ts
+// src/nes/cartridge.ts
+export class Cartridge {
+  constructor(private rom: Rom) {}
+
+  readPrg(addr: number): number {
+    if (addr < 0x8000) return 0                        // $6000-$7FFF はセーブ用 RAM
+    const offset = addr - 0x8000
+    // PRG が 16KB しかないときは、$C000 以降に同じものが見える
+    return this.rom.prg[offset % this.rom.prg.length]!
+  }
+
+  writePrg(_addr: number, _value: number) {
+    // NROM には書き込めるレジスタがない
+  }
+
+  readChr(addr: number): number {
+    return this.rom.chr[addr & 0x1fff]!
+  }
+}
+```
+
+**`offset % prg.length` が要点です。** PRG が 16KB（1 バンク）の ROM では、`$8000`〜`$BFFF` と `$C000`〜`$FFFF` に**同じ内容が見えます**。
+
+これが重要なのは、**リセットベクタが `$FFFC` にある**からです。16KB の ROM でも、`$FFFC` を読めば ROM の末尾付近が返る必要があります。
+
+## OAM DMA
+
+`$4014` への書き込みは、**特別な動作**をします。
+
+```ts
+private oamDma(page: number) {
+  const base = page << 8
+  for (let i = 0; i < 256; i++) {
+    this.ppu.oam[i] = this.read(base + i)
+  }
+  this.cpu.cycles += 513      // 奇数サイクルなら 514
+}
+```
+
+**256 バイトを一気に PPU の OAM（スプライト情報）へ転送します。** 1 バイトずつ `STA` で書くと 1000 サイクル以上かかるところを、513 サイクルで済ませます。
+
+第 7 章で読んだ DMA そのものです。CPU は転送中止まりますが、それでも手で書くより速い。
+
+## テストを書く
+
+```ts
+// src/nes/bus.check.ts
+import { strict as assert } from 'node:assert'
+import { parseINes } from './ines'
+
+// 最小の ROM を組み立てる
+function makeRom(prgBanks = 1, mapper = 0): Uint8Array {
+  const data = new Uint8Array(16 + prgBanks * 16384 + 8192)
+  data.set([0x4e, 0x45, 0x53, 0x1a], 0)         // "NES\x1a"
+  data[4] = prgBanks
+  data[5] = 1                                    // CHR 1 バンク
+  data[6] = (mapper & 0x0f) << 4
+  data[7] = mapper & 0xf0
+  return data
+}
+
+// パース
+{
+  const rom = parseINes(makeRom(2, 0))
+  assert.equal(rom.prg.length, 32768)
+  assert.equal(rom.chr.length, 8192)
+  assert.equal(rom.mapper, 0)
+  assert.equal(rom.mirroring, 'horizontal')
+  console.log('ok   iNES ヘッダのパース')
+}
+
+// マッパー番号の組み立て
+{
+  const rom = parseINes(makeRom(1, 4))
+  assert.equal(rom.mapper, 4, '下位 4 ビットが flags6 の上位から')
+  console.log('ok   マッパー番号')
+}
+
+// マジックナンバー
+{
+  const bad = makeRom()
+  bad[0] = 0x00
+  assert.throws(() => parseINes(bad), /iNES 形式ではありません/)
+  console.log('ok   不正なファイルを弾く')
+}
+
+// RAM のミラーリング
+{
+  const bus = makeTestBus()
+  bus.write(0x0000, 42)
+  assert.equal(bus.read(0x0000), 42)
+  assert.equal(bus.read(0x0800), 42, '$0800 は $0000 のミラー')
+  assert.equal(bus.read(0x1000), 42)
+  assert.equal(bus.read(0x1800), 42)
+
+  bus.write(0x1fff, 99)
+  assert.equal(bus.read(0x07ff), 99, '逆向きも成立する')
+  console.log('ok   RAM のミラーリング')
+}
+
+// 16KB ROM は $8000 と $C000 に同じものが見える
+{
+  const data = makeRom(1)
+  data[16] = 0xaa                       // PRG の先頭
+  data[16 + 16383] = 0xbb               // PRG の末尾
+  const bus = makeBusWith(parseINes(data))
+
+  assert.equal(bus.read(0x8000), 0xaa)
+  assert.equal(bus.read(0xc000), 0xaa, '16KB ROM はミラーされる')
+  assert.equal(bus.read(0xbfff), 0xbb)
+  assert.equal(bus.read(0xffff), 0xbb, 'リセットベクタの位置も読める')
+  console.log('ok   16KB PRG のミラーリング')
+}
+
+console.log('\n全部通りました')
+```
+
+**「16KB ROM で `$FFFC` が読めること」のテストが重要です。** ここが間違っていると、ROM を読み込んだ瞬間に見当違いのアドレスへジャンプし、**何も起きずに固まります**。原因が分かりにくい典型例です。
+
+## 演習
+
+1. **`peek` を実装する**。副作用なしでメモリを読む関数を作り、デバッグ表示に使ってください
+2. **メモリマップを表示する**。アドレスを渡すと「内蔵 RAM ($0123)」のように、どこに割り当てられているか返す関数を書きます
+3. **NES 2.0 形式に対応する**。iNES の拡張で、より大きな ROM を扱えます
+4. **ROM のハッシュを取る**。読み込んだ ROM の識別に使えます
+5. **未対応のマッパーを検出する**。対応していないマッパー番号なら、その旨を明確に報告してください
+
+## 次回
+
+**割り込み**です。RESET、NMI、IRQ。ファミコンでは NMI が画面の描画タイミングを知らせる中心的な役割を持ちます。第 2 章で読んだ割り込みベクタが、いよいよ実物として出てきます。

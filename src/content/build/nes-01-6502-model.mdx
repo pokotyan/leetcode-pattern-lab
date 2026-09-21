@@ -3,10 +3,325 @@ title: 6502 の世界を型にする
 description: 3 本のレジスタ、1 本のスタックポインタ、7 つのフラグ。まず状態の入れ物を作る
 track: nes
 order: 1
-status: planned
+status: published
 goal: CPU の状態を保持する構造と、フラグの読み書きが検証できる
 requires:
   - hw-13-6502-control
+basedOn:
+  - kind: math
+    slug: bit-tricks
+    why: 7 つのフラグを 1 バイトに詰める。ビットの立て方・落とし方・読み方が全編で出てくる
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## ここから先は、仕様が決まっている
+
+Track 1 と 2 では、自分で仕様を決めました。命令セットも言語も、好きに設計できました。
+
+Track 3 は違います。**1983 年に決まった仕様を、そのとおりに再現します。** 気に入らない部分も、バグも含めて。
+
+作るのは、ファミコン（Nintendo Entertainment System）のエミュレータです。中心にあるのが、**Ricoh 2A03** という 6502 系の CPU です。
+
+<Callout type="note" title="2A03 は 6502 そのものではない">
+  ファミコンの CPU は 6502 の改造版です。違いは 2 つ。
+
+  - **10 進補正モード（D フラグ）が無効化されている**。BCD 演算ができない
+  - **音源（APU）が同じチップに載っている**
+
+  1 つめのおかげで、実装が少し楽になります。
+  ADC / SBC で D フラグを見る必要がありません。
+</Callout>
+
+## レジスタ
+
+```ts
+// src/nes/cpu.ts
+export class CPU {
+  a = 0        // アキュムレータ。計算結果はここにしか入らない
+  x = 0        // インデックスレジスタ
+  y = 0        // インデックスレジスタ
+  s = 0xfd     // スタックポインタ（8 ビット）
+  p = 0x24     // ステータスレジスタ
+  pc = 0       // プログラムカウンタ（16 ビット）
+
+  cycles = 0   // 経過サイクル数
+}
+```
+
+**すべて 8 ビット、PC だけ 16 ビット**です。JavaScript の `number` に入れますが、**演算のたびに `& 0xff` でマスクする責任が自分にあります**。
+
+<Callout type="warn" title="マスクを忘れると静かに壊れる">
+```ts
+this.x = this.x + 1          // 0xff の次が 0x100 になってしまう
+this.x = (this.x + 1) & 0xff // 正しい
+```
+  8 ビットの世界では、255 の次は 0 です。
+  TypeScript の `number` は勝手に大きくなるので、
+  **境界を越えた瞬間に別の値になり、そこから先が全部おかしくなります**。
+
+  対策として、レジスタをプロパティではなくアクセサにして、
+  setter で必ずマスクする方法があります。
+</Callout>
+
+## スタックポインタが 8 ビットである意味
+
+`s` は 8 ビットです。実際のスタックのアドレスは、
+
+```
+$0100 + s
+```
+
+つまり、**スタックは $0100〜$01FF の 256 バイトに固定**されています。
+
+```ts
+push(value: number) {
+  this.bus.write(0x100 + this.s, value)
+  this.s = (this.s - 1) & 0xff        // 下に伸びる
+}
+
+pop(): number {
+  this.s = (this.s + 1) & 0xff
+  return this.bus.read(0x100 + this.s)
+}
+```
+
+**256 バイトしかありません。** 深い再帰はできません。溢れると `$01FF` の次が `$0100` に折り返し、**古いデータを上書きします**。エラーにはなりません。
+
+第 4 章で読んだ「ガードページで検出する」ような仕組みはありません。
+
+## ステータスレジスタ
+
+7 つのフラグを 1 バイトに詰めます。
+
+```
+  7   6   5   4   3   2   1   0
+┌───┬───┬───┬───┬───┬───┬───┬───┐
+│ N │ V │ U │ B │ D │ I │ Z │ C │
+└───┴───┴───┴───┴───┴───┴───┴───┘
+```
+
+```ts
+export const F = {
+  C: 0x01,   // Carry     符号なしの桁あふれ / 借りなし
+  Z: 0x02,   // Zero      結果が 0
+  I: 0x04,   // Interrupt IRQ を禁止
+  D: 0x08,   // Decimal   NES では未使用
+  B: 0x10,   // Break     BRK による割り込みか
+  U: 0x20,   // Unused    常に 1
+  V: 0x40,   // Overflow  符号付きの桁あふれ
+  N: 0x80,   // Negative  結果の bit7
+} as const
+```
+
+読み書きのヘルパを作っておきます。
+
+```ts
+getFlag(flag: number): 0 | 1 {
+  return (this.p & flag) !== 0 ? 1 : 0
+}
+
+setFlag(flag: number, value: boolean | number) {
+  if (value) this.p |= flag
+  else this.p &= ~flag
+}
+
+/** 多くの命令が、結果に応じて Z と N を更新する */
+setZN(value: number) {
+  this.setFlag(F.Z, (value & 0xff) === 0)
+  this.setFlag(F.N, (value & 0x80) !== 0)
+}
+```
+
+<Callout type="tip" title="U フラグは常に 1">
+  bit5 は使われていませんが、**読むと必ず 1 が返ります**。
+  スタックに積んだ値を比較するテスト（nestest）では、ここが 1 でないと不一致になります。
+
+  仕様として「未使用」と書かれているものが、実際には決まった値を返す。
+  **エミュレータでは、こういう細部が合否を分けます。**
+</Callout>
+
+## メモリへの窓口
+
+CPU はメモリを直接持ちません。**バス**を通してやり取りします。
+
+```ts
+// src/nes/bus.ts
+export class Bus {
+  private ram = new Uint8Array(0x10000)     // 第 4 回で本物のメモリマップに差し替える
+
+  read(addr: number): number {
+    return this.ram[addr & 0xffff]!
+  }
+
+  write(addr: number, value: number) {
+    this.ram[addr & 0xffff] = value & 0xff
+  }
+
+  /** リトルエンディアンで 2 バイト読む */
+  read16(addr: number): number {
+    return this.read(addr) | (this.read((addr + 1) & 0xffff) << 8)
+  }
+}
+```
+
+**`read16` が下位バイトを先に読む**のが 6502 の流儀です。第 1 章で読んだリトルエンディアンが、ここで実際の形になります。
+
+```
+メモリ:  $8000: 34   $8001: 12
+read16($8000) → $1234
+```
+
+## リセット
+
+電源を入れたとき、CPU は **$FFFC から 2 バイト読み、そこへジャンプします**。
+
+```ts
+reset() {
+  this.pc = this.bus.read16(0xfffc)
+  this.s = 0xfd
+  this.p = F.U | F.I
+  this.a = this.x = this.y = 0
+  this.cycles = 7                    // リセット自体に 7 サイクルかかる
+}
+```
+
+`s` の初期値が `0xfd` なのは、リセット処理が内部で 3 回 push の動作をするからです（実際には書き込まれませんが、`s` は減ります）。**この「意味のない挙動」も再現しないと、nestest が通りません。**
+
+<Callout type="note" title="第 8 章の起動シーケンスの、最も単純な形">
+  PC でいえば BIOS に相当するものが、ファミコンにはありません。
+  リセットベクタが指す先が、いきなりゲームのコードです。
+
+  ブートローダも initramfs も OS もなく、
+  **電源投入から 7 サイクル後にはゲームが動き始めています。**
+</Callout>
+
+## テストを書く
+
+```ts
+// src/nes/cpu.check.ts
+import { strict as assert } from 'node:assert'
+import { Bus } from './bus'
+import { CPU, F } from './cpu'
+
+const make = () => { const bus = new Bus(); return { bus, cpu: new CPU(bus) } }
+
+// フラグ
+{
+  const { cpu } = make()
+  cpu.p = 0
+  cpu.setFlag(F.C, true)
+  assert.equal(cpu.p, 0x01)
+  cpu.setFlag(F.N, true)
+  assert.equal(cpu.p, 0x81)
+  cpu.setFlag(F.C, false)
+  assert.equal(cpu.p, 0x80)
+  assert.equal(cpu.getFlag(F.N), 1)
+  assert.equal(cpu.getFlag(F.C), 0)
+  console.log('ok   フラグの読み書き')
+}
+
+// setZN
+{
+  const { cpu } = make()
+  cpu.setZN(0x00); assert.equal(cpu.getFlag(F.Z), 1); assert.equal(cpu.getFlag(F.N), 0)
+  cpu.setZN(0x01); assert.equal(cpu.getFlag(F.Z), 0); assert.equal(cpu.getFlag(F.N), 0)
+  cpu.setZN(0x80); assert.equal(cpu.getFlag(F.Z), 0); assert.equal(cpu.getFlag(F.N), 1)
+  cpu.setZN(0xff); assert.equal(cpu.getFlag(F.N), 1)
+  console.log('ok   Z と N の自動更新')
+}
+
+// スタック
+{
+  const { bus, cpu } = make()
+  cpu.s = 0xfd
+  cpu.push(0x42)
+  assert.equal(bus.read(0x01fd), 0x42, 'スタックは $0100 ページ')
+  assert.equal(cpu.s, 0xfc, '下に伸びる')
+
+  cpu.push16(0x1234)
+  assert.equal(bus.read(0x01fc), 0x12, '上位バイトが先')
+  assert.equal(bus.read(0x01fb), 0x34)
+  assert.equal(cpu.pop16(), 0x1234)
+  assert.equal(cpu.pop(), 0x42)
+  assert.equal(cpu.s, 0xfd, '元に戻る')
+  console.log('ok   スタック')
+}
+
+// 折り返し
+{
+  const { cpu } = make()
+  cpu.s = 0x00
+  cpu.push(0xaa)
+  assert.equal(cpu.s, 0xff, '0x00 の次は 0xff に折り返す')
+  console.log('ok   スタックポインタの折り返し')
+}
+
+// リトルエンディアン
+{
+  const { bus } = make()
+  bus.write(0x8000, 0x34)
+  bus.write(0x8001, 0x12)
+  assert.equal(bus.read16(0x8000), 0x1234)
+  console.log('ok   read16 はリトルエンディアン')
+}
+
+// リセット
+{
+  const { bus, cpu } = make()
+  bus.write(0xfffc, 0x00)
+  bus.write(0xfffd, 0xc0)
+  cpu.reset()
+  assert.equal(cpu.pc, 0xc000, 'リセットベクタから起動')
+  assert.equal(cpu.s, 0xfd)
+  assert.equal(cpu.cycles, 7)
+  console.log('ok   リセット')
+}
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/nes/cpu.check.ts
+```
+
+## 進め方の方針
+
+エミュレータは、**途中まで作っても何も動かない**という性質があります。CPU が 9 割できていても、画面には何も出ません。
+
+そこで、次の順序で進めます。
+
+| 回 | 作るもの | 確認方法 |
+| --- | --- | --- |
+| 1（今回） | 状態とバス | 単体テスト |
+| 2 | アドレッシング | 単体テスト |
+| 3 | 命令 | 単体テスト |
+| 4 | メモリマップと ROM | ROM が読める |
+| 5 | 割り込み | ベクタから起動する |
+| **6** | **検証 ROM** | **nestest のログと完全一致** |
+| 7〜9 | PPU | 画面が出る |
+| 10 | タイミング | 速度が合う |
+| 11 | 入力 | 操作できる |
+| 12〜13 | マッパー、音 | 実際のゲームが動く |
+
+**第 6 回が最大の関門**です。ここを越えると、CPU が完全に正しいことが保証されます。その先の不具合は全部 PPU のせいだと分かるので、切り分けが劇的に楽になります。
+
+<Callout type="tip" title="検証できる中間地点を置く">
+  「全部作らないと動かない」ものを作るときは、
+  **途中に検証できる地点を意図的に用意する**のが定石です。
+
+  nestest は、まさにそのために作られた検証用の ROM です。
+  1 命令ずつ実行ログを出し、正解のログと突き合わせられます。
+  **最初に食い違った行が、バグの場所です。**
+</Callout>
+
+## 演習
+
+1. **レジスタをアクセサにする**。setter で必ず `& 0xff` するようにし、マスク忘れを構造的に防いでください
+2. **ステータスレジスタを文字列で表示する**。`nvUbdIzc` のように、立っているフラグを大文字で出すと、デバッグが楽になります
+3. **スタックの中身を表示する**。`$01FF` から `s` までを出力してください
+4. **`Uint8Array` を使う**。レジスタを `number` ではなく長さ 1 の `Uint8Array` にすると、マスクが自動になります。速度も測ってみてください
+
+## 次回
+
+**アドレッシングモード**です。同じ `LDA` でも値の取り方が 13 通りあります。ここを先に片付けておくと、次の命令の実装がほとんど機械作業になります。

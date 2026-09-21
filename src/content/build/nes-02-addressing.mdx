@@ -1,12 +1,313 @@
 ---
 title: アドレッシングモード
-description: 同じ LDA でも、値の取り方が 8 通りある。ここを先に片付けると命令の実装が単純作業になる
+description: 同じ LDA でも、値の取り方が 13 通りある。ここを先に片付けると命令の実装が単純作業になる
 track: nes
 order: 2
-status: planned
+status: published
 goal: 各アドレッシングモードが、期待するアドレスとサイクル数を返す
 requires:
   - nes-01-6502-model
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 命令とモードは直交している
+
+`LDA` には 8 つのオペコードがあります。やることは全部同じ「値を A に入れる」で、**違うのは値の取り方だけ**です。
+
+```
+$A9  LDA #$42       即値
+$A5  LDA $10        ゼロページ
+$AD  LDA $1234      絶対
+$BD  LDA $1234,X    絶対 + X
+...
+```
+
+そこで、**「アドレスを決める処理」と「命令の処理」を分けます**。
+
+```
+1. オペコードから、命令とモードを引く
+2. モードに従って、オペランドのアドレスを計算する
+3. 命令の処理を行う（そのアドレスを使う）
+```
+
+こうすると、13 のモード × 56 の命令を、**13 + 56 個**の実装で済ませられます。
+
+## 13 のモード
+
+| モード | 記法 | アドレスの決め方 | バイト数 |
+| --- | --- | --- | --- |
+| Implied | `INX` | オペランドなし | 1 |
+| Accumulator | `ASL A` | A レジスタが対象 | 1 |
+| Immediate | `LDA #$42` | **次のバイトが値そのもの** | 2 |
+| Zero Page | `LDA $10` | `$0010` | 2 |
+| Zero Page,X | `LDA $10,X` | `($10 + X) & $FF` | 2 |
+| Zero Page,Y | `LDX $10,Y` | `($10 + Y) & $FF` | 2 |
+| Absolute | `LDA $1234` | `$1234` | 3 |
+| Absolute,X | `LDA $1234,X` | `$1234 + X` | 3 |
+| Absolute,Y | `LDA $1234,Y` | `$1234 + Y` | 3 |
+| Indirect | `JMP ($1234)` | `$1234` から 2 バイト読む | 3 |
+| Indexed Indirect | `LDA ($10,X)` | `$10+X` から 2 バイト読む | 2 |
+| Indirect Indexed | `LDA ($10),Y` | `$10` から 2 バイト読み、+Y | 2 |
+| Relative | `BNE $10` | **PC からの符号付きオフセット** | 2 |
+
+<Callout type="tip" title="Immediate をアドレスとして扱う">
+  即値は「値そのもの」であってアドレスではありません。
+  しかし、**オペランドが置かれているアドレス（PC の次）を返す**ことにすると、
+  他のモードと同じ扱いにできます。
+
+```ts
+imm: (c) => ({ addr: c.pc++, extra: 0 })
+```
+  命令側は `read(addr)` するだけでよく、モードを気にしません。
+  **場合分けを 1 箇所に閉じ込める**ための工夫です。
+</Callout>
+
+## 実装
+
+```ts
+// src/nes/addressing.ts
+import type { CPU } from './cpu'
+
+export type Mode =
+  | 'imp' | 'acc' | 'imm' | 'zp' | 'zpx' | 'zpy'
+  | 'abs' | 'absx' | 'absy' | 'ind' | 'indx' | 'indy' | 'rel'
+
+export type Resolved = { addr: number; extra: 0 | 1 }
+
+export const MODES: Record<Mode, (c: CPU) => Resolved> = {
+  imp: () => ({ addr: 0, extra: 0 }),
+  acc: () => ({ addr: 0, extra: 0 }),
+
+  imm: (c) => ({ addr: c.pc++, extra: 0 }),
+
+  zp:  (c) => ({ addr: c.bus.read(c.pc++), extra: 0 }),
+  zpx: (c) => ({ addr: (c.bus.read(c.pc++) + c.x) & 0xff, extra: 0 }),
+  zpy: (c) => ({ addr: (c.bus.read(c.pc++) + c.y) & 0xff, extra: 0 }),
+
+  abs: (c) => {
+    const addr = c.bus.read16(c.pc)
+    c.pc += 2
+    return { addr, extra: 0 }
+  },
+
+  absx: (c) => {
+    const base = c.bus.read16(c.pc); c.pc += 2
+    const addr = (base + c.x) & 0xffff
+    return { addr, extra: pageCrossed(base, addr) }
+  },
+
+  absy: (c) => {
+    const base = c.bus.read16(c.pc); c.pc += 2
+    const addr = (base + c.y) & 0xffff
+    return { addr, extra: pageCrossed(base, addr) }
+  },
+
+  ind: (c) => {
+    const ptr = c.bus.read16(c.pc); c.pc += 2
+    // 実機のバグ：下位が $FF のとき、上位はページ内で折り返す
+    const lo = c.bus.read(ptr)
+    const hi = c.bus.read((ptr & 0xff00) | ((ptr + 1) & 0xff))
+    return { addr: lo | (hi << 8), extra: 0 }
+  },
+
+  indx: (c) => {
+    const zp = (c.bus.read(c.pc++) + c.x) & 0xff
+    const lo = c.bus.read(zp)
+    const hi = c.bus.read((zp + 1) & 0xff)          // ゼロページ内で折り返す
+    return { addr: lo | (hi << 8), extra: 0 }
+  },
+
+  indy: (c) => {
+    const zp = c.bus.read(c.pc++)
+    const lo = c.bus.read(zp)
+    const hi = c.bus.read((zp + 1) & 0xff)          // ここも折り返す
+    const base = lo | (hi << 8)
+    const addr = (base + c.y) & 0xffff
+    return { addr, extra: pageCrossed(base, addr) }
+  },
+
+  rel: (c) => {
+    const offset = (c.bus.read(c.pc++) << 24) >> 24  // 符号付き 8 ビットに拡張
+    return { addr: (c.pc + offset) & 0xffff, extra: 0 }
+  },
+}
+
+const pageCrossed = (a: number, b: number): 0 | 1 =>
+  (a & 0xff00) !== (b & 0xff00) ? 1 : 0
+```
+
+## 4 つの落とし穴
+
+### 1. ゼロページは 8 ビットで折り返す
+
+```
+LDA $F0,X   （X = $20）
+  → $F0 + $20 = $110  ではなく  $10
+```
+
+`& 0xff` が要ります。**折り返さない実装は、一部のゲームでだけ誤動作します。**
+
+### 2. ゼロページのポインタも折り返す
+
+```
+LDA ($FF),Y
+  → 下位を $00FF から、上位を $0100 から  ではなく
+  → 下位を $00FF から、上位を $0000 から
+```
+
+これも `(zp + 1) & 0xff` です。
+
+### 3. JMP 間接のバグ
+
+```
+JMP ($30FF)
+  → 下位を $30FF から、上位を $3100 から  ではなく
+  → 下位を $30FF から、上位を $3000 から
+```
+
+**これは 6502 のハードウェアバグです。** 修正されないまま出荷され、後継の 65C02 でようやく直りました。
+
+<Callout type="warn" title="バグを再現しなければならない">
+  このバグに依存したソフトウェアが存在します。
+  「バグがあることを前提に書かれたコード」は、
+  **バグを直すと動かなくなります**。
+
+  第 2 章で読んだ「ISA は契約」の影の部分です。
+  実装の癖が、事実上の契約になってしまう。
+  Windows が古いアプリのために大量の互換性パッチを持っているのも、同じ構図です。
+</Callout>
+
+### 4. 相対分岐の符号拡張
+
+```ts
+const offset = (c.bus.read(c.pc++) << 24) >> 24
+```
+
+読んだ 1 バイトは `0x00`〜`0xFF` です。これを**符号付きとして解釈する**必要があります。
+
+左に 24 ビットずらしてから算術右シフトで戻すと、bit7 が上位に引き伸ばされます。第 1 章で見た算術右シフトの用法そのものです。
+
+`0xFD` → `-3` になります。
+
+## サイクル数への影響
+
+ページをまたぐと 1 サイクル増えます。理由は第 1 トラックで見たとおり、**下位バイトの加算で繰り上がりが出たときだけ、上位バイトを直すサイクルが必要**だからです。
+
+| モード | 追加サイクル |
+| --- | --- |
+| `absx`, `absy`, `indy` | 読み込み命令でページをまたぐと +1 |
+| 書き込み命令（`STA` など） | **常に +1**（投機できないため） |
+| 分岐（`rel`） | 成立で +1、さらにページをまたぐと +1 |
+
+## テストを書く
+
+```ts
+// src/nes/addressing.check.ts
+import { strict as assert } from 'node:assert'
+import { Bus } from './bus'
+import { CPU } from './cpu'
+import { MODES } from './addressing'
+
+const setup = (bytes: Record<number, number>) => {
+  const bus = new Bus()
+  for (const [addr, v] of Object.entries(bytes)) bus.write(Number(addr), v)
+  const cpu = new CPU(bus)
+  cpu.pc = 0x8000
+  return cpu
+}
+
+// ゼロページの折り返し
+{
+  const cpu = setup({ 0x8000: 0xf0 })
+  cpu.x = 0x20
+  assert.equal(MODES.zpx(cpu).addr, 0x10, '$F0 + $20 は $10')
+}
+{
+  const cpu = setup({ 0x8000: 0x10 })
+  cpu.x = 0x05
+  assert.equal(MODES.zpx(cpu).addr, 0x15)
+}
+console.log('ok   zpx は 8 ビットで折り返す')
+
+// absolute
+{
+  const cpu = setup({ 0x8000: 0x34, 0x8001: 0x12 })
+  assert.equal(MODES.abs(cpu).addr, 0x1234, 'リトルエンディアン')
+  assert.equal(cpu.pc, 0x8002, 'PC が 2 進む')
+}
+console.log('ok   abs')
+
+// ページまたぎ
+{
+  const cpu = setup({ 0x8000: 0x10, 0x8001: 0x20 })
+  cpu.x = 0x20
+  assert.deepEqual(MODES.absx(cpu), { addr: 0x2030, extra: 0 }, 'ページ内')
+}
+{
+  const cpu = setup({ 0x8000: 0xf0, 0x8001: 0x20 })
+  cpu.x = 0x20
+  assert.deepEqual(MODES.absx(cpu), { addr: 0x2110, extra: 1 }, 'ページをまたぐ')
+}
+console.log('ok   absx のページまたぎ判定')
+
+// (zp),Y のゼロページ折り返し
+{
+  const cpu = setup({ 0x8000: 0xff, 0x00ff: 0x34, 0x0000: 0x12, 0x0100: 0x99 })
+  cpu.y = 0
+  assert.equal(MODES.indy(cpu).addr, 0x1234, '$0000 から上位を読む（$0100 ではない）')
+}
+console.log('ok   indy のゼロページ折り返し')
+
+// (zp,X)
+{
+  const cpu = setup({ 0x8000: 0xf0, 0x0005: 0x78, 0x0006: 0x56 })
+  cpu.x = 0x15                      // $F0 + $15 = $105 → $05
+  assert.equal(MODES.indx(cpu).addr, 0x5678)
+}
+console.log('ok   indx')
+
+// JMP 間接のバグ
+{
+  const cpu = setup({
+    0x8000: 0xff, 0x8001: 0x30,
+    0x30ff: 0x40, 0x3000: 0x80, 0x3100: 0x50,
+  })
+  assert.equal(MODES.ind(cpu).addr, 0x8040, '上位を $3000 から読む（実機のバグ）')
+}
+{
+  const cpu = setup({ 0x8000: 0x10, 0x8001: 0x30, 0x3010: 0x40, 0x3011: 0x80 })
+  assert.equal(MODES.ind(cpu).addr, 0x8040, '境界でなければ正常')
+}
+console.log('ok   JMP 間接のページ境界バグ')
+
+// 相対分岐の符号
+{
+  const cpu = setup({ 0x8000: 0xfd })         // -3
+  assert.equal(MODES.rel(cpu).addr, 0x7ffe, 'PC(0x8001) - 3')
+}
+{
+  const cpu = setup({ 0x8000: 0x05 })
+  assert.equal(MODES.rel(cpu).addr, 0x8006)
+}
+console.log('ok   rel の符号拡張')
+
+console.log('\n全部通りました')
+```
+
+```bash
+npx tsx src/nes/addressing.check.ts
+```
+
+**折り返しとバグのテストが本体です。** 正常系は最初から動きます。バグを踏むのは境界だけなので、境界を狙ったテストがないと、後で ROM を動かして初めて気づくことになります。
+
+## 演習
+
+1. **13 モードすべてのテストを書く**。上には出ていない `zpy`、`absy` も
+2. **サイクル数の表を作る**。各モードの基本サイクル数と、追加条件をまとめてください
+3. **`ind` のバグを直した版を作り、切り替えられるようにする**。65C02 モードとして
+4. **デバッグ表示を作る**。`LDA $1234,X  → $2030` のように、解決したアドレスを表示できるようにします
+
+## 次回
+
+アドレスが取れるようになりました。次は **命令そのもの**です。転送、演算、分岐、スタック操作。公式 151 命令を、グループごとにまとめて片付けます。

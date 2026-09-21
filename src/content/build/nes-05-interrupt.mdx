@@ -3,10 +3,281 @@ title: 割り込み
 description: RESET / NMI / IRQ。実行中の処理を止めて別の場所へ飛び、また戻ってくる仕組み
 track: nes
 order: 5
-status: planned
+status: published
 goal: 割り込みベクタから正しく起動し、NMI で処理が切り替わる
 requires:
   - nes-04-bus
 ---
 
-準備中です。
+import Callout from '../../components/Callout.astro'
+
+## 3 つのベクタ
+
+6502 のメモリ空間の最後の 6 バイトは、**割り込みベクタ**として予約されています。
+
+| アドレス | 名前 | いつ発生するか |
+| --- | --- | --- |
+| `$FFFA`〜`$FFFB` | **NMI** | PPU が VBlank に入ったとき |
+| `$FFFC`〜`$FFFD` | **RESET** | 電源投入、リセットボタン |
+| `$FFFE`〜`$FFFF` | **IRQ / BRK** | マッパーやAPU からの要求、BRK 命令 |
+
+**電源を入れると、CPU は `$FFFC` から 2 バイト読み、そこへジャンプします。** これが「プログラムの開始」です。第 8 章で読んだ起動シーケンスの、最も単純な形です。
+
+## 共通の手順
+
+RESET を除く割り込みは、同じ手順で処理されます。
+
+```
+1. PC をスタックに積む（上位、下位の順）
+2. ステータスレジスタを積む
+3. I フラグを立てる（さらなる IRQ を禁止する）
+4. ベクタから飛び先を読み、PC に入れる
+5. 7 サイクル消費する
+```
+
+```ts
+// src/nes/interrupt.ts
+import { F, type CPU } from './cpu'
+
+function interrupt(c: CPU, vector: number, setBreak: boolean) {
+  c.push16(c.pc)
+  c.push(setBreak ? (c.p | F.B | F.U) : ((c.p & ~F.B) | F.U))
+  c.setFlag(F.I, true)
+  c.pc = c.bus.read16(vector)
+  c.cycles += 7
+}
+
+export const nmi = (c: CPU) => interrupt(c, 0xfffa, false)
+export const irq = (c: CPU) => {
+  if (c.getFlag(F.I)) return          // I フラグが立っていたら無視する
+  interrupt(c, 0xfffe, false)
+}
+export const brk = (c: CPU) => {
+  c.pc++                               // BRK は 2 バイト命令として扱う
+  interrupt(c, 0xfffe, true)
+}
+```
+
+<Callout type="warn" title="B フラグで区別する">
+  スタックに積むステータスレジスタの **B ビット**が、
+  `BRK` なら 1、ハードウェア割り込みなら 0 になります。
+
+  割り込みハンドラは、スタックから積まれた値を読んでこれを調べ、
+  ソフトウェア割り込みかどうかを判断します。
+
+  **B は実際のレジスタには存在しません。** 積むときだけ現れるビットです。
+  ここを間違えると nestest が通りません。
+</Callout>
+
+## NMI はマスクできない
+
+| 種類 | I フラグで禁止できるか |
+| --- | --- |
+| **NMI** | **できない** |
+| IRQ | できる（`SEI` で禁止、`CLI` で許可） |
+| BRK | そもそも命令なので、常に実行される |
+
+NMI は「無視することが許されない事象」に使います。ファミコンでは、**PPU が 1 フレームの描画を終えたとき**に発生します。
+
+なぜ無視できてはいけないのか。**描画中に VRAM を書き換えると、画面が乱れる**からです。書き換えてよい時間帯（VBlank）は限られており、ゲームはその通知を確実に受け取る必要があります。
+
+<Callout type="tip" title="ゲームのメインループの正体">
+```asm
+MainLoop:
+    ; ゲームの状態を更新する（当たり判定、AI、スコア計算）
+    JMP MainLoop         ; 延々と回り続ける
+
+NmiHandler:
+    ; VBlank に入った。ここで画面を更新する
+    ; スプライトの位置、スクロール量、背景の書き換え
+    RTI
+```
+  **メインループは「描画しない」**。
+  描画は NMI ハンドラの中だけで行います。
+
+  現代のゲームループの `requestAnimationFrame` や垂直同期と、まったく同じ発想です。
+  「描いてよいタイミングを待つ」という構造は、40 年変わっていません。
+</Callout>
+
+## RTI
+
+割り込みから戻る命令です。
+
+```ts
+const rti = (c: CPU) => {
+  c.p = (c.pop() & ~F.B) | F.U        // B を落とし、U を立てる
+  c.pc = c.pop16()                     // そのまま戻る（+1 しない）
+}
+```
+
+**`RTS` と違って +1 しません。** `JSR` が「戻り先 - 1」を積むのに対し、割り込みは正確な戻り先を積むからです。
+
+この非対称性は、`JSR` の実装の都合（第 3 回）によるものです。
+
+## 割り込みは命令の境界で起きる
+
+重要な点です。**割り込みは、実行中の命令の途中では発生しません。** 今の命令が終わってから処理されます。
+
+```ts
+// src/nes/nes.ts
+export class NES {
+  private nmiPending = false
+
+  step(): number {
+    if (this.nmiPending) {
+      this.nmiPending = false
+      nmi(this.cpu)
+      return 7
+    }
+    if (this.irqPending && !this.cpu.getFlag(F.I)) {
+      this.irqPending = false
+      irq(this.cpu)
+      return 7
+    }
+    return step(this.cpu)         // 通常の命令を 1 つ実行
+  }
+
+  requestNmi() { this.nmiPending = true }
+}
+```
+
+もし命令の途中で割り込めたら、レジスタが中途半端な状態で保存されてしまいます。**命令の境界であることが、状態の一貫性を保証しています。**
+
+第 6 章で読んだ「コンテキストスイッチは命令の完了後に起きる」のと同じ理由です。
+
+## RESET は特殊
+
+RESET だけは、**スタックに何も積みません**。
+
+```ts
+export function reset(c: CPU) {
+  c.pc = c.bus.read16(0xfffc)
+  c.s = 0xfd                       // 実際には 3 回「積む動作」をするので 3 減る
+  c.setFlag(F.I, true)
+  c.cycles += 7
+}
+```
+
+電源投入直後は、スタックポインタが何を指しているか分かりません。そこに書き込むのは危険です。
+
+しかし、**スタックポインタは 3 減ります**。リセット処理の内部で「積む動作」を 3 回行うためです（書き込み信号が出ないだけ）。初期値 `$00` から 3 減って `$FD` になります。
+
+<Callout type="note" title="意味のない挙動も再現する">
+  `$FD` という初期値には、機能上の意味がありません。
+  ハードウェアの内部動作が、たまたま外から見えているだけです。
+
+  しかし、nestest はこの値を前提にログを出します。
+  **再現しなければ、1 行目から食い違います。**
+
+  エミュレータとは、「仕様」ではなく「実物の振る舞い」を写すものだ、
+  ということがよく分かる箇所です。
+</Callout>
+
+## テストを書く
+
+```ts
+// src/nes/interrupt.check.ts
+import { strict as assert } from 'node:assert'
+import { F } from './cpu'
+import { brk, nmi, irq, reset, rti } from './interrupt'
+
+// RESET
+{
+  const { bus, cpu } = makeTestSystem()
+  bus.write(0xfffc, 0x00); bus.write(0xfffd, 0xc0)
+  reset(cpu)
+  assert.equal(cpu.pc, 0xc000)
+  assert.equal(cpu.s, 0xfd)
+  assert.equal(cpu.getFlag(F.I), 1)
+  console.log('ok   RESET ベクタから起動')
+}
+
+// NMI
+{
+  const { bus, cpu } = makeTestSystem()
+  bus.write(0xfffa, 0x34); bus.write(0xfffb, 0x12)
+  cpu.pc = 0x8000
+  cpu.p = F.U
+  cpu.s = 0xfd
+
+  nmi(cpu)
+
+  assert.equal(cpu.pc, 0x1234, 'NMI ベクタへ飛ぶ')
+  assert.equal(bus.read(0x01fd), 0x80, 'PC の上位が積まれている')
+  assert.equal(bus.read(0x01fc), 0x00, 'PC の下位')
+  assert.equal(bus.read(0x01fb) & F.B, 0, 'ハードウェア割り込みなので B は 0')
+  assert.equal(cpu.getFlag(F.I), 1, 'I が立つ')
+  assert.equal(cpu.s, 0xfa, '3 バイト積んだ')
+  console.log('ok   NMI')
+}
+
+// NMI はマスクできない
+{
+  const { bus, cpu } = makeTestSystem()
+  bus.write(0xfffa, 0x00); bus.write(0xfffb, 0x90)
+  cpu.setFlag(F.I, true)
+  cpu.pc = 0x8000
+  nmi(cpu)
+  assert.equal(cpu.pc, 0x9000, 'I が立っていても NMI は発生する')
+  console.log('ok   NMI はマスクできない')
+}
+
+// IRQ はマスクできる
+{
+  const { bus, cpu } = makeTestSystem()
+  bus.write(0xfffe, 0x00); bus.write(0xffff, 0xa0)
+  cpu.pc = 0x8000
+  cpu.setFlag(F.I, true)
+  irq(cpu)
+  assert.equal(cpu.pc, 0x8000, 'I が立っていたら無視される')
+
+  cpu.setFlag(F.I, false)
+  irq(cpu)
+  assert.equal(cpu.pc, 0xa000, 'I が落ちていれば発生する')
+  console.log('ok   IRQ のマスク')
+}
+
+// BRK は B を立てる
+{
+  const { bus, cpu } = makeTestSystem()
+  bus.write(0xfffe, 0x00); bus.write(0xffff, 0xb0)
+  cpu.pc = 0x8000
+  cpu.s = 0xfd
+  brk(cpu)
+  assert.notEqual(bus.read(0x01fb) & F.B, 0, 'BRK なので B が立つ')
+  console.log('ok   BRK の B フラグ')
+}
+
+// RTI で往復する
+{
+  const { bus, cpu } = makeTestSystem()
+  bus.write(0xfffa, 0x00); bus.write(0xfffb, 0x90)
+  cpu.pc = 0x8000
+  cpu.p = F.U | F.C
+  const savedP = cpu.p
+
+  nmi(cpu)
+  cpu.p = F.U                  // ハンドラの中でフラグが変わったとする
+  rti(cpu)
+
+  assert.equal(cpu.pc, 0x8000, '元の場所に戻る')
+  assert.equal(cpu.p & ~F.B, savedP & ~F.B, 'フラグも復元される')
+  console.log('ok   NMI → RTI の往復')
+}
+
+console.log('\n全部通りました')
+```
+
+**NMI → RTI の往復テストが要です。** 積む順序と取り出す順序が対応していないと、往復したときに元に戻りません。
+
+## 演習
+
+1. **割り込みの入れ子を試す**。NMI ハンドラの中でさらに NMI が来たらどうなるか
+2. **`BRK` が 2 バイト命令であることを確かめる**。`BRK` の次のバイトは無視されますが、PC は 2 進みます
+3. **割り込みの優先順位を実装する**。NMI と IRQ が同時なら NMI が優先されます
+4. **サイクル数を数える**。割り込みで 7 サイクル消費することを確認してください
+5. **ハンドラを書いてみる**。NMI でカウンタを増やすだけの ROM を手でアセンブルし、動かしてください
+
+## 次回
+
+**最大の関門**です。nestest という検証用 ROM を走らせ、1 命令ずつ実行ログを取り、正解のログと突き合わせます。ここが完全に一致すれば、CPU は正しいと言い切れます。
