@@ -1,0 +1,135 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro'
+import { getCollection } from 'astro:content'
+import { READING_SECTIONS } from '../../lib/curriculum'
+
+const base = import.meta.env.BASE_URL
+const reading = await getCollection('reading')
+
+const byCategory = READING_SECTIONS.map((s) => ({
+  section: s,
+  items: reading.filter((n) => n.data.category === s.id).sort((a, b) => a.data.order - b.data.order),
+})).filter((g) => g.items.length > 0)
+
+/** これから書く予定。増えたら published の区画へ移す */
+const PLANNED = [
+  { title: '要件の詰め方', summary: '曖昧なお題から、機能要件と非機能要件を切り出す' },
+  { title: '規模の見積もり', summary: 'QPS、保存容量、帯域。桁で当てるための手順' },
+  { title: 'API の設計', summary: '境界をどこに引くか。冪等性、ページング、バージョニング' },
+  { title: 'データモデルと保存先の選択', summary: 'RDB / KVS / 列指向 / 全文検索の使い分け' },
+  { title: 'キャッシュ戦略', summary: 'どこに置くか、いつ捨てるか、整合性をどう諦めるか' },
+  { title: 'スケールのさせ方', summary: '垂直と水平、シャーディング、レプリケーション' },
+  { title: '可用性と障害設計', summary: 'SLO、多重化、縮退、カスケード障害の防ぎ方' },
+  { title: '定番のお題', summary: 'URL 短縮、タイムライン、レートリミッタ、チャット、配車' },
+]
+---
+
+<BaseLayout
+  title="システム設計 | Pattern Lab"
+  description="検索、分散システム、データベースの索引、メッセージング。大きな仕組みを中身まで降りて読む"
+  area="system-design"
+>
+  <section class="mb-12">
+    <h1 class="mb-3 text-3xl font-bold leading-snug">システム設計</h1>
+    <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      システムデザイン面接で問われるのは、知識の暗記ではなく
+      <strong style="color: var(--fg)">「なぜその構成にしたのか」を説明できること</strong>です。
+      そのためには、使う部品の中で何が起きているかを知っている必要があります。
+    </p>
+    <p class="mt-3 max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      この区画は 2 部構成です。まず<strong style="color: var(--fg)">仕組みを読み</strong>、
+      次にそれを<strong style="color: var(--fg)">組み合わせて設計する</strong>。
+      今のところ前半が揃っています。
+    </p>
+  </section>
+
+  <section class="mb-14">
+    <div class="mb-4 flex flex-wrap items-baseline gap-3">
+      <h2 class="m-0 text-xl font-bold">1. 仕組みを読む</h2>
+      <a href={`${base}reading/`} class="text-sm font-bold no-underline" style="color: var(--accent)">
+        索引と逆引きを見る →
+      </a>
+    </div>
+    <p class="mb-5 max-w-2xl text-sm leading-relaxed" style="color: var(--fg-muted)">
+      名前だけは聞く仕組みを、中で何が起きているかまで降りて読みます。
+      どれも<strong style="color: var(--fg)">アルゴリズムの型の組み合わせ</strong>でできているので、
+      各記事の冒頭に土台になっている型へのリンクを置いてあります。
+    </p>
+
+    <div class="space-y-8">
+      {
+        byCategory.map((g) => (
+          <section>
+            <h3 class="mb-1 text-base font-bold">{g.section.title}</h3>
+            <p class="mb-3 text-sm" style="color: var(--fg-muted)">
+              {g.section.summary}
+            </p>
+            <ul class="m-0 grid list-none gap-3 p-0 sm:grid-cols-2">
+              {g.items.map((n) => (
+                <li>
+                  <a
+                    href={`${base}reading/${n.id}/`}
+                    class="flex h-full flex-col rounded-xl border px-4 py-3 no-underline transition-colors hover:border-[var(--accent)]"
+                    style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+                  >
+                    <span class="font-bold">{n.data.title}</span>
+                    <span class="mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
+                      {n.data.description}
+                    </span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="mb-14">
+    <h2 class="mb-1 text-xl font-bold">2. 設計の進め方</h2>
+    <p class="mb-5 max-w-2xl text-sm leading-relaxed" style="color: var(--fg-muted)">
+      部品を組み合わせて、要件から構成を導くまで。ここはこれから書きます。
+    </p>
+    <ol class="m-0 grid list-none gap-3 p-0 sm:grid-cols-2">
+      {
+        PLANNED.map((p, i) => (
+          <li
+            class="flex gap-3 rounded-xl border border-dashed px-4 py-3"
+            style="border-color: var(--border); color: var(--fg-muted)"
+          >
+            <span class="shrink-0 font-mono text-sm">{String(i + 1).padStart(2, '0')}</span>
+            <span class="min-w-0">
+              <span class="block font-bold">{p.title}</span>
+              <span class="mt-1 block text-xs leading-relaxed">{p.summary}</span>
+            </span>
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+
+  <section>
+    <h2 class="mb-1 text-xl font-bold">下の階へ</h2>
+    <p class="mb-4 max-w-2xl text-sm leading-relaxed" style="color: var(--fg-muted)">
+      「レイテンシが桁で違う」「ディスクへの書き込みが保証されるのはいつか」といった話は、
+      この区画の前提になっています。詰まったら降りてください。
+    </p>
+    <div class="flex flex-wrap gap-3">
+      <a
+        href={`${base}lowlevel/`}
+        class="rounded-lg border px-4 py-2 text-sm font-bold no-underline"
+        style="border-color: var(--accent); color: var(--accent)"
+      >
+        低レイヤへ →
+      </a>
+      <a
+        href={`${base}algorithms/`}
+        class="rounded-lg border px-4 py-2 text-sm font-bold no-underline"
+        style="border-color: var(--border); color: var(--fg-muted)"
+      >
+        アルゴリズムへ →
+      </a>
+    </div>
+  </section>
+</BaseLayout>

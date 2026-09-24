@@ -1,10 +1,17 @@
 ---
 import '../styles/global.css'
+import { AREAS, SITE_NAME, SITE_TAGLINE, areaById } from '../lib/nav'
 
-type Props = { title: string; description?: string }
-const { title, description = 'LeetCode の Medium から Hard までを「型」で解けるようにする、図とシミュレーター付きの学習ノート' } =
-  Astro.props
+type Props = {
+  title: string
+  description?: string
+  /** 今いる区画。ヘッダーの強調とサブナビに使う */
+  area?: string
+}
+const { title, description = SITE_TAGLINE, area } = Astro.props
 const base = import.meta.env.BASE_URL
+const current = area ? areaById.get(area) : undefined
+const subItems = current?.items ?? []
 ---
 
 <!doctype html>
@@ -31,17 +38,22 @@ const base = import.meta.env.BASE_URL
       class="sticky top-0 z-20 border-b backdrop-blur"
       style="border-color: var(--border); background: color-mix(in srgb, var(--bg) 88%, transparent)"
     >
-      <div class="mx-auto flex max-w-6xl items-center gap-4 px-4 py-3">
+      <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
         <a href={base} class="font-bold tracking-tight no-underline" style="color: var(--fg)">
-          <span style="color: var(--accent)">▲</span> LeetCode Pattern Lab
+          <span style="color: var(--accent)">▲</span> {SITE_NAME}
         </a>
-        <nav class="ml-auto flex items-center gap-4 text-sm">
-          <a href={base} style="color: var(--fg-muted)">目次</a>
-          <a href={`${base}path/`} style="color: var(--fg-muted)">学習経路</a>
-          <a href={`${base}math/`} style="color: var(--fg-muted)">数学</a>
-          <a href={`${base}lowlevel/`} style="color: var(--fg-muted)">低レイヤ</a>
-          <a href={`${base}reading/`} style="color: var(--fg-muted)">読み物</a>
-          <a href={`${base}build/`} style="color: var(--fg-muted)">作る</a>
+        <nav class="ml-auto flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+          {
+            AREAS.map((a) => (
+              <a
+                href={`${base}${a.path}`}
+                class={a.id === area ? 'font-bold' : ''}
+                style={a.id === area ? 'color: var(--accent)' : 'color: var(--fg-muted)'}
+              >
+                {a.title}
+              </a>
+            ))
+          }
           <button
             id="theme-toggle"
             class="rounded border px-2 py-1 text-xs"
@@ -50,6 +62,27 @@ const base = import.meta.env.BASE_URL
           >
         </nav>
       </div>
+
+      {
+        subItems.length > 0 && (
+          <div class="border-t" style="border-color: var(--border)">
+            <nav class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2 text-xs">
+              <a
+                href={`${base}${current!.path}`}
+                class="font-bold no-underline"
+                style="color: var(--fg)"
+              >
+                {current!.title}
+              </a>
+              {subItems.map((item) => (
+                <a href={`${base}${item.path}`} style="color: var(--fg-muted)">
+                  {item.title}
+                </a>
+              ))}
+            </nav>
+          </div>
+        )
+      }
     </header>
 
     <main class="mx-auto max-w-6xl px-4 py-10">
@@ -60,7 +93,7 @@ const base = import.meta.env.BASE_URL
       class="mt-16 border-t px-4 py-8 text-center text-xs"
       style="border-color: var(--border); color: var(--fg-muted)"
     >
-      LeetCode Pattern Lab — 図とシミュレーターで Medium から Hard までを落とす
+      {SITE_NAME} — {SITE_TAGLINE}
     </footer>
 
     <script is:inline>

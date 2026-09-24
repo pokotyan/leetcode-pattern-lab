@@ -29,7 +29,7 @@ const { byArticle } = await buildReadingGraph()
 const readingUses = byArticle.get(entry.id) ?? []
 ---
 
-<BaseLayout title={`${d.title} | LeetCode Pattern Lab`} description={d.description}>
+<BaseLayout title={`${d.title} | Pattern Lab`} description={d.description} area="algorithms">
   <div class="grid gap-10 lg:grid-cols-[minmax(0,1fr)_16rem]">
     <article class="prose min-w-0">
       <p class="not-prose m-0 flex items-center gap-2 text-xs font-bold">

@@ -1,7 +1,17 @@
-# LeetCode Pattern Lab
+# Pattern Lab
 
-LeetCode Medium を「型」で解けるようにするための学習サイト。
-解説記事と、アルゴリズムを1手ずつ進めながら状態を確認できるステップ実行を組み合わせている。
+型・仕組み・実装を繋ぎ直すための学習サイト。4 つの区画に分かれている。
+
+| 区画 | URL | 中身 |
+| --- | --- | --- |
+| アルゴリズム | `/algorithms/` | LeetCode を「型」で落とす。ステップ実行つき |
+| システム設計 | `/system-design/` | 大きな仕組みを中身まで降りて読む（`/reading/`） |
+| 低レイヤ | `/lowlevel/` | CPU からシステムコール、FFI と Wasm まで 9 章 |
+| 作る | `/build/` | NAND から CPU、言語、NES エミュレータまで 3 トラック |
+
+トップ (`/`) はポータルで、区画の一覧と目的別の入口を出す。
+区画の定義は `src/lib/nav.ts` の `AREAS` に集約してあり、
+ここに 1 つ足せばヘッダー・サブナビ・ポータルが同時に追従する。
 
 - 記事: Astro Content Collections（MDX）
 - ステップ実行: React コンポーネント（Astro islands、`client:visible` で遅延読み込み）

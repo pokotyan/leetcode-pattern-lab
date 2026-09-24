@@ -24,17 +24,18 @@ const fromMath = [...mathById.values()]
 ---
 
 <BaseLayout
-  title="読み物 | LeetCode Pattern Lab"
+  title="仕組みを読む | システム設計 | Pattern Lab"
   description="検索・分散システム・データ基盤で出てくる仕組みを、本編で扱った型と結びつけて読む"
->
+ area="system-design">
   <section class="mb-12">
-    <h1 class="mb-3 text-3xl font-bold leading-snug">読み物</h1>
+    <h1 class="mb-3 text-3xl font-bold leading-snug">仕組みを読む</h1>
     <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
       検索エンジン、分散システム、データベースの索引、メッセージング。
       実務で名前だけは聞く仕組みを、<strong style="color: var(--fg)">中で何が起きているか</strong>まで降りて読む。
     </p>
     <p class="mt-3 max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
-      ここに出てくる仕組みの多くは、本編で扱った型の組み合わせでできている。
+      ここに出てくる仕組みの多くは、<a href={`${base}algorithms/`} style="color: var(--accent)">アルゴリズム</a
+      >で扱った型の組み合わせでできている。
       各記事の冒頭に<strong style="color: var(--fg)">「この仕組みの土台になっている型」</strong>を置いてあるので、
       知らない土台に当たったらそちらへ戻れる。逆に、型の側から
       「この型は実務のどこで効くのか」を引くこともできる。
@@ -92,7 +93,7 @@ const fromMath = [...mathById.values()]
   <section>
     <h2 class="mb-1 text-xl font-bold">逆引き：この型は、実務のどこで効くのか</h2>
     <p class="mb-5 text-sm" style="color: var(--fg-muted)">
-      本編の型と数学ノートから、それが使われている読み物を引く。
+      アルゴリズムの型と数学ノートから、それが使われている記事を引く。
     </p>
     <div class="space-y-3">
       {

@@ -1,167 +1,149 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro'
 import { getCollection } from 'astro:content'
-import { SECTIONS, LEVELS, LEVEL_BADGE, type Level } from '../lib/curriculum'
+import { AREAS, SITE_TAGLINE } from '../lib/nav'
+import { LOWLEVEL_CHAPTERS, BUILD_TRACKS } from '../lib/curriculum'
 
-const all = await getCollection('articles')
 const base = import.meta.env.BASE_URL
-const published = all.filter((a) => a.data.status === 'published').length
-const totalProblems = new Set(all.flatMap((a) => a.data.problems.map((p) => p.url))).size
-const hardProblems = all.flatMap((a) => a.data.problems).filter((p) => p.level === 'Hard').length
-const titleById = new Map(all.map((a) => [a.id, a.data.title]))
 
-const byLevel = LEVELS.map((lv) => ({
-  level: lv,
-  groups: SECTIONS.map((s) => ({
-    section: s,
-    items: all
-      .filter((a) => a.data.section === s.id && a.data.level === lv.id)
-      .sort((a, b) => a.data.order - b.data.order),
-  })).filter((g) => g.items.length > 0),
-})).filter((g) => g.groups.length > 0)
+const [articles, math, reading, lowlevel, build] = await Promise.all([
+  getCollection('articles'),
+  getCollection('math'),
+  getCollection('reading'),
+  getCollection('lowlevel'),
+  getCollection('build'),
+])
+
+const pub = (xs: { data: { status: string } }[]) =>
+  xs.filter((x) => x.data.status === 'published').length
+
+/** 区画ごとに、カードへ出す数字 */
+const STATS: Record<string, { label: string; value: number | string }[]> = {
+  algorithms: [
+    { label: '記事', value: pub(articles) + pub(math) },
+    {
+      label: '扱う LeetCode 問題',
+      value: new Set(articles.flatMap((a) => a.data.problems.map((p) => p.url))).size,
+    },
+  ],
+  'system-design': [
+    { label: '記事', value: pub(reading) },
+    { label: '扱う用語', value: new Set(reading.flatMap((r) => r.data.topics)).size },
+  ],
+  lowlevel: [
+    { label: '章', value: LOWLEVEL_CHAPTERS.length },
+    { label: '記事', value: pub(lowlevel) },
+  ],
+  build: [
+    { label: 'トラック', value: BUILD_TRACKS.length },
+    { label: '公開済みの回', value: pub(build) },
+  ],
+}
 ---
 
-<BaseLayout title="LeetCode Pattern Lab">
+<BaseLayout title="Pattern Lab" description={SITE_TAGLINE}>
   <section class="mb-14">
-    <h1 class="mb-3 text-3xl font-bold leading-snug sm:text-4xl">
-      LeetCode を「型」で落とす
+    <h1 class="mb-4 text-3xl font-bold leading-snug sm:text-4xl">
+      型・仕組み・実装を、<br class="sm:hidden" />繋ぎ直す
     </h1>
     <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
-      閃きに頼らず、パターンを引き出しから取り出して解けるようにするための学習ノート。
-      各テクニックには<strong style="color: var(--fg)">1手ずつ動かせるシミュレーター</strong
-      >を用意してあるので、コードと図と変数の動きを同時に追える。
-      <strong style="color: var(--fg)">基礎 → 応用 → 発展</strong>の順に、前提が揃った記事から読めるように並べてある。
+      アルゴリズムの型、大きなシステムの仕組み、コンピュータの下のほうで起きていること、
+      そしてそれらを実際に組み上げること。
+      別々に学ぶと繋がらないものを、<strong style="color: var(--fg)">同じ 1 本の線の上に並べる</strong
+      >ための学習ノートです。
     </p>
-    <dl class="mt-6 flex flex-wrap gap-8 text-sm">
-      <div>
-        <dt style="color: var(--fg-muted)">公開済み記事</dt>
-        <dd class="m-0 text-2xl font-bold">{published}</dd>
-      </div>
-      <div>
-        <dt style="color: var(--fg-muted)">扱う LeetCode 問題</dt>
-        <dd class="m-0 text-2xl font-bold">{totalProblems}</dd>
-      </div>
-      <div>
-        <dt style="color: var(--fg-muted)">うち Hard</dt>
-        <dd class="m-0 text-2xl font-bold" style="color: var(--danger)">{hardProblems}</dd>
-      </div>
-    </dl>
-    <a
-      href={`${base}path/`}
-      class="mt-6 inline-block rounded-lg border px-4 py-2 text-sm font-bold no-underline"
-      style="border-color: var(--accent); color: var(--accent)"
-    >
-      前提つきの学習経路を見る →
-    </a>
+    <p class="mt-3 max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      どの区画からでも始められます。記事の中では、土台になっている別の区画の回へ
+      いつでも戻れるようにリンクを張ってあります。
+    </p>
   </section>
 
-  <section class="mb-14">
-    <h2 class="mb-1 text-xl font-bold">もうひとつの入口：コンピュータの下のほうへ</h2>
-    <p class="mb-5 max-w-2xl text-sm leading-relaxed" style="color: var(--fg-muted)">
-      アルゴリズムとは別に、その下で動いている仕組みそのものを扱う 2 つの区画がある。
-      まず<strong style="color: var(--fg)">読んで概観を掴み</strong>、次に<strong
-        style="color: var(--fg)">実際に組んで動かす</strong
-      >、という順で並べてある。
-    </p>
-    <div class="grid gap-4 sm:grid-cols-2">
-      <a
-        href={`${base}lowlevel/`}
-        class="flex flex-col rounded-xl border px-5 py-4 no-underline transition-colors hover:border-[var(--accent)]"
-        style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
-      >
-        <span class="text-xs font-bold" style="color: var(--accent)">STEP 1 ・ 読む</span>
-        <span class="mt-1 text-lg font-bold">低レイヤ</span>
-        <span class="mt-2 text-xs leading-relaxed" style="color: var(--fg-muted)">
-          CPU、キャッシュ、仮想メモリ、プロセスとスレッド、リンク、システムコール。
-          名前は知っているのに説明できないものを、9 章 47 回で上から順につなぎ直す。
-        </span>
-      </a>
-      <a
-        href={`${base}build/`}
-        class="flex flex-col rounded-xl border px-5 py-4 no-underline transition-colors hover:border-[var(--ok)]"
-        style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
-      >
-        <span class="text-xs font-bold" style="color: var(--ok)">STEP 2 ・ 作る</span>
-        <span class="mt-1 text-lg font-bold">作る</span>
-        <span class="mt-2 text-xs leading-relaxed" style="color: var(--fg-muted)">
-          NAND ひとつから CPU を組み、その上で動く言語を作り、最後に NES エミュレータを書く。
-          1 回ぶん手を動かすと、動くものが 1 つ増える。
-        </span>
-      </a>
-    </div>
-  </section>
-
-  <div class="space-y-16">
+  <div class="mb-16 grid gap-4 sm:grid-cols-2">
     {
-      byLevel.map((lv) => (
-        <div>
-          <div class="mb-6 border-b pb-3" style="border-color: var(--border)">
-            <h2 class="m-0 flex items-baseline gap-2 text-xl font-bold">
-              <span
-                class="rounded px-2 py-0.5 text-sm"
-                style={`color: ${LEVEL_BADGE[lv.level.id as Level].color}; background: ${LEVEL_BADGE[lv.level.id as Level].soft}`}
-              >
-                {lv.level.title}
-              </span>
-            </h2>
-            <p class="m-0 mt-2 text-sm" style="color: var(--fg-muted)">
-              {lv.level.summary}
-            </p>
-          </div>
-          <div class="space-y-10">
-            {lv.groups.map((g) => (
-              <section>
-                <h3 class="mb-1 text-lg font-bold">{g.section.title}</h3>
-                <p class="mb-3 text-sm" style="color: var(--fg-muted)">
-                  {g.section.summary}
-                </p>
-                <ul class="m-0 grid list-none gap-3 p-0 sm:grid-cols-2">
-                  {g.items.map((a) => (
-                    <li>
-                      <a
-                        href={`${base}articles/${a.id}/`}
-                        class="block h-full rounded-xl border px-4 py-3 no-underline transition-colors hover:border-[var(--accent)]"
-                        style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
-                      >
-                        <div class="flex items-baseline gap-2">
-                          <span class="font-bold">{a.data.title}</span>
-                          {a.data.status === 'planned' && (
-                            <span
-                              class="rounded px-1.5 py-0.5 text-[10px] font-bold"
-                              style="color: var(--warn); border: 1px solid var(--warn)"
-                            >
-                              準備中
-                            </span>
-                          )}
-                        </div>
-                        <p class="m-0 mt-1 text-xs leading-relaxed" style="color: var(--fg-muted)">
-                          {a.data.description}
-                        </p>
-                        {a.data.requires.length > 0 && (
-                          <p class="m-0 mt-2 text-[11px]" style="color: var(--fg-muted)">
-                            前提: {a.data.requires.map((r) => titleById.get(r) ?? r).join(' / ')}
-                          </p>
-                        )}
-                        {a.data.problems.length > 0 && (
-                          <p class="m-0 mt-1 font-mono text-[11px]" style="color: var(--fg-muted)">
-                            {a.data.problems.length} 問
-                            {a.data.problems.filter((p) => p.level === 'Hard').length > 0 && (
-                              <span style="color: var(--danger)">
-                                {' · '}
-                                {a.data.problems.filter((p) => p.level === 'Hard').length} Hard
-                              </span>
-                            )}
-                          </p>
-                        )}
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              </section>
+      AREAS.map((area, i) => (
+        <a
+          href={`${base}${area.path}`}
+          class="flex flex-col rounded-xl border px-5 py-5 no-underline transition-colors hover:border-[var(--accent)]"
+          style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+        >
+          <span class="font-mono text-xs" style="color: var(--fg-muted)">
+            {String(i + 1).padStart(2, '0')}
+          </span>
+          <span class="mt-1 text-xl font-bold">{area.title}</span>
+          <span class="mt-1 text-sm font-bold" style="color: var(--accent)">
+            {area.tagline}
+          </span>
+          <span class="mt-3 text-[13px] leading-relaxed" style="color: var(--fg-muted)">
+            {area.summary}
+          </span>
+
+          <dl class="mt-4 flex flex-wrap gap-6 text-xs">
+            {STATS[area.id]?.map((s) => (
+              <div>
+                <dt style="color: var(--fg-muted)">{s.label}</dt>
+                <dd class="m-0 text-lg font-bold">{s.value}</dd>
+              </div>
             ))}
-          </div>
-        </div>
+          </dl>
+
+          {area.items.length > 1 && (
+            <span class="mt-3 font-mono text-[11px]" style="color: var(--fg-muted)">
+              {area.items.map((it) => it.title).join(' / ')}
+            </span>
+          )}
+        </a>
       ))
     }
   </div>
+
+  <section class="mb-10">
+    <h2 class="mb-1 text-xl font-bold">迷ったら</h2>
+    <p class="mb-5 max-w-2xl text-sm leading-relaxed" style="color: var(--fg-muted)">
+      目的別の入口です。
+    </p>
+    <div class="space-y-3">
+      {
+        [
+          {
+            q: 'コーディング面接の対策をしたい',
+            a: 'アルゴリズム',
+            href: 'algorithms/',
+            why: '型ごとに解説とシミュレーター、対応する LeetCode 問題が並んでいます',
+          },
+          {
+            q: 'システムデザイン面接の対策をしたい',
+            a: 'システム設計',
+            href: 'system-design/',
+            why: '検索、分散合意、索引、メッセージングを、中身まで降りて読みます',
+          },
+          {
+            q: '「なんとなく知っている」を説明できるようにしたい',
+            a: '低レイヤ',
+            href: 'lowlevel/',
+            why: 'セグフォ、仮想メモリ、リンク、システムコール。9 章で上から順に',
+          },
+          {
+            q: '読むだけでは身についた気がしない',
+            a: '作る',
+            href: 'build/',
+            why: 'NAND から CPU を組み、言語を作り、エミュレータを書きます',
+          },
+        ].map((row) => (
+          <a
+            href={`${base}${row.href}`}
+            class="flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-xl border px-4 py-3 no-underline"
+            style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+          >
+            <span class="text-sm font-bold">{row.q}</span>
+            <span class="text-sm font-bold" style="color: var(--accent)">
+              → {row.a}
+            </span>
+            <span class="w-full text-xs" style="color: var(--fg-muted)">
+              {row.why}
+            </span>
+          </a>
+        ))
+      }
+    </div>
+  </section>
 </BaseLayout>

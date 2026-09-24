@@ -3,3 +3,6 @@ dist/
 .astro/
 .DS_Store
 *.log
+
+# playwright-cli のセッション成果物
+.playwright-cli/

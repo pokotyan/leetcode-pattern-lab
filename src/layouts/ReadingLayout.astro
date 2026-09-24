@@ -25,11 +25,12 @@ const foundations = d.basedOn.map((b) => ({
 }))
 ---
 
-<BaseLayout title={`${d.title} | 読み物 | LeetCode Pattern Lab`} description={d.description}>
+<BaseLayout title={`${d.title} | システム設計 | Pattern Lab`} description={d.description} area="system-design">
   <div class="grid gap-10 lg:grid-cols-[minmax(0,1fr)_16rem]">
     <article class="prose min-w-0">
       <p class="not-prose m-0 flex flex-wrap items-center gap-2 text-xs font-bold">
-        <a href={`${base}reading/`} class="no-underline" style="color: var(--accent)">読み物</a>
+        <a href={`${base}system-design/`} class="no-underline" style="color: var(--accent)">システム設計</a>
+        <a href={`${base}reading/`} class="no-underline" style="color: var(--accent)">仕組みを読む</a>
         <span style="color: var(--fg-muted)">{section?.title ?? d.category}</span>
       </p>
       <h1 class="mt-1 mb-2 text-3xl font-bold leading-snug">{d.title}</h1>
