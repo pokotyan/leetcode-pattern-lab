@@ -1,0 +1,313 @@
+---
+title: Dockerfile とビルド
+description: 1 行が 1 層になり、1 行ごとにキャッシュが効くか判定される。順番、ビルドコンテキスト、マルチステージ、そしてベースイメージの libc
+chapter: ship
+order: 3
+status: published
+topics:
+  - BuildKit
+  - ビルドキャッシュ
+  - ビルドコンテキスト / .dockerignore
+  - マルチステージビルド
+  - キャッシュマウント / シークレットマウント
+  - scratch / distroless / alpine
+  - musl / glibc
+  - 再現可能なビルド
+requires:
+  - ll-50-image
+  - ll-27-static-dynamic-link
+  - ll-28-loader
+---
+
+import Callout from '../../components/Callout.astro'
+
+## Dockerfile は層の作り方の手順書
+
+第 50 回で、イメージは層の積み重ねと config だと見ました。Dockerfile は、**その層を 1 枚ずつ作る手順**を書いたものです。
+
+```dockerfile
+FROM node:22-slim                 # ベースの層をそのまま使う
+WORKDIR /app                      # config を書き換える（層は増えない）
+COPY package*.json ./             # 層 1: package.json を置く
+RUN npm ci                        # 層 2: node_modules を作る
+COPY . .                          # 層 3: ソースコードを置く
+CMD ["node", "server.js"]         # config を書き換える
+```
+
+ファイルシステムを変える命令（`COPY`、`ADD`、`RUN`）が層を作り、それ以外（`CMD`、`ENV`、`WORKDIR` など）は config だけを変えます。第 50 回で見た alpine の config の `history` に `"empty_layer": true` とあったのが、後者です。
+
+`RUN` が層を作る仕組みは素朴です。前の層までを重ねた一時的なコンテナを起動し、コマンドを実行し、**書き込み層に残った差分を tar にまとめて**、次の層にします。第 51 回のコンテナ起動と、第 50 回の書き込み層を組み合わせているだけです。
+
+## ビルドするのは BuildKit
+
+`docker build` を実行しているのは、現在は **BuildKit** というビルドエンジンです。Linux の Docker Engine では 23.0（2023 年 2 月）から既定になり、`docker build` は `docker buildx build` の別名になりました（[Docker Engine 23.0 release notes](https://docs.docker.com/engine/release-notes/23.0/)）。
+
+BuildKit は、Dockerfile を上から 1 行ずつ実行するのではなく、**命令の依存関係をグラフにしてから実行**します。
+
+- 互いに依存しない段は並列に実行する
+- 最終的なイメージに使われない段は、そもそも実行しない
+- どの段の結果が再利用できるかを、グラフの上で判定する
+
+最後の「再利用」が、ビルドの速さをほぼ決めます。
+
+## キャッシュは上から順に判定される
+
+各命令の結果は、**キャッシュキー** とひもづけて保存されます。次のビルドで同じキーが来れば、実行せずに保存した層を使います。
+
+キーを決めるものは、命令によって違います。
+
+| 命令 | キャッシュキーに含まれるもの |
+| --- | --- |
+| `FROM` | ベースイメージの digest |
+| `COPY` / `ADD` | コピーするファイルの **中身のチェックサム**（更新時刻は含まない） |
+| `RUN` | **コマンドの文字列だけ** |
+| すべて | 直前の層のキー |
+
+最後の行が重要です。**ある命令のキーには、その前の層のキーが含まれます**。したがって、どこかで 1 回キャッシュが外れると、そこから下はすべて外れます。
+
+手元で確かめます。
+
+```dockerfile
+FROM alpine:3.20
+COPY deps.txt /deps.txt
+RUN sleep 2 && echo installed      # 依存のインストールに見立てた、重い処理
+COPY app.txt /app.txt
+```
+
+`app.txt` だけを変えて再ビルドすると、重い `RUN` はキャッシュから出てきます。
+
+```
+#6 [2/4] COPY deps.txt /deps.txt
+#6 CACHED
+#7 [3/4] RUN sleep 2 && echo installed
+#7 CACHED
+#8 [4/4] COPY app.txt /app.txt
+#8 DONE 0.0s
+```
+
+`deps.txt` を変えると、その下がすべて実行し直しになります。
+
+```
+#6 [2/4] COPY deps.txt /deps.txt
+#6 DONE 0.0s
+#7 [3/4] RUN sleep 2 && echo installed
+#7 2.107 installed
+#7 DONE 2.1s
+#8 [4/4] COPY app.txt /app.txt
+#8 DONE 0.0s
+```
+
+## 変わりにくいものを上に置く
+
+この性質から、Dockerfile の書き方の原則が 1 つ決まります。**変わりにくいものを上に、変わりやすいものを下に置く**。Docker の公式文書も、重い手順を前のほうに置くように勧めています（[Docker Docs: Optimize cache usage](https://docs.docker.com/build/cache/optimize/)）。
+
+```dockerfile
+# 悪い例: ソースを 1 文字変えるだけで npm ci が走り直す
+COPY . .
+RUN npm ci
+
+# よい例: package.json が変わらない限り npm ci はキャッシュされる
+COPY package*.json ./
+RUN npm ci
+COPY . .
+```
+
+依存関係の一覧（`package.json`、`go.mod`、`requirements.txt`、`Cargo.toml`）だけを先にコピーし、インストールを済ませてから、ソースコード全体をコピーします。どの言語でも同じ形になります。
+
+<Callout type="warn" title="RUN のキャッシュは外の世界を見ていない">
+  `RUN` のキャッシュキーはコマンドの文字列だけです。コマンドが外から取ってくる中身は見ていません。
+
+```dockerfile
+RUN apt-get update
+RUN apt-get install -y curl
+```
+  1 行目が一度キャッシュされると、何ヶ月たっても古いパッケージ一覧が使われ続けます。
+  その状態で 2 行目だけを書き換えると、古い一覧を前提にインストールしようとして失敗します。
+  `apt-get update` と `install` は 1 つの `RUN` にまとめるのが定石です。
+</Callout>
+
+## ビルドコンテキスト
+
+`docker build .` の `.` は、**ビルドコンテキスト** と呼ばれるディレクトリです。`COPY` で参照できるのは、この中のファイルだけです。
+
+BuildKit は、コンテキストのうち必要なファイルだけをデーモンに転送します。それでも、`COPY . .` と書けば、ディレクトリの中身がすべて対象になります。
+
+- `.git` が丸ごとイメージに入る
+- 手元の `node_modules` が、`npm ci` の結果を上書きする
+- `.env` の秘密情報がイメージに残る
+- 無関係なファイルを 1 つ変えただけで、`COPY . .` のキャッシュが外れる
+
+これを防ぐのが `.dockerignore` です。書式は `.gitignore` に似ています。
+
+```
+.git
+node_modules
+.env
+*.log
+dist
+```
+
+## マルチステージビルド
+
+ビルドに必要なものと、実行に必要なものは違います。コンパイラ、ヘッダファイル、テストの依存関係は、実行時には要りません。
+
+**マルチステージビルド** は、1 つの Dockerfile に複数の `FROM` を書き、**前の段から必要なファイルだけを取り出す**方法です。
+
+```dockerfile
+# 段 1: ビルド用。Go のツールチェーン一式が入っている（数百 MB）
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/app .
+
+# 段 2: 実行用。バイナリ 1 つだけを持ってくる
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/app /app
+USER nonroot
+ENTRYPOINT ["/app"]
+```
+
+最終的なイメージに入るのは、最後の段の層だけです。段 1 の層は、ビルドのキャッシュとしては残りますが、配布されるイメージには含まれません。第 50 回の「層で消しても小さくならない」問題も、これで避けられます。
+
+## ビルド中だけ使うもの
+
+`RUN` には、**層に残さずに** ファイルを見せる方法があります。
+
+### キャッシュマウント
+
+パッケージマネージャは、ダウンロードしたものを手元に溜めて再利用します。ところが `RUN npm ci` は、`package.json` が変わると層ごと作り直しになり、ダウンロードも最初からやり直しです。
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.npm npm ci
+```
+
+`/root/.npm` は、ビルドをまたいで保持されるディレクトリになります。**層には入らない**ので、イメージは大きくなりません。層のキャッシュが外れても、パッケージの 1 つ 1 つは手元のキャッシュから取れます（[Docker Docs: Optimize cache usage](https://docs.docker.com/build/cache/optimize/)）。
+
+### シークレットマウント
+
+プライベートなリポジトリから依存を取ってくるのに、トークンが要ることがあります。
+
+```dockerfile
+# 悪い例: トークンが層と history に残る
+ARG NPM_TOKEN
+RUN echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc && npm ci
+
+# よい例: そのコマンドの実行中だけ、ファイルとして見える
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+```
+
+```bash
+docker build --secret id=npmrc,src=$HOME/.npmrc .
+```
+
+`ARG` や `ENV` の値は config の `history` や層に残り、イメージを受け取った誰もが読めます。後の `RUN` で `rm` しても、第 50 回で見たとおり前の層には残っています。
+
+## ベースイメージを選ぶ
+
+最後の段の `FROM` に何を書くかで、イメージの大きさと、中に何があるかが決まります。
+
+| ベース | 中身 | 大きさの目安 | 向いているもの |
+| --- | --- | --- | --- |
+| `scratch` | **何もない**。空の層 | 0 | 完全に静的リンクされたバイナリ |
+| distroless | libc、CA 証明書など、実行に要る最小限。シェルもパッケージマネージャもない | 数 MB〜 | 静的バイナリ、JVM、Node など |
+| `alpine` | musl libc と BusyBox。シェルとパッケージマネージャ（apk）がある | 数 MB | 小さくしたいが、中で作業もしたい |
+| `debian-slim` など | glibc と最小限の Debian | 数十 MB | 互換性を優先したいもの |
+
+distroless は、アプリケーションとその実行時の依存だけを持ち、パッケージマネージャやシェルを含まないイメージ群です。最も小さい `static` 系は約 2MiB です（[GoogleContainerTools/distroless](https://github.com/GoogleContainerTools/distroless)）。**シェルがないので、侵入されても攻撃者が使える道具が少ない**という利点もあります。代わりに、`docker exec` で中に入って調べることもできません。
+
+### scratch に何が要るのか
+
+`scratch` は本当に空です。そこに置いたバイナリが動くかどうかは、**第 27 回と第 28 回の話**で決まります。
+
+動的リンクされたバイナリは、起動時にローダ（`/lib64/ld-linux-x86-64.so.2` など）と共有ライブラリを探します。`scratch` にはどちらもありません。
+
+```
+$ docker run --rm my-dynamic-binary
+exec /app: no such file or directory
+```
+
+ファイルはあるのに「no such file or directory」と言われます。**見つからないのはバイナリではなく、ELF のヘッダに書かれたローダ**です。第 28 回で見たとおり、カーネルは ELF の `INTERP` セグメントに書かれた動的リンカを先に読み込もうとし、それが無いと失敗します。
+
+Go が `CGO_ENABLED=0` を付けて静的リンクのバイナリを作るのは、このためです。C のライブラリを一切呼ばないので、ローダも libc も要りません。ただし、完全に空だと困るものもあります。
+
+- HTTPS で通信するなら、CA 証明書（`/etc/ssl/certs`）
+- タイムゾーンを扱うなら、tzdata
+- ユーザ名で権限を落とすなら、`/etc/passwd`
+
+distroless の `static` は、これらだけを足したものと考えるとよいでしょう。
+
+### alpine と musl
+
+alpine は小さく、シェルもあるので人気があります。ただし、libc が **glibc ではなく musl** です。第 27 回の最後に、完全な静的リンクには musl が使われると書いたものです。
+
+libc が違うと、次のことが起きます。
+
+- **glibc 向けにビルドされたバイナリが動かない**。ローダの名前も、ライブラリの ABI も違う。上と同じ「no such file or directory」になる
+- **Python や Node のネイティブ拡張** が、glibc 用に配布されたビルド済みのものを使えず、ソースからのビルドになる。ビルドが遅く、コンパイラが要る
+- **細かな挙動の差**。有名な例は DNS で、musl は長い間、UDP の応答が切り詰められたときに TCP でやり直しませんでした。musl 1.2.4 でこれに対応し、Alpine 3.18 から入っています（[Alpine 3.18.0 released](https://alpinelinux.org/posts/Alpine-3.18.0-released.html)）
+
+<Callout type="tip" title="小ささより、libc を先に決める">
+  イメージの大きさは、ほとんどがアプリケーションと言語ランタイムで決まります。
+  ベースを alpine にして数十 MB 減らしても、全体が 1GB なら誤差です。
+  それより、**ビルドした環境と実行する環境の libc が一致しているか**を先に確かめるほうが、
+  トラブルを減らします。ビルド段と実行段で、同じ系統（glibc 同士、musl 同士）を選びます。
+</Callout>
+
+## 同じ Dockerfile から同じイメージを
+
+同じ Dockerfile を 2 回ビルドしても、**digest は普通は一致しません**。
+
+- ベースイメージのタグが付け替えられている（第 50 回）
+- `apt-get install` が、その日の最新版を取ってくる
+- ファイルの更新時刻や、config の作成日時が、ビルドした時刻になる
+
+第 50 回で見たとおり、digest は中身のバイト列から決まるので、時刻が 1 秒違えば別物です。
+
+ビルドを再現可能にするには、揺れるものを 1 つずつ固定します。
+
+```dockerfile
+FROM debian:12-slim@sha256:...                            # タグではなく digest
+RUN apt-get install -y curl=7.88.1-10+deb12u8             # バージョンを固定
+```
+
+```bash
+# 時刻をコミットの時刻に揃える
+docker buildx build \
+  --build-arg SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct) \
+  --output type=image,name=example.com/app,rewrite-timestamp=true .
+```
+
+`SOURCE_DATE_EPOCH` は、ビルドの時刻を固定するための、ツールをまたいだ約束です。BuildKit は v0.13 から、この値に合わせてイメージの中のファイルの時刻を書き換える `rewrite-timestamp` に対応しています（[moby/buildkit: build-repro.md](https://github.com/moby/buildkit/blob/master/docs/build-repro.md)）。
+
+再現できると、「このイメージは、このコミットから作られた」と第三者が確かめられます。第 58 回のサプライチェーンの話につながります。
+
+## 大きさを調べる
+
+```bash
+# 層ごとの大きさと、それを作った命令
+docker history my-app
+
+# 各層で何のファイルが増えたかを対話的に見る
+dive my-app
+
+# 最終イメージのファイル一覧を取り出す
+docker create --name tmp my-app && docker export tmp | tar -t | less; docker rm tmp
+```
+
+`docker history` で、大きい層を作った命令を探します。多くの場合、キャッシュの消し忘れ（`apt` のリスト、`pip` のキャッシュ）、ビルドにしか要らないツール、`.dockerignore` の漏れのどれかです。
+
+## まとめ
+
+- Dockerfile は層を作る手順書。`RUN` は一時コンテナで実行し、書き込み層の差分を次の層にする
+- `docker build` の実体は BuildKit。Linux では Docker Engine 23.0 から既定
+- キャッシュキーは直前の層のキーを含むので、1 回外れると以降はすべて外れる。変わりにくいものを上に置く
+- `RUN` のキャッシュはコマンドの文字列しか見ない。外から取ってくる中身の変化は検知しない
+- `.dockerignore` でコンテキストを絞り、マルチステージで実行に要るものだけを最後の段に持ってくる
+- キャッシュマウントとシークレットマウントは、層に残さずにファイルを見せる
+- scratch には何もない。動的リンクのバイナリは、ローダが無くて「no such file or directory」になる
+- alpine は musl。glibc 向けのバイナリやビルド済みの拡張が動かないことがある
+- 再現可能なビルドには、digest の固定、バージョンの固定、`SOURCE_DATE_EPOCH` を使う
+
+ここまでは、ビルドした機械と動かす機械が同じ CPU である前提でした。次は、Mac で作ったイメージが x86 のサーバで動かない理由と、1 つのタグで複数の CPU に対応する仕組みを見ます。

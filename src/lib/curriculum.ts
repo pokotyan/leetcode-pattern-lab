@@ -239,7 +239,12 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'around',
     title: '第9章　その下と、その横',
-    summary: '電源投入から OS が立ち上がるまで、仮想化とコンテナ、そして実際に測るための道具',
+    summary: '電源投入から OS が立ち上がるまで。そして、その OS ごと、あるいは OS の一部だけを切り出して動かす仮想化とコンテナの原理',
+  },
+  {
+    id: 'ship',
+    title: '第10章　手元から本番へ',
+    summary: '書いたプログラムを、別のマシンで同じように動かすということ。コンテナイメージの中身、Dockerfile と Buildpacks、CPU アーキテクチャの違い、資源の制限、そして本番で測るための道具',
   },
 ]
 

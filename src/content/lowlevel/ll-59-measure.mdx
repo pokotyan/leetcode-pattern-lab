@@ -1,8 +1,8 @@
 ---
 title: 実測する道具
 description: ここまでの話を、自分の環境で確かめるために。何を疑うときに何を使うかの対応表
-chapter: around
-order: 3
+chapter: ship
+order: 10
 status: published
 topics:
   - perf
@@ -176,6 +176,49 @@ heaptrack ./a.out                      # より高速なリーク検出
   合計が実際の使用量に近くなるので、**プロセスごとの実質的な消費を見るなら PSS** です。
 </Callout>
 
+## コンテナの中を測る
+
+本番のプログラムはコンテナの中で動いていることが多く、しかも最小限のイメージには `ps` どころかシェルすら入っていません。それでも、ここまでの道具は使えます。第 49 回で見たとおり、**コンテナはホストから見ればただのプロセス**だからです。
+
+**ホスト側から道具を向ける。** ホストでの PID さえ分かれば、`perf`、`strace`、`/proc` はそのまま使えます。
+
+```bash
+docker inspect -f '{{.State.Pid}}' <コンテナ>   # ホストでの PID
+strace -f -p <PID>
+perf top -p <PID>
+ls /proc/<PID>/root/                             # コンテナから見たファイルシステム
+```
+
+**名前空間だけ借りる。** `nsenter` は、指定したプロセスの名前空間に入ってコマンドを実行します。**道具はホストのもの、見える世界はコンテナのもの**になります。
+
+```bash
+nsenter -t <PID> -n ss -tnp      # ネットワーク名前空間だけ入り、ホストの ss で接続を見る
+```
+
+**道具入りのコンテナを横に付ける。** 名前空間を共有する別のコンテナを起動すれば、道具をイメージに入れずに済みます。
+
+```bash
+docker run --rm -it --pid=container:<コンテナ> --network=container:<コンテナ> \
+  --cap-add SYS_PTRACE nicolaka/netshoot
+```
+
+Kubernetes の `kubectl debug --target` も、同じ考え方で一時的なコンテナを差し込むものです。
+
+**cgroup の数字を見る。** コンテナ単位の CPU とメモリは、cgroup が数えています。
+
+```bash
+docker stats
+cat /sys/fs/cgroup/<コンテナの cgroup>/cpu.stat       # nr_throttled が増えていればスロットリング
+cat /sys/fs/cgroup/<コンテナの cgroup>/memory.stat    # anon と file の内訳
+```
+
+<Callout type="warn" title="コンテナの中の top は信用しない">
+  コンテナの中で `free` や `top` を実行すると、**ホスト全体**のメモリと CPU が表示されることがあります。
+  `/proc/meminfo` は名前空間で分離されていないからです。
+  コンテナに割り当てられた量は cgroup のファイルで確かめます。
+  詳しくは第 57 回で扱います。
+</Callout>
+
 ## macOS / Windows
 
 | 用途 | macOS | Windows |
@@ -213,7 +256,7 @@ sudo cpupower frequency-set -g performance
 
 ここまでで、低レイヤの読み物は終わりです。
 
-第 1 章で 0 と 1 から始め、CPU が命令を実行する仕組み、メモリの階層、アドレスの変換、プログラムが実行可能になるまで、複数の流れが同時に走る仕組み、カーネルとの境界、言語の壁を越える方法、そして全体の起動と計測まで来ました。
+第 1 章で 0 と 1 から始め、CPU が命令を実行する仕組み、メモリの階層、アドレスの変換、プログラムが実行可能になるまで、複数の流れが同時に走る仕組み、カーネルとの境界、言語の壁を越える方法、全体の起動、コンテナで本番に届けるまでの流れ、そして計測まで来ました。
 
 ここから先は、**実際に作る番**です。
 
@@ -233,4 +276,5 @@ sudo cpupower frequency-set -g performance
 - フレームグラフで、横に広い部分を探す
 - `/proc` にはプロセスの詳細がファイルとして見える
 - eBPF なら、本番環境でも対象を止めずに観測できる
+- コンテナはホストから見ればただのプロセス。ホストの道具を向けるか、名前空間だけ借りる
 - ウォームアップ、複数回測定、環境を揃える、1 度に 1 つだけ変える

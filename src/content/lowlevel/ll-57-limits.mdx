@@ -1,0 +1,226 @@
+---
+title: cgroup の制限が効くとき
+description: --cpus と --memory は、カーネルの中で何になるのか。スロットリング、OOM kill、そして制限に気づかないランタイム
+chapter: ship
+order: 8
+status: published
+topics:
+  - cgroup v2
+  - cpu.max / cpu.weight
+  - CPU スロットリング
+  - memory.max / memory.high
+  - OOM kill
+  - GOMAXPROCS
+  - requests / limits
+requires:
+  - ll-49-virtualization
+  - ll-33-scheduler
+  - ll-51-runtime
+---
+
+import Callout from '../../components/Callout.astro'
+
+## オプションはファイルになる
+
+第 49 回で、コンテナは名前空間と cgroup の組み合わせだと書きました。第 51 回で見たとおり、runc はコンテナを起動するときに cgroup を 1 つ作り、そこにプロセスを入れます。
+
+`docker run` の資源のオプションは、**その cgroup のファイルへの書き込み**に変換されます。コンテナの中から、そのファイルを読めます。
+
+```bash
+docker run --rm --cpus=0.5 --memory=64m alpine \
+  cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.weight
+```
+
+```
+50000 100000
+67108864
+100
+```
+
+| オプション | cgroup v2 のファイル | 意味 |
+| --- | --- | --- |
+| `--cpus=0.5` | `cpu.max` = `50000 100000` | 100ms ごとに 50ms まで CPU を使える |
+| `--cpu-shares` | `cpu.weight` | 混んでいるときの取り分の比率 |
+| `--cpuset-cpus=0,1` | `cpuset.cpus` | 使ってよいコアの番号 |
+| `--memory=64m` | `memory.max` = `67108864` | これを超えたら OOM kill |
+| `--memory-reservation` | `memory.low` | これ以下なら回収されにくい |
+| `--pids-limit` | `pids.max` | プロセス数の上限 |
+
+同じ「CPU を制限する」でも、`cpu.max` と `cpu.weight` と `cpuset.cpus` はまったく違う仕組みです。ここを取り違えると、設定と挙動が噛み合わなくなります。
+
+## CPU: 上限と比率と場所
+
+**cpu.weight** は比率です。CPU が空いていれば、いくらでも使えます。**取り合いになったときだけ**、重みの比で配分されます。第 33 回で見た CFS が、仮想実行時間を進める速さを重みで変える仕組みそのものです。
+
+**cpu.max** は上限です。CPU が空いていても、決められた量を超えて使えません。
+
+**cpuset.cpus** は場所です。量ではなく、どのコアで動くかを決めます。
+
+```
+                CPU が空いているとき        CPU が混んでいるとき
+cpu.weight       いくらでも使える           重みの比で分ける
+cpu.max          上限で止められる           上限で止められる
+cpuset.cpus      指定のコアだけ使う          指定のコアだけ使う
+```
+
+## スロットリング: 平均は低いのに遅い
+
+`cpu.max` の上限は、**期間（既定 100ms）ごとの予算**として実装されています。`50000 100000` なら、100ms の期間ごとに 50ms 分の CPU 時間を配ります。予算を使い切ったら、**次の期間が始まるまで、そのグループのスレッドは 1 本も動けません**。これが**スロットリング**です。
+
+問題は、予算が**全スレッドの合計**だということです。
+
+```
+--cpus=2 → 100ms ごとに 200ms の予算
+
+8 スレッドが同時に動くと:
+  0ms          25ms                          100ms
+  ├─────────────┤                             │
+  │ 8 本 × 25ms = 200ms で予算を使い切る        │
+  │             │←────── 75ms 全員停止 ───────→│
+```
+
+この間に届いたリクエストは、最大 75ms 待たされます。1 秒平均の CPU 使用率はわずかでも、**瞬間的に並列で使うと、期間の大半を止められる**。平均使用率のグラフを見ても原因が分からない、典型的な遅延の原因です。
+
+実際に起こしてみます。0.2 CPU に制限したコンテナで、3 秒間空ループを回します。
+
+```bash
+docker run --rm --cpus=0.2 alpine sh -c \
+  'timeout 3 sh -c "while :; do :; done"; cat /sys/fs/cgroup/cpu.stat'
+```
+
+```
+usage_usec 620061
+nr_periods 31
+nr_throttled 30
+throttled_usec 2396576
+```
+
+31 回の期間のうち 30 回で止められ、合計 2.4 秒待たされています。3 秒のうち実際に動けたのは 0.62 秒、つまり 0.2 CPU 分です。
+
+| 項目 | 意味 |
+| --- | --- |
+| `nr_periods` | 経過した期間の数 |
+| `nr_throttled` | そのうち予算を使い切って止められた回数 |
+| `throttled_usec` | 止められていた時間の合計 |
+
+`nr_throttled / nr_periods` が高いなら、上限が足りていません。
+
+<Callout type="tip" title="上限を外すという選択">
+  レイテンシが重要なサービスでは、**CPU の上限（limits）を設定せず、比率（requests）だけを設定する**という運用がよく取られます。
+  混んでいないときは余った CPU を使え、混んだときも重みの比で公平に分けられます。
+  上限は、他のコンテナを守るための仕組みであって、自分を速くする仕組みではありません。
+</Callout>
+
+## メモリ: 超えたら殺される
+
+CPU は止めれば済みますが、メモリは止めても減りません。`memory.max` を超えそうになると、カーネルはまず回収できるページ（ページキャッシュなど）を捨てて空けようとします。それでも足りなければ、**cgroup の中のプロセスを OOM killer が殺します**。
+
+```bash
+docker run --rm --memory=64m alpine sh -c 'head -c 200m /dev/zero | tail > /dev/null'
+echo $?
+```
+
+```
+Killed
+137
+```
+
+`tail` は改行が来るまでデータを溜め込むので、64MB を超えたところで殺されます。
+
+**137** は、第 41 回で見た「シグナルで死んだプロセスの終了コードは 128 + シグナル番号」の規則によるものです。`SIGKILL` は 9 なので、128 + 9 = 137。Kubernetes で `OOMKilled` と表示されるコンテナも、中身はこれです。`SIGKILL` は捕まえられないので、アプリケーションには後始末の機会がありません。
+
+<Callout type="warn" title="ページキャッシュも数えられる">
+  cgroup のメモリ使用量には、プロセスが確保したメモリだけでなく、
+  **そのグループが読み書きしたファイルのページキャッシュ**も含まれます（第 24 回、第 42 回）。
+  大きなファイルを読むだけで使用量が上限近くまで増えて見えることがあります。
+  ページキャッシュは回収できるので、それだけで殺されることは通常ありませんが、
+  監視のグラフで「使用量」だけを見ると誤解します。
+  `memory.stat` の `anon`（プロセスが確保した分）と `file`（ページキャッシュ）を分けて見るのが確実です。
+</Callout>
+
+`memory.max` の手前に、**memory.high** という段階もあります。これを超えると、カーネルはそのグループに対して積極的にメモリを回収し、割り当てを遅らせます。殺す前に**遅くして知らせる**ための仕組みです。
+
+## ランタイムが制限に気づかない
+
+cgroup の制限は、プロセスから見えるハードウェアの情報を変えません。`/proc/cpuinfo` は、ホストのコアをすべて表示します。
+
+```bash
+docker run --rm --cpus=0.5 alpine nproc
+```
+
+```
+8
+```
+
+0.5 CPU に制限されていても、`nproc` はホストのコア数 8 を返します。**多くの言語ランタイムは、起動時にこの数でスレッドの数を決めていました**。
+
+- Go の `GOMAXPROCS`：同時に Go のコードを実行するスレッドの数
+- JVM の GC スレッド数、`ForkJoinPool` の並列度
+- Node.js の libuv のスレッドプールの大きさ、ワーカーの数
+
+2 CPU に制限されたコンテナで 64 本のスレッドを並列に走らせると、前節のとおり予算を一瞬で使い切り、スロットリングで止まります。**コアが多いマシンほど遅くなる**という逆転が起きます。
+
+各ランタイムは順に対応してきました。
+
+| ランタイム | 対応 |
+| --- | --- |
+| **JVM** | `-XX:+UseContainerSupport` が既定で有効。cgroup v2 に対応したのは JDK 15 からで、11.0.16 と 8u372 に取り込まれた。それより古い版を cgroup v2 だけのホストで動かすと、ホストの値を使う（[Red Hat Developer](https://developers.redhat.com/articles/2023/04/19/openjdk-8u372-feature-cgroup-v2-support)） |
+| **Go** | Go 1.25 から、起動時に cgroup の CPU の上限を読み、コア数との小さいほうを `GOMAXPROCS` の既定値にする。端数は切り上げ。実行中に上限が変わっても定期的に追従する（[The Go Blog](https://go.dev/blog/container-aware-gomaxprocs)） |
+| **Node.js** | `os.cpus().length` はホストのコア数を返す。`os.availableParallelism()` は libuv を通して cgroup の上限を考慮するようになったが、版によって挙動に差がある（[libuv#4740](https://github.com/libuv/libuv/issues/4740)） |
+
+<Callout type="warn" title="上限が無ければ、読むものが無い">
+  Go 1.25 の対応が読むのは `cpu.max`、つまり上限です。
+  前節の Callout のように上限を設定せず比率だけにしている場合、
+  読むべき値が無いので、ホストのコア数がそのまま使われます。
+  比率だけで運用するなら、スレッド数は自分で決めて環境変数などで渡すことになります。
+</Callout>
+
+## Kubernetes の requests と limits
+
+Kubernetes のコンテナの設定は、同じ cgroup のファイルに落ちます（[Kubernetes](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)）。
+
+```yaml
+resources:
+  requests:
+    cpu: 500m       # → cpu.weight（比率）。スケジューラが配置を決める根拠にもなる
+    memory: 256Mi   # → スケジューラの判断に使う
+  limits:
+    cpu: "1"        # → cpu.max（上限）
+    memory: 512Mi   # → memory.max（超えたら OOM kill）
+```
+
+`requests.cpu` から `cpu.weight` への換算は、cgroup v1 の `cpu.shares`（1 CPU = 1024）を経由して行われてきました。この換算式では 1 CPU の requests が重み約 39 になり、cgroup v2 の既定の重み 100 を大きく下回るため、**cgroup v2 のノードでは、1 CPU を要求したコンテナが既定の重みのプロセスより弱い優先度で扱われる**という問題が指摘され、2026 年に新しい換算式が導入されました。新しい式では 1 CPU が約 102 になります。切り替えは Kubernetes 側ではなくランタイム側で行われ、runc 1.3.2、crun 1.23 から有効です（[Kubernetes Blog](https://www.kubernetes.io/blog/2026/01/30/new-cgroup-v1-to-v2-cpu-conversion-formula/)）。比率は、中の換算式によって効き方が変わるということです。
+
+さらに、requests と limits の組み合わせで **QoS クラス**が決まります。
+
+| QoS クラス | 条件 | ノードのメモリが足りなくなったとき |
+| --- | --- | --- |
+| **Guaranteed** | すべてのコンテナで requests = limits | 最後まで残される |
+| **Burstable** | requests だけ、または requests が limits より小さい | 使用量が requests を超えている順に狙われる |
+| **BestEffort** | 何も設定しない | 真っ先に追い出される |
+
+QoS クラスごとに cgroup の親が分かれていて、その下に Pod、その下にコンテナの cgroup が並びます。
+
+```
+/sys/fs/cgroup/kubepods.slice/
+  ├── kubepods-pod<uid>.slice/                ← Guaranteed の Pod
+  ├── kubepods-burstable.slice/
+  │     └── kubepods-burstable-pod<uid>.slice/
+  │           └── cri-containerd-<id>.scope   ← コンテナ 1 つ
+  └── kubepods-besteffort.slice/
+```
+
+`limits.memory` を超えた場合と、ノード全体のメモリが足りない場合は別物です。前者はそのコンテナの cgroup の中での OOM kill、後者は kubelet が Pod を**追い出す**（eviction）判断です。
+
+## まとめ
+
+- `--cpus` は `cpu.max`、`--memory` は `memory.max` になる。コンテナの中から読める
+- `cpu.weight` は混んだときの比率、`cpu.max` は常に効く上限、`cpuset.cpus` は場所
+- 上限は期間ごとの予算。並列に使うと予算を一瞬で使い切り、期間の残りを止められる
+- `cpu.stat` の `nr_throttled` と `throttled_usec` でスロットリングを確かめる
+- メモリの上限を超えると OOM kill。終了コード 137 = 128 + SIGKILL
+- ページキャッシュも使用量に数えられる
+- `nproc` はホストのコア数を返す。Go は 1.25、JVM は JDK 15 以降で cgroup v2 の上限を読む
+- Kubernetes の requests は比率、limits は上限。組み合わせで QoS クラスが決まる
+
+次は、資源ではなく**権限**の側からコンテナを絞る方法を見ます。
