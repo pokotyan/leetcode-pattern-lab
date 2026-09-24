@@ -1,0 +1,280 @@
+---
+title: 実測する道具
+description: ここまでの話を、自分の環境で確かめるために。何を疑うときに何を使うかの対応表
+chapter: ship
+order: 10
+status: published
+topics:
+  - perf
+  - strace
+  - eBPF
+  - /proc
+  - フレームグラフ
+requires:
+  - ll-48-io-dma
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 推測しない
+
+性能の問題に対して、コードを読んで原因を推測するのは、たいてい外れます。実際のボトルネックは、思ってもみない場所にあることがほとんどです。
+
+まず測る。測ってから直す。この順序を崩さないことが、最も重要な規律です。
+
+## 何を疑うときに何を使うか
+
+| 疑うもの | 道具 |
+| --- | --- |
+| そもそもどこが遅いのか | `perf top`、`perf record` |
+| CPU を使っているのか、待っているのか | `top`、`vmstat`、`pidstat` |
+| システムコールが多いのか | `strace -c` |
+| キャッシュミスか | `perf stat -e cache-misses` |
+| 分岐予測ミスか | `perf stat -e branch-misses` |
+| TLB ミスか | `perf stat -e dTLB-load-misses` |
+| メモリが足りないのか | `free`、`vmstat`（si/so）、`/proc/<pid>/status` |
+| ディスクが遅いのか | `iostat -x`、`iotop`、`biolatency` |
+| ネットワークか | `ss`、`tcpdump`、`sar -n DEV` |
+| ロック競合か | `perf lock`、`pidstat -w`（自発的切り替え） |
+| false sharing か | `perf c2c` |
+| メモリリークか | `valgrind`、`heaptrack`、`/proc/<pid>/smaps` |
+
+## まず全体を見る
+
+```bash
+top                    # 全体像。%CPU、%MEM、ロードアベレージ
+htop                   # コアごとの使用率が見やすい
+vmstat 1               # CPU、メモリ、スワップ、I/O、切り替え回数
+```
+
+`vmstat` の見るべき列です。
+
+| 列 | 意味 | 危険信号 |
+| --- | --- | --- |
+| `r` | 実行待ちのプロセス数 | コア数を大きく超えている |
+| `b` | 割り込み不可の待ち | 継続的に 0 でない |
+| `si` / `so` | スワップ | **0 以外が続いている** |
+| `bi` / `bo` | ブロック I/O | 高止まり |
+| `cs` | コンテキストスイッチ | 異常に多い |
+| `us` / `sy` / `wa` / `id` | CPU の内訳 | `wa` が高い = I/O 待ち |
+
+**`us` が高ければアプリケーションの計算、`sy` が高ければシステムコールやカーネル処理、`wa` が高ければ I/O 待ち。** ここで方向が決まります。
+
+## perf
+
+Linux で最も重要な計測ツールです。
+
+```bash
+# 今何が CPU を使っているか（リアルタイム）
+perf top
+
+# プロファイルを取る
+perf record -g ./a.out
+perf report
+
+# ハードウェアカウンタの集計
+perf stat ./a.out
+perf stat -e cache-misses,cache-references,branch-misses,instructions,cycles ./a.out
+
+# システムコールの集計（strace より軽い）
+perf trace ./a.out
+```
+
+`perf stat` の出力で重要な指標です。
+
+| 指標 | 見方 |
+| --- | --- |
+| **IPC**（instructions per cycle） | 1 未満なら、何かを待っている。3 以上なら十分に並列 |
+| cache-miss 率 | 数 % を超えるとメモリ律速を疑う |
+| branch-miss 率 | 数 % を超えると分岐予測が効いていない |
+
+**IPC が低いことが、メモリ待ちの最も分かりやすい兆候です。**
+
+<Callout type="tip" title="フレームグラフ">
+  `perf report` のテキスト表示は読みにくいので、視覚化します。
+
+```bash
+perf record -F 99 -g ./a.out
+perf script | stackcollapse-perf.pl | flamegraph.pl > out.svg
+```
+  横幅が「そこで消費された時間の割合」、縦が呼び出しの深さです。
+  **横に広い平らな部分がボトルネック**で、一目で分かります。
+
+  待ち時間を見たい場合は、off-CPU フレームグラフという別の取り方があります。
+</Callout>
+
+<Callout type="warn" title="フレームポインタが必要">
+  `-g` でスタックを取るには、フレームポインタが必要です。
+  最適化ビルドでは省略されているため、スタックが途中で切れます。
+  `-fno-omit-frame-pointer` でビルドするか、`--call-graph dwarf` を使います。
+</Callout>
+
+## strace / ltrace
+
+```bash
+strace -c ./a.out               # システムコールの回数と時間の集計
+strace -f -T -e trace=file ./a.out    # ファイル関連だけ、所要時間付き
+ltrace ./a.out                  # ライブラリ関数の呼び出し
+```
+
+`strace` は「プログラムが OS に何を頼んでいるか」を見る道具です。設定ファイルをどこから読んでいるか、なぜファイルが見つからないのか、といった調査にも有効です。
+
+**ただし対象が数十倍遅くなります。** 性能測定そのものには向きません。
+
+## /proc
+
+Linux では、カーネルの情報がファイルとして見えます。
+
+```bash
+cat /proc/cpuinfo              # CPU の情報
+cat /proc/meminfo              # メモリの詳細
+cat /proc/<pid>/status         # プロセスの状態、メモリ、切り替え回数
+cat /proc/<pid>/maps           # メモリ配置
+cat /proc/<pid>/smaps_rollup   # メモリ使用量の内訳
+ls -l /proc/<pid>/fd           # 開いているファイル
+cat /proc/<pid>/stack          # カーネル内のどこで止まっているか（root）
+cat /proc/<pid>/wchan          # 待っている関数名
+```
+
+**`/proc/<pid>/stack` は、D 状態で固まっているプロセスの原因を特定するのに使えます。**
+
+## eBPF
+
+カーネル内に安全に検証されたプログラムを挿入し、任意の場所で情報を取る仕組みです。**カーネルを再コンパイルせず、対象を止めずに観測できます。**
+
+```bash
+# bcc ツール群
+execsnoop              # プロセスの起動を追跡
+opensnoop              # ファイルのオープンを追跡
+biolatency             # I/O レイテンシの分布をヒストグラムで
+tcpconnect             # TCP 接続を追跡
+profile                # CPU プロファイル
+
+# bpftrace（ワンライナー）
+bpftrace -e 'tracepoint:syscalls:sys_enter_open { @[comm] = count(); }'
+```
+
+従来なら「カーネルにパッチを当てて再起動」が必要だった観測が、その場でできます。本番環境で使える観測手段として、近年の標準になりつつあります。
+
+## メモリ
+
+```bash
+free -h                        # 全体。available を見る
+ps aux --sort=-%mem | head     # メモリを使っているプロセス
+pmap -x <pid>                  # 領域ごとの内訳
+cat /proc/<pid>/smaps_rollup   # Rss、Pss、Swap の合計
+
+valgrind --leak-check=full ./a.out    # リーク検出
+heaptrack ./a.out                      # より高速なリーク検出
+```
+
+<Callout type="note" title="RSS と PSS">
+  **RSS** は、共有ライブラリなど他プロセスと共有しているページも全部数えます。
+  したがって、全プロセスの RSS を足すと物理メモリを超えます。
+
+  **PSS**（Proportional Set Size）は、共有ページを共有しているプロセス数で割ります。
+  合計が実際の使用量に近くなるので、**プロセスごとの実質的な消費を見るなら PSS** です。
+</Callout>
+
+## コンテナの中を測る
+
+本番のプログラムはコンテナの中で動いていることが多く、しかも最小限のイメージには `ps` どころかシェルすら入っていません。それでも、ここまでの道具は使えます。第 68 回で見たとおり、**コンテナはホストから見ればただのプロセス**だからです。
+
+**ホスト側から道具を向ける。** ホストでの PID さえ分かれば、`perf`、`strace`、`/proc` はそのまま使えます。
+
+```bash
+docker inspect -f '{{.State.Pid}}' <コンテナ>   # ホストでの PID
+strace -f -p <PID>
+perf top -p <PID>
+ls /proc/<PID>/root/                             # コンテナから見たファイルシステム
+```
+
+**名前空間だけ借りる。** `nsenter` は、指定したプロセスの名前空間に入ってコマンドを実行します。**道具はホストのもの、見える世界はコンテナのもの**になります。
+
+```bash
+nsenter -t <PID> -n ss -tnp      # ネットワーク名前空間だけ入り、ホストの ss で接続を見る
+```
+
+**道具入りのコンテナを横に付ける。** 名前空間を共有する別のコンテナを起動すれば、道具をイメージに入れずに済みます。
+
+```bash
+docker run --rm -it --pid=container:<コンテナ> --network=container:<コンテナ> \
+  --cap-add SYS_PTRACE nicolaka/netshoot
+```
+
+Kubernetes の `kubectl debug --target` も、同じ考え方で一時的なコンテナを差し込むものです。
+
+**cgroup の数字を見る。** コンテナ単位の CPU とメモリは、cgroup が数えています。
+
+```bash
+docker stats
+cat /sys/fs/cgroup/<コンテナの cgroup>/cpu.stat       # nr_throttled が増えていればスロットリング
+cat /sys/fs/cgroup/<コンテナの cgroup>/memory.stat    # anon と file の内訳
+```
+
+<Callout type="warn" title="コンテナの中の top は信用しない">
+  コンテナの中で `free` や `top` を実行すると、**ホスト全体**のメモリと CPU が表示されることがあります。
+  `/proc/meminfo` は名前空間で分離されていないからです。
+  コンテナに割り当てられた量は cgroup のファイルで確かめます。
+  詳しくは第 76 回で扱います。
+</Callout>
+
+## macOS / Windows
+
+| 用途 | macOS | Windows |
+| --- | --- | --- |
+| プロファイル | Instruments、`sample` | VTune、WPA |
+| システムコール | `dtruss`、`dtrace` | Process Monitor |
+| メモリ | `vmmap`、`leaks` | VMMap |
+| 全体 | Activity Monitor | リソースモニター |
+
+## 測るときの注意
+
+**1. ウォームアップする。** 初回はキャッシュが冷え、JIT が最適化前で、ページフォールトが多発します。数回動かしてから測ります。
+
+**2. 複数回測る。** 1 回の測定はばらつきます。中央値や分布を見ます。平均だけでは、たまに起きる極端な遅延が隠れます。
+
+**3. 環境を揃える。** 周波数の変動（Turbo Boost、省電力モード）、他のプロセスの影響、NUMA ノードの配置。
+
+```bash
+# CPU 周波数を固定する
+sudo cpupower frequency-set -g performance
+```
+
+**4. マイクロベンチマークを信用しすぎない。** 小さなループだけを測ると、キャッシュに全部乗ってしまい、実際の状況と乖離します。コンパイラが計算ごと削除してしまうこともあります。
+
+**5. 変えるのは 1 度に 1 つ。** 複数変えると、どれが効いたか分かりません。
+
+<Callout type="tip" title="推測を検証可能な形にする">
+  「ここが遅いと思う」ではなく、
+  **「ここがボトルネックなら、cache-miss 率が高いはずだ」**という形にすると、
+  測定で真偽が決まります。
+  外れたら、その仮説を捨てて次に進めます。デバッグと同じ進め方です。
+</Callout>
+
+## この章を終えて
+
+ここまでで、低レイヤの読み物は終わりです。
+
+第 1 章で 0 と 1 から始め、CPU が命令を実行する仕組み、メモリの階層、アドレスの変換、プログラムが実行可能になるまで、複数の流れが同時に走る仕組み、カーネルとの境界、データを残す仕組み、ネットワーク、データベースの中身、言語の壁を越える方法、全体の起動、コンテナで本番に届けるまでの流れ、そして計測まで来ました。
+
+ここから先は、**実際に作る番**です。
+
+1. **論理回路からコンピュータへ** — NAND から CPU を組み、機械語を走らせる
+2. **アセンブラからコンパイラへ** — 自作言語を自作 CPU まで落とす
+3. **NES エミュレータ** — 実在するハードウェアを再現する
+
+<a href={`${import.meta.env.BASE_URL}build/`}>「作る」へ進む →</a>
+
+読んで分かった気になっていたことが、作ってみると分かっていなかったと気づきます。それが目的です。
+
+## まとめ
+
+- 推測せず、測ってから直す
+- `vmstat` の `us` / `sy` / `wa` で大まかな方向を決める
+- `perf stat` の IPC が、メモリ待ちの最も分かりやすい指標
+- フレームグラフで、横に広い部分を探す
+- `/proc` にはプロセスの詳細がファイルとして見える
+- eBPF なら、本番環境でも対象を止めずに観測できる
+- コンテナはホストから見ればただのプロセス。ホストの道具を向けるか、名前空間だけ借りる
+- ウォームアップ、複数回測定、環境を揃える、1 度に 1 つだけ変える
