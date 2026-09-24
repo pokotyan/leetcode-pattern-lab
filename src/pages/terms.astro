@@ -1,0 +1,105 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro'
+import { loadTerms } from '../lib/terms'
+
+const base = import.meta.env.BASE_URL
+const { groups, total, lowlevelCount, readingCount } = await loadTerms(base)
+---
+
+<BaseLayout
+  title="用語索引 | Pattern Lab"
+  description="低レイヤとシステム設計の読み物で扱う用語の一覧。用語から、主に扱う回と言及している回を引く"
+>
+  <section class="mb-8">
+    <h1 class="mb-3 text-3xl font-bold leading-snug">用語索引</h1>
+    <p class="max-w-2xl text-[15px] leading-relaxed" style="color: var(--fg-muted)">
+      <a href={`${base}lowlevel/`} style="color: var(--accent)">低レイヤ</a>と
+      <a href={`${base}reading/`} style="color: var(--accent)">システム設計の読み物</a>で扱う用語を、
+      初めて出てくる章ごとに並べています。
+      <strong style="color: var(--fg)">主に扱う</strong>はその用語を説明している回、
+      <strong style="color: var(--fg)">言及</strong>は本文で触れている回です。
+    </p>
+    <dl class="mt-6 flex flex-wrap gap-8 text-sm">
+      <div>
+        <dt style="color: var(--fg-muted)">用語</dt>
+        <dd class="m-0 text-2xl font-bold">{total}</dd>
+      </div>
+      <div>
+        <dt style="color: var(--fg-muted)">低レイヤ</dt>
+        <dd class="m-0 text-2xl font-bold">{lowlevelCount}</dd>
+      </div>
+      <div>
+        <dt style="color: var(--fg-muted)">システム設計</dt>
+        <dd class="m-0 text-2xl font-bold">{readingCount}</dd>
+      </div>
+    </dl>
+    <input
+      id="term-filter"
+      type="search"
+      placeholder="用語で絞り込む（例: fsync、TLB、MVCC）"
+      autocomplete="off"
+      class="mt-6 w-full max-w-md rounded-lg border px-3 py-2 text-sm"
+      style="border-color: var(--border); background: var(--bg-soft); color: var(--fg)"
+    />
+    <p id="term-empty" class="mt-3 hidden text-sm" style="color: var(--fg-muted)">該当する用語はありません。</p>
+  </section>
+
+  <div class="space-y-10">
+    {
+      groups.map((g) => (
+        <section data-group>
+          <h2 class="mb-3 text-lg font-bold">
+            <span class="mr-2 text-xs font-bold" style="color: var(--accent)">{g.area}</span>
+            {g.title}
+          </h2>
+          <ul class="m-0 list-none space-y-2 p-0">
+            {g.terms.map((t) => (
+              <li
+                id={t.anchor}
+                data-term={t.name.toLowerCase()}
+                class="scroll-mt-24 rounded-lg border px-4 py-2.5 target:border-[var(--accent)]"
+                style="border-color: var(--border); background: var(--bg-soft)"
+              >
+                <span class="font-bold">{t.name}</span>
+                <span class="mt-1 block text-xs leading-relaxed">
+                  <span style="color: var(--fg-muted)">主に扱う: </span>
+                  {t.declared.map((p, i) => (
+                    <>{i > 0 && '、'}<a href={p.href} title={p.title} style="color: var(--accent)">{p.label === p.title ? p.title : `${p.label} ${p.title}`}</a></>
+                  ))}
+                </span>
+                {t.mentioned.length > 0 && (
+                  <span class="mt-0.5 block text-xs leading-relaxed" style="color: var(--fg-muted)">
+                    言及（{t.mentioned.length}）:{' '}
+                    {t.mentioned.map((p, i) => (
+                      <>{i > 0 && '、'}<a href={p.href} title={p.title} style="color: var(--fg-muted)">{p.label}</a></>
+                    ))}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))
+    }
+  </div>
+
+  <script is:inline>
+    ;(() => {
+      const input = document.getElementById('term-filter')
+      const empty = document.getElementById('term-empty')
+      const items = [...document.querySelectorAll('[data-term]')]
+      const groups = [...document.querySelectorAll('[data-group]')]
+      input.addEventListener('input', () => {
+        const q = input.value.trim().toLowerCase()
+        let shown = 0
+        for (const li of items) {
+          const hit = !q || li.dataset.term.includes(q)
+          li.hidden = !hit
+          if (hit) shown++
+        }
+        for (const g of groups) g.hidden = !g.querySelector('[data-term]:not([hidden])')
+        empty.classList.toggle('hidden', shown > 0)
+      })
+    })()
+  </script>
+</BaseLayout>

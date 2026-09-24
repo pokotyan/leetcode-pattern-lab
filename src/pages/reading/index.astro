@@ -1,4 +1,5 @@
 ---
+import { splitTopic } from '../../lib/terms'
 import BaseLayout from '../../layouts/BaseLayout.astro'
 import { READING_SECTIONS } from '../../lib/curriculum'
 import { buildReadingGraph, orderArticles } from '../../lib/prereq'
@@ -11,7 +12,7 @@ const byCategory = READING_SECTIONS.map((s) => ({
   items: notes.filter((n) => n.data.category === s.id),
 })).filter((g) => g.items.length > 0)
 
-const topicCount = new Set(notes.flatMap((n) => n.data.topics)).size
+const topicCount = new Set(notes.flatMap((n) => n.data.topics.flatMap(splitTopic))).size
 
 // 型から引く向き
 const fromArticles = orderArticles([...articleById.values()])
@@ -47,7 +48,9 @@ const fromMath = [...mathById.values()]
       </div>
       <div>
         <dt style="color: var(--fg-muted)">扱う用語</dt>
-        <dd class="m-0 text-2xl font-bold">{topicCount}</dd>
+        <dd class="m-0 text-2xl font-bold">
+          <a href={`${base}terms/`} class="no-underline" style="color: var(--accent)">{topicCount}</a>
+        </dd>
       </div>
       <div>
         <dt style="color: var(--fg-muted)">つながる型</dt>

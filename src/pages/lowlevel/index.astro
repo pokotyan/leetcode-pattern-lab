@@ -1,4 +1,5 @@
 ---
+import { splitTopic } from '../../lib/terms'
 import BaseLayout from '../../layouts/BaseLayout.astro'
 import { LOWLEVEL_CHAPTERS } from '../../lib/curriculum'
 import { loadLowLevelNotes } from '../../lib/prereq'
@@ -12,7 +13,7 @@ const byChapter = LOWLEVEL_CHAPTERS.map((chapter) => ({
 })).filter((g) => g.items.length > 0)
 
 const published = notes.filter((n) => n.data.status === 'published').length
-const topicCount = new Set(notes.flatMap((n) => n.data.topics)).size
+const topicCount = new Set(notes.flatMap((n) => n.data.topics.flatMap(splitTopic))).size
 ---
 
 <BaseLayout
@@ -43,7 +44,9 @@ const topicCount = new Set(notes.flatMap((n) => n.data.topics)).size
       </div>
       <div>
         <dt style="color: var(--fg-muted)">扱う用語</dt>
-        <dd class="m-0 text-2xl font-bold">{topicCount}</dd>
+        <dd class="m-0 text-2xl font-bold">
+          <a href={`${base}terms/`} class="no-underline" style="color: var(--accent)">{topicCount}</a>
+        </dd>
       </div>
     </dl>
   </section>

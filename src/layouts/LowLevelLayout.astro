@@ -1,4 +1,5 @@
 ---
+import { splitTopic, termHref } from '../lib/terms'
 import BaseLayout from './BaseLayout.astro'
 import { chapterById } from '../lib/curriculum'
 import { loadLowLevelNotes } from '../lib/prereq'
@@ -36,12 +37,15 @@ const handsOn = d.handsOn.map((h) => {
       {
         d.topics.length > 0 && (
           <ul class="not-prose m-0 mt-4 flex list-none flex-wrap gap-1.5 p-0">
-            {d.topics.map((t) => (
-              <li
-                class="rounded px-2 py-0.5 font-mono text-[11px]"
-                style="background: var(--bg-soft); color: var(--fg-muted); border: 1px solid var(--border)"
-              >
-                {t}
+            {d.topics.flatMap(splitTopic).map((t) => (
+              <li>
+                <a
+                  href={termHref(base, t)}
+                  class="block rounded px-2 py-0.5 font-mono text-[11px] no-underline hover:border-[var(--accent)]"
+                  style="background: var(--bg-soft); color: var(--fg-muted); border: 1px solid var(--border)"
+                >
+                  {t}
+                </a>
               </li>
             ))}
           </ul>

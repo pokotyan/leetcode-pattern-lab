@@ -54,6 +54,7 @@ export const AREAS: Area[] = [
         path: 'reading/',
         summary: '検索エンジン、分散合意、DB の索引など 13 本',
       },
+      { title: '用語索引', path: 'terms/', summary: '用語から、主に扱う回と言及している回を引く' },
     ],
   },
   {
@@ -64,7 +65,7 @@ export const AREAS: Area[] = [
       'CPU、キャッシュ、仮想メモリ、プロセス、リンク、システムコール、ファイルシステム、TCP、データベース、FFI と WebAssembly、コンテナ。13 章で上から順に繋ぎ直す。',
     path: 'lowlevel/',
     status: 'published',
-    items: [],
+    items: [{ title: '用語索引', path: 'terms/', summary: '用語から、主に扱う回と言及している回を引く' }],
   },
   {
     id: 'build',

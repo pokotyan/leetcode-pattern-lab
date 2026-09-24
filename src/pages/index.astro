@@ -1,4 +1,5 @@
 ---
+import { splitTopic } from '../lib/terms'
 import BaseLayout from '../layouts/BaseLayout.astro'
 import { getCollection } from 'astro:content'
 import { AREAS, SITE_TAGLINE } from '../lib/nav'
@@ -28,11 +29,12 @@ const STATS: Record<string, { label: string; value: number | string }[]> = {
   ],
   'system-design': [
     { label: '記事', value: pub(reading) },
-    { label: '扱う用語', value: new Set(reading.flatMap((r) => r.data.topics)).size },
+    { label: '扱う用語', value: new Set(reading.flatMap((r) => r.data.topics.flatMap(splitTopic))).size },
   ],
   lowlevel: [
     { label: '章', value: LOWLEVEL_CHAPTERS.length },
     { label: '記事', value: pub(lowlevel) },
+    { label: '扱う用語', value: new Set(lowlevel.flatMap((n) => n.data.topics.flatMap(splitTopic))).size },
   ],
   build: [
     { label: 'トラック', value: BUILD_TRACKS.length },
