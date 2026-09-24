@@ -11,7 +11,7 @@ topics:
   - コンテナ
   - WebAssembly
 requires:
-  - ll-42-boot
+  - ll-45-boot
   - ll-29-process
 ---
 
@@ -154,7 +154,7 @@ ps aux | grep <コンテナ内のプロセス>
 
 ## WebAssembly
 
-さらに別方向の分離として、**WebAssembly**（Wasm）があります。
+さらに別方向の分離として、**WebAssembly**（Wasm）があります。前章で扱ったものです。
 
 - サンドボックス内の**線形メモリ**しか触れない。ホストのメモリに到達する手段がない
 - システムコールに相当する機能は、明示的にインポートしたものだけ（WASI）
