@@ -1,0 +1,228 @@
+---
+title: 'Buildpacks: Dockerfile を書かない'
+description: ソースコードを渡すと、イメージが返ってくる。言語の判定、層の組み立て、そして OS の層だけを差し替える rebase が成り立つ理由
+chapter: ship
+order: 7
+status: published
+topics:
+  - Cloud Native Buildpacks
+  - builder / lifecycle
+  - ビルド用ベースイメージ / 実行用ベースイメージ
+  - rebase
+  - SBOM
+  - 再現可能なビルド
+requires:
+  - ll-77-image
+  - ll-79-dockerfile
+  - ll-31-abi
+---
+
+import Callout from '../../components/Callout.astro'
+
+## Dockerfile は誰が書くのか
+
+第 79 回で見た Dockerfile は、**イメージの組み立て手順をアプリケーションの開発者が 1 行ずつ書く**方式です。自由度は高い。しかし、組織の中に 100 のサービスがあれば、100 通りの Dockerfile ができます。
+
+- ベースイメージの選び方がばらばら
+- キャッシュの効かせ方がばらばら
+- ベースイメージに脆弱性が見つかると、100 個すべてを直してビルドし直す必要がある
+
+**Buildpacks** は、この手順を開発者から取り上げます。開発者が渡すのはソースコードだけです。
+
+```bash
+pack build my-app --builder paketobuildpacks/builder-jammy-base
+```
+
+`package.json` があれば Node.js、`go.mod` があれば Go と判定し、依存を取ってきて、コンパイルし、実行用のイメージを組み立てます。
+
+## Heroku から CNCF へ
+
+発想は 2011 年ごろの Heroku にさかのぼります。`git push heroku main` と打つと、Heroku 側でソースコードの言語を判定し、実行できる形に組み立てていました。この「言語ごとの組み立て担当」が buildpack です。Cloud Foundry も同じ仕組みを採用しました。
+
+ただし当時の buildpack が作るのは、それぞれのプラットフォーム専用の形式でした。そこで 2018 年、Heroku と Pivotal（Cloud Foundry の開発元）が共同で、**成果物を OCI イメージにする**仕様として **Cloud Native Buildpacks**（CNB）を始めます。CNCF のプロジェクトとなり、2026 年 8 月に最上位の段階である Graduated に達しました（[CNCF](https://www.cncf.io/announcements/2026/08/11/cncf-announces-graduation-of-cloud-native-buildpacks-advancing-the-standard-for-container-builds/)）。
+
+CNB が決めているのは仕様とその実装の枠組みで、個々の buildpack は別の団体が作ります。
+
+| 名前 | 何か |
+| --- | --- |
+| **pack** | CNB 公式のコマンドラインツール |
+| **Paketo Buildpacks** | Cloud Foundry 系の buildpack 群。Spring Boot の `bootBuildImage` が既定で使う |
+| **Heroku の buildpack** | Heroku が CNB 仕様で作り直したもの |
+| **Google Cloud の buildpacks** | Cloud Run の `gcloud run deploy --source` が、Dockerfile が無いときに使う（[Google Cloud](https://docs.cloud.google.com/run/docs/deploying-source-code)） |
+
+## 登場人物
+
+CNB には、似た名前の部品がいくつも出てきます。整理すると次のようになります。
+
+```
+ builder（1 つのイメージ）
+ ┌─────────────────────────────────────────────┐
+ │  lifecycle        ビルド全体を進める実行ファイル │
+ │  buildpack 群     Node.js, Go, Java, ...        │
+ │  ビルド用ベースイメージ  コンパイラや開発ヘッダ入り  │
+ └─────────────────────────────────────────────┘
+                     │ ビルドする
+                     ▼
+ アプリのイメージ
+ ┌─────────────────────────────────────────────┐
+ │  アプリの層         コンパイル結果、ソース        │
+ │  buildpack ごとの層  Node.js 本体、node_modules   │
+ │  実行用ベースイメージの層  OS の最小限のファイル     │
+ └─────────────────────────────────────────────┘
+```
+
+**ビルド用ベースイメージ**と**実行用ベースイメージ**が分かれている点が重要です。第 79 回のマルチステージビルドと同じ考え方で、コンパイラは実行時には要りません。
+
+以前はこの 2 つの組を **stack** と呼び、ID で管理していました。現在の仕様（Platform API 0.12）では stack という概念は廃止され、OS の名前、ディストリビューション、CPU アーキテクチャといった、コンテナイメージの世界に既にある情報で表すようになっています（[Cloud Native Buildpacks](https://buildpacks.io/docs/for-platform-operators/how-to/migrate/platform-api-0.11-0.12/)）。古い資料で stack という言葉を見たら、「ベースイメージの組」と読み替えてください。
+
+## lifecycle の 5 段階
+
+`pack build` を実行すると、builder のイメージの中で **lifecycle** が次の順に動きます（[Cloud Native Buildpacks](https://buildpacks.io/docs/for-buildpack-authors/concepts/lifecycle-phases/)）。
+
+| 段階 | すること |
+| --- | --- |
+| **analyze** | 前回ビルドしたイメージがあれば、そのメタデータを読む。レジストリに書き込めるかを確かめる |
+| **detect** | 各 buildpack の `/bin/detect` を順に実行し、どの buildpack を使うかを決める |
+| **restore** | 前回のイメージとキャッシュから、層を復元する |
+| **build** | 選ばれた buildpack の `/bin/build` を実行する。各 buildpack が自分の層を作る |
+| **export** | 層を重ねてイメージを作り、キャッシュを保存する |
+
+**detect** は、単に「このファイルがあるか」を見ているだけです。Node.js の buildpack なら `package.json` の有無を見て、ある場合に「Node.js の実行環境が必要だ」という計画を出します。複数の buildpack が組になって、計画を満たす組み合わせを探します。
+
+**build** では、buildpack ごとに**別々の層**を作ります。
+
+```
+層 5: アプリの層（ソースと成果物）
+層 4: node_modules          ← package-lock.json が変わらなければ再利用
+層 3: Node.js 本体 22.x      ← バージョンが変わらなければ再利用
+層 2〜1: 実行用ベースイメージ
+```
+
+Dockerfile では、命令の順番を工夫してキャッシュを効かせていました（第 79 回）。Buildpacks では、**buildpack が「この層は何に依存しているか」を知っている**ので、依存が変わっていない層は作り直しません。開発者が順番を考える必要はありません。
+
+## rebase: 層を差し替えるだけで済む理由
+
+ここがこの回の中心です。
+
+実行用ベースイメージ（Ubuntu の最小構成など）に脆弱性が見つかり、修正版が出たとします。Dockerfile の世界では、すべてのアプリを**ビルドし直す**必要があります。`FROM` が変わると、それより後の命令のキャッシュはすべて無効になるからです。
+
+Buildpacks には **rebase** という操作があります。
+
+```bash
+pack rebase my-app
+```
+
+やっていることは、**イメージの下の層を新しい実行用ベースイメージの層に取り替え、メタデータを書き換える**だけです。アプリの層には一切触りません。コンパイルもしません。
+
+```
+ rebase 前                        rebase 後
+ ┌────────────────┐              ┌────────────────┐
+ │ アプリの層       │  そのまま    │ アプリの層       │
+ │ Node.js の層     │  ────────→  │ Node.js の層     │
+ ├────────────────┤              ├────────────────┤
+ │ 実行用ベース v1   │  差し替え    │ 実行用ベース v2   │
+ └────────────────┘              └────────────────┘
+```
+
+第 77 回で見たとおり、イメージは**層の digest の並び**をマニフェストに書いたものです。層そのものは不変なので、マニフェストの下のほうの digest を入れ替えるだけで新しいイメージになります。アプリと新しいベースイメージが同じレジストリにあれば、層の転送すらほとんど要りません（[buildpacks/spec](https://github.com/buildpacks/spec/blob/main/platform.md)）。数百のサービスを数秒ずつで更新できます。
+
+### なぜ壊れないのか
+
+しかし、考えてみると乱暴な操作です。アプリの層には、**古いベースイメージの上でコンパイルされたバイナリ**が入っています。その下にある libc や OpenSSL を、アプリに断りなく差し替えている。
+
+これが成り立つのは、第 31 回で見た **ABI** の約束があるからです。
+
+アプリのバイナリが動的リンクしている `libc.so.6` は、第 29 回で見たとおり、起動のたびにローダが探して読み込みます。バイナリに埋め込まれているのは**名前と、ABI の約束**だけです。
+
+- 関数の引数をどのレジスタで渡すか
+- 構造体のメンバがどのオフセットにあるか
+- どのシンボルが存在するか
+
+これらが変わらない限り、**中身が修正された新しい `libc.so.6` を読み込んでも、アプリは同じように動きます**。ディストリビューションのセキュリティ更新が、アプリを再コンパイルせずに `apt upgrade` だけで済むのと同じ理屈です。共有ライブラリのファイル名の番号（`.so.6`）が変わらないのは、ABI が変わっていないという意味でした。
+
+CNB の仕様は、これを実行用ベースイメージの作者の**義務**として明記しています。
+
+> Base image authors MUST ensure that new run image versions maintain ABI-compatibility with previous versions.
+> （ベースイメージの作者は、実行用イメージの新しい版が以前の版と ABI 互換であることを保証しなければならない）
+>
+> — [Platform Interface Specification](https://github.com/buildpacks/spec/blob/main/platform.md)
+
+さらに、アプリや buildpack の層の振る舞いを変えてはならない（脆弱性の修正を除く）とも書かれています。rebase は、**ABI という第 5 章の約束の上に乗った運用**です。
+
+<Callout type="warn" title="rebase が安全でない場合">
+  約束が守られないと、rebase は壊れたイメージを作ります。
+
+  - ベースイメージのメジャーバージョンを上げる（Ubuntu 22.04 から 24.04 へ）。libc や OpenSSL の ABI が変わりうる
+  - アプリが、ベースイメージのファイルの中身や OS のパッケージの版に直接依存している
+
+  前者の場合は rebase ではなく**ビルドし直し**ます。仕様でも、SBOM から OS のパッケージが消える rebase は失敗させてよい、とされています。
+  **静的リンクしたバイナリ**は、そもそも下の層の libc を使わないので、rebase の恩恵も受けません。
+  脆弱性が見つかったら、バイナリごと作り直す必要があります。
+</Callout>
+
+## SBOM と再現性
+
+Buildpacks は、自分が何を入れたかを知っています。Node.js の何版を入れたか、`node_modules` に何が入ったか。そこで、ビルドのたびに **SBOM**（Software Bill of Materials、部品表）を生成し、イメージに添付します。
+
+```bash
+pack sbom download my-app      # イメージに付いた SBOM を取り出す
+```
+
+脆弱性が公表されたとき、「どのサービスがこのライブラリのこの版を含むか」を、イメージを走査せずに部品表から引けます。
+
+もう一つが**再現性**です。同じ入力からは、同じ digest のイメージができるべきです。しかし、ファイルの更新時刻やイメージの作成日時が入ると、中身が同じでも digest が変わります。CNB の仕様は、これらを**実際の時刻ではなく定数にすべき**と定めています（[buildpacks/spec](https://github.com/buildpacks/spec/blob/main/platform.md)）。
+
+```bash
+docker images my-app
+# REPOSITORY   TAG      IMAGE ID       CREATED        SIZE
+# my-app       latest   3f2a...        46 years ago   210MB
+```
+
+作成日時が「46 年前」と表示されるのは、1980 年 1 月 1 日という固定値が入っているからです。壊れているのではなく、**再現性のために時刻を捨てた**結果です。
+
+## CPU アーキテクチャ
+
+第 80 回で見たマルチアーキテクチャの問題は、Buildpacks にもあります。buildpack は Node.js 本体のような**ネイティブバイナリを取ってきて層に入れる**ので、アーキテクチャごとに正しいものを選ぶ必要があります。
+
+対応は後から進みました。Heroku の `heroku/builder:24` は amd64 と arm64 の両方に対応しており、Apple Silicon の Mac で `pack build` すれば arm64 のイメージができます。ただし、**別のアーキテクチャのイメージを作ることは基本的にできません**。エミュレーション（QEMU）が使える環境なら、遅くなりますが可能です（[heroku/buildpacks](https://github.com/heroku/buildpacks/discussions/25)）。
+
+```bash
+pack build my-app --platform linux/arm64 --builder heroku/builder:24
+```
+
+Dockerfile なら第 80 回のクロスコンパイルの技法で「amd64 のマシンで arm64 のイメージを作る」ことができますが、Buildpacks では builder に任せる分、その自由が効きにくいということです。
+
+## どちらを選ぶか
+
+| 観点 | Dockerfile | Buildpacks |
+| --- | --- | --- |
+| 手順を書くのは誰か | アプリの開発者 | buildpack の作者 |
+| 自由度 | 何でもできる | buildpack が想定した範囲 |
+| サービス間の統一 | 各自の書き方次第 | 同じ builder なら揃う |
+| ベースイメージの更新 | 全サービスをビルドし直す | rebase で下の層だけ差し替え |
+| SBOM | 別の道具で生成する | 標準で付く |
+| 特殊な依存（独自のネイティブライブラリなど） | 自分で入れられる | buildpack を書くか、拡張が必要 |
+
+目安は次のとおりです。
+
+- **サービスが多く、多くは典型的な Web アプリ**。ベースイメージの更新を一斉に回したい。Buildpacks が向きます
+- **システムの深いところに依存がある**。特殊なライブラリ、GPU のドライバ、独自のビルド手順。Dockerfile が向きます
+- **とりあえず動かしたい**。Cloud Run の `--source` や Spring Boot の `bootBuildImage` は、内部で Buildpacks を使っています。気づかずに使っていることも多いはずです
+
+<Callout type="note" title="Dockerfile か Buildpacks かは、誰の責任かの話">
+  Dockerfile は「イメージの中身はアプリの開発者の責任」、
+  Buildpacks は「OS と言語の実行環境はプラットフォーム側の責任、アプリの層だけが開発者の責任」という分担です。
+  rebase は、この分担を**層の境界**として物理的に表したものと言えます。
+</Callout>
+
+## まとめ
+
+- Buildpacks は、ソースコードから言語を判定し、イメージを組み立てる。手順を書くのは buildpack の作者
+- builder は lifecycle と buildpack 群とビルド用ベースイメージをまとめたもの。実行用ベースイメージは別
+- stack という用語は廃止され、OS やアーキテクチャの情報で表すようになった
+- lifecycle は analyze / detect / restore / build / export の 5 段階で動く。buildpack ごとに層を作る
+- rebase は、アプリの層に触らずに実行用ベースイメージの層だけを差し替える。ABI 互換の約束があるから成り立つ
+- SBOM が標準で付き、時刻を固定して再現性を保つ
+- 別のアーキテクチャ向けのビルドは苦手
+
+次は、でき上がったイメージをコンテナとして動かしたとき、cgroup の制限が**実際にどう効くのか**を見ます。

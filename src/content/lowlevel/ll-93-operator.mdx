@@ -1,0 +1,243 @@
+---
+title: 自分でコントローラを書く
+description: Kubernetes に新しい種類の物を教え、その物のための調整ループを書く。CRD、Operator、冪等性、そして API サーバの手前に割り込む webhook
+chapter: cloud
+order: 8
+status: published
+topics:
+  - CRD
+  - カスタムリソース
+  - Operator パターン
+  - 冪等性
+  - 楽観的並行性制御
+  - オーナー参照
+  - finalizer
+  - admission webhook
+  - リーダー選出
+requires:
+  - ll-86-reconcile
+  - ll-92-stateful
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 人間の手順を、ループにする
+
+前回の最後で、データベースの運用には固有の知識が要ると書きました。
+
+- 主が落ちたら、最も複製が進んでいる従を選んで昇格させる
+- バージョンを上げるときは、従から 1 台ずつ。最後に主を切り替える
+- 毎晩バックアップを取り、7 日分だけ残す
+
+これらは、これまで**人間の運用者**が手順書を見ながらやってきた仕事です。**Operator パターン**は、この知識をプログラムに書き、Kubernetes の中で動かすという考え方です（[Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/)）。
+
+道具は 2 つだけです。
+
+1. **カスタムリソース**: 「PostgreSQL のクラスタ」のような新しい種類の物を、Kubernetes の API に足す
+2. **コントローラ**: その物のあるべき姿と今の姿を比べて、差を埋める調整ループ
+
+2 つ目は、第 86 回で見た仕組みそのものです。Deployment のコントローラが「Pod が 3 つあるべき」を実現しているのと、まったく同じ形で書きます。**Kubernetes の組み込みの機能も、同じ部品でできています。** 組み込みか、後から足したかの違いしかありません。
+
+## 新しい種類の物を足す: CRD
+
+まず、API に新しい種類を登録します。**CRD**（CustomResourceDefinition）は、「こういう形の物を受け付けてほしい」という定義です。
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: pgclusters.example.com
+spec:
+  group: example.com
+  names: { kind: PGCluster, plural: pgclusters }
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:          # 受け付ける形。違反すれば API サーバが拒否する
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas: { type: integer, minimum: 1 }
+                version:  { type: string }
+```
+
+これを登録すると、API サーバは `PGCluster` という種類を受け付けるようになります。
+
+```yaml
+apiVersion: example.com/v1
+kind: PGCluster
+metadata: { name: orders }
+spec:
+  replicas: 3
+  version: "17"
+```
+
+`kubectl get pgclusters` で一覧が出て、etcd に保存され、watch で変更を受け取れます。**組み込みの Pod や Service と同じ扱い**です。
+
+ただし、これだけでは何も起きません。公式の文書が言うとおり、カスタムリソースは単体では**構造化されたデータを保存して取り出せるだけ**です（[Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/)）。「3 台のクラスタがあるべき」と書いても、それを読んで動く者がいなければ、ただのメモです。
+
+## 動く者を書く: 調整関数
+
+コントローラの中心は、1 つの関数です。
+
+```go
+// 対象の名前だけを受け取る。「何が変わったか」は受け取らない
+func Reconcile(name string) (requeueAfter time.Duration, err error) {
+    want, err := get[PGCluster](name)          // あるべき姿
+    if notFound(err) { return 0, nil }          // もう無いなら何もしない
+
+    have := listPods(labelSelector(name))       // 今の姿
+
+    switch {
+    case len(have) < want.Spec.Replicas:
+        createPod(nextOrdinal(have))            // 足りない分を 1 つ作る
+        return 5 * time.Second, nil             // 少し待ってから見直す
+    case primaryDown(have):
+        promote(mostCaughtUp(have))             // 人間の知識を書く場所
+        return 5 * time.Second, nil
+    }
+
+    updateStatus(name, observe(have))           // 見た結果を status に書く
+    return 5 * time.Minute, nil                 // 何もなくても定期的に見直す
+}
+```
+
+この関数の形には、第 86 回で見た考え方がそのまま出ています。
+
+**変化ではなく名前を受け取る。** 「Pod が 1 つ消えた」というイベントの中身は渡されません。渡されるのは「`orders` を見直せ」という名前だけです。関数は毎回、**あるべき姿と今の姿をゼロから読み直して**比べます。イベントを取りこぼしても、重複して届いても、次に呼ばれたときに正しい状態へ向かいます。第 45 回のエッジトリガとレベルトリガの区別でいえば、**レベルトリガ**の書き方です。
+
+**1 回で全部やろうとしない。** 足りない Pod を 1 つ作ったら、いったん戻ります。作った Pod が起動するのを待ってから、また呼ばれて続きをやります。
+
+### 何度呼ばれても同じ結果になるように
+
+この関数は、**いつ、何回呼ばれるか分かりません**。同じ名前で連続して呼ばれることも、途中でコントローラが再起動して最初からやり直すこともあります。
+
+したがって、関数は**冪等**でなければなりません。同じ状態に対して何度実行しても、結果が同じになるということです。
+
+| 冪等でない書き方 | 冪等な書き方 |
+| --- | --- |
+| 「Pod を 1 つ作る」 | 「`orders-2` という名前の Pod が無ければ作る」 |
+| 「バックアップを取る」 | 「今日の日付のバックアップが無ければ取る」 |
+| 「カウンタを 1 増やす」 | 「観測した台数を status に書く」 |
+
+名前を決めてから作るのが定石です。同じ名前の物は 2 つ作れないので、2 回実行しても 2 つ目は失敗するだけで済みます。第 50 回で見た「一時ファイルに書いて `rename`」と同じく、**何度やり直しても壊れない手順**を組み立てるという発想です。
+
+### 書き込みが衝突したら
+
+コントローラと人間が、同時に同じ物を書き換えることがあります。Kubernetes はここでロックを取りません。代わりに、すべての物が `resourceVersion` という版の印を持っています（[API conventions](https://github.com/kubernetes/community/blob/main/contributors/devel/sig-architecture/api-conventions.md)）。
+
+```
+1. 読む        → resourceVersion: "812"
+2. 書き換える
+3. 書き込む    → 「812 のつもりで書く」
+                  間に誰かが書いていたら、409 Conflict で拒否される
+```
+
+拒否されたら、読み直してやり直します。**楽観的並行制御**と呼ばれる方式です。第 37 回で見た compare-and-swap（比較して一致したら書く）を、API の単位でやっているのと同じです。調整関数は最初から「読み直してやり直す」形をしているので、衝突したら単に次の呼び出しに任せれば済みます。
+
+## 片付けの仕組み
+
+作った物は、いつか消す必要があります。
+
+**オーナー参照。** コントローラが作った Pod には、「この Pod の持ち主は `PGCluster/orders` である」という参照を付けておきます。持ち主が削除されると、Kubernetes のガベージコレクタが、持ち主のいなくなった物を自動で消します。第 26 回の GC と同じく、**参照を辿って、辿れなくなった物を回収する**仕組みです。
+
+**finalizer。** しかし、クラスタの外にある物（クラウドのディスク、外部のバックアップ）は、Kubernetes のガベージコレクタには見えません。そこで、削除の前に後始末をする機会を作ります（[Kubernetes](https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/)）。
+
+1. 物に finalizer という印を付けておく
+2. 削除が要求されると、API サーバはすぐには消さず、`deletionTimestamp` を付けて「削除中」にする
+3. コントローラがそれを見て、外部の後始末をする
+4. 終わったら finalizer を外す。すべて外れた時点で、実際に消える
+
+<Callout type="warn" title="finalizer を外すコントローラがいなくなると、消えない">
+  コントローラを先にアンインストールしてから物を消そうとすると、
+  finalizer を外す者がいないので、物は「削除中」のまま永遠に残ります。
+  **片付ける者を先に片付けてはいけない**、という順序の問題です。
+</Callout>
+
+## 状態を報告する: status
+
+カスタムリソースには、**spec**（あるべき姿、人間が書く）と **status**（観測した姿、コントローラが書く）の 2 つの欄を分けて持たせるのが慣習です。
+
+```yaml
+spec:
+  replicas: 3
+status:
+  readyReplicas: 2
+  primary: orders-0
+  observedGeneration: 7     # どの版の spec を見て書いた status か
+  conditions:
+    - type: Ready
+      status: "False"
+      reason: ReplicaCatchingUp
+```
+
+`observedGeneration` は地味ですが重要です。spec を書き換えた直後の status は、**まだ古い spec に対する結果**かもしれません。この値が spec の版に追いつくまでは、status を信用しないという判断ができます。
+
+## コントローラ自身を冗長にする
+
+コントローラが 1 つしか動いていなければ、それが落ちている間は誰も調整しません。かといって 2 つ動かすと、**同じ物を 2 人が同時に調整する**ことになります。
+
+そこで、複数を起動しておき、**同時に動くのは 1 つだけ**にします。Kubernetes の組み込みのコントローラも同じ方法を取っていて、Lease という物を取り合い、取れたものだけが動き、残りは待機します（[Kubernetes](https://kubernetes.io/docs/concepts/architecture/leases/)）。<a href={`${import.meta.env.BASE_URL}reading/consensus/`}>分散合意</a>で見たリーダー選出を、etcd の上で簡単に済ませている形です。
+
+## API サーバの手前に割り込む: admission webhook
+
+コントローラは、物が**保存された後**に動きます。しかし、**保存される前**に口を出したいこともあります。
+
+- 「CPU の limits が無い Pod は受け付けない」
+- 「すべての Pod に、既定のラベルを付け足す」
+
+これを実現するのが **admission webhook** です。API サーバは、要求を受け取ってから etcd に保存するまでの間に、登録された外部の HTTP サーバを呼び出します（[Kubernetes](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)）。
+
+```
+kubectl apply
+    │
+    ↓
+ API サーバ ─ 認証・認可
+    │
+    ├→ mutating webhook   … 書き換えてよい（既定値を足す、サイドカーを差し込む）
+    │
+    ├─ スキーマの検証
+    │
+    ├→ validating webhook … 書き換えず、許すか拒否するかだけ
+    │
+    ↓
+  etcd に保存 → watch で各コントローラに届く
+```
+
+順番に意味があります。**書き換える側が先、判定する側が後**です。判定する側は、すべての書き換えが終わった最終形を見て決められます。第 90 回で見たサイドカーの自動注入は、mutating webhook が Pod の定義に 1 つコンテナを書き足している、ということです。
+
+<Callout type="warn" title="webhook は API サーバの通り道にある">
+  webhook のサーバが落ちると、そこを通る要求がすべて止まる可能性があります。
+  「失敗したら拒否する」設定にしていれば、Pod を 1 つも作れなくなります。
+  しかも、その webhook のサーバ自身も Pod として動いていることが多く、
+  **自分を直すための Pod が作れない**という状態に陥ることがあります。
+  便利な割り込み口ほど、障害の影響範囲が広くなります。
+</Callout>
+
+## どこまで自動化するか
+
+Operator は強力ですが、書くのは簡単ではありません。
+
+- 調整関数は、**あらゆる途中の状態から**正しい方向に進めなければならない。「昇格の途中でコントローラが落ちた」も含めて
+- 人間なら状況を見て判断することを、すべて条件分岐に落とす必要がある
+- 間違えたとき、人間の運用者よりはるかに速く、広い範囲を壊す
+
+したがって、定型的で頻繁な作業（台数の維持、定期的なバックアップ）から自動化し、まれで判断が要る作業（データの復旧）は人間の確認を挟む、という線引きがよく取られます。
+
+## まとめ
+
+- Operator は、人間の運用手順をカスタムリソースとコントローラで書いたもの
+- CRD で新しい種類を API に足す。単体ではデータを保存するだけで、動かすのはコントローラ
+- 調整関数は名前だけを受け取り、毎回ゼロから読み直して比べる。レベルトリガの書き方
+- 何度呼ばれても同じ結果になる冪等な手順にする。名前を決めてから作る
+- 書き込みの衝突は resourceVersion による楽観的並行制御。拒否されたら読み直す
+- オーナー参照で中の物を、finalizer で外の物を片付ける
+- spec はあるべき姿、status は観測した姿。observedGeneration で古い status を見分ける
+- admission webhook は保存の前に割り込む。書き換えが先、判定が後。落ちると通り道が塞がる
+
+次は、調整ループの中でも最もよく使われるもの、負荷に合わせて台数を増減させる仕組みを見ます。

@@ -60,6 +60,8 @@ import DebounceThrottle from '../../components/sim/problems/DebounceThrottle'
 
 問題は 2 番です。1 つの要素の幅が変わると、その影響が周囲に広がります。100 個の要素を 1 つずつ書き換えると、この計算が何度も走ります。
 
+この 4 段がブラウザの中でどう動いているのか、何を変えるとどの段からやり直しになるのかは、低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-63-rendering-pipeline/`}>レンダリングパイプライン</a>の回で詳しく扱っています。
+
 そこで、こう考えます。
 
 > **DOM を触る回数そのものを減らす。** 必要な変更だけをまとめて、1 回で適用する
