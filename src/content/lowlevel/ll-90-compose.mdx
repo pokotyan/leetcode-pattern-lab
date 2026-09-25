@@ -1,0 +1,301 @@
+---
+title: Compose で複数を束ねる
+description: docker run を何行も並べる代わりに、あるべき姿を 1 つのファイルに書く。Compose は何を覚えていて、何をしてくれないのか
+chapter: ship
+order: 6
+status: published
+topics:
+  - Compose Specification
+  - docker compose（v2 以降）
+  - プロジェクト名 / ラベル
+  - 既定ネットワークとサービス名の解決
+  - depends_on / healthcheck
+  - 変数展開 / env ファイル
+  - override / include / profiles
+  - develop.watch
+requires:
+  - ll-89-network-storage
+  - ll-87-dockerfile
+---
+
+import Callout from '../../components/Callout.astro'
+
+## docker run を並べると何が辛いか
+
+Web アプリとデータベースを手で動かすと、次のようになります。
+
+```bash
+docker network create myapp
+docker volume create pgdata
+docker run -d --name db --network myapp -v pgdata:/var/lib/postgresql/data \
+  -e POSTGRES_PASSWORD=example postgres:17-alpine
+docker build -t myapp-web .
+docker run -d --name web --network myapp -p 8080:3000 \
+  -e DATABASE_URL=postgres://postgres:example@db:5432/postgres myapp-web
+```
+
+前回見たとおり、名前で繋ぐにはネットワークを自分で作る必要があり、データを残すにはボリュームが要ります。これを毎回、正しい順番で打つのは現実的ではありません。止めるとき、作り直すときも同じだけの手間がかかります。
+
+**Compose** は、これを 1 つのファイルに **あるべき姿として** 書く道具です。
+
+```yaml
+# compose.yaml
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  web:
+    build: .
+    ports:
+      - "8080:3000"
+    environment:
+      DATABASE_URL: postgres://postgres:example@db:5432/postgres
+
+volumes:
+  pgdata:
+```
+
+`docker compose up` と打つと、ネットワークとボリュームを作り、イメージをビルドし、コンテナを起動します。手順ではなく **結果** を書いておき、今の状態との差を Compose が埋める、という考え方です。
+
+## Compose の 2 つの顔: ファイルの仕様と、それを読む道具
+
+「Compose」という言葉は 2 つのものを指します。
+
+| | 何か | 現在 |
+| --- | --- | --- |
+| ファイルの形式 | `compose.yaml` に何をどう書くか | **Compose Specification**（[compose-spec.io](https://compose-spec.io/)）として独立した仕様 |
+| 道具 | そのファイルを読んで Docker に指示を出すプログラム | `docker compose`（Docker CLI のプラグイン、Go 製） |
+
+道具のほうには歴史があります。もともとは Python で書かれた `docker-compose`（ハイフン付き）という別のコマンドでした。Go で書き直された Compose V2 が `docker compose`（スペース区切り）として Docker CLI に組み込まれ、Python 版は 2023 年 7 月にサポートが終了しています（[Docker Blog](https://www.docker.com/blog/new-docker-compose-v2-and-v1-deprecation/)）。
+
+<Callout type="note" title="version: はもう書かない">
+  古い Compose ファイルの先頭には `version: "3.8"` のような行があります。
+  これはファイル形式の版で、Python 版の時代には意味がありました。
+  今の Compose は常に最新の仕様で読むため、この行は無視され、書くと警告が出ます
+  （[Docker Docs](https://docs.docker.com/reference/compose-file/version-and-name/)）。
+
+```
+the attribute `version` is obsolete, it will be ignored,
+please remove it to avoid potential confusion
+```
+
+  ちなみに道具の版は、V2 の次が v5 です。ファイル形式の 2.x、3.x と紛らわしいため、
+  3 と 4 を飛ばしています（[Compose v5.0.0 リリースノート](https://github.com/docker/compose/releases/tag/v5.0.0)）。
+</Callout>
+
+## Compose は状態をどこに覚えているのか
+
+`docker compose down` は、自分が作ったコンテナだけを正確に消します。では、「自分が作ったもの」をどこに記録しているのか。
+
+答えは、**どこにも記録していません**。代わりに、作ったコンテナやネットワークに **ラベル** を貼っておき、次に呼ばれたときに Docker に問い合わせて探します。
+
+```bash
+docker inspect cdemo-web-1 --format '{{json .Config.Labels}}'
+# "com.docker.compose.project": "cdemo"
+# "com.docker.compose.service": "web"
+# "com.docker.compose.container-number": "1"
+# "com.docker.compose.config-hash": "0df62ea0..."
+# ...
+```
+
+- **project**：プロジェクト名。既定では `compose.yaml` があるディレクトリ名
+- **service**：どのサービスのコンテナか
+- **config-hash**：そのコンテナを作ったときの設定のハッシュ
+
+`docker compose up` を再度実行すると、Compose は「プロジェクト名が一致するコンテナ」を探し、ファイルから計算した設定のハッシュと、ラベルに残ったハッシュを比べます。**一致すればそのまま、違えば作り直します**。設定を変えたサービスだけが再作成されるのは、この比較のおかげです。
+
+<Callout type="warn" title="プロジェクト名がぶつかる">
+  プロジェクト名はディレクトリ名から決まるので、
+  別の場所にある同じ名前のディレクトリ（たとえば `app`）から `docker compose up` すると、
+  **同じプロジェクトとして扱われ、互いのコンテナを上書きします**。
+  `-p` オプションか、ファイル先頭の `name:` で明示すると避けられます。
+</Callout>
+
+## サービス名で繋がる理由
+
+上のファイルで、`web` は `db:5432` という名前でデータベースに繋いでいます。この名前が引けるのは、前回見た組み込み DNS のおかげです。
+
+Compose は、プロジェクトごとに **`<プロジェクト名>_default`** というユーザ定義ネットワークを自動で作り、すべてのサービスをそこに繋ぎます。
+
+```bash
+docker compose config
+# ...
+# networks:
+#   default:
+#     name: cdemo_default
+```
+
+ユーザ定義ネットワークなので、コンテナ内の `127.0.0.11` の DNS がサービス名を解決します。
+
+```bash
+docker compose exec web nslookup db
+# Name:    db
+# Address: 172.19.0.2
+```
+
+ここで返るアドレスは、その時点で **動いている** `db` のコンテナのものです。`db` が起動に失敗して止まっていると、名前自体が見つからなくなります（`NXDOMAIN`）。「名前が引けない」は、多くの場合「相手が落ちている」の意味です。
+
+## 起動順と、準備ができたことは違う
+
+`depends_on` を書くと、起動の順番を指定できます。
+
+```yaml
+services:
+  web:
+    depends_on:
+      - db
+```
+
+ただしこれは、「**`db` のコンテナを起動してから** `web` を起動する」という意味でしかありません。コンテナが起動した瞬間は、PostgreSQL のプロセスが動き始めただけで、まだ接続を受け付けていません。`web` が起動直後に接続しに行くと、失敗します。
+
+プロセスが存在することと、仕事を受け付けられることは別の状態です。後者を判定するのが **healthcheck** です。
+
+```yaml
+services:
+  db:
+    image: postgres:17-alpine
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 15
+  web:
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+healthcheck を設定すると、Docker が定期的に **コンテナの中で** `test` のコマンドを実行し、終了コードが 0 なら healthy、失敗が続けば unhealthy と記録します。`condition: service_healthy` は、`db` が healthy になるまで `web` の起動を待たせます。
+
+```
+db:  起動 ── starting ── starting ── healthy
+                                       │
+web:                                   └── ここで初めて起動
+```
+
+<Callout type="tip" title="それでもアプリ側で再接続は必要">
+  healthcheck が守ってくれるのは、**最初の起動の順番**だけです。
+  動いている途中で `db` が再起動すれば、`web` の接続は切れます。
+  接続が失敗したら待って再試行する、という処理はアプリケーションの側に必要です。
+</Callout>
+
+## 変数と、環境ごとの差分
+
+### 変数展開
+
+ファイルの中では `${変数}` の形でシェルの環境変数を参照できます。同じディレクトリの `.env` ファイルに書いた値も読まれます。
+
+```yaml
+services:
+  web:
+    image: myapp:${TAG:-latest}   # TAG が未設定なら latest
+```
+
+ここで混同しやすいのが、**2 種類の「環境変数」** です。
+
+| 書き方 | 誰が使うか | いつ効くか |
+| --- | --- | --- |
+| `.env` と `${...}` | Compose 自身 | ファイルを読むとき（値が埋め込まれる） |
+| `environment:` / `env_file:` | コンテナの中のプロセス | コンテナの起動時（第 30 回で見た、execve に渡す環境変数になる） |
+
+`.env` に書いた値は、`${...}` で参照しない限りコンテナの中には届きません。
+
+### override ファイル
+
+`compose.yaml` と同じ場所に `compose.override.yaml` があると、Compose は自動で 2 つを **マージ** します。開発用の設定だけを別ファイルに分けられます。
+
+マージの規則は項目ごとに違い、直感と合わないことがあります（[Docker Docs](https://docs.docker.com/reference/compose-file/merge/)）。
+
+```yaml
+# compose.yaml                     # compose.override.yaml
+services:                          services:
+  web:                               web:
+    ports: ["8080:80"]                 ports: ["9090:80"]
+    environment:                       environment:
+      TAG: latest                        DEBUG: "1"
+```
+
+```bash
+docker compose config
+# environment:  DEBUG と TAG の両方が残る（キーごとにマージ）
+# ports:        8080 と 9090 の両方が公開される（上書きではなく追加）
+```
+
+`ports` は置き換わらず、**足し算**になります。本当に置き換えたいときは、`!override` というタグを使います。消したいときは `!reset` です。
+
+```yaml
+services:
+  web:
+    ports: !override ["9090:80"]   # 8080 は消え、9090 だけになる
+```
+
+### include と profiles
+
+- **include**：別の Compose ファイルを、そのまま取り込む。別チームが管理するサービス群を、自分のファイルを書き換えずに組み込める（Compose 2.20 以降、[Docker Docs](https://docs.docker.com/reference/compose-file/include/)）
+- **profiles**：サービスに `profiles: [debug]` のように印を付けると、`--profile debug` を指定したときだけ起動する。管理画面や負荷試験用のツールなど、普段は要らないものに使う
+
+## 開発中の変更を反映する: develop.watch
+
+ソースコードを変えるたびに `docker compose up --build` し直すのは手間です。前回見たように、バインドマウントでソースを見せる方法もありますが、Docker Desktop では遅くなりがちです。
+
+Compose 2.22 以降では、`develop.watch` で **ファイルの変更を監視して、決めた動作をさせる** ことができます（[Docker Docs](https://docs.docker.com/reference/compose-file/develop/)）。
+
+```yaml
+services:
+  web:
+    build: .
+    develop:
+      watch:
+        - action: sync          # ソースの変更はコンテナにコピーするだけ
+          path: ./src
+          target: /app/src
+        - action: rebuild       # 依存の定義が変わったらイメージから作り直す
+          path: package.json
+```
+
+| action | 何をするか |
+| --- | --- |
+| `sync` | 変わったファイルを、動いているコンテナにコピーする |
+| `rebuild` | イメージをビルドし直し、コンテナを作り直す |
+| `restart` | コンテナを再起動する |
+| `sync+restart` | コピーしてから再起動する |
+
+バインドマウントとの違いは、**ファイルを共有していない** ことです。変更があったファイルだけを、その都度コンテナの中にコピーします。コンテナは自分のファイルシステムの中のファイルを読むので、ファイル共有の遅さの影響を受けません。
+
+`build:` の設定は、第 87 回で見た BuildKit にそのまま渡されます。Compose v5 では Compose 内部のビルド処理がなくなり、`docker build` と同じ経路（Bake）に一本化されました（[Compose v5.0.0 リリースノート](https://github.com/docker/compose/releases/tag/v5.0.0)）。
+
+## Compose がやらないこと
+
+Compose は **1 台の Docker Engine** に対して指示を出す道具です。次のことはやりません。
+
+- 複数のマシンにコンテナを振り分ける
+- マシンが落ちたときに、別のマシンでコンテナを立て直す
+- 負荷に応じてコンテナの数を自動で増減させる
+
+これらを担うのが、**Kubernetes** のようなオーケストレータです。ただし考え方は地続きです。
+
+| Compose | Kubernetes |
+| --- | --- |
+| `compose.yaml` にあるべき姿を書く | マニフェストにあるべき姿を書く |
+| ラベルで自分の作ったものを探す | ラベルとセレクタで対象を選ぶ |
+| healthcheck | readiness / liveness probe |
+| サービス名で DNS を引く | Service 名で DNS を引く |
+| `network_mode: service:x` で名前空間に相乗り | Pod の中のコンテナが Network 名前空間を共有する |
+
+**あるべき姿を宣言し、現在の状態との差を埋める**という仕組みは同じで、それを 1 台で一度だけやるか、多数のマシンでずっとやり続けるかの違いです。多数のマシンでやり続ける側の仕組みは、第 16 章で詳しく見ます。
+
+## まとめ
+
+- Compose は、コンテナ・ネットワーク・ボリュームのあるべき姿を 1 つのファイルに書く道具
+- ファイル形式は Compose Specification。道具は Go 製の `docker compose`。Python 版と `version:` は過去のもの
+- Compose は状態を保存せず、ラベルで自分の作ったものを探し、設定のハッシュで差分を判定する
+- プロジェクトごとの既定ネットワークと組み込み DNS により、サービス名で繋がる
+- `depends_on` は起動の順番だけ。準備完了を待つには healthcheck と `service_healthy`
+- `.env` は Compose が読む変数、`environment:` はコンテナに渡す変数
+- override のマージは項目ごとに規則が違う。`ports` は足し算になる
+- `develop.watch` はファイルを共有せず、変更をコピーして反映する
+- 複数マシンへの配置と自己修復は Compose の範囲外で、Kubernetes の領分
+
+ここまでは Dockerfile を自分で書く前提でした。次は、Dockerfile を書かずにイメージを作る Buildpacks を見ます。

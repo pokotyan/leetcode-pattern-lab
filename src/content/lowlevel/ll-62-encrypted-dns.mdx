@@ -1,0 +1,308 @@
+---
+title: 覗かれない問い合わせ
+description: 前回の DNSSEC で答えの偽造は見破れるようになりました。では、どの名前を引いたかは誰に見えているのか。DNS を TLS、HTTPS、QUIC に載せる 3 つの方法と、それでも残る SNI、そして暗号化で本当に変わるものを見る
+chapter: dns
+order: 7
+status: published
+topics:
+  - DNS over TLS（DoT）
+  - DNS over HTTPS（DoH）
+  - DNS over QUIC（DoQ）
+  - 分割 DNS
+  - SNI
+  - Encrypted Client Hello（ECH）
+  - Oblivious DoH（ODoH）
+  - QNAME 最小化
+requires:
+  - ll-61-dnssec
+  - ll-57-dns-message
+  - ll-54-tcp-flow
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 署名は中身を隠さない
+
+前回の DNSSEC は、答えに署名を付けて**偽物を見破る**仕組みでした。しかし署名された答えも、問い合わせそのものも、UDP の 53 番を**平文のまま**流れています。
+
+第 57 回で自分で組んだメッセージを思い出してください。質問部には `example.com` という名前が、ラベル形式でそのまま入っていました。経路の途中でパケットを 1 つ拾えば、誰がどの名前を引いたかがそのまま読めます。
+
+この回では、**問い合わせを覗かれないようにする**方法を見ます。そして最後に、それが本当に「誰にも見られない」ことを意味するのかを考えます。
+
+## 平文の DNS で、誰に何が見えるか
+
+スマートフォンから `bank.example` を引くとき、問い合わせは次の順に渡っていきます。
+
+```
+端末 ──→ Wi-Fi のルータ ──→ 回線事業者の網 ──→ フルリゾルバ ──→ ルート / TLD / 権威
+     ①                 ②                  ③             ④
+```
+
+| 見ている者 | 見えるもの |
+| --- | --- |
+| ① 同じ Wi-Fi にいる人、ルータ | 端末の IP と、引いた名前すべて |
+| ② 経路上の事業者 | 同上。書き換えて偽の答えを返すこともできる |
+| ③ フルリゾルバの運営者 | 端末の IP と、引いた名前すべて。記録として残せる |
+| ④ 権威サーバ | フルリゾルバの IP と、自分の担当範囲の名前 |
+
+④ については、フルリゾルバ側で漏れを減らす工夫があります。**QNAME 最小化**です。ルートに `www.bank.example` をまるごと聞く必要はなく、「`example` はどこか」だけ聞けば十分なので、各段には必要な部分だけを送ります（[RFC 9156](https://datatracker.ietf.org/doc/html/rfc9156)）。
+
+残る問題は ①〜③ です。**端末からフルリゾルバまでの区間**が平文であること。この区間を暗号化するのが、この回の主題です。
+
+<Callout type="note" title="DNSSEC はこの区間をほとんど守っていない">
+  DNSSEC の検証は、多くの場合フルリゾルバが行います。
+  端末のスタブリゾルバは、フルリゾルバが検証済みの印（AD ビット）を付けて返した答えを信じるだけです。
+  つまり**フルリゾルバから端末までの最後の区間**では、書き換えられても端末は気づけません。
+  この区間を暗号化すると、盗み見と同時にこの書き換えも防げます。
+</Callout>
+
+## 3 つの運び方
+
+DNS メッセージの中身（第 57 回で組んだバイト列）は変えずに、**何に載せて運ぶか**だけを変えるのが基本の考え方です。
+
+```
+             平文の DNS     DoT          DoH              DoQ
+メッセージ    DNS           DNS          DNS              DNS
+                                         HTTP/2 or /3
+                            TLS          TLS              QUIC（TLS 1.3 を内蔵）
+             UDP / TCP      TCP          TCP  or  UDP     UDP
+ポート        53            853          443              853
+```
+
+| | 規格 | ポート | 特徴 |
+| --- | --- | --- | --- |
+| DoT | [RFC 7858](https://datatracker.ietf.org/doc/html/rfc7858)（2016 年） | TCP 853 | 専用ポート。DNS だと一目で分かる |
+| DoH | [RFC 8484](https://datatracker.ietf.org/doc/html/rfc8484)（2018 年） | TCP/UDP 443 | ふつうの HTTPS に紛れる |
+| DoQ | [RFC 9250](https://datatracker.ietf.org/doc/html/rfc9250)（2022 年） | UDP 853 | TCP の HOL ブロッキングがない |
+
+### DoT: TLS の中で、TCP の DNS をそのまま
+
+DoT は、**TCP で DNS を送るときの形式をそのまま TLS の中に入れた**ものです。第 57 回で見たとおり、TCP の DNS はメッセージの前に長さを 2 バイト付けます。DoT もまったく同じです。
+
+TCP と TLS のハンドシェイクで往復が増えるので、RFC 7858 は**接続を閉じずに使い回す**よう求めています。第 53 回で見た keep-alive と同じ理由です。
+
+弱点は、**853 番という専用のポート**です。経路上の機器は、中身が読めなくても「これは DNS だ」と分かります。ポートを塞げば、端末は平文に戻るか、名前を引けなくなるかのどちらかです。
+
+### DoH: HTTPS の 1 リクエストとして
+
+DoH は、DNS メッセージを **HTTP の本文**として送ります。メディアタイプは `application/dns-message` で、本文は第 57 回と同じバイト列です。
+
+```
+POST /dns-query HTTP/2
+content-type: application/dns-message
+accept: application/dns-message
+
+<DNS メッセージのバイト列>
+```
+
+`GET` も使えます。その場合はメッセージを base64url で符号化して、`dns` というパラメータに入れます。
+
+```
+GET /dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE
+```
+
+仕様には細かい工夫があります。**ヘッダの ID を 0 にする**よう勧めているのです（RFC 8484 の 4.1 節）。UDP では ID が偽の応答を弾く役目を持っていましたが（前回）、HTTPS の上では応答は必ず自分のリクエストに対応して返ってきます。ID を毎回変えると、中身が同じ問い合わせでも HTTP のキャッシュから見て別物になってしまうため、0 に揃えて使い回せるようにしています。
+
+**DoH の強みは、区別がつかないこと**です。443 番の TLS の中身は外から読めないので、外から見るとふつうの Web の通信と見分けがつきません。DoH だけを塞ぐには、既知の DoH サーバの IP やホスト名を一つずつ遮断するしかありません。
+
+### DoQ: QUIC に載せる
+
+DoQ は、QUIC の上に DNS を直接載せます。1 つの問い合わせに 1 つのストリームを使い、ここでも ID は 0 と決められています。
+
+利点は第 54 回で見た QUIC の利点そのものです。TCP の上では、1 つのパケットが失われると後ろの応答がすべて待たされます（HOL ブロッキング）。QUIC ではストリームごとに独立しているので、失われた問い合わせだけが待たされます。
+
+<Callout type="warn" title="暗号化しても大きさは見える">
+  TLS は中身を隠しますが、**パケットの大きさと時刻**は隠しません。
+  名前の長さや応答の大きさから、どのサイトかを推測される余地が残ります。
+  そこで EDNS0 に**パディング**（詰め物）を入れて大きさを揃える仕組みがあります（[RFC 7830](https://datatracker.ietf.org/doc/html/rfc7830)）。
+  推奨される方式では、問い合わせを 128 バイト、応答を 468 バイトの倍数に揃えます（[RFC 8467](https://datatracker.ietf.org/doc/html/rfc8467)、実験的な位置づけ）。
+</Callout>
+
+## 手元で確かめる
+
+Python の標準ライブラリだけで、同じ問い合わせを DoH と DoT の両方で送ってみます。メッセージの組み立ては第 57 回と同じです。
+
+```python
+import socket, ssl, struct, urllib.request
+
+def query(name, qtype=1):
+    header = struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0)   # ID は 0、RD を立てる
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0"
+    return header + qname + struct.pack(">HH", qtype, 1)
+
+q = query("example.com")
+
+# DoH: HTTPS の POST 本文に、DNS メッセージをそのまま入れる
+req = urllib.request.Request(
+    "https://cloudflare-dns.com/dns-query", data=q,
+    headers={"content-type": "application/dns-message",
+             "accept": "application/dns-message"})
+print(urllib.request.urlopen(req).read().hex())
+
+# DoT: 853 番に TLS で接続し、TCP の DNS と同じく長さ 2 バイトを前置する
+ctx = ssl.create_default_context()
+raw = socket.create_connection(("1.1.1.1", 853))
+with ctx.wrap_socket(raw, server_hostname="cloudflare-dns.com") as s:
+    s.sendall(struct.pack(">H", len(q)) + q)
+    n = struct.unpack(">H", s.recv(2))[0]
+    print(s.recv(n).hex(), s.version())
+```
+
+応答を第 57 回と同じ要領で読むと、どちらからも同じ A レコードが出てきます（値は実行した時点のものです）。
+
+```
+DoH: ['172.66.147.243', '104.20.23.154']
+DoT: ['104.20.23.154', '172.66.147.243'] TLSv1.3
+```
+
+**運び方が違うだけで、中のメッセージは 1 バイトも変わっていない**ことが分かります。
+
+`curl` には、自分の名前解決を DoH で行うオプションもあります。`sudo tcpdump -i any -nn port 53` を別の端末で動かしながら実行すると、53 番に何も流れないことを確かめられます。
+
+```bash
+curl --doh-url https://cloudflare-dns.com/dns-query https://example.com/
+```
+
+## 誰が暗号化を決めるのか
+
+第 59 回で見たとおり、アプリケーションはふつう `getaddrinfo` を通じて OS に名前解決を任せます。暗号化も、本来は OS の設定で決まるはずです。
+
+ところがブラウザは、**自分の中に DoH のクライアントを持つ**ようになりました。
+
+- **Chrome** は 83 から、今使っている DNS の事業者が DoH も提供していれば、その DoH に自動で切り替えます。事業者は変えずに運び方だけを変える方式で、失敗すれば平文に戻ります。企業のポリシーが設定された端末や、Windows のペアレンタルコントロールが有効な端末では無効になります（[Chromium Blog](https://blog.chromium.org/2020/05/a-safer-and-more-private-browsing-DoH.html)）
+- **Firefox** は 2020 年、米国の利用者について、既定で Cloudflare の DoH を使い始めました（[Mozilla](https://blog.mozilla.org/en/products/firefox/firefox-continues-push-to-bring-dns-over-https-by-default-for-us-users/)）。こちらは**事業者ごと切り替える**方式です
+
+OS の側も追いついています。Android は 9 で「プライベート DNS」として DoT に対応し（[Android Developers Blog](https://android-developers.googleblog.com/2018/04/dns-over-tls-support-in-android-p.html)）、Apple は 2020 年に DoT と DoH を OS として扱えるようにしました（[WWDC20](https://developer.apple.com/videos/play/wwdc2020/10047/)）。Linux の systemd-resolved にも `DNSOverTLS=` の設定があります（[resolved.conf](https://www.freedesktop.org/software/systemd/man/latest/resolved.conf.html)）。
+
+さらに、DHCP で配られた平文のリゾルバに「あなたの暗号化された入口はどこか」を聞く仕組みも決まりました。特別な名前 `_dns.resolver.arpa` の SVCB レコードを問い合わせると、DoH や DoT の接続先が返ってきます（[RFC 9462](https://datatracker.ietf.org/doc/html/rfc9462)、DDR と呼ばれます）。
+
+```
+アプリ（getaddrinfo） ──→ OS のスタブ ──→ 設定されたリゾルバ（平文 or 暗号化）
+ブラウザ              ──→ ブラウザ内蔵の DoH ──→ ブラウザが選んだリゾルバ
+```
+
+**同じ端末の中に、名前解決の経路が 2 本ある**。これが次の衝突の原因になります。
+
+## 企業ネットワークとの衝突
+
+企業のネットワークでは、社内のリゾルバが**社内でだけ通じる名前**を持っていることがよくあります。同じ名前でも、社内から引くか社外から引くかで答えが違う構成を **分割 DNS**（split-horizon DNS）と呼びます。
+
+```
+                         社内のリゾルバ                 公開のリゾルバ（DoH）
+wiki.corp.example    →   10.0.3.15                      NXDOMAIN（存在しない）
+mail.example.co.jp   →   10.0.8.2（社内の経路）          203.0.113.25（公開の経路）
+```
+
+ブラウザが社内のリゾルバを飛ばして公開の DoH に直接聞くと、社内の名前が引けなくなります。さらに、社内のリゾルバで行っていた**有害なサイトの遮断や、問い合わせの記録**もすり抜けます。
+
+各ブラウザの対処は次のとおりです。
+
+| 仕組み | 動き |
+| --- | --- |
+| Chrome のポリシー検出 | 企業のポリシーがあれば既定の DoH を止める。管理者はポリシーで DoH を明示的に設定できる |
+| Firefox のカナリアドメイン | OS のリゾルバで `use-application-dns.net` を引き、NOERROR 以外（NXDOMAIN など）が返れば既定の DoH を止める。**利用者が自分で DoH を有効にした場合は無視される**（[Mozilla](https://support.mozilla.org/en-US/kb/canary-domain-use-application-dnsnet)） |
+| Firefox の失敗時の後戻り | 既定の動作では、DoH で引けなければ OS のリゾルバで引き直す（[Mozilla Wiki](https://wiki.mozilla.org/Trusted_Recursive_Resolver)） |
+
+<Callout type="warn" title="後戻りでは救えない名前がある">
+  失敗時に OS のリゾルバへ戻る方式は、上の表の `wiki.corp.example` のように**公開側で存在しない名前**なら救えます。
+  しかし `mail.example.co.jp` のように**公開側にも答えがある名前**は、DoH がそれを正常に返すので後戻りが起きません。
+  社内から公開の経路へつながり、社内向けのサーバには届かなくなります。
+  根本的な対処は、社内のリゾルバ自体を DoH に対応させ、ポリシーで端末に配ることです。
+</Callout>
+
+## それでも名前は漏れている: SNI
+
+DNS を完全に暗号化しても、直後に張る HTTPS の接続で、名前がもう一度見えてしまいます。
+
+TLS のハンドシェイクで、ブラウザは最初に **ClientHello** を送ります。1 つの IP で多数のサイトを動かしているサーバは、どのサイトの証明書を返すかを決めるために、接続先の名前を知る必要があります。そのため ClientHello には **SNI**（Server Name Indication）という欄があり、ホスト名が**平文で**入っています（[RFC 6066](https://datatracker.ietf.org/doc/html/rfc6066#section-3)）。暗号の鍵が決まる前なので、暗号化できません。
+
+```
+ClientHello（平文）
+  ├─ 対応する暗号方式
+  ├─ 鍵交換の材料
+  └─ server_name: bank.example    ← 経路上から読める
+```
+
+DNS だけ隠しても、**経路上の観測者は SNI を見れば同じことが分かる**のです。
+
+### ECH: ClientHello を二重にする
+
+この穴をふさぐのが **ECH**（Encrypted Client Hello）で、2026 年 3 月に [RFC 9849](https://datatracker.ietf.org/doc/html/rfc9849) になりました。
+
+ブラウザは本物の ClientHello（**内側**）を暗号化し、それを当たり障りのない ClientHello（**外側**）の中に入れて送ります。外側の SNI には、CDN などの共通の入口の名前（**public_name**）が入ります。
+
+```
+外側の ClientHello   server_name: cloudflare-ech.com     ← 見えるのはこれだけ
+  └─ 暗号化された内側の ClientHello
+       server_name: bank.example                         ← 入口のサーバだけが開ける
+```
+
+では、ブラウザは内側を暗号化するための**公開鍵**をどこから手に入れるのか。答えは DNS です。第 58 回で見た **HTTPS レコード**に `ech` という項目を載せて配ります（[RFC 9848](https://datatracker.ietf.org/doc/html/rfc9848)。項目の番号 5 は [RFC 9460](https://datatracker.ietf.org/doc/html/rfc9460) の時点で予約されていました）。
+
+```bash
+dig crypto.cloudflare.com HTTPS +short
+# 1 . alpn="h2" ipv4hint=... ech=AEX+DQBB... ipv6hint=...   （新しい dig の表示。値は例）
+```
+
+手元の古い dig（9.10）では HTTPS 型を解読できないので、`TYPE65` と指定すると 16 進のまま出てきます。その中に `cloudflare-ech.com` という public_name の文字列が埋まっているのが読み取れます。
+
+ここで話がつながります。**HTTPS レコードの問い合わせが平文なら、それ自体が「bank.example に行こうとしている」と明かしてしまう**。ECH は、DNS の暗号化とそろって初めて意味を持ちます。
+
+<Callout type="note" title="ECH が隠せるのは、大勢で入口を共有しているときだけ">
+  ECH を使っても、接続先の **IP アドレス**は隠せません。
+  1 つの IP に 1 つのサイトしかなければ、IP を見れば行き先が分かります。
+  ECH が効くのは、CDN のように**多数のサイトが同じ入口を共有している**場合です。
+</Callout>
+
+## ODoH: リゾルバからも隠す
+
+ここまでの暗号化で、経路上の観測者からは隠せました。しかし DoH の相手、つまり**フルリゾルバの運営者**には、依然として「どの IP が、どの名前を引いたか」がすべて見えています。
+
+**ODoH**（Oblivious DoH）は、これを 2 者に分けます（[RFC 9230](https://datatracker.ietf.org/doc/html/rfc9230)）。
+
+```
+端末 ──(問い合わせを target の公開鍵で暗号化)──→ proxy ──→ target（リゾルバ）
+```
+
+| | 端末の IP | 問い合わせの中身 |
+| --- | --- | --- |
+| proxy | 知っている | 知らない（暗号化されていて読めない） |
+| target | 知らない（proxy の IP しか見えない） | 知っている |
+
+どちらか一方だけでは、「誰が何を引いたか」を組み立てられません。暗号化には、ECH と同じ HPKE という方式を使います（[RFC 9180](https://datatracker.ietf.org/doc/html/rfc9180)）。
+
+ただし RFC 9230 は IETF の標準ではなく、**実験的**（Experimental）な位置づけの文書です。そして **proxy と target が結託すれば、この分離は崩れます**。
+
+## 信頼は消えず、移るだけ
+
+この回の話を、「誰に見えるか」で並べ直します。
+
+| 方式 | 経路上（Wi-Fi、回線事業者） | リゾルバの運営者 |
+| --- | --- | --- |
+| 平文の DNS | 名前が見える | 名前と IP が見える |
+| DoT / DoH / DoQ | 見えない（SNI が残る） | 名前と IP が見える |
+| + ECH | 見えない（IP は残る） | 名前と IP が見える |
+| ODoH | 見えない | 結託しない限り、どちらか半分だけ |
+
+暗号化によって、**見る者の数は減ります**。しかし、ゼロにはなりません。平文なら「近くの Wi-Fi と回線事業者」に見られていたものが、DoH では「自分が選んだリゾルバの運営者」1 社に集まります。
+
+<Callout type="tip" title="選んでいるのは、誰に見せるか">
+  DoH を有効にすることは「誰にも見られない」ことではなく、
+  **見せる相手を回線事業者から DoH の事業者に替える**ことです。
+  ブラウザが既定で特定の事業者を選ぶと、多くの人の問い合わせが数社に集中します。
+  Chrome が「今の事業者のまま運び方だけ変える」方式を採ったのは、この選択を利用者から奪わないためでもあります。
+  どの方式を使うにしても、**最後に信じている相手が誰か**を把握しておくことが大切です。
+</Callout>
+
+## まとめ
+
+- DNSSEC は答えの偽造を見破るが、問い合わせは平文のまま。端末からフルリゾルバまでの区間で、名前がすべて読める
+- 権威サーバへ漏れる分は、フルリゾルバの QNAME 最小化で減らせる
+- DoT（TCP 853）、DoH（443、HTTPS に紛れる）、DoQ（UDP 853）は、どれも DNS メッセージの中身はそのままで、運び方だけを変える
+- DoH と DoQ は ID を 0 にする。暗号化しても大きさは見えるので、パディングで揃える
+- ブラウザ内蔵の DoH と OS の名前解決が並ぶと、分割 DNS の社内名が引けなくなる。ポリシーやカナリアドメインで止める仕組みがある
+- DNS を隠しても TLS の SNI に名前が出る。ECH は ClientHello を二重にし、鍵を HTTPS レコードで配る
+- ODoH は、端末の IP と問い合わせの中身を別々の者にしか見せない
+- 暗号化は見る者を減らすが、ゼロにはしない。信頼する相手を選び直しているだけ
+
+次は章の最後として、名前解決が**動かなくなったとき**に何が起きるのかを見ます。問い合わせの回数が膨らむ設定、5 秒の謎の待ち、そして権威サーバごと消えた大規模な障害です。

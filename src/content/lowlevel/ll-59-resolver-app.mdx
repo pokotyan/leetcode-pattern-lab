@@ -1,0 +1,301 @@
+---
+title: アプリの中の名前解決
+description: requests.get("https://example.com") の 1 行で、DNS のパケットが出ていくまでにプロセスの中では何が起きているのか。同じ名前を引いても、glibc、Alpine の musl、Go、Node.js で振る舞いが違うのはなぜか
+chapter: dns
+order: 4
+status: published
+topics:
+  - getaddrinfo
+  - nsswitch.conf
+  - /etc/hosts
+  - resolv.conf
+  - ndots / search
+  - systemd-resolved
+  - glibc / musl
+  - Go の名前解決
+  - dns.lookup / dns.resolve
+  - Happy Eyeballs
+requires:
+  - ll-58-dns-records
+  - ll-41-syscall
+  - ll-44-blocking-async
+---
+
+import Callout from '../../components/Callout.astro'
+
+ここまでの 3 回は、DNS をネットワークの側から見てきました。名前がどこに書いてあり、どんなメッセージでやり取りされ、どんなレコードがあるのか。
+
+今回は反対側、**名前を引くプログラムの中**に入ります。アプリケーションが「`example.com` に接続したい」と思ってから、最初の DNS パケットが出ていくまでの間に、何が起きているのでしょうか。
+
+- 名前を引くシステムコールは、あるのか
+- `/etc/hosts` は、誰が、いつ読んでいるのか
+- 同じ Dockerfile でも、ベースイメージを Alpine に替えると名前解決の挙動が変わるのはなぜか
+- Node.js で、名前解決が遅いとファイルの読み込みまで遅くなるのはなぜか
+
+## getaddrinfo はシステムコールではない
+
+C でも Python でも Ruby でも、名前からアドレスを得る入口はたいてい **`getaddrinfo`** です。POSIX で決められた関数で（[getaddrinfo(3)](https://man7.org/linux/man-pages/man3/getaddrinfo.3.html)）、Python の `socket.getaddrinfo` も、中でこれを呼んでいます。
+
+ところが、Linux のカーネルに `getaddrinfo` というシステムコールはありません。第 41 回で見たとおり、カーネルが提供するのは `open`、`read`、`socket`、`sendto` のような**部品**だけです。`getaddrinfo` は **libc の中のただの関数**で、その部品を組み合わせて、設定ファイルを読み、UDP でパケットを送り、応答を解読しています。
+
+つまり、名前解決の振る舞いは**カーネルではなく、プロセスにリンクされたライブラリが決めています**。libc が違えば、振る舞いも違います。
+
+その証拠が、glibc を静的リンクしようとしたときに出る警告です（第 29 回）。
+
+```
+$ gcc -static g.c -o gs
+warning: Using 'getaddrinfo' in statically linked applications requires at runtime
+the shared libraries from the glibc version used for linking
+```
+
+静的にリンクしたはずなのに、実行時に共有ライブラリが要る。理由は次の節の **NSS** にあります。
+
+## glibc の道順: nsswitch.conf
+
+glibc の `getaddrinfo` は、いきなり DNS に問い合わせるわけではありません。まず `/etc/nsswitch.conf` を読んで、**どこに、どの順で聞くか**を決めます。
+
+```
+hosts:          files dns
+```
+
+これは「まず `files`（`/etc/hosts`）を見て、見つからなければ `dns` に聞け」という指示です。この仕組みを **NSS**（Name Service Switch）と呼びます。`files` や `dns` の実体は `libnss_files.so`、`libnss_dns.so` という共有ライブラリで、glibc は実行時にそれを読み込みます（[nsswitch.conf(5)](https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html)）。静的リンクで警告が出るのはこのためです。
+
+差し込み口になっているので、ここにはいろいろなものが入ります。
+
+| 書くもの | 何に聞くか |
+| --- | --- |
+| `files` | `/etc/hosts` |
+| `dns` | `/etc/resolv.conf` に書かれたネームサーバ |
+| `resolve` | systemd-resolved（後述） |
+| `mdns4_minimal` | 同じ LAN の中で `xxx.local` を引く mDNS |
+| `myhostname` | 自分のホスト名を、設定なしで引けるようにする |
+
+`[NOTFOUND=return]` のように書くと、「見つからなかったらそこで打ち切る」といった制御もできます。
+
+**`/etc/hosts` が DNS より優先されるのは、DNS の仕様ではなく、この 1 行の並び順の結果**です。`dns files` と書き換えれば、順番は逆になります。
+
+## resolv.conf: DNS への聞き方
+
+`dns` の番が来ると、次は `/etc/resolv.conf` です。ここには、どのネームサーバに、どう問い合わせるかが書かれています。
+
+```
+nameserver 10.0.0.2
+nameserver 10.0.0.3
+search corp.example svc.example
+options ndots:1 timeout:5 attempts:2
+```
+
+各項目の意味と、glibc での既定値は次のとおりです（[resolv.conf(5)](https://man7.org/linux/man-pages/man5/resolv.conf.5.html)）。
+
+| 項目 | 意味 | 既定値 / 上限 |
+| --- | --- | --- |
+| `nameserver` | 問い合わせ先。上から順に使う | 最大 3 個 |
+| `search` | 短い名前に補って試すドメインの一覧 | 自分のドメイン 1 つ |
+| `ndots` | 名前にドットがいくつ以上あれば、まずそのまま引くか | 1 / 最大 15 |
+| `timeout` | 1 つのサーバの応答を待つ秒数 | 5 秒 / 最大 30 秒 |
+| `attempts` | サーバの一覧を何周するか | 2 / 最大 5 |
+| `rotate` | 毎回、先頭のサーバを変えて負荷を分ける | 無効 |
+| `single-request` | A と AAAA を並列でなく順に送る | 無効 |
+
+<Callout type="warn" title="1 台目が黙っていると、毎回 5 秒待たされる">
+  `nameserver` は「複数書けば同時に聞いてくれる」わけではありません。glibc は**上から順に**聞き、応答が来なければ `timeout` の間待ってから次へ進みます。
+  1 台目が落ちていて、パケットが黙って捨てられる状態だと、**名前を引くたびに 5 秒前後の遅れ**が乗ります。
+  RST のようにすぐ失敗が返ってこないので、アプリケーションからは「なぜか遅い」としか見えません。
+</Callout>
+
+### search と ndots
+
+`search` と `ndots` は、短い名前を補うための仕組みです。社内で `db` とだけ書けば `db.corp.example` を引いてくれる、という使い方をします。
+
+判断の基準が `ndots` です。**名前に含まれるドットの数が `ndots` 以上なら、まずそのまま引き、だめなら search の候補を補います。`ndots` 未満なら、先に search の候補を順に試し、最後にそのまま引きます。**
+
+```
+ndots:1 のとき
+  "db"          ドット 0 個 → db.corp.example → db.svc.example → db
+  "example.com" ドット 1 個 → example.com（見つかればここで終わり）
+
+ndots:5 のとき
+  "example.com" ドット 1 個 → example.com.corp.example → example.com.svc.example → example.com
+```
+
+`ndots` を大きくすると、外部の名前を 1 回引くだけで、存在しない名前の問い合わせが何回も先に走ります。第 97 回で見た Kubernetes の `ndots:5` がまさにこれで、その影響は第 63 回で詳しく見ます。
+
+末尾にドットを付けた `example.com.` は「これで完結した名前」という意味になり、search の補完は行われません。
+
+## systemd-resolved: 127.0.0.53 の正体
+
+最近の Ubuntu などで `/etc/resolv.conf` を開くと、書いてあるネームサーバは 1 つだけです。
+
+```
+nameserver 127.0.0.53
+options edns0 trust-ad
+search .
+```
+
+`127.0.0.53` は、自分のマシンの中で動く **systemd-resolved** が待ち受けているアドレスです。本当の上流のサーバ（DHCP で配られたものや VPN のもの）は resolved が握っていて、アプリケーションには見せません（[systemd-resolved(8)](https://man7.org/linux/man-pages/man8/systemd-resolved.8.html)）。
+
+```
+アプリ ─ getaddrinfo ─→ 127.0.0.53（systemd-resolved） ─→ 上流のフルリゾルバ
+                         ・キャッシュ
+                         ・VPN 用、社内用などインターフェースごとの振り分け
+                         ・LLMNR / mDNS
+```
+
+こうしておくと、Wi-Fi を切り替えたり VPN につないだりして上流が変わっても、`/etc/resolv.conf` を書き換える必要がありません。第 60 回で見るキャッシュの段が、1 つ増えることにもなります。
+
+`127.0.0.54` でも待ち受けていて、こちらはキャッシュや DNSSEC 検証をせずにそのまま上流へ中継する「proxy」モードです。上流の設定の本体を見たいときは `resolvectl status` を使います。
+
+## glibc、musl、Go: 3 つの実装
+
+名前解決がライブラリの仕事である以上、ライブラリが違えば振る舞いも違います。よく出会うのは次の 3 つです。
+
+| | glibc（Debian、Ubuntu など） | musl（Alpine） | Go の標準ライブラリ |
+| --- | --- | --- | --- |
+| nsswitch.conf | 読む | **読まない** | 読む（解釈できる範囲で） |
+| 複数の nameserver | 順に聞く | **全部に同時に聞き、早い答えを採る** | 順に聞く |
+| A と AAAA | 同じソケットから並列 | 同じソケットから並列 | **別々のソケットから並列** |
+| TCP へのフォールバック | あり | **1.2.4 から** | あり |
+| `single-request` | 効く | 効かない | — |
+| 待っている間 | 呼んだスレッドが止まる | 呼んだスレッドが止まる | **goroutine だけが止まる** |
+
+musl の違いは、musl 自身が文書にしています（[musl wiki](https://wiki.musl-libc.org/functional-differences-from-glibc.html)）。
+
+- nameserver に**並列で聞く**ので、1 台目が落ちていても待たされません。代わりに、「1 台目は社内用、2 台目は外部用」のように**順番に意味を持たせた設定は成り立ちません**
+- `ndots` 以上のドットがある名前は、そのまま引いて失敗しても **search を試しません**（glibc は試す）
+- **TCP を使えるようになったのは 1.2.4 から**です。それより前は、第 57 回で見た TC ビット付きの応答が来ても TCP でやり直さず、512 バイトに収まらない大きな答えを受け取れませんでした。Alpine では 3.18（2023 年）で入りました（[Alpine 3.18.0](https://alpinelinux.org/posts/Alpine-3.18.0-released.html)）
+
+<Callout type="note" title="Alpine で名前が引けなくなったら">
+  「Debian ベースでは動くのに、Alpine に替えたら名前が引けない」ときは、まず次を疑います。
+  `/etc/nsswitch.conf` に頼った設定（mDNS や LDAP で引く名前）、nameserver の順番に意味を持たせた設定、
+  そして古い Alpine での大きな応答です。**同じ `resolv.conf` でも、読む側が違えば結果が違います。**
+</Callout>
+
+### Go は自分で DNS を話す
+
+Go は libc の `getaddrinfo` を使わず、**Go で書かれたリゾルバ**が自分で `/etc/resolv.conf` と `/etc/hosts` を読み、UDP のパケットを組み立てます。Unix ではこれが既定です（[net パッケージ](https://pkg.go.dev/net)）。
+
+理由は第 44 回の話そのものです。`getaddrinfo` はブロッキングする関数なので、cgo で呼ぶと、応答を待つ間 **OS のスレッドを 1 本まるごと止めます**。名前解決が詰まれば、スレッドがどんどん増えます。Go のリゾルバなら、待っている間に止まるのは goroutine だけで、ランタイムは第 45 回の I/O 多重化で他の goroutine を動かし続けられます。
+
+ただし、Go のリゾルバが扱えない設定もあります。`nsswitch.conf` に Go の知らないサービスが書いてある、`resolv.conf` に解釈できないオプションがある、`LOCALDOMAIN` や `RES_OPTIONS` といった環境変数が設定されている、といった場合、Go は **cgo 経由で libc に任せる**側に切り替えます。どちらを使うかは明示的にも選べます。
+
+```bash
+GODEBUG=netdns=go ./app       # Go のリゾルバを使う
+GODEBUG=netdns=cgo ./app      # libc の getaddrinfo を使う
+GODEBUG=netdns=go+1 ./app     # 選んだ結果をログに出す
+```
+
+`CGO_ENABLED=0` で作った静的バイナリは libc を呼べないので、常に Go のリゾルバです。「手元の Mac では引けるのに、コンテナの中の同じバイナリでは引けない」ときは、どちらのリゾルバが動いているかを最初に確かめます。
+
+## Node.js: dns.lookup がスレッドプールを塞ぐ
+
+Node.js には、名前を引く関数が 2 系統あり、中身がまったく違います（[Node.js dns](https://nodejs.org/api/dns.html)）。
+
+| | `dns.lookup` | `dns.resolve4` など |
+| --- | --- | --- |
+| 中身 | libc の `getaddrinfo` | c-ares（DNS を自分で話すライブラリ） |
+| `/etc/hosts`、nsswitch | 効く | **効かない**。常にネットワークに問い合わせる |
+| どこで待つか | **libuv のスレッドプール** | イベントループ（ノンブロッキング） |
+| 誰が使うか | `http.get`、`net.connect` など**ほぼすべての接続** | 明示的に呼んだときだけ |
+
+問題は `dns.lookup` です。JavaScript からは非同期に見えますが、実際にはブロッキングする `getaddrinfo` を**スレッドプールのスレッドで**呼んでいるだけです。そしてこのスレッドプールは、既定で **4 本**しかありません（[libuv](https://docs.libuv.org/en/v1.x/threadpool.html)）。
+
+```
+libuv のスレッドプール（既定 4 本）
+┌──────────┬──────────┬──────────┬──────────┐
+│ lookup   │ lookup   │ lookup   │ lookup   │  ← 応答の遅い名前解決で 4 本とも埋まる
+└──────────┴──────────┴──────────┴──────────┘
+  待ち行列: fs.readFile, crypto.pbkdf2, zlib, 次の lookup ...
+```
+
+同じプールは、`fs` のファイル操作、`crypto` の一部、`zlib` も使っています。**DNS の応答が遅いと、ファイルの読み込みまで待たされる**のはこのためです。逆も起きます。重い計算でプールを埋めてから、両方の関数で同じ名前を引いてみます。
+
+```js
+const dns = require('node:dns');
+const crypto = require('node:crypto');
+for (let i = 0; i < 4; i++) crypto.pbkdf2('pw', 'salt', 3_000_000, 64, 'sha512', () => {});
+const t0 = Date.now();
+dns.lookup('example.com', () => console.log('lookup  ', Date.now() - t0, 'ms'));
+dns.resolve4('example.com', () => console.log('resolve4', Date.now() - t0, 'ms'));
+```
+
+```
+resolve4 34 ms
+lookup   1710 ms
+```
+
+`resolve4` はすぐ返り、`lookup` は pbkdf2 がスレッドを空けるまで 1.7 秒待たされました（値は手元の Mac で Node.js 20 を使った一例です）。
+
+対策は、環境変数 `UV_THREADPOOL_SIZE` でプールを増やす（最大 1024）か、`http.Agent` などの `lookup` オプションに c-ares を使う関数やキャッシュ付きの関数を渡して、`getaddrinfo` を通らないようにすることです。後者では `/etc/hosts` が効かなくなる点に注意が要ります。
+
+## A と AAAA、どちらにつなぐか
+
+`getaddrinfo` に `AF_UNSPEC` を渡すと、A と AAAA の両方を引き、アドレスの**一覧**を返します。その並び順は RFC 6724 の規則で決まり（glibc では `/etc/gai.conf` で調整可能）、**使える送信元アドレスがあるなら IPv6 を先に**並べます（[RFC 6724](https://datatracker.ietf.org/doc/html/rfc6724)）。
+
+では、IPv6 の経路が壊れていたらどうなるか。一覧の先頭の IPv6 アドレスに `connect` して、SYN の再送を繰り返し、タイムアウトしてから IPv4 に移るのでは、**数十秒以上**待たされます。
+
+これを避けるのが **Happy Eyeballs** です。現在の版は RFC 8305 で、要点は次のとおりです（[RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305)）。
+
+```
+t=0     AAAA と A を続けて問い合わせる（AAAA が先）
+        A だけ先に返ってきたら、AAAA を 50ms だけ待つ（Resolution Delay）
+t=?     一覧を IPv6、IPv4、IPv6 ... と交互に並べ替える
+        先頭に connect → 250ms 返事がなければ、切らずに次のアドレスにも connect
+        最初につながった接続を使い、残りは閉じる
+```
+
+**順番に試すのではなく、少しずらして競走させる**のがこの方式です。遅れの上限が「タイムアウトの秒数」から「250ms」に縮みます。ブラウザや curl はこれを実装しています。Node.js でも `net.connect` の `autoSelectFamily` が v20 から既定で有効になりました（[Node.js net](https://nodejs.org/api/net.html)）。
+
+<Callout type="tip" title="名前解決と接続は別の層で起きている">
+  `getaddrinfo` はアドレスの一覧を返すだけで、つなぐのは呼んだ側です。
+  Happy Eyeballs は、その**2 つの層をまたいで**時間を詰める工夫です。
+  自分で `getaddrinfo` の結果の先頭だけに `connect` するコードを書くと、この恩恵を受けられません。
+</Callout>
+
+## 手元で確かめる
+
+`strace` で、`getaddrinfo` が実際に呼んでいるシステムコールを見ます。Docker が使えれば、手元が Mac でも試せます。
+
+```bash
+docker run --rm --cap-add SYS_PTRACE debian:stable-slim sh -c '
+  apt-get update -qq && apt-get install -y -qq strace python3-minimal >/dev/null
+  strace -e trace=openat,socket,connect,sendmmsg,recvfrom \
+    python3 -c "import socket; socket.getaddrinfo(\"example.com\", 443)"'
+```
+
+出力から、名前解決に関わる部分だけを抜き出すと次のとおりです（アドレスや ID は実行した環境での一例です）。
+
+```
+openat(AT_FDCWD, "/etc/nsswitch.conf", O_RDONLY|O_CLOEXEC) = 3      ← まず道順を読む
+openat(AT_FDCWD, "/etc/host.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/resolv.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 3               ← files
+socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 3
+connect(3, {sin_port=htons(53), sin_addr=inet_addr("192.168.65.7")}, 16) = 0
+sendmmsg(3, [{... "\7example\3com\0\0\1\0\1" ...},                    ← A（タイプ 1）
+             {... "\7example\3com\0\0\34\0\1" ...}], 2, ...) = 2      ← AAAA（タイプ 28）
+recvfrom(3, ...) = 83
+recvfrom(3, ...) = 107
+openat(AT_FDCWD, "/etc/gai.conf", O_RDONLY|O_CLOEXEC) = 3            ← 並べ替えの規則
+connect(3, {sa_family=AF_INET6, ... "2606:4700:10::ac42:93f3" ...}) = -1 ENETUNREACH
+```
+
+読みどころは 3 つあります。
+
+- `sendmmsg` 1 回で、**A と AAAA の 2 つの問い合わせを同じソケットから**送っています。中身は第 57 回で組んだラベル形式そのままです
+- 最後の `connect` は UDP のソケットに対するもので、パケットは送りません。**どの送信元アドレスが使えるかをカーネルに尋ねて**、RFC 6724 の並べ替えに使っています。この環境には IPv6 の経路がないので、IPv4 のアドレスが先頭に並びました
+- `getaddrinfo` という名前のシステムコールは、どこにも出てきません
+
+同じことを Alpine（`alpine:3.20` に `apk add strace` して `getent ahosts example.com`）でやると、`/etc/nsswitch.conf` を開く行が消え、`sendmmsg` の代わりに `sendto` が 2 回並びます。`CGO_ENABLED=0` で作った Go のバイナリでは、A と AAAA が**別々のソケット**から送られ、問い合わせに第 57 回の EDNS0 の OPT レコードが付いているのが見えます。
+
+## まとめ
+
+- `getaddrinfo` はシステムコールではなく libc の関数。名前解決の振る舞いは、プロセスにリンクされたライブラリが決める
+- glibc は `nsswitch.conf` で聞く先と順番を決める。`/etc/hosts` が先に効くのは `hosts: files dns` の並びの結果
+- `resolv.conf` の nameserver は上から順に聞く。1 台目が黙っていると `timeout`（既定 5 秒）ずつ遅れる
+- `ndots` 未満のドットしかない名前は search の候補を先に試す。`ndots` を大きくすると外部の名前で無駄な問い合わせが増える
+- `127.0.0.53` は systemd-resolved。上流の切り替えとキャッシュを引き受けている
+- musl は nsswitch を読まず、nameserver に並列で聞き、TCP は 1.2.4 から。Go は既定で自前のリゾルバを使い、待っても goroutine しか止めない
+- Node.js の `dns.lookup` は既定 4 本のスレッドプールを使い、ファイル操作や暗号と取り合う。`dns.resolve` は別物で `/etc/hosts` を見ない
+- `getaddrinfo` は IPv6 を先に並べる。壊れた IPv6 で待たされないよう、Happy Eyeballs は 250ms ずらして接続を競走させる
+
+次は、こうして引いた答えが**どこに、どれだけの間残るのか**を見ます。ブラウザ、OS、フルリゾルバの各段のキャッシュと TTL、そして「TTL を短くしたのに切り替わらない」理由です。

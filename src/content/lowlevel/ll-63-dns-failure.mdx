@@ -1,0 +1,284 @@
+---
+title: いつも DNS のせい
+description: 外部の名前を 1 回引いただけなのに、なぜ問い合わせが 8 回飛ぶのか。ときどき 5 秒だけ待たされるのはなぜか。DNS が止まると、なぜ関係のなさそうなものまで一斉に倒れるのか。DNS が原因の障害を、クラスタの中とインターネットの両方で見る
+chapter: dns
+order: 8
+status: published
+topics:
+  - ndots / search
+  - conntrack の競合
+  - single-request-reopen
+  - NodeLocal DNSCache
+  - CoreDNS
+  - DNS 増幅攻撃
+  - オープンリゾルバ
+  - 再試行の嵐
+  - BGP と権威 DNS
+requires:
+  - ll-59-resolver-app
+  - ll-60-dns-cache
+  - ll-62-encrypted-dns
+---
+
+import Callout from '../../components/Callout.astro'
+
+## なぜ DNS の障害は分かりにくいのか
+
+障害の振り返りで「原因は DNS でした」という結論になることがよくあります。**"It's always DNS"**（いつも DNS のせい）という言い回しが運用者の間で冗談として通じるほどです。
+
+DNS の障害が厄介なのは、**DNS のせいに見えない**からです。
+
+| 見える症状 | 実際に起きていること |
+| --- | --- |
+| API がときどき 5 秒遅い | 名前解決の問い合わせが 1 つ落ち、再送まで待っている |
+| 外部 API を呼ぶと遅いが、IP 直打ちなら速い | 1 回の名前解決が何回もの問い合わせに化けている |
+| 接続先を切り替えたのに古い方へ行き続ける | どこかの段のキャッシュが古い答えを持っている（第 60 回） |
+| 無関係に見える多数のサービスが同時に落ちる | 共通して使っている権威サーバかリゾルバが止まった |
+
+どれも、アプリのログには「タイムアウト」や「接続できない」としか出ません。名前解決は `connect` の**手前**で済んでいる前提で書かれているので、そこで時間を使っても、その時間は次の処理のせいに見えます。
+
+この回では、クラスタの中で起きる 2 つの典型と、インターネット規模で起きた 2 つの事件を見ます。
+
+## 1 回の名前が 8 回の問い合わせになる
+
+第 59 回で、`resolv.conf` の `search` と `ndots` を見ました。`ndots:n` は「ドットが n 個未満の名前は、まず `search` の候補を順に付けて引く」という指定で、既定値は 1 です（[resolv.conf(5)](https://man7.org/linux/man-pages/man5/resolv.conf.5.html)）。
+
+Kubernetes の Pod には、kubelet が次のような `resolv.conf` を書き込みます（[Kubernetes のドキュメント](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/)）。
+
+```
+nameserver 10.96.0.10
+search shop.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+
+`ndots:5` になっているのは、`api.shop`（ドット 1 個）や `api.shop.svc`（ドット 2 個）のような短い名前でもクラスタ内の Service を引けるようにするためです。仕組みそのものは第 97 回で扱います。
+
+問題は、この設定のまま**外部の名前**を引いたときです。`api.example.com` はドットが 2 個しかないので、「短い名前」とみなされます。
+
+```
+api.example.com.shop.svc.cluster.local.   A と AAAA  → NXDOMAIN
+api.example.com.svc.cluster.local.        A と AAAA  → NXDOMAIN
+api.example.com.cluster.local.            A と AAAA  → NXDOMAIN
+api.example.com.                          A と AAAA  → やっと答え
+```
+
+A と AAAA を両方引くので、**search が 3 つなら 8 回、ノード側から引き継いだ search が 1 つ増えれば 10 回**の問い合わせになります。そのうち答えに意味があるのは最後の 2 回だけです。外部 API を 1 秒に数百回呼ぶアプリなら、DNS サーバが受ける問い合わせはその何倍にもなります。
+
+対策は、どこで手を打つかで分かれます。
+
+| 対策 | やること | 注意点 |
+| --- | --- | --- |
+| 末尾にドットを付ける | `api.example.com.` と書いて絶対名にする | 設定値やライブラリが末尾ドットを受け付けないことがある |
+| `ndots` を下げる | Pod の `dnsConfig` で `ndots` を 1〜2 にする | 短い名前でクラスタ内の Service を引いている箇所が壊れる |
+| サーバ側で補う | CoreDNS の [autopath](https://coredns.io/plugins/autopath/) で、search の連鎖を DNS サーバ側でたどる | Pod の IP から名前空間を推定するので、IP の付け替え直後に誤りうる |
+| 手前でキャッシュする | 後述の NodeLocal DNSCache | 問い合わせ回数そのものは減らない |
+
+<Callout type="note" title="musl は search の扱いが違う">
+  Alpine が使う musl の名前解決は、ドットが `ndots` 以上ある名前について、search の候補を**まったく試しません**。
+  glibc は、そのまま引いて見つからなければ search の候補も試します。
+  また musl は、複数の `nameserver` に**同時に**問い合わせて最初の答えを採ります（[musl の wiki](https://wiki.musl-libc.org/functional-differences-from-glibc.html)）。
+  同じ `resolv.conf` でも、イメージの C ライブラリが変わると問い合わせの流れが変わります。第 59 回で見た違いが、障害の形の違いとして表に出ます。
+</Callout>
+
+## ときどき 5 秒待たされる
+
+もう 1 つの典型は、**ごくまれに名前解決がちょうど 5 秒かかる**という症状です。Kubernetes では 2017 年に「DNS intermittent delays of 5s」として報告され（[kubernetes#56903](https://github.com/kubernetes/kubernetes/issues/56903)）、長く多くの環境を悩ませました。
+
+原因は 3 つの事情の組み合わせです。
+
+**1. glibc は A と AAAA を同じソケットから並列に送る。** glibc 2.9 以降の既定の動作です（[resolv.conf(5)](https://man7.org/linux/man-pages/man5/resolv.conf.5.html)）。送信元ポートが同じなので、2 つのパケットは**まったく同じ 5 つ組**（送信元と宛先の IP とポート、プロトコル）を持ちます。
+
+**2. DNS サーバへの宛先は DNAT で書き換えられる。** Pod が送る宛先 `10.96.0.10` は Service の仮想 IP で、実在しません。ノードの iptables がそれを CoreDNS の Pod の IP に書き換えます。その対応を覚えておくのが **conntrack**（接続追跡）です。
+
+**3. conntrack は、UDP の最初のパケットで表の行を作る。** TCP なら SYN で行ができますが、UDP には接続の始まりがありません。そのため、同じ 5 つ組のパケットが 2 つ**同時に**届くと、どちらも「まだ表にない新しい接続」として処理が始まります。最後に表へ登録する段階で片方が負け、**そのパケットは黙って捨てられます**（[Martynas Pumputis による解析](https://lambda.lt/blog/2018/racy_conntrack.html)）。
+
+```
+Pod（送信元ポート 43882）
+  ├─ A?    ──┐
+  │          ├─→ conntrack: どちらも「新規」として処理が並走
+  └─ AAAA? ──┘          ↓
+                   先に登録した方だけ通る。もう片方は捨てられる
+                        ↓
+            glibc は、来ない答えを timeout（既定 5 秒）まで待つ
+```
+
+5 秒という数字は、`resolv.conf` の `timeout` の既定値です（[resolv.conf(5)](https://man7.org/linux/man-pages/man5/resolv.conf.5.html)）。答えが来ないまま 5 秒たってから再送するので、**遅延はちょうど 5 秒の倍数**になります。平均の遅延にはほとんど現れず、p99 のような上位の値にだけ出るのも特徴です。
+
+カーネル側の修正は段階的に入りました。同じ 5 つ組の行を重複して作る競合は Linux 4.19 で、重複した行に別の送信元ポートを割り当ててしまう競合は Linux 5.0 で直っています。ただし、**2 つのパケットが DNAT で別々の CoreDNS に振り分けられる**場合の競合は、表の仕組み上残ります（[Pumputis の解析](https://lambda.lt/blog/2018/racy_conntrack.html)、[TKE ハンドブック](https://github.com/TencentCloudContainerTeam/tke-handbook/blob/master/damn/dns-lookup-delay.md)）。
+
+アプリ側でできる回避策は、`resolv.conf` のオプションです。
+
+```
+options single-request-reopen   # A と AAAA を別のソケットから送る
+options single-request          # A と AAAA を順番に送る
+```
+
+どちらも glibc のオプションで、musl は解釈しません。Alpine のイメージでは効かない、という点が落とし穴です。
+
+## NodeLocal DNSCache と CoreDNS の負荷
+
+根本的な対策として Kubernetes が用意したのが **NodeLocal DNSCache** です。各ノードに DNS のキャッシュを 1 つずつ置き、Pod はまずそこに問い合わせます（[Kubernetes のドキュメント](https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/)）。
+
+```
+これまで                               NodeLocal DNSCache
+Pod ─→ 10.96.0.10（仮想 IP）            Pod ─→ 169.254.20.10（同じノードの上）
+        │ DNAT + conntrack（UDP）               │ DNAT なし
+        ↓                                       ├─ 当たれば即答
+     別のノードの CoreDNS                        └─ 外れたら CoreDNS へ（TCP にできる）
+```
+
+ドキュメントが挙げる利点は、ここまでの話にそのまま対応しています。
+
+- 同じノードの上で答えるので、**DNAT と conntrack を通らない**。競合も、UDP の行が conntrack の表を埋めることも起きない
+- CoreDNS への問い合わせを **TCP にできる**。TCP の行は接続を閉じた時点で消えるが、UDP の行は `nf_conntrack_udp_timeout`（既定 30 秒）まで残る
+- ノードごとに問い合わせの数を測れる
+
+待ち受けのアドレスには `169.254.0.0/16` のリンクローカルアドレスを使うよう推奨されています。クラスタの中のどの IP とも衝突しないと保証できるからです。
+
+これで CoreDNS の負荷も下がります。ndots:5 で増えた NXDOMAIN の問い合わせも、ノードのキャッシュで吸収されるからです。逆に言えば、NodeLocal DNSCache がない構成では、**クラスタ全体の名前解決が数個の CoreDNS に集中します**。Pod を増やすと問い合わせは比例して増えますが、CoreDNS の数は自動では増えません。アプリの負荷試験は通ったのに本番で遅い、という場合、見落とされているのがこの共有部分です。
+
+## 手元で確かめる
+
+Docker で、Kubernetes と同じ `resolv.conf` を持つコンテナを作り、問い合わせを覗いてみます。`--dns-search` と `--dns-opt` で `resolv.conf` を指定できます。
+
+```bash
+docker run --rm \
+  --dns 8.8.8.8 \
+  --dns-search shop.svc.cluster.local \
+  --dns-search svc.cluster.local \
+  --dns-search cluster.local \
+  --dns-opt ndots:5 \
+  debian:bookworm-slim sh -c '
+    apt-get update -qq && apt-get install -y -qq tcpdump >/dev/null
+    tcpdump -i any -nn -l udp port 53 &
+    sleep 2
+    perl -MSocket=getaddrinfo -e "getaddrinfo(q(example.com), 443, {socktype => 1})"
+    sleep 3'
+```
+
+手元で実行した結果です（時刻と ID は省略。IP アドレスは実行時点のもの）。
+
+```
+172.17.0.22.43882 > 8.8.8.8.53: A?    example.com.shop.svc.cluster.local.
+172.17.0.22.43882 > 8.8.8.8.53: AAAA? example.com.shop.svc.cluster.local.
+8.8.8.8.53 > 172.17.0.22.43882: NXDomain
+8.8.8.8.53 > 172.17.0.22.43882: NXDomain
+172.17.0.22.42653 > 8.8.8.8.53: A?    example.com.svc.cluster.local.
+172.17.0.22.42653 > 8.8.8.8.53: AAAA? example.com.svc.cluster.local.
+  …（cluster.local でも同じく NXDomain）
+172.17.0.22.49652 > 8.8.8.8.53: A?    example.com.
+172.17.0.22.49652 > 8.8.8.8.53: AAAA? example.com.
+8.8.8.8.53 > 172.17.0.22.49652: A 104.20.23.154, A 172.66.147.243
+```
+
+見るべき点は 2 つです。**8 回の問い合わせ**が飛んでいること。そして、A と AAAA が**同じ送信元ポート**（`43882` など）から続けて出ていることです。これが、DNAT を挟むと conntrack の競合を起こす形です。
+
+`--dns-opt single-request-reopen` を足して同じことをすると、A と AAAA がそれぞれ別のポートから、1 つずつ順番に出ていくのが見えます。名前を `example.com.`（末尾にドット）にすれば、問い合わせは 2 回で済みます。
+
+## DNS を武器にされる: 増幅攻撃
+
+ここからはインターネット規模の話です。
+
+第 61 回で、UDP は送信元を偽れると見ました。これを DNS の**応答が問い合わせより大きい**性質と組み合わせたのが **DNS 増幅攻撃**です。
+
+```
+攻撃者 ── 送信元を「被害者の IP」に偽った小さな問い合わせ ──→ オープンリゾルバ
+                                                              │
+被害者 ←──────────── 何十倍にもなった応答 ────────────────────┘
+```
+
+米国の CISA は、DNS の増幅率（応答の大きさ ÷ 問い合わせの大きさ）を **28〜54 倍**としています（[CISA](https://www.cisa.gov/news-events/alerts/2014/01/17/udp-based-amplification-attacks)）。第 57 回で見た EDNS0 で UDP でも大きな応答を返せること、`ANY` のように多くのレコードをまとめて返させる問い合わせがあることが、増幅に使われます。
+
+対策は、踏み台になる側で打つのが基本です。
+
+| 対策 | 中身 |
+| --- | --- |
+| オープンリゾルバを塞ぐ | フルリゾルバは、自分の利用者にだけ再帰検索を提供する（[RFC 5358](https://datatracker.ietf.org/doc/html/rfc5358)、BCP 140） |
+| 送信元の偽装を出口で落とす | 自分のネットワークから、自分のものでない送信元アドレスのパケットを出さない（[RFC 2827](https://datatracker.ietf.org/doc/html/rfc2827)、BCP 38） |
+| `ANY` に小さく答える | 全部を返さず、一部のレコードか合成した HINFO だけを返してよい（[RFC 8482](https://datatracker.ietf.org/doc/html/rfc8482)） |
+
+## 権威 DNS が落ちると: Dyn（2016）
+
+2016 年 10 月 21 日、DNS をサービスとして提供していた **Dyn** が大規模な DDoS 攻撃を受けました。攻撃は 3 波に分かれ、Twitter、Spotify、Netflix など、Dyn に権威 DNS を任せていた多くのサイトが北米と欧州で引けなくなりました。攻撃元は、IP カメラや家庭用ルータなどに感染したボットネット **Mirai** でした（[Wikipedia](https://en.wikipedia.org/wiki/DDoS_attacks_on_Dyn)、[Krebs on Security](https://krebsonsecurity.com/2016/10/ddos-on-dyn-impacts-twitter-spotify-reddit/)）。
+
+各サイトのサーバ自体は動いていました。止まったのは、**その名前を答えるサーバ**だけです。それでも利用者から見れば、サイトが落ちたのと区別がつきません。
+
+ここから得られる教訓は、第 60 回のキャッシュの話とつながります。
+
+- **権威 DNS を 1 つの事業者に任せると、そこが単一障害点になる。** 複数の事業者に NS を分けて登録しておけば、片方が止まっても引ける
+- **TTL が長ければ、フルリゾルバのキャッシュが残っている間は引ける。** 短い TTL は切り替えやすさと引き換えに、権威サーバが止まったときの猶予を削る
+- serve-stale（第 60 回）のように、期限切れの答えを使い続ける仕組みはこの状況のためにある
+
+## 権威 DNS ごと消える: Facebook（2021）
+
+2021 年 10 月 4 日、Facebook、Instagram、WhatsApp が約 5 時間半、インターネットから消えました。
+
+発端は DNS ではありません。定例の保守作業で、バックボーンの容量を調べるために出したコマンドが、**バックボーン網の接続をすべて切ってしまいました**。本来それを止めるはずの監査ツールには不具合がありました（[Meta のエンジニアリングブログ](https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/)）。
+
+DNS が巻き込まれたのは、次の設計のためです。Facebook の権威 DNS サーバは、各地の拠点から BGP で自分のアドレスを広告しています（第 56 回で見たエニーキャスト）。そして**データセンターと通信できなくなったら、自分は不健全だとみなして BGP の広告を取り下げる**ようになっていました。1 拠点だけが切れたなら、それは正しい動作です。利用者は別の拠点へ流れます。ところがバックボーン全体が落ちたので、**全拠点が一斉に広告を取り下げました**。
+
+```
+通常:     拠点 A ─ BGP で「DNS はここ」─→ インターネット
+          拠点 B ─ BGP で「DNS はここ」─→
+
+障害時:   バックボーン断 → 全拠点が「DC に届かない、自分は不健全」
+          → 全拠点が広告を撤回 → 権威 DNS への経路がインターネットから消える
+```
+
+Cloudflare の観測では、15 時 58 分（UTC）ごろに Facebook の DNS のアドレスへの経路が消え、1.1.1.1 は `facebook.com` に SERVFAIL を返すようになりました。そして、アプリと利用者が引けない名前を繰り返し引き直したため、**世界中のフルリゾルバが普段の 30 倍の問い合わせを受けました**。復旧は 21 時 20 分ごろです（[Cloudflare](https://blog.cloudflare.com/october-2021-facebook-outage/)）。
+
+<Callout type="warn" title="健全性の判定が、全体を止める側に回ることがある">
+  「不健全なら自分を外す」は、一部が壊れたときに被害を狭める仕組みです。
+  しかし**全員が同じ理由で同時に不健全になる**と、全員が自分を外し、何も残りません。
+  外す判定には、「全体のうちどれだけが同時に外れようとしているか」という歯止めが要ります。
+  そして、引けない名前に対するアプリの再試行は、攻撃に匹敵する負荷をリゾルバにかけます。
+  再試行には、間隔を倍々に伸ばす指数バックオフを入れておくべきです。
+</Callout>
+
+## "It's always DNS" の理由
+
+ここまでの例を並べると、DNS が障害の原因になりやすい理由が見えてきます。
+
+- **すべての通信の手前にある。** 名前解決が遅れれば、その上のすべてが遅れる。止まれば、すべてが止まる
+- **共有されている。** 1 つのクラスタの CoreDNS、1 つの DNS 事業者、1 つのフルリゾルバを、多数のサービスが同時に頼っている
+- **失敗が別の症状に見える。** アプリのログには「タイムアウト」としか出ない
+- **キャッシュのせいで、原因と症状の時刻がずれる。** 設定を誤っても、TTL が切れるまで表に出ない。直しても、TTL が切れるまで直らない
+
+疑うときの手順を持っておくと、原因にたどり着くのが早くなります。
+
+```bash
+cat /etc/resolv.conf                      # search、ndots、nameserver は何か
+dig +search api.example.com               # search を効かせて引く。+nosearch と比べる
+dig @10.96.0.10 api.example.com           # リゾルバを直接指定して、段を切り分ける
+sudo tcpdump -i any -nn udp port 53       # 実際に何回、何を問い合わせているか
+nstat -az | grep -i drop                  # カーネルでパケットが捨てられていないか
+```
+
+## この章で見たもの
+
+第 10 章では、ほぼすべての通信の最初にある「名前を引く」処理を、8 回に分けて見てきました。
+
+| 回 | 見たもの |
+| --- | --- |
+| 第 56 回 | 名前はゾーンに分けて書かれ、委任をたどって探す |
+| 第 57 回 | 問い合わせは UDP の小さなメッセージ。手で組める |
+| 第 58 回 | レコードには種類があり、それぞれに役割がある |
+| 第 59 回 | アプリの中では、C ライブラリと設定ファイルが名前解決を決めている |
+| 第 60 回 | 答えは TTL の間、各段にキャッシュされる。切り替えはすぐには効かない |
+| 第 61 回 | 偽の答えを防ぐには、署名の連鎖が要る |
+| 第 62 回 | 盗み見を防ぐには、問い合わせそのものを暗号化する |
+| 第 63 回 | 名前解決は共有された前提なので、壊れると広く、分かりにくく壊れる |
+
+一貫していたのは、DNS が**巨大な分散キャッシュ**だということです。答えを持つ者を階層で分け、途中の段で答えを覚え、覚えている間は問い合わせずに済ませる。速さも、切り替えの遅さも、障害の広がり方も、すべてここから来ています。
+
+## まとめ
+
+- DNS の障害は、アプリからはタイムアウトや遅延としか見えない。名前解決は接続の手前で、見えないところで時間を使う
+- Kubernetes の `ndots:5` と search により、外部の名前 1 回が 8〜10 回の問い合わせになる。末尾ドット、`ndots` の変更、autopath、キャッシュで抑える
+- glibc は A と AAAA を同じソケットから並列に送る。DNAT を挟むと conntrack の競合で片方が捨てられ、`timeout` の 5 秒だけ待たされる
+- `single-request-reopen` は glibc にしか効かない。根本的には NodeLocal DNSCache で DNAT と conntrack を避ける
+- 増幅攻撃は、送信元の偽装と大きな応答の組み合わせ。オープンリゾルバを塞ぎ、偽装を出口で落とす
+- Dyn の事件は、権威 DNS を 1 か所に任せる危うさを示した。Facebook の事件は、健全性の判定が全拠点で一斉に働くと、権威 DNS ごと消えることを示した
+- 引けない名前への再試行は、それ自体が大きな負荷になる
+
+次の第 11 章では、これまでの章で見てきたページキャッシュ、B 木、ログ、ロックといった部品を組み合わせた大きなプログラムとして、**データベースの中身**を見ます。まずは、データがディスクの上でどんな単位に分けて置かれているかからです。
