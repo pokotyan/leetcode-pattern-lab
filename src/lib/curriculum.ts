@@ -259,7 +259,12 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'ship',
     title: '第13章　手元から本番へ',
-    summary: '書いたプログラムを、別のマシンで同じように動かすということ。コンテナイメージの中身、Dockerfile と Buildpacks、CPU アーキテクチャの違い、資源の制限、そして本番で測るための道具',
+    summary: '書いたプログラムを、別のマシンで同じように動かすということ。コンテナイメージの中身、Dockerfile と Buildpacks、CPU アーキテクチャの違い、資源の制限、そして権限の絞り方',
+  },
+  {
+    id: 'observe',
+    title: '第14章　観測する',
+    summary: '本番で動いているものを、止めずに外から見る。カーネルに小さなプログラムを差し込む eBPF、アプリケーションの中から見る OpenTelemetry、コードを書き換えずに計装を差し込む仕組み、そして手元で測る道具',
   },
 ]
 
