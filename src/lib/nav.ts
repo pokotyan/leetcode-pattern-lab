@@ -62,7 +62,7 @@ export const AREAS: Area[] = [
     title: '低レイヤ',
     tagline: 'コンピュータの下のほうで何が起きているか',
     summary:
-      'CPU、キャッシュ、仮想メモリ、プロセス、リンク、システムコール、ファイルシステム、TCP、データベース、FFI と WebAssembly、コンテナ、観測。14 章で上から順に繋ぎ直す。',
+      'CPU、キャッシュ、仮想メモリ、プロセス、リンク、システムコール、ファイルシステム、TCP、データベース、FFI と WebAssembly、コンテナ、クラウドネイティブ、観測。15 章で上から順に繋ぎ直す。',
     path: 'lowlevel/',
     status: 'published',
     items: [{ title: '用語索引', path: 'terms/', summary: '用語から、主に扱う回と言及している回を引く' }],

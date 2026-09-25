@@ -182,7 +182,7 @@ debuginfod-find debuginfo <Build ID>
 
 <Callout type="note" title="フレームポインタが戻ってきた">
   フレームポインタはレジスタを 1 本使うため、長く省略されるのが普通でした。
-  しかし、本番環境でのプロファイリング（第 81 回）で正しいスタックが取れない問題が大きくなり、
+  しかし、本番環境でのプロファイリング（第 90 回）で正しいスタックが取れない問題が大きくなり、
   Fedora 38 はパッケージの既定のビルドオプションに `-fno-omit-frame-pointer` を加えました
   （[Fedora Project Wiki](https://fedoraproject.org/wiki/Changes/fno-omit-frame-pointer)）。
   Ubuntu 24.04 も 64 ビットの全プラットフォームで同じ方針を取っています
