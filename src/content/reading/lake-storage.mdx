@@ -1,0 +1,325 @@
+---
+title: データの置き場所（HDFS・S3・GCS）
+description: データレイクの一番下にあるのは、ファイルシステムか、オブジェクトストレージか。rename も追記もディレクトリも無い置き場所の上に、なぜテーブルを作れるのか
+category: lake
+order: 15
+status: published
+topics:
+  - HDFS
+  - NameNode
+  - Data Locality
+  - Object Storage
+  - Amazon S3
+  - Google Cloud Storage
+  - Prefix
+  - Range GET
+  - Conditional Write
+  - S3 Express One Zone
+  - S3A Committer
+basedOn:
+  - kind: article
+    slug: binary-search
+    why: S3 の一般用バケットはキーを辞書順に並べて持っており、接頭辞での LIST は、ソート済みの列から範囲を切り出す操作になっている
+  - kind: article
+    slug: hash-counting
+    why: 同じ接頭辞に要求が集まると 1 つの区画に負荷が偏る。キーの先頭にハッシュ値を付けて散らすという対策は、ハッシュで振り分ける考え方そのもの
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 5 層の一番下
+
+<a href={`${import.meta.env.BASE_URL}reading/lake-map/`}>データレイクの地図</a>で、データレイクを 5 つの層に分けました。今回はその一番下、**ストレージ層**を扱います。
+
+```
+  Metadata      Hive metastore / Glue Data Catalog
+  Computing     Spark / Flink / Trino / Presto / Redshift
+  Table spec    Hive / Hudi / Iceberg / Delta Lake
+  File format   CSV / JSON / Parquet / Avro / ORC
+▶ Storage       HDFS / S3 / GCS          ← この回
+```
+
+ストレージ層の役目は、バイトの並びに名前を付けて、壊さずに保管し、求められたら返すことです。候補は **HDFS のような分散ファイルシステム**と、**S3 や GCS のようなオブジェクトストレージ**の 2 系統です。どちらも「パスのような名前でデータを置ける」ので似て見えますが、できる操作がかなり違います。**その違い、特にオブジェクトストレージに「無いもの」が、上の層（テーブル形式）の設計を決めています。**
+
+## HDFS：大きなファイルを、データのある場所で処理する
+
+HDFS（Hadoop Distributed File System）は、Hadoop の一部として作られた分散ファイルシステムです。多数のマシンのディスクを束ねて、1 つのファイルシステムとして見せます。
+
+登場人物は 2 種類です。**NameNode** は、名前空間（どのディレクトリにどのファイルがあるか）と、各ファイルがどのブロックからなり、そのブロックがどこにあるかを管理するサーバーです。**DataNode** は、ブロックの実体をローカルディスクに持つサーバーで、多数並びます。
+
+```
+ NameNode（メタデータはすべてメモリ上）
+   /logs/app.log → [blk_1, blk_2]    blk_1 → DN1, DN3, DN4    blk_2 → DN2, DN3, DN5
+        ↑ ① どこにある？   ↓ ② DN1, DN3, DN4
+ クライアント ── ③ データは DataNode と直接やり取り ──→
+   [DN1: blk_1]  [DN2: blk_2]  [DN3: blk_1, blk_2]  [DN4: blk_1]  [DN5: blk_2]
+```
+
+ファイルは**ブロック**という固定長の単位に切って保存されます。HDFS の設計文書は典型的なブロックの大きさを 128 MB としており（[HDFS Architecture](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html)）、設定ファイルの既定値も `dfs.blocksize = 134217728`（128 MiB）です（[hdfs-default.xml](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/hdfs-default.xml)）。ローカルのファイルシステムのブロック（多くは 4 KB）と比べて桁違いに大きいのは、大きなファイルを先頭から順に読む処理を前提にしているからです。
+
+各ブロックは**複製**（レプリカ）を作って複数の DataNode に置きます。既定の複製数は `dfs.replication = 3` です。3 つの置き方にも決まりがあり、1 つめを書き込んだマシン自身（書き手が DataNode 上にいる場合）に、2 つめを別のラックのノードに、3 つめをその 2 つめと同じラックの別のノードに置きます（[HDFS Architecture](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html)）。ラックごと電源が落ちても、1 つは残ります。
+
+### データのある場所で計算する
+
+HDFS の設計文書には「Moving Computation is Cheaper than Moving Data（データを動かすより計算を動かすほうが安い）」という節があります。処理はそのデータの近くで実行したほうがずっと効率がよく、ネットワークの混雑も減る、という考え方です（[HDFS Architecture](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html)）。これを**データ局所性**（data locality）と呼びます。MapReduce（<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理</a>で扱いました）のスケジューラーは、NameNode にブロックの場所を尋ね、**そのブロックを持つ DataNode の上で map タスクを動かそうとします。** 計算するマシンとデータを持つマシンが同じ、という構成です。
+
+### ファイルシステムとしての意味論
+
+HDFS は「ファイルシステム」なので、低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-49-filesystem/`}>ファイルシステムの中身</a>で見た操作の多くがそのまま使えます。
+
+- **ディレクトリが実在する。** NameNode がディレクトリの木を持っているので、一覧はその木を読むだけ
+- **rename が原子的。** NameNode の中で名前の表を書き換えるだけなので、何 GB のディレクトリでも一瞬で、途中の状態は見えない
+- **追記ができる。** 設計文書は「一度書いたら何度も読む（write-once-read-many）」モデルを採り、書き終えたファイルに許す変更は追記（append）と切り詰め（truncate）だけとしている（[HDFS Architecture](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html) の Simple Coherency Model）
+
+特に rename は重要です。Hadoop や Hive の出力処理は、一時ディレクトリに書き終えてから、**最後に rename 1 回で本番の場所へ移す**ことで「出力が全部見えるか、まったく見えないか」を実現してきました。ローカルのファイルシステムで「一時ファイルに書く → rename で置き換える」とするのと同じ発想です（<a href={`${import.meta.env.BASE_URL}lowlevel/ll-50-durability/`}>書いたはずのデータが消える</a>）。
+
+### NameNode がメモリに持つもの
+
+設計文書は「NameNode はファイルシステムの名前空間全体と、ファイルとブロックの対応表をメモリに持つ」と書いています（[HDFS Architecture](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html)）。一覧や rename が速いのはこのためですが、裏返すと、**ファイルとブロックの数が NameNode 1 台のメモリで上限づけられる**ということです。同じ 1 TB でも、128 MB のファイル 8,000 個なら表の行は少なく済みます。1 MB のファイル 100 万個だと、ファイルの数もブロックの数も 100 倍以上になります。1 ブロックは 128 MB まで入れられる箱ですが、1 MB のファイルでも 1 ブロックとして数えられるからです。**小さいファイルが多いと、データの量ではなく、名前の数で NameNode が苦しくなります。**
+
+## オブジェクトストレージ：キーと値の巨大な表
+
+Amazon S3（Simple Storage Service）や Google Cloud Storage（GCS）は**オブジェクトストレージ**です。オブジェクトストレージとは、データを「オブジェクト」という単位で丸ごと置き、名前で丸ごと取り出す、HTTP の API で操作する保管サービスです。
+
+**バケット**はオブジェクトを入れる入れ物、**オブジェクト**はデータ本体とそれを説明するメタデータの組、**キー**はバケットの中でオブジェクトを一意に指す名前（`sales/2026/09/part-0001.parquet` のような文字列）です。S3 の文書は、S3 を「バケット + キー +（版）からオブジェクトへの対応表」と考えてよい、と説明しています（[What is Amazon S3?](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html)）。**本質は巨大なキーバリューストアです。**
+
+### ディレクトリは実在しない
+
+`sales/2026/09/part-0001.parquet` というキーには `/` が含まれていますが、これは**ただの文字**です。S3 の一般用バケット（general purpose bucket）は階層ではなく平らな構造で、コンソールが見せる「フォルダ」は、共通の**接頭辞**（prefix、キーの先頭部分の文字列）でオブジェクトをまとめて表示しているだけです（[Organizing objects using folders](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-folders.html)）。GCS の既定の（平らな）名前空間でも、フォルダは表示上のものです（[About Cloud Storage objects](https://docs.cloud.google.com/storage/docs/objects)）。
+
+では「ディレクトリの一覧」はどうするのか。**LIST**（ListObjectsV2）に接頭辞と区切り文字（delimiter）を渡します。すると S3 は、接頭辞で始まるキーを辞書順に辿り、区切り文字までが共通するものを `CommonPrefixes` として 1 つにまとめて返します。1 回の応答は最大 1,000 件です（[ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)）。
+
+```
+キーの一覧（辞書順）              Prefix="a/", Delimiter="/" の応答
+  a/b/c.parquet  ┐               CommonPrefixes: a/b/   ← 「ディレクトリ」に見える
+  a/b/d.parquet  ┘ → まとめる    Contents:       a/x.parquet
+  a/x.parquet
+```
+
+**ディレクトリの一覧は、ソート済みのキーの列を範囲で切り出して、その場でまとめた結果**です。ディレクトリという物が保存されているわけではありません。
+
+### rename が無い
+
+一般用バケットには、オブジェクトの名前を変える操作がありません。名前を変えたければ、**新しいキーへコピー（CopyObject）して、古いキーを削除（DeleteObject）** します。1 つのオブジェクトなら困ることは少なく、問題は「ディレクトリ」の rename です。1 万個のオブジェクトを持つ接頭辞を移すには、コピーと削除を 1 万回ずつ行います。時間はデータ量に比例し、途中で失敗すれば半分だけ移った状態が残ります。そして S3 の文書が明言している通り、**複数のキーをまとめて原子的に更新する方法はありません**（[Amazon S3 data consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)）。Hadoop の S3A コネクタの文書も「ディレクトリの rename は原子的ではなく途中で失敗しうるので、コミットの仕組みに使ってはならない」と警告しています（[Hadoop-AWS module](https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/index.html)）。
+
+### 丸ごと置き換える。ただし一部だけ読める
+
+オブジェクトは**丸ごと書いて、丸ごと置き換える**ものです。GCS の文書は「アップロードしたオブジェクトは、保存されている間に変化しない」と書いています（[About Cloud Storage objects](https://docs.cloud.google.com/storage/docs/objects)）。追記や、途中の数バイトだけの書き換えはできません。1 GB のファイルの末尾に 1 行足したければ、1 GB を書き直します。一方で、**読むほうは一部だけでも構いません。** GET の要求に HTTP の `Range` ヘッダーを付けると、指定したバイトの範囲だけが返ります（[GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)）。これを**範囲 GET**（range GET）と呼びます。書くのは丸ごと、読むのは部分、という非対称が、次回のファイル形式の設計に効いてきます。
+
+### 整合性：いまは「書いたらすぐ見える」
+
+S3 は長く、上書きや LIST の結果が遅れて反映されることのある**結果整合性**（eventual consistency、しばらく待てば最新が見える性質）でした。2020 年 12 月 1 日から、すべてのリージョンで**強い read-after-write 整合性**（書き込みが成功したあとの読み出しは必ずその内容を返す性質）になっています（[AWS What's New, 2020-12-01](https://aws.amazon.com/about-aws/whats-new/2020/12/amazon-s3-now-delivers-strong-read-after-write-consistency-automatically-for-all-applications/)）。PUT の直後の GET も LIST も、新しい内容を返します。GCS も、オブジェクトの読み書きと一覧は強い整合性です。結果整合なのはアクセス権の付与や取り消しなど一部に限られます（[Cloud Storage consistency](https://docs.cloud.google.com/storage/docs/consistency)）。
+
+ただし、整合性が強いことと、**同時に書く人同士がぶつからないこと**は別の話です。S3 は同じキーへの同時の PUT を「最後に書いたものが勝つ」で決め、ロックの仕組みは持たない、と書いています（[Amazon S3 data consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)）。2 つのジョブが同じ「最新版の目次」を同時に書くと、片方の更新は黙って消えます。
+
+### 条件付き書き込み：ぶつかったら失敗させる
+
+そこで使えるのが**条件付き書き込み**（conditional write）です。書き込みに前提条件を付け、条件が成り立たなければ S3 側で拒否させます（[Conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)）。
+
+| ヘッダー | 意味 | 成り立たないとき |
+| --- | --- | --- |
+| `If-None-Match: *` | そのキーのオブジェクトがまだ無ければ書く | `412 Precondition Failed` |
+| `If-Match: <ETag>` | いまのオブジェクトの ETag（内容から決まる識別子）が指定値と同じなら書く | `412 Precondition Failed` |
+
+同じキーに複数の条件付き書き込みが同時に来た場合、先に終わった 1 つが成功し、残りは 412 で失敗します。`If-None-Match` は 2024 年 8 月、`If-Match` は 2024 年 11 月に一般用バケットとディレクトリバケットで使えるようになりました（[What's New, 2024-08](https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes/)、[What's New, 2024-11](https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-functionality-conditional-writes/)）。
+
+GCS には以前から同じ働きの**前提条件**（precondition）があります。各オブジェクトは版の番号である generation を持ち、`ifGenerationMatch` で「generation がこの値なら」、特に `ifGenerationMatch=0` で「まだ存在しなければ」を指定でき、外れると 412 です（[Request preconditions](https://docs.cloud.google.com/storage/docs/request-preconditions)）。**「無ければ作る」を 1 回の要求で原子的に行える**ことは、小さな機能に見えて、実は大きな意味を持ちます。これは比較して交換する（compare-and-swap）操作の一種であり、複数の書き手の中から 1 人だけを勝たせる仕組みの土台になるからです。
+
+<Callout type="note" title="資料（2023 年 5 月）との違い">
+  Black Belt の資料の時点では、S3 に条件付き書き込みはありませんでした。S3 自体が排他の手段を持たなかったため、たとえば Delta Lake の文書は、複数のクラスタから S3 上の同じテーブルへ書く場合に、DynamoDB で排他を補う LogStore の設定を案内しています（執筆時点の [Delta Lake: Storage configuration](https://docs.delta.io/latest/delta-storage.html)）。条件付き書き込みは、この種の排他をストレージ自身で行う手段になります。各テーブル形式が何を使って排他しているかは<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a>で扱います。
+</Callout>
+
+### リクエストに値段と上限がある
+
+オブジェクトストレージでは、**保存した量だけでなく、要求の回数にも料金がかかります。** 執筆時点の米国東部（バージニア北部）の S3 Standard では、PUT・COPY・POST・LIST が 1,000 回あたり 0.005 ドル、GET が 1,000 回あたり 0.0004 ドルで、オブジェクトの大きさには関係しません（[Amazon S3 pricing](https://aws.amazon.com/s3/pricing/)）。LIST は GET ではなく PUT と同じ高いほうの料金です。
+
+速度にも目安があります。S3 は**分割された接頭辞 1 つあたり、毎秒少なくとも 3,500 回の PUT/COPY/POST/DELETE と 5,500 回の GET/HEAD** を処理でき、接頭辞を増やせば並列に伸びます。ただし伸びるのは段階的で、その間は `503 Slow Down` が返ることがあります（[Optimizing Amazon S3 performance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html)）。GCS はバケットの初期の目安を毎秒およそ 1,000 回の書き込み、5,000 回の読み出しとし、負荷の再配分には数分かかるので 20 分で 2 倍を超えない速さで増やすよう勧めています。連番や時刻で始まる名前は負荷が一か所に寄るので避ける、とも書いています（[Request rate and access distribution guidelines](https://docs.cloud.google.com/storage/docs/request-rate)）。1 回の要求の遅延も、ローカルディスクとは桁が違います。S3 の文書は、小さなオブジェクトの遅延（大きなオブジェクトなら最初の 1 バイトが届くまで）をおよそ 100〜200 ミリ秒としています（[Optimizing Amazon S3 performance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html)）。
+
+### S3 Express One Zone とディレクトリバケット
+
+S3 には、一般用バケットとは別の**ディレクトリバケット**があります。1 つのアベイラビリティゾーン（データセンターの区画）に置き、S3 Express One Zone というストレージクラスで、1 桁ミリ秒の PUT/GET を狙うものです（[What is Amazon S3?](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html)）。名前の通り、**ディレクトリバケットは階層を持ちます。** キー `dir1/dir2/file1.txt` を書くと `dir1/` と `dir2/` というディレクトリが実際に作られ、区切り文字は `/` だけです。その代わり、LIST の結果は辞書順ではありません。上限の目安はバケットあたり毎秒 20 万回の読み出しと 10 万回の書き込みです（[Working with directory buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-buckets-overview.html)）。
+
+さらに、ディレクトリバケットの S3 Express One Zone に限って、**追記**（`PutObject` に `x-amz-write-offset-bytes` を付ける。1 オブジェクト 10,000 回まで）と、**RenameObject**（同じバケット内でのオブジェクトの名前の変更）が用意されています（[Appending data to objects](https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-buckets-objects-append.html)、[RenameObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_RenameObject.html)）。GCS にも、バケット作成時にだけ選べる**階層型名前空間**（hierarchical namespace）があり、実在するフォルダと、フォルダの原子的な rename を提供します（[Hierarchical namespace](https://docs.cloud.google.com/storage/docs/hns-overview)）。つまり、**オブジェクトストレージの側もファイルシステムに近づく方向へ動いています。** とはいえ、データレイクの大半が置かれている一般用バケットや平らな名前空間には、これらはありません。
+
+## 実験：MinIO でオブジェクトストレージの性質を確かめる
+
+手元で試します。S3 のアカウントは使わず、S3 互換の API を持つ **MinIO** を docker で起動しました。**MinIO は S3 そのものではありません。** 同じ API を話すローカルの代替であり、速度も細かな挙動も S3 とは違います（実際に違いが 1 つ見つかりました。後述します）。執筆時点では Docker Hub の `minio/minio` が取得できなかったため、コミュニティによる派生版 `pgsty/minio`（`RELEASE.2026-08-04T00-00-00Z`）を使い、クライアントは Python の boto3 1.43.103 としました。
+
+```bash
+docker run --rm -d --name lake-minio -p 19000:9000 \
+  -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 \
+  pgsty/minio server /data
+```
+
+実験後は `docker stop` で止め、`--rm` によりコンテナも消えています。
+
+### (1) ディレクトリは接頭辞にすぎない
+
+`a/b/c.parquet`、`a/b/d.parquet`、`a/x.parquet` を置き、`list_objects_v2` を区切り文字の有無で比べ、`a/b/` を `head_object` で引きます。
+
+```
+Prefix='a/' Delimiter='/'
+  CommonPrefixes: ['a/b/']
+  Contents      : ['a/x.parquet']
+Prefix='a/' (Delimiter なし)
+  Contents      : ['a/b/c.parquet', 'a/b/d.parquet', 'a/x.parquet']
+HEAD a/b/ -> 404
+```
+
+区切り文字を付けると `a/b/` が「ディレクトリ」のように返りますが、付けなければただのキーの列です。`a/b/` という名前のものは存在せず、HEAD は 404 です。
+
+### (2) rename の代わりにコピーと削除
+
+`a/b/c.parquet` を `a/b2/c.parquet` へ `copy_object` し、元を `delete_object` します。
+
+```
+copy + delete 後: ['a/b/d.parquet', 'a/b2/c.parquet', 'a/x.parquet']
+```
+
+2 回の要求の間には、**同じデータが 2 か所にある瞬間**があります。コピーの後で落ちれば、両方が残ります。
+
+ここで気づいたことがあります。boto3 には `rename_object` という関数があります。これは上で触れた S3 Express One Zone 専用の RenameObject です。試しに MinIO へ送ってみました。
+
+```
+rename_object HTTP 200
+  a/new.parquet 0 バイト
+  a/old.parquet 5000 バイト
+```
+
+**MinIO は 200 を返しましたが、名前は変わっていません。** 0 バイトの `a/new.parquet` ができ、元のオブジェクトはそのまま残りました。RenameObject は `PUT /{Key}?renameObject` という形の要求なので、この MinIO はそれを空の本文の PUT として処理したと見られます。**互換品で成功したことは、S3 での動作の証明にはなりません。**
+
+### (3) 範囲 GET で末尾の 8 バイトだけ読む
+
+1 万行の Parquet ファイル（`a/x.parquet`）の末尾 8 バイトを、`get_object(..., Range="bytes=-8")` で取り出します。
+
+```
+オブジェクトの大きさ: 123159 バイト
+ContentRange: bytes 123151-123158/123159  返ったバイト数: 8
+末尾 8 バイト: b'8\x02\x00\x00PAR1'
+フッタの長さ (little endian): 568  末尾 4 バイト: b'PAR1'
+```
+
+12 万バイトのうち 8 バイトだけが返りました。末尾の 4 バイトは Parquet の目印 `PAR1`、その前の 4 バイトはファイルのメタデータ（フッタ）の長さです。Parquet の仕様は、メタデータをデータの後ろに書き、読み手はまずメタデータを読んで必要な列の位置を知る、と定めています（[Parquet File Format](https://parquet.apache.org/docs/file-format/)）。**Parquet の読み手はまず末尾のフッタを読む必要があり、S3 上ではそれがこの形の範囲 GET になります。** 続けて 568 バイトのフッタを読めば、どの列がどこにあるかが分かります。その中身は<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>の回で読みます。
+
+### (4) `If-None-Match: *` の条件付き PUT
+
+同じキー `_commit/00001.json` に `put_object(..., IfNoneMatch="*")` を 2 回送り、続けて `IfMatch` に正しい ETag と古い ETag を渡します。
+
+```
+1 回目: 成功
+2 回目: 412 PreconditionFailed
+If-Match (正しい ETag): 成功
+If-Match (古い ETag): 412 PreconditionFailed
+```
+
+この MinIO は条件付き書き込みに対応しており、2 回目は S3 の文書と同じ 412 になりました。**「00001 番の記録を書けるのは 1 人だけ」** という約束を、ストレージ自身に守らせることができます。
+
+### (5) 小さい 1,000 個と大きい 1 個
+
+1,024 バイトのオブジェクト 1,000 個と、1,024,000 バイトのオブジェクト 1 個を置き、同じ 1,024,000 バイトを読む時間を比べました（macOS 上の docker、同じマシン内の通信）。
+
+```
+LIST: 1000 個 96.2 ms
+小さい 1000 個: 1024000 バイト 1738.4 ms（GET 1000 回）
+大きい 1 個  : 1024000 バイト 2.8 ms（GET 1 回）
+比: 616 倍
+```
+
+同じ量を読むのに、GET 1,000 回は GET 1 回の 600 倍ほどかかりました（再実行では 615 倍と 815 倍）。時間の大半はデータの転送ではなく、**1 回ごとの要求の往復と処理**です。しかもこれはネットワークを通らない手元の数字です。S3 では 1 回の要求に 100〜200 ミリ秒かかりうるので、1,000 回を順に送れば 2〜3 分になります。実際のエンジンは並列に送って隠しますが、要求の回数とその料金は減りません。
+
+## 小さいファイル問題を、ストレージの側から見る
+
+資料は、従来のデータレイクの課題の 1 つめに「小さいファイルが増えて遅くなる」を挙げていました。ストレージの側から見ると、原因は 3 つに分けられます。
+
+| 置き場所 | 小さいファイルが多いと何が起きるか |
+| --- | --- |
+| HDFS | NameNode のメモリがファイルとブロックの数で埋まる。データ量は小さくても名前の数が上限を決める |
+| オブジェクトストレージ（読み） | 1 ファイルにつき少なくとも 1 回（Parquet ならフッタと本体で複数回）の GET。遅延と料金が回数に比例する |
+| オブジェクトストレージ（一覧） | LIST は 1 回で最大 1,000 件。100 万ファイルなら 1,000 回の LIST を順に辿る。料金も PUT と同じ高いほう |
+
+ストリームを数秒ごとに書き出したり、パーティション（値ごとに分けた接頭辞）を細かく切りすぎたりすると、1 つ数 KB〜数 MB のファイルが大量にできます。**解決の方向は、小さなファイルをまとめて書き直すこと（コンパクション）と、LIST に頼らずファイルの一覧を別に持つこと**です。前者は<a href={`${import.meta.env.BASE_URL}reading/lake-table-ops/`}>更新・削除と運用</a>で、後者はテーブル形式の回で扱います。
+
+## 計算とストレージの分離
+
+HDFS の時代は、データを持つマシンで計算するのが基本でした。クラウドのデータレイクでは逆に、**データを S3 や GCS に置き、計算用のクラスタは必要なときだけ起動して、ネットワーク越しに読みます。** これを**計算とストレージの分離**と呼びます。
+
+```
+HDFS 時代       [計算+データ] [計算+データ] [計算+データ] …   増やすときは両方一緒
+分離した構成    [計算] [計算] …（必要なときだけ起動）
+                   │ HTTP（GET / 範囲 GET / PUT）
+                [ S3 / GCS ]（容量は別に伸びる）
+```
+
+利点は、容量と計算力を別々に増減できることです。データを 10 倍に増やしても計算用のマシンを買い足す必要はなく、夜間の集計のときだけ 100 台を起動できます。同じデータを Spark と Trino と Athena から同時に読むこともできます。代償は、**すべての読み出しがネットワーク越しの HTTP 要求になる**ことです。データ局所性を失った分を、次のような工夫で埋めています。
+
+- **範囲 GET で必要な部分だけ読む。** Parquet のフッタを先に読み、必要な列、必要な行グループだけを取りに行く（実験 3）
+- **要求を並列に送る。** 接頭辞ごとの上限を超えないように、複数の接頭辞に分散させる
+- **キャッシュする。** 計算ノードのローカルディスクやメモリに、よく読むファイルやフッタを置いておく
+- **読む前に絞り込む。** 統計情報やパーティションで、そもそも読まなくてよいファイルを除く（テーブル形式とファイル形式が担う）
+
+## rename に頼れないとき、出力をどう確定するか
+
+HDFS 流の「一時ディレクトリに書いて、最後に rename」を S3 で行うと、コピーと削除の繰り返しになり、遅いうえに原子的ではありません。Hadoop の S3A コネクタは、このために専用の**コミッタ**（出力の確定を担う部品）を用意しています（[Committing work to S3 with the S3A Committers](https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/committers.html)）。考え方は、S3 の**マルチパートアップロード**（大きなオブジェクトを部品に分けて送り、最後の「完了」の要求で 1 つのオブジェクトとして現れさせる仕組み）を使うことです。
+
+```
+タスク:     部品をアップロードする。ただし「完了」はまだ送らない
+            → S3 上ではまだオブジェクトとして見えない
+ジョブ確定: 全タスクが成功したら、各アップロードに「完了」を送る
+            → 最終的な場所にファイルが現れる
+失敗時:     完了させずに中止する → 何も現れない
+```
+
+rename の代わりに「完了の要求」を確定の合図にするわけです。コミッタには Directory、Partitioned、Magic の 3 種類があり、確定後には使ったコミッタ名などを含む JSON の `_SUCCESS` ファイルを書きます。ただし、ジョブ確定では多数のアップロードを 1 つずつ完了させます。S3 の原子性は 1 キーごとなので、その最中に落ちれば一部のファイルだけが現れた状態になりえます。**ファイルの集合を 1 つの操作で切り替える**ことは、ストレージの機能だけでは実現できません。
+
+## 何が無くなったのか
+
+ここまでの話を、低レイヤで見た POSIX（UNIX 系 OS のファイル操作の標準）のファイルシステムと並べます。
+
+| 操作 | ローカルのファイルシステム | HDFS | S3 一般用バケット / GCS（平らな名前空間） |
+| --- | --- | --- | --- |
+| ディレクトリ | 実在する | 実在する（NameNode の木） | 無い。接頭辞と LIST で模倣 |
+| rename | 原子的、一瞬 | 原子的、一瞬 | 無い。コピー + 削除、件数に比例、原子的でない |
+| 追記・部分書き換え | できる | 追記と切り詰めのみ | できない。丸ごと置き換え |
+| 一部の読み出し | できる | できる | できる（範囲 GET） |
+| 複数のものをまとめて原子的に更新 | rename 1 回で実現 | rename 1 回で実現 | できない。1 キーごと |
+| 1 キーの「無ければ作る」 | `O_CREAT \| O_EXCL` | できる | できる（条件付き書き込み、412） |
+| 一覧の速さ | 速い | 速い（メモリ上） | 1,000 件ずつの LIST、料金もかかる |
+
+要点は「複数のものをまとめて原子的に更新」の行です。**Hive 形式のテーブルは、ディレクトリ（接頭辞）の下にあるファイル全体をテーブルの中身とみなします。** そのためディレクトリを LIST しないとテーブルが読めず、ディレクトリを rename しないと更新を原子的に見せられません。オブジェクトストレージでは、どちらも遅いか、存在しません。それでも使えるものが 2 つ残っています。**1 つのオブジェクトの PUT は原子的**（読み手には古いか新しいかのどちらかが見え、途中の状態は見えない。[Amazon S3 data consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)）で、**1 つのキーに対する条件付き書き込み**もあります。
+
+**Iceberg、Delta Lake、Hudi は、この 2 つだけを足場に作り直されたテーブルです。** ディレクトリを LIST する代わりに、テーブルを構成するファイルの一覧をメタデータのファイルに書いておく。ディレクトリを rename する代わりに、「最新版はこれ」という 1 つのポインタ（1 つのオブジェクトや、カタログの 1 行）を条件付きで切り替える。ファイルの集合を丸ごと入れ替えるという、ストレージが持たない操作を、1 キーの原子的な更新に還元しているのです。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| HDFS | Hadoop の分散ファイルシステム。多数のマシンのディスクを 1 つのファイルシステムとして見せる |
+| NameNode | HDFS の名前空間とブロックの所在をメモリで管理するサーバー |
+| ブロック | HDFS がファイルを切る単位。既定 128 MB |
+| データ局所性 | データを持つマシンで計算すること |
+| オブジェクトストレージ | データを名前付きの塊として丸ごと置き、HTTP で出し入れするサービス |
+| キー | バケットの中でオブジェクトを指す名前。`/` はただの文字 |
+| 接頭辞（prefix） | キーの先頭部分。フォルダに見えるものの正体 |
+| LIST | 接頭辞で始まるキーを最大 1,000 件ずつ返す要求 |
+| 範囲 GET | `Range` ヘッダーでオブジェクトの一部だけを読む要求 |
+| 条件付き書き込み | 前提条件（未存在、ETag 一致など）が成り立つときだけ書く要求。外れると 412 |
+| ディレクトリバケット | S3 の、階層を持つ種類のバケット。S3 Express One Zone で使う |
+| S3 Express One Zone | 1 つのアベイラビリティゾーンに置く低遅延のストレージクラス |
+| 階層型名前空間 | GCS の、実在するフォルダと原子的なフォルダの rename を持つバケットの設定 |
+| 計算とストレージの分離 | データを共有のストレージに置き、計算用のマシンを別に増減させる構成 |
+| S3A コミッタ | Hadoop が S3 へ出力を確定するための部品。rename の代わりにマルチパートアップロードの完了を使う |
+
+似た用語の区別を 2 つ補います。**ファイルシステムとオブジェクトストレージ**は、どちらもパスのような名前を使いますが、前者は名前の表（ディレクトリ）を実体として持ち、後者は持ちません。**一般用バケットとディレクトリバケット**は、どちらも S3 のバケットですが、後者だけが階層、追記、rename を持ち、LIST の順序も違います。
+
+## まとめ
+
+- HDFS は、NameNode がメタデータをメモリに持ち、DataNode が 128 MB のブロックを 3 つずつ持つ分散ファイルシステム。データのある場所で計算する
+- HDFS ではディレクトリが実在し、rename は原子的で、追記もできる。出力は「一時ディレクトリに書いて rename」で確定してきた
+- S3 や GCS はキーからオブジェクトへの巨大な表。ディレクトリは接頭辞にすぎず、一覧は LIST で 1,000 件ずつ辿る
+- オブジェクトは丸ごと置き換える。rename はコピーと削除で、原子的でない。一方、範囲 GET で一部だけ読める
+- S3 は 2020 年 12 月から強い整合性。2024 年からは条件付き書き込み（`If-None-Match` / `If-Match`）で、1 キーの「無ければ作る」を原子的に行える
+- 要求には料金と速度の上限があり、1 回の往復も遅い。小さいファイルが多いと、要求の回数と LIST の回数で遅くなる
+- 計算とストレージの分離は、局所性を捨てる代わりに、範囲 GET、並列化、キャッシュ、読む前の絞り込みで補う
+- ディレクトリと rename が無い置き場所で、原子的に使えるのは「1 つのオブジェクトの PUT」と「1 キーの条件付き書き込み」だけ。テーブル形式はこの 2 つの上に作られている
+
+次の回は、この置き場所に実際に並ぶ中身、つまり**ファイル形式**です。CSV や JSON のように行を順に書く形式と、Parquet や ORC のように列ごとにまとめる形式は、何が違うのか。実験 3 で読んだ 8 バイトのフッタに何が書かれていて、エンジンがなぜ範囲 GET だけで必要な列にたどり着けるのかを、<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式（CSV・JSON・Avro・Parquet・ORC）</a>で見ていきます。

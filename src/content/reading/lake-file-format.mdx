@@ -1,0 +1,368 @@
+---
+title: ファイル形式（CSV・JSON・Avro・Parquet・ORC）
+description: 同じ 100 万行でも、書き方しだいでファイルの大きさは 10 倍変わり、1 列を読むためにファイル全体を読むかどうかも変わります。5 つの形式はバイト列の中に何を置き、読み手に何を読み飛ばさせているのでしょうか
+category: lake
+order: 16
+status: published
+topics:
+  - CSV
+  - JSON Lines
+  - Avro
+  - Parquet
+  - ORC
+  - 列指向
+  - 辞書エンコーディング
+  - 述語プッシュダウン
+  - 行グループ
+  - スキーマ進化
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 辞書エンコーディングは、値から番号への対応表を作って値を番号に置き換える。出現した値を辞書に登録していく形そのもの
+  - kind: article
+    slug: binary-search
+    why: 並んだ列の行グループやページが持つ最小値と最大値を見て、探す値を含まない範囲をまとめて捨てる。範囲を絞り込む考え方が同じ
+---
+
+import Callout from '../../components/Callout.astro'
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>では、オブジェクトストレージが範囲を指定した GET でオブジェクトの一部だけを返せることを見ました。ただし、一部だけ読めても、**どこを読めばよいかがファイルの中に書かれていなければ**役に立ちません。今回はファイルの中身、つまりバイト列の並べ方を見ます。
+
+<Callout type="note" title="ファイル形式とテーブル形式は別の層">
+  **ファイル形式**は 1 つのファイルの中でデータをどう並べるかの取り決めです（Parquet、ORC、Avro など）。**テーブル形式**は、多数のファイルをまとめて 1 つのテーブルとして扱うための取り決めで、どのファイルが今のテーブルに属するかを記録します（Iceberg、Delta Lake、Hudi）。テーブル形式はファイル形式の上に載ります。後者は<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a>で扱います。
+</Callout>
+
+## 同じ 100 万行を 5 つの形式で書いてみる
+
+まず実験です。注文を模した 100 万行を作り、形式と圧縮を変えて書き出しました。列は `order_id`（0 からの連番）、`ts`（3 秒おきの時刻）、`country`（10 種類）、`status`（3 種類）、`user_token`（ランダムな 16 桁の 16 進文字列）、`amount`（ランダムな金額）の 6 つです。pyarrow 25.0.1（CSV・Parquet・ORC）、duckdb 1.5.5（JSON Lines）、fastavro 1.12.2（Avro）で書いています。
+
+| 形式 | 無圧縮 | Snappy | deflate 系（gzip、zlib） | ZSTD |
+| --- | --- | --- | --- | --- |
+| JSON Lines | 129.0 MB | | | |
+| CSV | 72.0 MB | | 23.0 MB（gzip） | |
+| Avro | 44.4 MB | 33.8 MB | 24.0 MB（deflate） | |
+| Parquet | 45.6 MB | 33.0 MB | 19.5 MB（GZIP） | 17.7 MB |
+| ORC | 33.1 MB | | 15.3 MB（zlib） | 13.7 MB |
+
+最大の JSON Lines と最小の ORC（ZSTD 圧縮）で約 9.4 倍の差があります。gzip で圧縮した CSV（23.0 MB）は Snappy 圧縮の Parquet（33.0 MB）より小さいのですが、後で見るとおり、**小さいことと速く読めることは別の話**です。以下、この差がどこから来るのかを順に見ます。
+
+## CSV と JSON Lines：人が読めるが、型が無い
+
+**CSV**（Comma-Separated Values）は、1 行に 1 レコードを置き、値をカンマで区切るテキストです。広く使われていますが、RFC 4180 自身が、この形式は一度も正式に文書化されてこなかったと書いており、RFC 4180 も標準ではなく情報提供（Informational）の文書です（[RFC 4180](https://www.rfc-editor.org/rfc/rfc4180)）。改行・ダブルクォート・カンマを含む値はダブルクォートで囲み、値の中のダブルクォートは 2 つ重ねる、というのが RFC 4180 の決まりですが、区切り文字をタブにする、引用を使わない、といった変種が多数あります。
+
+**JSON Lines** は、1 行に 1 つの JSON の値を置く形式です。UTF-8 で書き、各行は正しい JSON で、行の終わりは `\n` と決められています（[JSON Lines](https://jsonlines.org/)）。JSON なので入れ子を書けますが、**各行がキーの名前を毎回繰り返す**ため大きくなります。上の実験で CSV の 1.8 倍になったのはこのためです。
+
+どちらにも**スキーマ**（列の名前と型の定義）がファイルの中にありません。読み手は値を見て型を推測します。次の小さな CSV を、2 つのライブラリで読んでみました。
+
+```text
+id,zip,memo,amount
+1,0070012,"hello",10
+2,1500001,"line1
+line2, still memo",20
+3,0600000,"ok",1e3
+```
+
+```text
+pyarrow : [DataType(int64), DataType(int64), DataType(string), DataType(double)] [70012, 1500001, 600000]
+duckdb  : [BIGINT, VARCHAR, VARCHAR, DOUBLE] ['0070012', '1500001', '0600000']
+```
+
+郵便番号の列 `zip` を、pyarrow は整数と推測して先頭の 0 を落とし、DuckDB は文字列として残しました。**同じファイルでも、読み手によって値が変わります。** 型を明示すれば防げますが、その型の情報はファイルの外で管理するしかありません。
+
+大きなファイルを複数の読み手で分担するには、途中のバイト位置で切り、それぞれが「次の行の先頭」から読み始めます。ところが上の CSV を `line2` の位置（57 バイト目）から読み始めると、最初の行は `line2, still memo",20` に見えます。**改行が引用の中にあるのか外にあるのかは、ファイルの先頭から読まないと分かりません。** 引用の中に改行を置かないと決めて書けば分割できますが、それは形式ではなく運用の約束です。JSON の文字列の中には改行をそのまま置けず、必ずエスケープされます（[RFC 8259](https://www.rfc-editor.org/rfc/rfc8259)）。1 行に 1 つの値と決めた JSON Lines なら、改行で切る方法が CSV より安全です。
+
+圧縮も分割に関わります。gzip は先頭から順にしか展開できず、途中のバイト位置から展開を始められません。Hadoop では任意の位置から展開できる圧縮方式が `SplittableCompressionCodec` を実装することになっており、その実装クラスとして挙がっているのは `BZip2Codec` だけです（[Hadoop API](https://hadoop.apache.org/docs/current/api/org/apache/hadoop/io/compress/SplittableCompressionCodec.html)）。**gzip で圧縮した 1 つの大きな CSV は、1 つの読み手が先頭から全部読むことになります。** Athena のドキュメントも、分割できないファイルは 1 つの読み手しか読めず、ほかの読み手は待つだけになると書いています（[Athena: Optimize your tables](https://docs.aws.amazon.com/athena/latest/ug/performance-tuning-s3-throttling-optimizing-your-tables.html)）。後で見る Avro、Parquet、ORC は、ファイルの中を独立して展開できる塊（ブロック、行グループ、ストライプ）に分けて圧縮するので、圧縮方式に関係なく分割できます。
+
+## 行指向と列指向
+
+表を 1 次元のバイト列に並べる方法は、大きく 2 つあります。
+
+```text
+          order_id  country  amount
+  行 0        0       JP     8262.37
+  行 1        1       KR     9745.81
+  行 2        2       JP      123.40
+
+行指向:  [0 JP 8262.37][1 KR 9745.81][2 JP 123.40]
+列指向:  [0 1 2][JP KR JP][8262.37 9745.81 123.40]
+```
+
+**行指向**は 1 行の値を隣り合わせに置きます。1 件を丸ごと書く・読むのが速く、追記も簡単です。CSV、JSON Lines、Avro がこちらです。**列指向**は 1 列の値を隣り合わせに置きます。Parquet と ORC がこちらです。分析の問い合わせ（**OLAP**、Online Analytical Processing。大量の行を集計する処理）は、「国ごとの売上合計」のように、数十列あるうちの 2〜3 列だけを大量の行にわたって読むのが典型です。行指向では、使わない列の値も同じ塊に混ざっているので、ディスクやネットワークから読むしかありません。列指向なら、**必要な列の塊だけを範囲 GET で取りに行けます**。これを**列の射影**（projection）と呼びます。
+
+列指向はもう 1 つの利点を持ちます。同じ列には同じ型で、似た値が並びます。`country` なら 10 種類の文字列の繰り返し、`order_id` なら 1 ずつ増える整数です。**似た値が隣り合うと、圧縮が効きます。** 行指向では整数、文字列、浮動小数点が交互に現れるので、この規則性を使えません。上の実験で、同じ deflate 系の圧縮でも Avro（24.0 MB）より Parquet の GZIP（19.5 MB）が小さかったのはこのためです。逆に、列指向は 1 行を組み立てるのに全列の塊を回る必要があり、1 行ずつの追記には向きません。書き手は一定数の行を手元にためてから、列ごとに並べ替えて書き出します。
+
+## Avro：スキーマを持ち歩く行指向
+
+**Avro** は Apache のデータの直列化の仕組み（プログラム上のデータをバイト列にする方式）で、執筆時点で公開されている仕様は 1.12.0 です（[Avro Documentation](https://avro.apache.org/docs/)）。スキーマは JSON で書き、値はスキーマに従って詰めたバイナリにします。**バイナリの中には型の情報もフィールドの名前も入りません。** 整数は Protocol Buffers と同じくジグザグ符号化した可変長整数です（<a href={`${import.meta.env.BASE_URL}lowlevel/ll-66-protobuf-wire/`}>Protocol Buffers のワイヤ形式</a>の回で見た varint と zigzag）。
+
+名前も型も無いバイト列を読むには書き手のスキーマが要るので、ファイルに保存するときは**オブジェクトコンテナファイル**という形にして、ヘッダにスキーマを書きます（[Avro Specification: Object Container Files](https://avro.apache.org/docs/1.12.0/specification/)）。
+
+```text
+"Obj" 0x01 | メタデータ（avro.schema, avro.codec） | 同期マーカー 16 バイト
+ブロック:  行数 | バイト数 | 行を詰めたバイト列（codec で圧縮） | 同期マーカー
+ブロック:  行数 | バイト数 | ...                                | 同期マーカー
+```
+
+2 列 3 行のファイルを書き、同期マーカーを 00 01 02 … 0f に固定して中を見ました。
+
+```text
+b'Obj\x01\x04\x14avro.codec\x08null\x16avro.schema\xf8\x01{"type": "record", "name": "Order",
+  "fields": [{"name": "order_id", "type": "long"}, {"name": "country", "type": "string"}]}\x00
+  \x00\x01\x02 ... \x0f\x06\x18\x00\x04JP\x02\x04JP\x04\x04JP\x00\x01\x02 ... \x0f'
+```
+
+ヘッダの同期マーカーに続く `06` は行数 3、`18` はバイト数 12 です（どちらもジグザグ符号化）。続く `00 04 4a 50` が 1 行目で、`order_id` の 0 と、長さ 2 の文字列 `JP` です。**フィールド名は 1 行目にも 2 行目にも出てきません。** JSON Lines との大きさの差はここから来ます。
+
+同期マーカーはファイルごとにランダムに作る 16 バイトで、各ブロックの終わりに置かれます。仕様は、これによって MapReduce の処理のためにファイルを効率よく分割できると書いています。途中から読み始めた読み手は、このマーカーを探せば次のブロックの先頭が分かります。16 バイトのランダムな値なので、CSV の改行と違い、値の中に偶然現れる心配はほぼありません。
+
+### 書き手のスキーマと読み手のスキーマ
+
+Avro では、**書いたときのスキーマ（書き手のスキーマ）と、読むときのスキーマ（読み手のスキーマ）が違ってもよい**ことになっています。仕様の「Schema Resolution」の主な規則は次のとおりです。
+
+- レコードのフィールドは**名前で対応づける**。並び順は違ってよい
+- 書き手にあって読み手に無いフィールドは読み飛ばす
+- 読み手にあって書き手に無いフィールドは、読み手のスキーマの既定値（`default`）を使う。既定値が無ければエラー
+- 型の昇格ができる。`int` は `long`・`float`・`double` へ、`long` は `float`・`double` へ、`float` は `double` へ、`string` と `bytes` は相互に
+- 別名（`aliases`）で、書き手の古い名前を読み手の新しい名前に対応づけられる
+
+さきほどのファイルを、列名を変え（`country` → `country_code`、別名に `country`）、既定値付きの列 `channel` を足した読み手のスキーマで読みました。既定値を外すと失敗します。
+
+```text
+{'order_id': 0, 'country_code': 'JP', 'channel': 'web'}
+...
+SchemaResolutionError No default value for field channel in Order
+```
+
+このように、スキーマを変えても古いデータを読めるようにすることを**スキーマ進化**と呼びます。Protocol Buffers は同じことを**フィールド番号**で行い、名前はバイナリに載りませんでした（<a href={`${import.meta.env.BASE_URL}lowlevel/ll-67-protobuf-types/`}>Protobuf の型</a>の回）。Avro は**名前**で対応づけるので、名前を変えるときは別名を残す必要があり、代わりに番号を管理する必要がありません。どちらも「データだけでは読めず、書き手のスキーマが要る」点は同じです。
+
+ストリームで 1 件ずつ送るメッセージには、毎回スキーマ全体を付けられません。そのため仕様には、2 バイトの印 `C3 01` とスキーマの 8 バイトの指紋（CRC-64-AVRO）を値の前に付ける単一オブジェクト符号化も定められています。読み手は指紋からスキーマを引きます。データレイクでは、Avro は**書き込みの途中の層**でよく見かけます。Iceberg のマニフェスト（テーブルに属するデータファイルの一覧）は Avro ファイルです（[Iceberg Table Spec](https://iceberg.apache.org/spec/)）。Hudi の Merge-on-Read（MoR、更新を別のログに追記しておき、読むときに合わせる方式）では、ログファイルのデータブロックに行指向の Avro を使え、Hudi のドキュメントはその目的を高速で軽い書き込みとしています（[Hudi: Storage Layouts](https://hudi.apache.org/docs/storage_layouts)）。
+
+## Parquet の構造
+
+**Parquet** は Apache の列指向のファイル形式です。ファイルの並びは次のとおりです（[Parquet: File Format](https://parquet.apache.org/docs/file-format/)）。
+
+```text
+"PAR1"
+行グループ 0:  列チャンク order_id [辞書ページ][データページ][データページ]...
+               列チャンク ts       [...]   列チャンク country [...]  ...
+行グループ 1:  ...
+（ページ索引・ブルームフィルタ）
+FileMetaData（Thrift） | その長さ（4 バイト、リトルエンディアン） | "PAR1"
+```
+
+- **行グループ**（row group）: 行をいくつかずつに区切った横の分割。各列について列チャンクを 1 つずつ持つ
+- **列チャンク**（column chunk）: 1 つの行グループの中の 1 列ぶんのデータ。ファイルの中で連続して置かれる
+- **ページ**（page）: 列チャンクをさらに分けたもの。エンコーディングと圧縮はページ単位で行う
+
+仕様のリポジトリは、行グループを 512 MB〜1 GB と大きくし、データページを 8 KB 程度にすることを推奨しています（[parquet-format README](https://github.com/apache/parquet-format/blob/master/README.md)）。ただし実装の既定値はこれと一致しません。pyarrow の既定は 1 行グループあたり最大 1,048,576 行、データページは約 1 MB です（`pq.write_table` の説明による）。
+
+**メタデータはデータの後に書きます。** 書き手は最後に各列チャンクの位置と統計をまとめて置けばよいので、ファイルを 1 回の書き込みで作れます。読み手は逆に、まず末尾を読みます。FileMetaData は Thrift という直列化の仕組みの TCompactProtocol で書かれます（[Parquet: Metadata](https://parquet.apache.org/docs/file-format/metadata/)）。
+
+### 末尾の 8 バイトを見る
+
+さきほどのデータを、行グループを 10 万行ずつにして書き直し、末尾を読みました。
+
+```text
+file size: 26169708
+last 8 bytes : 9a 1d 00 00 50 41 52 31
+footer length (little endian u32): 7578 magic: b'PAR1'
+```
+
+`50 41 52 31` が "PAR1"、その前の `9a 1d 00 00` をリトルエンディアンで読むと 0x1d9a = 7,578 バイトです。**26 MB のファイルでも、末尾の 7,578 + 8 バイトを読めばスキーマと全行グループの統計が分かります。** その中身が次です。
+
+```text
+  num_rows: 1000000
+  num_row_groups: 10
+  optional int64 field_id=-1 order_id;
+  ...
+order_id   encodings=('PLAIN', 'RLE', 'RLE_DICTIONARY') compressed=  297430 uncompressed= 1003110 min=0 max=99999 nulls=0
+country    encodings=('PLAIN', 'RLE', 'RLE_DICTIONARY') compressed=   42691 uncompressed=   50504 min='BR' max='US' nulls=0
+amount     encodings=('PLAIN', 'RLE', 'RLE_DICTIONARY') compressed=  705656 uncompressed=  964414 min=0.19 max=10000.0 nulls=0
+
+order_id min/max per row group:  rg0: 0..99999  rg1: 100000..199999  ...  rg9: 900000..999999
+```
+
+列チャンクごとに、使ったエンコーディング、圧縮前後の大きさ、**最小値・最大値・null の数**が記録されています。スキーマの `field_id=-1` は列の番号が未設定という意味で、Iceberg はここに列の番号を入れ、名前ではなく番号で列を選びます（Iceberg の仕様は「データファイルの列はフィールド ID で選ぶ」と書いています）。
+
+## エンコーディングと圧縮
+
+Parquet はページの値を**エンコーディング**（値の並びを規則性を使って短く表す方法）で詰めてから、**圧縮**（汎用の圧縮アルゴリズム）にかけます。主なエンコーディングは次のとおりです（[Parquet: Encodings](https://parquet.apache.org/docs/file-format/data-pages/encodings/)）。
+
+| エンコーディング | 仕組み | 効く列 |
+| --- | --- | --- |
+| PLAIN | 値をそのまま並べる | どれでも（最後の手段） |
+| RLE_DICTIONARY（辞書） | 列チャンクに出てくる値の一覧（辞書ページ）を作り、各値を辞書の番号に置き換える | 種類の少ない列 |
+| RLE / ビットパッキングの組み合わせ | 同じ値の連続を「値 × 回数」で表し（RLE、ランレングス符号化）、連続しない部分は必要なビット数だけで詰める | 辞書の番号、真偽値、後述の level |
+| DELTA_BINARY_PACKED | 隣との差を取り、差をビットパッキングする | 単調に増える整数や時刻 |
+| DELTA_BYTE_ARRAY など | 前の文字列との共通の接頭辞を省く | 並べ替えた文字列 |
+
+辞書が大きくなりすぎると、仕様は PLAIN に切り替える（fallback）としています。上のメタデータで encodings に 3 つが並んでいるのは、辞書ページが `PLAIN` で、辞書の番号が `RLE_DICTIONARY` で書かれ、`RLE` が null の有無を表す definition level（後述）に使われるためです。
+
+辞書の有無で、列ごとの大きさを比べました（1 行グループ、100 万行）。
+
+```text
+column        distinct   dict+none  plain+none   dict+zstd  plain+zstd
+order_id     1,000,000      8.27MB      8.00MB      1.28MB      1.02MB
+ts           1,000,000      8.27MB      8.00MB      2.38MB      1.94MB
+country             10      0.50MB      6.00MB      0.43MB      1.05MB
+status               3      0.25MB     10.34MB      0.21MB      0.86MB
+user_token   1,000,000     20.11MB     20.00MB      9.07MB      8.98MB
+amount         632,693      8.22MB      8.00MB      4.32MB      3.89MB
+```
+
+**種類が 3 つの `status` は 10.34 MB から 0.25 MB になりました**（約 41 分の 1）。100 万行を 2 ビットずつの番号で表せば 250 KB ほどなので、ほぼ計算どおりです。一方、値がすべて異なる `order_id` や `user_token` では辞書が役に立たず、辞書の分だけわずかに大きくなりました。
+
+`order_id` と `ts` には差分のエンコーディングが向いています。
+
+```text
+PLAIN {'order_id': 8003850, 'ts': 8003850}
+DELTA_BINARY_PACKED {'order_id': 23948, 'ts': 28050}
+```
+
+差がいつも 1（`ts` なら 3,000 ミリ秒）なので、8 MB が 24 KB になりました。pyarrow は既定ではこれを選ばないので、最初の実験で無圧縮の Parquet（45.6 MB）が無圧縮の ORC（33.1 MB）より大きかったのは、後で見るように ORC が整数に差分の符号化を自動で使うことが一因と考えられます。
+
+圧縮方式は、仕様上 UNCOMPRESSED、SNAPPY、GZIP、LZO、BROTLI、LZ4（非推奨）、ZSTD、LZ4_RAW が定義されています（[Parquet: Compression](https://parquet.apache.org/docs/file-format/data-pages/compression/)）。Snappy は圧縮率より圧縮と展開の速さを優先する方式で（[Athena: Use compression](https://docs.aws.amazon.com/athena/latest/ug/compression-formats.html)）、pyarrow の既定です。実験では ZSTD が 17.7 MB と、Snappy の 33.0 MB の約半分でした。
+
+## 読まずに済ませる：述語プッシュダウン
+
+列チャンクの最小値と最大値があれば、`WHERE order_id BETWEEN 120000 AND 130000` のような条件で、**範囲が重ならない行グループを開かずに捨てられます**。条件を読み出しの層まで押し下げて、読む量そのものを減らすことを**述語プッシュダウン**（predicate pushdown）と呼びます。
+
+DuckDB に読んだバイト数を数えるファイルシステム（fsspec）を登録し、10 万行ずつの行グループを持つ上のファイル `f` に問い合わせました。
+
+```text
+SELECT * FROM f                                      read=26,194,886 bytes  reads= 11
+SELECT sum(amount) FROM f                            read= 7,088,972 bytes  reads= 11
+SELECT sum(amount) FROM f
+  WHERE order_id BETWEEN 120000 AND 130000           read= 1,034,257 bytes  reads=  3
+SELECT sum(amount) FROM f WHERE amount < 50          read= 7,088,972 bytes  reads= 11
+SELECT sum(amount) FROM f WHERE order_id > 2000000   read=    32,768 bytes  reads=  1
+```
+
+`amount` の 1 列だけなら全体の約 27% の読み出しで済みます（列の射影）。`order_id` の条件では、10 個の行グループのうち `rg1` だけを読み、読み出しは 1 MB でした（フッタと、`rg1` の `order_id` と `amount` の列チャンク）。どの行グループにも当たらない条件なら、末尾の 32 KB を 1 回読んだだけで終わっています。
+
+一方、`amount < 50` は該当する行が 4,977 行しか無いのに、全行グループを読みました。`amount` はランダムな値なので、**どの行グループの最小値も 50 未満で、統計では捨てられない**からです。**述語プッシュダウンが効くかどうかは、データの並び順で決まります。** よく絞り込む列で並べ替えてから書くと効きます（テーブル形式での扱いは<a href={`${import.meta.env.BASE_URL}reading/lake-table-ops/`}>更新・削除と運用</a>で見ます）。また、行グループを小さくすれば細かく捨てられますが、圧縮は効きにくくなります。この実験でも、行グループが 1 つのファイルは 17.7 MB、10 個に分けたファイルは 26.2 MB でした。
+
+<Callout type="warn" title="最小値と最大値は「本当の値」とは限らない">
+  Parquet の Thrift 定義では、統計の `min_value` と `max_value` は範囲の下限と上限であって、実在する値でなくてもよいとされています。長い文字列の代わりに `"B"` と `"C"` のような短い値を書いてよく、本当の値かどうかは `is_min_value_exact` などで示します（[parquet.thrift](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift)）。範囲で捨てる判断には使えますが、統計から最大値を答えるような使い方には注意が要ります。
+</Callout>
+
+### ページ索引とブルームフィルタ
+
+統計は各データページのヘッダにも書けますが、ヘッダはページごとに散らばっていて、見るにはページを順にたどる必要がありました。そこで**ページ索引**（Page Index）が加えられ、フッタの近くにまとめて置かれます（[Parquet: Page Index](https://parquet.apache.org/docs/file-format/pageindex/)）。**Column Index** はページごとの最小値・最大値で、条件に合うページを見つけます。**Offset Index** はページごとの位置と先頭の行番号で、見つけた行を含む他の列のページを探します。並べ替えた列で 1 行を引くなら、各列 1 ページずつ読めば済みます。pyarrow では `write_page_index=True` で書きます（既定では書きません）。
+
+最小値と最大値は、`user_token` のように種類が多く、値がばらばらに散らばる列では役に立ちません。そこで列チャンクごとに**ブルームフィルタ**（ある値が「確実に無い」か「あるかもしれない」かを小さなビット列で答える仕組み。<a href={`${import.meta.env.BASE_URL}reading/bloom-filter/`}>「無い」だけを高速に言う</a>を参照）も置けます。Parquet は 256 ビットのブロックに分けた分割ブロック型のブルームフィルタを使い、ハッシュ関数は XXH64 です（[Parquet: Bloom Filter](https://parquet.apache.org/docs/file-format/bloomfilter/)）。`user_token` にブルームフィルタを付けたファイルと付けないファイルで、1 つの値を探しました。
+
+```text
+nobloom  token=5555555555555555 rows=0 read= 9,985,196 reads=11
+nobloom  token=29d8194a28ba3dc3 rows=1 read= 9,985,196 reads=11
+bloom    token=5555555555555555 rows=0 read= 1,343,658 reads=11
+bloom    token=29d8194a28ba3dc3 rows=1 read= 3,333,463 reads=13
+```
+
+ファイルは 26.2 MB から 27.5 MB に大きくなりましたが、存在しない値なら読み出しは約 7 分の 1 になりました。10 個のブルームフィルタだけを読み、すべて「無い」と答えたので列チャンクを開いていません。存在する値では、該当する 1 つの行グループだけを読んでいます。
+
+### 入れ子のデータ
+
+Parquet は構造体やリストも列に分けて保存します。その方法は Google の Dremel 論文（[Melnik ほか, VLDB 2010](https://research.google.com/pubs/archive/36632.pdf)）に由来し、各値に 2 つの小さな整数を添えます（[Parquet: Nested Encoding](https://parquet.apache.org/docs/file-format/nestedencoding/)）。
+
+- **definition level**: その値に至る経路の optional（または repeated）なフィールドのうち、いくつが実際に存在するか。null や空がどの深さで起きたかを表す
+- **repetition level**: その値がどの深さの repeated なフィールドで繰り返されているか。0 なら新しいレコードの始まり
+
+たとえば `repeated binary tags` という列に、3 つのレコード `["a", "b"]`、`[]`、`["c"]` を入れると、次のようになります。
+
+```text
+値      repetition level  definition level
+"a"            0                1        ← 1 件目の始まり
+"b"            1                1        ← 同じリストの続き
+(無し)         0                0        ← 2 件目。リストが空
+"c"            0                1        ← 3 件目の始まり
+```
+
+level の最大値はスキーマの入れ子の深さから決まるので、たいていは 1〜2 ビットで済み、RLE で詰められます。
+
+## ORC：Hive のために作られた列指向
+
+**ORC**（Optimized Row Columnar）も列指向のファイル形式で、2013 年 1 月に Hive を速くする取り組みの一部として作られました（[ORC Documentation](https://orc.apache.org/docs/)）。**Hive** は、HDFS や S3 上のファイルに SQL を実行する仕組みで、テーブルの定義を管理するメタストアを持ちます（<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>で扱います）。構造は次のとおりです（[ORC Specification v1](https://orc.apache.org/specification/ORCv1/)）。
+
+```text
+"ORC"
+ストライプ 0:  索引ストリーム（10,000 行ごとの統計と位置）
+               データストリーム（列ごとに PRESENT、DATA、LENGTH など）
+               ストライプフッタ（ストリームの位置、列のエンコーディング）
+ストライプ 1:  ...
+メタデータ（ストライプごとの統計） | フッタ（スキーマ、ストライプの一覧、全体の統計）
+ポストスクリプト（圧縮方式、フッタの長さ、"ORC"） | ポストスクリプトの長さ（1 バイト）
+```
+
+- **ストライプ**（stripe）: Parquet の行グループに当たる横の分割。行がストライプをまたぐことはなく、それぞれ独立に処理できる。Java 版の既定の大きさは 64 MB（`orc.stripe.size` = 67108864、[ORC Java 設定](https://orc.apache.org/docs/core-java-config.html)）
+- **行索引**（row index）: ストライプの中を 10,000 行ごと（`orc.row.index.stride` の既定）に区切り、それぞれの統計と各ストリームの位置を持つ。Parquet の行グループより細かい単位で読み飛ばせる
+- **フッタとポストスクリプト**: 末尾に置く。メタデータは Protocol Buffers で書かれる。読み手はまず末尾の 16 KB を読み、最後の 1 バイトからポストスクリプトの長さ（256 バイト未満）を知る
+
+実験のファイル（pyarrow が使う C++ 版の ORC で書いたもの）でも確かめました。
+
+```text
+nrows 1000000 nstripes 1 compression ZSTD row_index_stride 10000 file_postscript_length 25 file_version 0.12
+postscript + last byte: 08 d0 02 10 05 18 80 80 04 22 02 00 0c 28 cd 01 30 06 82 f4 03 03 4f 52 43 19
+```
+
+最後の 1 バイト `19`（25）がポストスクリプトの長さで、その直前の `4f 52 43` が "ORC" です。整数には RLE の第 2 版が使われ、単調に増える列には差分の符号化（Delta）、繰り返しには短い繰り返しの符号化が選ばれます。文字列は直接の書き方と辞書のどちらかで書き、Java 版の既定では、異なる値の数が非 null の行数の 80% を超えると辞書をやめます（`orc.dictionary.key.threshold` = 0.8）。null は PRESENT というビット列のストリームで表し、リストは要素数のストリーム（LENGTH）と子の列で表します。Parquet の definition level / repetition level とは表し方が違います。
+
+Hive との結びつきは ACID（Atomicity・Consistency・Isolation・Durability。更新をまとめて確定させ、途中の状態を見せない性質）にも表れています。Hive の Wiki は、Hive のトランザクションは最初のリリースでは ORC だけに対応し、他の形式への組み込みはまだ行われていないと書いています（[Hive Transactions](https://cwiki.apache.org/confluence/display/Hive/Hive+Transactions)）。ORC 側のドキュメントも、そのためのベースとデルタのディレクトリ構成を説明しています（[ORC: ACID support](https://orc.apache.org/docs/acid.html)）。
+
+| 観点 | Parquet | ORC |
+| --- | --- | --- |
+| 横の分割 | 行グループ（仕様は 512 MB〜1 GB を推奨） | ストライプ（Java 版の既定 64 MB） |
+| 細かい読み飛ばし | ページ索引（書くかどうかは書き手しだい） | 行索引（既定で 10,000 行ごと） |
+| フッタの直列化 | Thrift（TCompactProtocol） | Protocol Buffers |
+| 入れ子 | definition / repetition level | PRESENT と LENGTH のストリーム |
+| ブルームフィルタ | 列チャンクごと、分割ブロック型 | 行索引の単位ごと（Hive 1.2.0 から） |
+| 生い立ち | 入れ子の表し方を Dremel から採用 | Hive の高速化のために作られた |
+
+どちらが速いかは、書き手の設定とエンジンの実装で大きく変わるので、この表からは言えません。例として執筆時点の Athena のドキュメントは、Parquet の入れ子の列では指定した列だけでなく行全体を読んでしまう既知の問題があり、回避策として ORC を挙げています（[Athena: Optimize your tables](https://docs.aws.amazon.com/athena/latest/ug/performance-tuning-s3-throttling-optimizing-your-tables.html)）。これはエンジン側の事情で、形式の優劣ではありません。
+
+## どれを選ぶか
+
+| 場面 | 向く形式 | 理由 |
+| --- | --- | --- |
+| 外部から受け取る、人が見る | CSV、JSON Lines | どの道具でも読める。ただし型は取り込み側で決める |
+| ストリームや CDC の取り込み途中、1 件ずつの追記 | Avro（JSON Lines も） | 行指向で書くのが軽い。スキーマ進化の規則がある |
+| テーブル形式のメタデータ | Avro（Iceberg のマニフェスト） | 行単位で書き、全件を読む |
+| 分析用に貯める | Parquet、ORC | 列の射影、統計による読み飛ばし、圧縮の効き |
+
+**CDC**（Change Data Capture）は、データベースの変更を 1 件ずつ取り出して流す仕組みです。変更は 1 件ずつ届くので、行指向の形式で受け、たまったら列指向に書き直す 2 段の構成になります。Iceberg の仕様も、読みに最適化した形式と書きに最適化した形式の両方を使えることを目標に挙げています。
+
+<Callout type="warn" title="資料の「AVRO は OLAP 処理に利用可能」について">
+  資料（2023 年 5 月）は Avro について「行ごとにエンコードされているため、行単位での操作に優れているため、OLAP 処理に利用可能」と書いています。行指向であることと OLAP に向くことは、ここまで見てきたとおり逆の関係です。Avro の仕様やドキュメントにも、OLAP 向けという記述は見当たりません。Avro のファイルに SQL を実行できるエンジンは多いので「OLAP のエンジンから読める」のは確かですが、1 列を読むにも全列を展開する必要があり、列の統計で読み飛ばすこともできません。Hudi のドキュメントも、Avro のログの役割を高速で軽い書き込みとし、列指向の形式を分析向けとしています。**正確には「Avro は行単位の書き込みや受け渡しに向き、分析には Parquet か ORC に書き直して使う」**です。
+</Callout>
+
+## この回の用語
+
+| 用語 | 意味 |
+| --- | --- |
+| 行指向 / 列指向 | 1 行の値を隣に置くか、1 列の値を隣に置くか |
+| OLAP | 大量の行を集計する分析の処理 |
+| 分割可能（splittable） | ファイルを途中から読み始めて、複数の読み手で分担できること |
+| オブジェクトコンテナファイル | スキーマをヘッダに持ち、同期マーカーでブロックを区切る Avro のファイル |
+| スキーマ進化 | スキーマを変えても、古いスキーマで書いたデータを読めるようにすること |
+| 行グループ / ストライプ | Parquet / ORC で行を区切った横の分割。Parquet の行グループは列チャンク、さらにページに分かれる |
+| フッタ | ファイル末尾のメタデータ。スキーマ、各塊の位置、統計を持つ |
+| エンコーディング | 値の規則性を使って短く表す方法（辞書、RLE、差分など） |
+| 辞書エンコーディング | 値の一覧を作り、各値をその番号に置き換える方法 |
+| 列の射影 | 必要な列だけを読むこと |
+| 述語プッシュダウン | 条件を読み出しの層に渡し、統計などで読む量を減らすこと |
+| ページ索引 | Parquet のページごとの統計（Column Index）と位置（Offset Index） |
+| 行索引 | ORC のストライプの中で 10,000 行ごとに持つ統計と位置 |
+| definition / repetition level | 入れ子のデータを列に分けるときに値に添える、null の深さと繰り返しの深さ |
+
+## まとめ
+
+- CSV と JSON Lines は人が読めるが、スキーマが無く、型は読み手が推測する。引用の中の改行や gzip の圧縮は、分割して並列に読むことを妨げる
+- 行指向は 1 件の書き込みに、列指向は少数の列を大量の行にわたって読む分析に向く。列指向は似た値が並ぶので圧縮も効く
+- Avro はスキーマをヘッダに持つ行指向の形式で、同期マーカーで分割できる。書き手と読み手のスキーマをフィールドの**名前**で対応づけ、既定値と別名でスキーマ進化を支える
+- Parquet は行グループ → 列チャンク → ページの入れ子で、末尾の「長さ 4 バイト + "PAR1"」からフッタを読めば、スキーマと統計が分かる
+- 辞書、RLE、差分のエンコーディングの効き方は列の性質で大きく違う。実験では 3 種類の列が約 41 分の 1、連番の列が差分で 8 MB から 24 KB になった
+- 統計による読み飛ばしは、データがその列で並んでいるときにしか効かない。ページ索引とブルームフィルタはそれを補う
+- ORC は Hive のために作られた列指向の形式で、ストライプと 10,000 行ごとの行索引を持ち、メタデータを Protocol Buffers で末尾に書く
+- 取り込みの途中は Avro や JSON Lines、分析用には Parquet か ORC。「Avro は OLAP に利用可能」は正確ではない
+
+ここまでで、ファイル 1 つの中身は読めるようになりました。しかし実際のテーブルは、数千から数百万のファイルの集まりです。どのファイルがどのテーブルのどのパーティションに属し、スキーマは何か、を誰が覚えておくのでしょうか。次回の<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>では、その記録係である Hive メタストアや Glue Data Catalog と、それを読んで問い合わせを実行する Spark や Trino を見ます。

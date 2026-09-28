@@ -1,0 +1,354 @@
+---
+title: カタログと計算エンジン（Hive metastore・Spark・Trino）
+description: S3 に並んだファイルの山は、どうやって「sales.orders という表」になるのか。名前を引く台帳（カタログ）と、それを読んで計算する側（エンジン）の分担を、Hive metastore の表の中身から確かめます
+category: lake
+order: 17
+status: published
+topics:
+  - Catalog
+  - Hive Metastore
+  - AWS Glue Data Catalog
+  - Partition Projection
+  - Iceberg REST Catalog
+  - Apache Spark
+  - Apache Flink
+  - Trino
+  - Presto
+  - Separation of Storage and Compute
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: カタログは「名前 → 場所」の対応表そのもので、Spark の shuffle や Trino のステージ間の受け渡しも「同じキーを同じ担当へ集める」ハッシュによる振り分けで動いている
+---
+
+import Callout from '../../components/Callout.astro'
+
+## ファイルの山には名前がない
+
+<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で見たとおり、S3 はキーからオブジェクトへの巨大な表です。<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>で見た Parquet は、1 つのファイルの中に列の型と統計を持っています。ところが、この 2 つだけでは次の SQL が動きません。
+
+```sql
+SELECT sum(amount) FROM sales.orders WHERE dt = '2024-03-15';
+```
+
+`sales.orders` という名前は、S3 のどこにも書かれていないからです。エンジンが知りたいのは次の 4 つです。
+
+1. **場所**：その表のファイルは `s3://my-lake/warehouse/sales.db/orders/` の下にある
+2. **スキーマ**：列は `order_id bigint, user_id bigint, amount decimal(10,2)`
+3. **パーティション**：`dt` と `hr` の値ごとにディレクトリが分かれている
+4. **形式**：中身は Parquet で、この読み書き用のクラスで扱う
+
+この対応を持つ台帳を**カタログ**と呼びます。カタログとは、**表の名前から、場所・スキーマ・パーティション・形式を引くための対応表**です。Hive の世界ではこれを**メタストア**と呼んできたので、「Hive metastore」は「Hive のカタログ」と読み替えて構いません。
+
+資料の 5 層でいえば、この回は上の 2 層、Metadata（カタログ）と Computing（計算エンジン）を扱います。エンジンはまずカタログに名前を問い合わせ、返ってきた場所のファイルを読んで計算します。
+
+```
+  SELECT ... FROM sales.orders WHERE dt = '2024-03-15'
+        │
+        ▼
+  計算エンジン（Spark / Trino / Athena ...）
+        │ ①「sales.orders はどこ？ 列は？ dt=2024-03-15 はどこ？」
+        ▼
+  カタログ（Hive metastore / Glue Data Catalog / REST カタログ）
+        │ ② s3://.../orders/dt=2024-03-15/..., Parquet, 列の一覧
+        ▼
+  エンジンが ② の場所のファイルだけを S3 から読む
+```
+
+## Hive metastore の中身は普通の RDB
+
+Hive metastore（HMS）は特別なデータベースではありません。Hive の管理者向け文書は、表とパーティションのメタデータはすべてメタストアを通して読み書きされ、その永続化には ORM（プログラムのオブジェクトと RDB の表を対応づける仕組み。ここでは DataNucleus）を使うので、それが対応するデータベースなら何でも使えると説明しています（[Hive: AdminManual Metastore Administration](https://cwiki.apache.org/confluence/display/Hive/AdminManual+Metastore+Administration)）。挙げられているのは MySQL、PostgreSQL、Oracle、SQL Server です。
+
+その RDB の前に、**Thrift**（Apache の RPC の仕組み。関数呼び出しをネットワーク越しに送る）で話すサーバーが立ちます。同じ文書は `hive --service metastore` で Thrift のサーバーを起動でき、待ち受けポートの既定値は 9083 だと書いています。Spark も Trino も Redshift Spectrum も、この Thrift の口に `thrift://ホスト:9083` の形でつなぎます（[Trino: Metastores](https://trino.io/docs/current/object-storage/metastores.html)、[Redshift: External schemas](https://docs.aws.amazon.com/redshift/latest/dg/c-spectrum-external-schemas.html)）。
+
+RDB の中の表の名前と列は、Hive のリポジトリにあるスキーマ定義の SQL で確認できます。執筆時点の最新リリース 4.2.1 のタグにある `hive-schema-4.2.0.mysql.sql` を取得すると、`CREATE TABLE` が 84 個ありました（[apache/hive: hive-schema-4.2.0.mysql.sql](https://github.com/apache/hive/blob/rel/release-4.2.1/standalone-metastore/metastore-server/src/main/sql/mysql/hive-schema-4.2.0.mysql.sql)）。古い版の定義は `metastore/scripts/upgrade/mysql/` にあります（[2.3.0 の定義](https://github.com/apache/hive/blob/rel/release-2.3.10/metastore/scripts/upgrade/mysql/hive-schema-2.3.0.mysql.sql)）。名前を引くのに使う中心の表は次のとおりで、主要な列の名前は 2.3 と 4.2 で変わっていません。
+
+| 表 | 1 行が表すもの | 主な列 |
+| --- | --- | --- |
+| `DBS` | データベース（名前空間） | `DB_ID`, `NAME`, `DB_LOCATION_URI`, `CTLG_NAME` |
+| `TBLS` | 表 | `TBL_ID`, `DB_ID`, `TBL_NAME`, `TBL_TYPE`, `SD_ID` |
+| `SDS` | 格納の記述（storage descriptor）。場所と形式 | `SD_ID`, `LOCATION`, `INPUT_FORMAT`, `OUTPUT_FORMAT`, `CD_ID`, `SERDE_ID`, `NUM_BUCKETS` |
+| `COLUMNS_V2` | 列 | `CD_ID`, `COLUMN_NAME`, `TYPE_NAME`, `INTEGER_IDX` |
+| `SERDES` | 行とバイト列の変換クラス（SerDe） | `SERDE_ID`, `SLIB` |
+| `PARTITION_KEYS` | 表のパーティション列の定義 | `TBL_ID`, `PKEY_NAME`, `PKEY_TYPE`, `INTEGER_IDX` |
+| `PARTITIONS` | パーティション 1 つ | `PART_ID`, `TBL_ID`, `PART_NAME`, `SD_ID` |
+| `PARTITION_KEY_VALS` | パーティションのキーの値 1 つ | `PART_ID`, `PART_KEY_VAL`, `INTEGER_IDX` |
+| `TABLE_PARAMS` | 表の任意のプロパティ（キーと値） | `TBL_ID`, `PARAM_KEY`, `PARAM_VALUE` |
+
+注目すべきは、**パーティション 1 つごとに `PARTITIONS` の行と `SDS` の行（そのパーティション自身の場所）ができ、キーの値ごとに `PARTITION_KEY_VALS` の行ができる**ことです。
+
+## 実験 1：sqlite を「メタストア」にして名前を引く
+
+上の表から必要な列だけを残した最小のスキーマを sqlite に作り、`sales.orders`（`dt` と `hr` でパーティション分割、Parquet）を 1 年分登録しました。スクリプトは `work-lake-catalog-engine/hms_mini.py` です。パーティションの登録は、実際の HMS と同じく 1 パーティションにつき `SDS` 1 行、`PARTITIONS` 1 行、`PARTITION_KEY_VALS` 2 行（`dt` と `hr`）です。
+
+表の名前から場所を引くのは `TBLS`・`DBS`・`SDS` の結合、パーティションを引くのは次のクエリです。
+
+```sql
+-- 3. WHERE dt = '2024-03-15' AND hr >= '22' に当たるパーティションの場所
+SELECT p.PART_NAME, s.LOCATION
+FROM PARTITIONS p
+JOIN PARTITION_KEY_VALS v0 ON v0.PART_ID = p.PART_ID AND v0.INTEGER_IDX = 0
+JOIN PARTITION_KEY_VALS v1 ON v1.PART_ID = p.PART_ID AND v1.INTEGER_IDX = 1
+JOIN SDS s ON s.SD_ID = p.SD_ID
+WHERE p.TBL_ID = 1 AND v0.PART_KEY_VAL = '2024-03-15' AND v1.PART_KEY_VAL >= '22';
+```
+
+実際の出力です。
+
+```
+-- 1. 表の名前から、場所と形式を引く
+db | tbl | TBL_TYPE | LOCATION | INPUT_FORMAT
+sales | orders | EXTERNAL_TABLE | s3://my-lake/warehouse/sales.db/orders | org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+
+-- 2. 列（スキーマ）とパーティション列（COLUMNS_V2 と PARTITION_KEYS。省略）
+...
+
+-- 3. WHERE dt = '2024-03-15' AND hr >= '22' に当たるパーティションの場所
+PART_NAME | LOCATION
+dt=2024-03-15/hr=22 | s3://my-lake/warehouse/sales.db/orders/dt=2024-03-15/hr=22
+dt=2024-03-15/hr=23 | s3://my-lake/warehouse/sales.db/orders/dt=2024-03-15/hr=23
+
+-- 4. 1 年分（日 x 時）で各表の行数
+tbl | rows
+PARTITIONS | 8784
+PARTITION_KEY_VALS | 17568
+SDS | 8785
+TBLS | 1
+```
+
+クエリ 3 が**パーティションの刈り込み**（partition pruning。条件に合わないパーティションを読む前に除くこと）の中身です。エンジンは WHERE 句のパーティション列の条件をカタログへの問い合わせに変え、返ってきた 2 つのディレクトリだけを読みます。
+
+一方でクエリ 4 を見ると、表は 1 つなのに、1 時間ごとのパーティションを 1 年（2024 年はうるう年で 366 日）続けただけで、カタログに約 3.5 万行が積まれています。
+
+<Callout type="note" title="カタログが知っているのは「ディレクトリ」まで">
+  この最小スキーマには、個々の Parquet ファイルの一覧がどこにもありません。実際の HMS も同じです。Trino の Iceberg コネクタの文書は、Hive はパーティションの場所をメタストアで管理するが個々のデータファイルは管理しないので、Hive コネクタは「メタストアでパーティションの場所を得る → 各パーティションの中のファイルをファイルシステムで一覧する → 各ファイルのメタデータを読む」の順に呼び出す必要がある、と説明しています（[Trino: Iceberg connector](https://trino.io/docs/current/connector/iceberg.html)）。**S3 の LIST はパーティションの数だけ走ります。**データの置き場所の回で見たとおり、S3 の LIST は 1 回で 1,000 件ずつしか返らず、往復も遅いので、パーティションが多い表ほどこの段階が重くなります。
+</Callout>
+
+## パーティションが増えると何が起きるか
+
+HMS 方式の表は、パーティションが増えるほど 2 つの面で重くなります。
+
+**1 つめは、カタログとファイルがずれることです。** データを書くプログラムが S3 に `dt=2024-03-16/` を作っても、カタログに行が無ければエンジンからは見えません。登録は `ALTER TABLE ... ADD PARTITION` で行います。Hive の DDL の文書は、これは表のメタデータを変えるだけでデータは読み込まない、と注記しています（[Hive: LanguageManual DDL](https://cwiki.apache.org/confluence/display/Hive/LanguageManual+DDL)）。まとめて直す手段が `MSCK REPAIR TABLE` で、ファイルシステムに存在するのにメタストアに無いパーティションを追加します。`DROP PARTITIONS` で消えたものを除き、`SYNC PARTITIONS` で両方を行えます。同じ文書は、`hive.msck.repair.batch.size` の既定値が 0 で、そのままだと全パーティションを一度に処理するとも書いています。**`MSCK REPAIR` は、ディレクトリを走査してカタログを作り直す処理**なので、パーティションが多いほど時間がかかります。
+
+**2 つめは、問い合わせそのものが重くなることです。** Athena の文書は、Athena はクエリのたびに Glue Data Catalog へ `GetPartitions` を呼んでから刈り込みを行い、パーティションが多い表ではこの呼び出しが性能に悪影響を与えうる、と説明しています（[Athena: Partition projection](https://docs.aws.amazon.com/athena/latest/ug/partition-projection.html)）。
+
+## AWS Glue Data Catalog：HMS 互換の管理サービス
+
+AWS Glue Data Catalog は、AWS が運用するカタログです。Glue の文書は、Data Catalog は Apache Hive Metastore の代わりにそのまま差し替えられる（drop-in replacement）と書き、アカウントとリージョンごとに 1 つあり、表はデータベースにまとめられる、と説明しています（[AWS Glue components](https://docs.aws.amazon.com/glue/latest/dg/components-overview.html)）。Athena、Redshift Spectrum、EMR がこれを使います。自前で MySQL と Thrift サーバーを運用しなくてよくなる、というのが HMS との違いです。
+
+**クローラ**（crawler）は、データの置き場所を走査して形式とスキーマを推定し、Data Catalog に表とパーティションを作る、または更新する機能です（[Glue: Using crawlers](https://docs.aws.amazon.com/glue/latest/dg/add-crawler.html)）。S3 のフォルダ構造を見て、スキーマが似たフォルダは 1 つの表のパーティションとみなします。**`MSCK REPAIR` と同じく、ファイルの側からカタログを作る仕組み**です。
+
+資料（2023 年 5 月）は、クローラが Hudi と Iceberg に未対応だと書いていました。執筆時点の文書では、クローラの対象に Delta Lake 2.0.x、Apache Iceberg 1.5、Apache Hudi 0.14 が並んでいます（[Glue: Supported data sources for crawling](https://docs.aws.amazon.com/glue/latest/dg/crawler-data-stores.html)）。ただし Iceberg については、クローラが唯一の書き手のときだけ使うこと、Iceberg v3 の新しい型（VARIANT など）を含む表は扱えないこと、という注意が付いています。
+
+**パーティション射影**（partition projection）は、2 つめの問題への Athena の対策です。表のプロパティに「`dt` は 2020-01-01 から今日までの日付」のような範囲と型を書いておくと、Athena はカタログにパーティションを問い合わせず、その設定から値と場所を計算します（[Athena: Partition projection](https://docs.aws.amazon.com/athena/latest/ug/partition-projection.html)）。パーティションを登録する作業も不要になります。代わりに、射影を有効にするとカタログに登録済みのパーティション情報は無視され、存在しないパーティションを射影しても 0 行が返るだけでエラーになりません。そして文書は、**射影は Athena から読むときだけ効き、Redshift Spectrum、Athena for Spark、EMR から同じ表を読むと通常のパーティション情報が使われる**と書いています。この点は、この回の後半の主題「1 つの表を複数のエンジンで読む」の小さな実例です。
+
+## テーブル形式が来て、カタログの仕事が変わった
+
+Iceberg、Delta Lake、Hudi といった**テーブル形式**（ファイルの集まりを 1 つの表として扱うための、メタデータの置き方の仕様）は、ファイルの一覧とパーティションの情報をカタログの RDB から取り出し、データの隣のメタデータファイルに書くようにしました。詳しい仕組みは<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a>で扱います。ここでは、カタログの側から見た変化だけを確かめます。
+
+Iceberg の仕様は、表の状態はメタデータファイルに保持され、表への変更はすべて新しいメタデータファイルを作り、古いものと**原子的に差し替える**ことで行う、と書いています（[Iceberg Table Spec: Overview](https://iceberg.apache.org/spec/#overview)）。そして、この差し替えは「メタストアかデータベースに**ポインタ**を置き、それを check-and-put（今の値が期待どおりのときだけ書き換える操作）で更新する」ことで実現できる、としています（[Iceberg Table Spec: Metastore Tables](https://iceberg.apache.org/spec/#metastore-tables)）。
+
+```
+  Hive 形式                                Iceberg
+  カタログ = 表・パーティション・場所の全部   カタログ = 「今のメタデータファイルはこれ」だけ
+
+  TBLS ─ SDS (表の場所)                     iceberg_tables
+  PARTITIONS ×8784 ─ SDS ×8784              └ metadata_location ─▶ 00003-....metadata.json
+  PARTITION_KEY_VALS ×17568                                         └ スナップショット → マニフェスト → ファイル
+  （ファイルの一覧は持たない → 毎回 LIST）                            （ファイルの一覧もここにある）
+```
+
+**カタログは「名前 → 表の全部」の台帳から、「名前 → 今の版を指すポインタ 1 つ」を持ち、それを原子的に差し替える場所に変わりました。** 実際、Iceberg を Hive metastore に置く場合も、表の行は 1 つだけで、ポインタは `TABLE_PARAMS` の `metadata_location` というプロパティに入ります（Iceberg の [BaseMetastoreTableOperations.java](https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/BaseMetastoreTableOperations.java) が定義するプロパティ名）。
+
+## 実験 2：pyiceberg のカタログを sqlite で覗く
+
+pyiceberg 0.12.0 の `SqlCatalog` は、SQLAlchemy 経由の RDB をカタログとして使います。sqlite を指定して、`ts` 列の日単位でパーティション分割した `sales.orders` を作り、30 行ずつ 3 回追記しました（`iceberg_catalog.py`）。追記のたびにカタログのポインタを読み、最後に sqlite の中身をそのまま表示しています。
+
+```
+-- create 直後のポインタ: 00000-6544a946-12fd-40f7-a8f0-ef10eef31bd3.metadata.json
+-- append 1 回目のあとのポインタ: 00001-b2ae44e3-b80d-45f5-a6e2-a5c99dfe5094.metadata.json
+-- append 2 回目のあとのポインタ: 00002-3f336a59-e462-4163-8030-ea3cc0c4f0a5.metadata.json
+-- append 3 回目のあとのポインタ: 00003-f2560572-c063-4929-a27c-945a1b6fff96.metadata.json
+
+-- sqlite のテーブル一覧
+iceberg_namespace_properties
+iceberg_tables
+
+-- iceberg_tables の中身
+catalog_name                 local
+table_namespace              sales
+table_name                   orders
+metadata_location            warehouse/sales/orders/metadata/00003-f2560572-...metadata.json
+previous_metadata_location   warehouse/sales/orders/metadata/00002-3f336a59-...metadata.json
+iceberg_type                 TABLE
+
+-- 行数: 1
+-- パーティション数（Iceberg 側で数えたもの）: 30
+-- スナップショット数: 3
+
+-- data/ 以下の Parquet ファイル数: 90
+```
+
+パーティションは 30 個、データファイルは 90 個あるのに、**カタログの表は 2 つだけで、この表の行は 1 行**です。中身は名前と `metadata_location`、1 つ前の `previous_metadata_location` しかありません。パーティションもファイルもスキーマも、ポインタの先の `metadata.json` とそこから辿るファイルに入っています。追記のたびに変わったのはポインタの値だけで、ファイル名の先頭の番号（`00000` → `00003`）は、仕様にある `<V>-<random-uuid>.metadata.json` という命名の版番号 `V` です。
+
+差し替えの書き方も pyiceberg のソースで確かめました。`sql.py` のコミット処理は、`WHERE table_name = ... AND metadata_location = <読み込んだときの値>` の条件で `metadata_location` を新しい値に書き換える UPDATE を発行し、更新された行が 0 なら「別のプロセスが先に更新した」として失敗させます。
+
+同じ表を 2 つのクライアント A と B で読み込み、A が追記したあとに、古い状態のままの B で追記してみました（`conflict.py`）。
+
+```
+Commit failed due to a concurrent update, retrying (1/4) in 109 ms
+A の append は成功。ポインタ: 00004-73f3a562-7747-40d0-bd56-cd211e1dc512.metadata.json
+B の append も成功。ポインタ: 00005-88dcb819-f8d4-4272-827b-4ce95b0188f6.metadata.json
+```
+
+B の最初の差し替えは、ポインタがもう `00003` ではないので失敗し、pyiceberg は最新の版を読み直して再試行し、`00005` として成功しました。**カタログの 1 行に対する check-and-put が、同時に書く人どうしの調停役になっている**わけです。追記どうしは再試行で済みますが、更新や削除がぶつかったときに何を検査するかは、テーブル形式の回で扱います。
+
+## REST カタログと、その実装
+
+ポインタを 1 つ持つだけなら、カタログは HMS でも JDBC でも Glue でも作れます。実際 Iceberg には、Hive、Hadoop、Glue、JDBC、Nessie などのカタログ実装が並んでいました（[Iceberg: Configuration](https://iceberg.apache.org/docs/latest/configuration/)）。しかし Iceberg の文書は、言語やエンジンが増えるにつれ、カタログを言語ごとに実装し直す必要があり、製品側も多くのカタログとクライアントに対応しきれなくなった、と経緯を説明しています。その解決として作られたのが **REST カタログ**の仕様で、OpenAPI で定義した共通の HTTP API です。文書はこれを「HMS に対する Hive の Thrift プロトコルに相当するもの」と位置づけています（[Iceberg: REST Catalog Spec](https://iceberg.apache.org/rest-catalog-spec/)）。
+
+仕様（[rest-catalog-open-api.yaml](https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml)）の要点は次のとおりです。
+
+- 表を読む `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}` の応答は、メタデータ本体と、その場所を示す `metadata-location` を返す
+- 表を更新する `POST` は、**要件**（requirements）と**更新**（updates）の 2 つからなる。要件は「この参照のスナップショット ID が今この値であること」（`assert-ref-snapshot-id`）のような前提条件で、満たされなければ 409 Conflict を返し、クライアントは再試行できる
+- 応答に、ストレージへの一時的な認証情報（`storage-credentials`）を含められる（credential vending）。エンジンに S3 の広い権限を持たせず、カタログが表ごとに鍵を渡せる
+
+要件と更新の組は、実験 2 の `WHERE metadata_location = 今の値` を、HTTP の上で表現したものと読めます。違いは、クライアントがポインタを直接書き換えるのではなく、**カタログのサーバーが差し替えを行い、衝突の検査と再試行もサーバー側で行える**点です（上の REST Catalog Spec はこれを利点の 1 つに挙げています）。
+
+執筆時点で確認できた主な実装です。
+
+| 実装 | 何か | 出典 |
+| --- | --- | --- |
+| Apache Polaris | Iceberg の REST API を実装したオープンソースのカタログ。2024 年 8 月から Apache Incubator で育成され、2026 年 2 月に Apache のトップレベルプロジェクトになった | [polaris.apache.org](https://polaris.apache.org/)、[卒業の告知](https://polaris.apache.org/blog/2026/02/19/apache-polaris-graduates-to-top-level-project/) |
+| Unity Catalog（OSS） | OpenAPI の仕様と Apache 2.0 の実装を持つカタログ。Delta Lake を中心に、Iceberg は REST カタログ API と UniForm で扱う。LF AI & Data Foundation がホスト | [docs.unitycatalog.io](https://docs.unitycatalog.io/) |
+| AWS Glue の Iceberg REST エンドポイント | `https://glue.<region>.amazonaws.com/iceberg`。Glue Data Catalog を REST カタログとして使える。文書の記載では Iceberg の表仕様 v1 と v2 に対応（既定は v2） | [Glue: Iceberg REST endpoint](https://docs.aws.amazon.com/glue/latest/dg/connect-glu-iceberg-rest.html) |
+| Amazon S3 Tables | Iceberg 形式の表を入れる専用の「テーブルバケット」。コンパクションやスナップショットの管理を S3 が自動で行う。`https://s3tables.<region>.amazonaws.com/iceberg` の REST エンドポイントを持つ | [S3 Tables](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables.html)、[S3 Tables Iceberg REST endpoint](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-open-source.html) |
+| Project Nessie | Git のようなブランチ、コミット、タグを持つデータレイク用のカタログ | [projectnessie.org](https://projectnessie.org/) |
+
+S3 Tables の REST エンドポイントの操作表は、この回の話をよく表しています。`loadTable` は `s3tables:GetTableMetadataLocation`、`updateTable` は `s3tables:UpdateTableMetadataLocation` という権限に対応づけられています。**表を読む・更新するとは、メタデータの場所を取得する・差し替えること**だと、権限の名前がそのまま言っています。
+
+## 計算エンジン：何が得意か
+
+カタログから場所を聞いたあと、実際にファイルを読んで計算するのが**計算エンジン**です。資料の Computing 層には 5 つが並んでいます。処理の型としての MapReduce、ストリーム、窓の考え方は<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理（MapReduce とストリーム）</a>で扱ったので、ここでは各エンジンの役回りに絞ります。
+
+| エンジン | 一言でいうと | 得意なこと | 注意点 |
+| --- | --- | --- | --- |
+| Apache Spark | 汎用の分散処理。バッチと、小さなバッチを繰り返すストリーム | 大量データの変換（ETL）、テーブルへの書き込み、機械学習の前処理 | ストリームは既定でマイクロバッチ |
+| Apache Flink | ストリームを先に考えた分散処理 | 状態を持つ連続処理、イベント時刻での集計、変更の取り込み | 状態とチェックポイントの運用が要る |
+| Trino / Presto | 対話的な分散 SQL エンジン | 人や BI ツールが投げるアドホックな集計、複数のデータ源をまたぐ結合 | OLTP 向けではない。既定ではノードが途中で落ちるとクエリ全体が失敗する（[Fault-tolerant execution](https://trino.io/docs/current/admin/fault-tolerant-execution.html) で緩和できる） |
+| Amazon Redshift | データウェアハウス（DWH）。自前の保存領域を持つ | 取り込み済みデータへの高速な集計。Spectrum で S3 の外部表も読む | 自前の保存領域とは別に、外部表のためのカタログが要る |
+| Apache Hive | HiveQL を分散処理のジョブに変換するエンジン | HMS と Hive 形式の表の本家。既存の Hadoop 環境 | MapReduce の実行エンジンは非推奨 |
+
+**Spark** のプログラムは、**ドライバ**（`main()` を動かし、計画を立てるプロセス）と、各ノードで**エグゼキュータ**（タスクを実行し、データをメモリやディスクに持つプロセス）に分かれます。1 回の処理（ジョブ）は**ステージ**に分かれ、Spark の文書はこれを MapReduce の map と reduce の段に似たもの、と書いています（[Spark: Cluster Mode Overview](https://spark.apache.org/docs/latest/cluster-overview.html)。執筆時点の文書は 4.2.0）。ステージの境目で起きるのが **shuffle**、つまりデータをパーティションをまたいで配り直す操作です（[RDD Programming Guide: Shuffle operations](https://spark.apache.org/docs/latest/rdd-programming-guide.html#shuffle-operations)）。利用者は多くの場合、名前付きの列を持つ表として扱う **DataFrame** の API か SQL で書きます。ストリームを扱う Structured Streaming は、既定では小さなバッチを繰り返す**マイクロバッチ**で動き、文書の記載では遅延は 100 ミリ秒程度まで下げられます（[Structured Streaming Programming Guide](https://spark.apache.org/docs/latest/streaming/index.html)）。
+
+**Flink** は、ストリームを 1 件ずつ流しながら処理する設計です。複数のイベントにまたがって覚えておく情報を**状態**（state）と呼び、入力の位置と各演算子の状態を定期的に記録した**チェックポイント**から再開することで、障害のあとも結果の一貫性（exactly-once）を保ちます（[Flink: Stateful Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/)。執筆時点の stable は 2.3.0）。時刻は、できごとが起きた**イベント時刻**と、処理したマシンの**処理時刻**を区別し、**ウォーターマーク**（「このストリームでは時刻 t 以前のイベントはもう来ない」という宣言）で窓を確定させます（[Flink: Timely Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/)）。
+
+**Trino** は、SQL を解析して計画を立てる**コーディネータ**と、実際にデータを処理する**ワーカー**からなり、データ源ごとの差は**コネクタ**が吸収します（[Trino: Concepts](https://trino.io/docs/current/overview/concepts.html)）。文書は、Trino は MySQL や PostgreSQL の代わりになる汎用の RDB ではなく、OLTP（Online Transaction Processing。少量の読み書きを大量にさばく処理）向けでもなく、大量のデータを分散クエリで集計・分析する OLAP（Online Analytical Processing）向けだと明言しています（[Trino: Use cases](https://trino.io/docs/current/overview/use-cases.html)）。全ノードが並列にクエリの一部を受け持つこの形を **MPP**（Massively Parallel Processing）と呼びます。
+
+**Redshift** も MPP ですが、自前の保存領域を持つ DWH です。リーダーノードが計画を立ててコンピュートノードに配り、データはスライスに分散されます（[Redshift: System architecture](https://docs.aws.amazon.com/redshift/latest/dg/c_high_level_system_architecture.html)）。**Redshift Spectrum** を使うと、S3 のファイルを Redshift に取り込まずに外部表として読めます（[Redshift Spectrum](https://docs.aws.amazon.com/redshift/latest/dg/c-using-spectrum.html)）。外部表の定義は、Glue Data Catalog、Athena、または Hive metastore のどれかに置きます（[External schemas](https://docs.aws.amazon.com/redshift/latest/dg/c-spectrum-external-schemas.html)）。資料の時点から対応は広がり、執筆時点の Spectrum の文書には、Iceberg の表や S3 Tables を Redshift から読む章が並んでいます。
+
+**Hive** は、HiveQL を分散処理のジョブに変換して実行するエンジンです。Hive の設定の文書は、実行エンジンの既定値 `mr`（MapReduce）は歴史的な理由で残っているだけで、Hive 2 系で非推奨になっている、と注記しています（[Hive: Configuration Properties](https://cwiki.apache.org/confluence/display/Hive/Configuration+Properties)）。代わりに Tez などを使います。<a href={`${import.meta.env.BASE_URL}reading/lake-map/`}>データレイクの地図</a>で見たように、エンジンとしての Hive を使わない環境でも、HMS と Hive 形式の表は使われ続けています。
+
+<Callout type="tip" title="Presto と Trino はなぜ 2 つあるのか">
+  Presto は 2012 年に Facebook のデータ基盤チームで作られました。Trino の告知によると、2018 年に Facebook がプロジェクトをより強く管理したがっていることが明らかになり、創設者たちは Facebook を離れ、2019 年 1 月に独立した Presto Software Foundation を作りました。こちらの系統が **PrestoSQL** です。一方、Facebook は Presto の商標を出願し、2019 年 9 月に Linux Foundation の下に Presto Foundation を作りました。こちらの系統が **PrestoDB** です。商標の問題から、PrestoSQL は 2020 年 12 月 27 日に **Trino** へ改名しました（[Trino: We're rebranding PrestoSQL as Trino](https://trino.io/blog/2020/12/27/announcing-trino.html)）。
+
+  つまり、**今「Presto」と呼ばれるのは PrestoDB の系統（prestodb.io）で、Trino は PrestoSQL の改名後の名前**です。両者は同じ祖先を持つ別のプロジェクトで、執筆時点の最新リリースは Presto が 0.299、Trino が 483 と、版番号の付け方も違います（GitHub の [prestodb/presto](https://github.com/prestodb/presto/releases) と [trinodb/trino](https://github.com/trinodb/trino/releases)）。
+
+  Amazon Athena のエンジンバージョン 3 について、AWS の文書は、オープンソースの Trino と Presto の変更を継続的に取り込む方式をとったと説明し、追加機能の多くを「オープンソースの Trino から取り入れた機能」として挙げ、関数の一覧は Trino の文書を参照するよう案内しています（[Athena engine version 3](https://docs.aws.amazon.com/athena/latest/ug/engine-versions-reference-0003.html)）。一方で、Trino や Presto のコネクタはそのままでは使えず、Trino の障害耐性のある実行も未対応だと書いています。**Athena は Trino の機能を取り込んだ AWS のサービスで、Trino そのものではありません。**
+</Callout>
+
+## 実験 3：Trino の「カタログ」を見る
+
+docker で Trino の公式イメージ（`trinodb/trino:latest`。起動ログの版は 483）を 1 つ立て、`SHOW CATALOGS` を実行しました。
+
+```
+$ trino --execute "SHOW CATALOGS"
+"jmx"
+"memory"
+"system"
+"tpcds"
+"tpch"
+$ cat /etc/trino/catalog/tpch.properties
+connector.name=tpch
+tpch.splits-per-node=4
+```
+
+ここで言葉のずれに気づきます。**Trino の「カタログ」は、この回でいう Hive metastore のようなカタログではありません。** Trino の文書は、カタログを「特定のデータ源にアクセスするための設定の集まりで、使うコネクタや認証情報、URL などを含む」と定義しています（[Trino: Concepts](https://trino.io/docs/current/overview/concepts.html)）。実際、`tpch.properties` は `connector.name=tpch` と書いただけのファイルです。S3 の表を読むなら、たとえば `lake.properties` に `connector.name=iceberg` と、その先のカタログの種類（`iceberg.catalog.type` に `hive_metastore`、`glue`、`jdbc`、`rest`、`nessie`、`snowflake` のいずれか）を書きます（[Trino: Metastores](https://trino.io/docs/current/object-storage/metastores.html)）。**Trino のカタログ 1 つが、HMS や REST カタログ 1 つへの接続設定を包んでいる**、という入れ子の関係です。
+
+分散実行の形も見ておきます。組み込みの TPC-H データで国別の顧客数を数えるクエリの分散実行計画です（抜粋）。
+
+```
+$ trino --execute "EXPLAIN (TYPE DISTRIBUTED) SELECT n.name, count(*) AS customers
+    FROM tpch.tiny.customer c JOIN tpch.tiny.nation n ON c.nationkey = n.nationkey GROUP BY n.name"
+ Trino version: 483
+ Fragment 0 [HASH]
+     └─ Aggregate[type = FINAL, keys = [name_2]]
+        └─ LocalExchange[partitioning = HASH, arguments = [name_2::varchar(25)]]
+           └─ RemoteSource[sourceFragmentIds = [1]]
+ Fragment 1 [SOURCE]
+     Output partitioning: HASH [name_2]
+     Aggregate[type = INTERMEDIATE, keys = [name_2]]
+     └─ InnerJoin[criteria = (nationkey = nationkey_1), distribution = REPLICATED]
+        ├─ Aggregate[type = PARTIAL, keys = [nationkey]]
+        │  └─ ScanFilter[table = tpch:tiny:customer, dynamicFilters = {nationkey = #df_236}]
+        └─ RemoteSource[sourceFragmentIds = [2]]
+ Fragment 2 [SOURCE]
+     Output partitioning: BROADCAST []
+     TableScan[table = tpch:tiny:nation]
+...
+```
+
+`Fragment` が Trino のステージにあたります。小さい `nation` は全ワーカーへ配られ（`BROADCAST`、結合は `REPLICATED`）、`customer` を読むワーカーはその場で部分集計（`PARTIAL`）し、結果を国名のハッシュで振り分けて（`HASH [name_2]`）最後の集計（`FINAL`）へ送ります。**部分集計してからハッシュで配り直す**のは、MapReduce の combiner と shuffle と同じ形です。ステージ間の受け渡しは、文書の用語では exchange と呼ばれます。
+
+## 1 つのデータを複数のエンジンで読む
+
+<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で見た**ストレージと計算の分離**（データを共有のストレージに置き、計算用のマシンを別に増減させる構成）をとると、同じ S3 のデータを、取り込みは Flink、夜間の変換は Spark、対話的な分析は Trino や Athena、定型の報告は Redshift、というように複数のエンジンで扱うのが普通になります。データを複製しなくてよいのが利点です。
+
+ただし、そのためには**全エンジンが同じカタログを見て、同じテーブル形式を同じように解釈する**必要があります。ここに組み合わせの問題が生まれます。
+
+- **カタログへの対応**：エンジンがそのカタログの口（Thrift、Glue の API、REST）を話せるか。REST カタログはこの組み合わせを「エンジン × カタログ」から「エンジン × 1 つの API」に減らすために作られた
+- **テーブル形式とその版への対応**：Iceberg の v2 と v3、Delta Lake のどの機能まで、Hudi の CoW（Copy on Write）と MoR（Merge on Read）のどちらを、読めるか・書けるか。本文で見た範囲でも、Glue の Iceberg REST エンドポイントは文書の記載で v1 と v2 に対応し、クローラは v3 の新しい型を含む表を扱えない
+- **エンジン固有の設定**：パーティション射影が Athena でしか効かないように、あるエンジンだけが解釈する表のプロパティがある。別のエンジンから読むと結果や速度が変わる
+
+1 つのエンジンが新しい版の機能で表を書き換えると、古いエンジンはその表を読めなくなります。Iceberg の仕様は、表の `format-version` が自分の対応する版より高ければ、実装は例外を投げなければならないと定めています（[Iceberg Table Spec: Table Metadata Fields](https://iceberg.apache.org/spec/#table-metadata-fields)）。**「どのエンジンで書き、どのエンジンで読むか」を先に決め、その全部が対応する範囲の機能だけを使う**のが、複数エンジンで表を共有するときの基本です。各形式が何をどこまで持つかは、次の 2 回で比べます。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| カタログ | 表の名前から、場所・スキーマ・パーティション・形式（テーブル形式では今のメタデータの場所）を引く台帳 |
+| メタストア | Hive の世界でのカタログの呼び名 |
+| Hive metastore（HMS） | RDB と Thrift のサーバーでできた Hive のカタログ |
+| storage descriptor（`SDS`） | 表やパーティションの場所、入出力形式、SerDe をまとめた記述 |
+| パーティションの刈り込み | 条件に合わないパーティションを、読む前に除くこと |
+| `MSCK REPAIR TABLE` | ファイルシステムにあるのにカタログに無いパーティションを登録する Hive の命令 |
+| AWS Glue Data Catalog | AWS が運用する、HMS と差し替えられるカタログ |
+| クローラ | 置き場所を走査してスキーマを推定し、カタログに表とパーティションを作る Glue の機能 |
+| パーティション射影 | カタログに問い合わせず、表の設定からパーティションを計算する Athena の機能 |
+| `metadata_location` | テーブル形式の表で、カタログが持つ「今のメタデータファイル」へのポインタ |
+| check-and-put | 今の値が期待どおりのときだけ書き換える操作。カタログでのコミットの土台 |
+| REST カタログ | Iceberg のカタログ操作を OpenAPI で定めた共通の HTTP API |
+| ドライバ / エグゼキュータ | Spark で計画を立てるプロセス / タスクを実行するプロセス |
+| shuffle | 集計や結合のため、データをキーごとにノード間で配り直す操作 |
+| コネクタ | Trino をデータ源につなぐ部品 |
+| MPP | 多数のノードがクエリの一部ずつを並列に処理する方式 |
+| OLAP / OLTP | 大量データの集計・分析 / 少量の読み書きを大量にさばく処理 |
+
+似た用語の区別を 3 つ補います。
+
+- **カタログとメタストア**：指すものは同じ「名前を引く台帳」で、メタストアは Hive 由来の呼び名です。ただし **Trino のカタログは「コネクタの接続設定」**のことで、HMS のようなカタログは、Trino のカタログの設定の中で接続先として指定します。
+- **Presto と Trino**：同じ Presto から分かれた 2 つのプロジェクトです。PrestoDB が今の Presto、PrestoSQL が改名して Trino になりました。
+- **パーティションとバケット**：どちらも行を分ける仕組みですが、パーティションは列の値そのものでディレクトリを分け、カタログに 1 つずつ登録されます。バケットは列の値のハッシュで決まった数のファイルに分けるもので、カタログにはバケットの数（`SDS.NUM_BUCKETS`）とバケットに使う列（`BUCKETING_COLS`）だけが記録されます。
+
+## まとめ
+
+- カタログは「表の名前 → 場所・スキーマ・パーティション・形式」の対応表。これが無いとファイルの山に SQL を向けられない
+- Hive metastore の中身は、`DBS`・`TBLS`・`SDS`・`PARTITIONS`・`PARTITION_KEY_VALS` などを持つ普通の RDB と、その前の Thrift サーバー
+- HMS はパーティションごとに行を持ち、ファイルの一覧は持たない。パーティションが増えるほど、登録（`MSCK REPAIR`）、問い合わせ（`GetPartitions`）、S3 の LIST が重くなる
+- Glue Data Catalog は HMS と差し替えられる管理サービス。クローラはファイルからカタログを作り、Athena のパーティション射影は問い合わせ自体を省く（Athena でだけ効く）
+- テーブル形式では、カタログの仕事は「今のメタデータファイルへのポインタ 1 つ」を check-and-put で差し替えることになった。実験では 30 パーティション・90 ファイルでもカタログは 1 行だった
+- REST カタログはこの差し替えを共通の HTTP API にしたもので、Polaris、Unity Catalog、Glue、S3 Tables などが実装している
+- Spark は汎用のバッチ、Flink は状態を持つストリーム、Trino と Presto は対話的な分散 SQL、Redshift は DWH、Hive は HMS の本家。Trino は PrestoSQL の改名後の名前
+- 1 つのデータを複数のエンジンで読むときは、カタログの口と、テーブル形式とその版への対応を、全エンジンでそろえる必要がある
+
+この回では、カタログが「今の版はこれ」というポインタを差し替えるところまでを見ました。では、ポインタの先の `metadata.json` には何が書かれていて、なぜ差し替え 1 回で表全体が原子的に切り替わり、過去の版を読むこと（タイムトラベル）までできるのでしょうか。Hive 形式の表がどこで行き詰まったのかから始めて、Iceberg、Delta Lake、Hudi がそれぞれどう解いたかを、<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a>で見ていきます。

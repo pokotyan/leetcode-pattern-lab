@@ -1,0 +1,321 @@
+---
+title: データレイクの地図（5 つの層と用語）
+description: ストレージ、ファイル形式、テーブル形式、カタログ、計算エンジン。似た名前の部品が 5 層に並ぶとき、それぞれは何を決めているのか。1 本の SELECT 文でたどります
+category: lake
+order: 14
+status: published
+topics:
+  - Data Lake
+  - Lakehouse
+  - Table Format
+  - File Format
+  - Catalog
+  - Hive Metastore
+  - Partition Pruning
+  - OLAP
+  - Columnar Storage
+  - Open Table Format
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: Hive 形式のパーティションは「同じキーの行を同じ場所に集める」グルーピングそのもの。キーの値がそのままディレクトリ名になる
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 資料の図をもう一度見る
+
+AWS Black Belt の資料「AWSにおけるHudi/Iceberg/DeltaLakeの使いどころと違いについて」（2023 年 5 月）は、データレイクを次の 5 層で描いています。
+
+```
+Metadata    │ Hive metastore
+Computing   │ Spark  Flink  Trino  Presto  Redshift
+Table spec  │ Hive   Hudi   Iceberg  Delta Lake
+File format │ CSV    JSON   Parquet  Avro  ORC
+Storage     │ HDFS   S3     GCS
+```
+
+この図で迷いやすい理由は 3 つあります。**「Hive」が 3 つの層に顔を出す**こと、**「形式（format）」と呼ばれる層が 2 つある**こと、そして**「メタデータ」がいちばん上の層だけでなく、テーブル形式の層にも入っている**ことです。
+
+この回では、5 層がそれぞれ**何を決めている部品なのか**を 1 本のクエリでたどり、似た言葉を 1 組ずつ区別します。個々の層の中身は、続く 5 回で順に扱います。
+
+## 湖と倉庫、そしてその間
+
+<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理</a>の回で、Data Lake（生のデータを置き、読むときにスキーマを決める）と Data Warehouse（整形したデータを置き、書くときにスキーマを決める）を比べました。ここではその先、両者の間に生まれた **Lakehouse（レイクハウス）** を位置づけます。
+
+この言葉を広めた CIDR 2021 の論文（Armbrust, Ghodsi, Xin, Zaharia "[Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics](https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf)"）は、分析基盤の歴史を次のように整理しています。
+
+| 世代 | 構成 | 論文が挙げる問題 |
+| --- | --- | --- |
+| 第 1 世代 | 業務データベースから Warehouse へ直接 ETL | 計算とストレージが一体の機器で、ピークに合わせて買う必要がある。非構造データを置けない |
+| 第 2 世代 | 生データを Lake（HDFS、のちに S3 などの）に置き、一部を Warehouse へ再び ETL | 2 つの系の整合を保つのが難しい。Warehouse のデータが古い。ストレージ代が二重にかかる |
+| Lakehouse | Lake の上に、表を管理する層を載せる | （論文の提案） |
+
+ETL は Extract, Transform, Load（取り出し、変換し、読み込む）の略で、ある系から別の系へデータを整形して移す処理です。論文は Lakehouse を「安価で直接アクセスできるストレージの上に、ACID トランザクション、データの版管理、監査、索引、キャッシュ、クエリ最適化といった分析用 DBMS の管理機能と性能機能を備えたデータ管理システム」と定義しています。ACID は Atomicity（不可分性）、Consistency（一貫性）、Isolation（分離性）、Durability（永続性）の頭文字で、トランザクションが守るべき 4 つの性質です。
+
+実装の要として論文が挙げるのが、**オブジェクトストアの上に「どのオブジェクトがある版のテーブルに属するかを定める、トランザクション付きのメタデータ層」を置く**という考え方です。例として Delta Lake と Apache Iceberg が名指しされています。**この「メタデータ層」が、資料の図でいう Table spec の層です。** 6 本を通して、この一文が何を意味するかを確かめていきます。
+
+<Callout type="note" title="Lakehouse は製品名ではありません">
+  Lakehouse は構成の型を指す言葉で、特定の製品を指しません。論文の著者は Databricks の所属で、Delta Lake もそこから出たものですが、Iceberg や Hudi を使った構成も同じ型に入ります。資料が「新たなデータレイクフォーマット」と呼んでいるものは、この回以降「テーブル形式」と呼びます。
+</Callout>
+
+## 1 本の SELECT で 5 層を通る
+
+次のクエリを、Iceberg 形式のテーブルに対して実行するとします。
+
+```sql
+SELECT sum(amount) FROM sales.orders WHERE dt = DATE '2026-09-02';
+```
+
+エンジンの中では、おおむね次の順で層をたどります（Iceberg の[仕様](https://iceberg.apache.org/spec/)に沿った流れです）。
+
+```
+① 計算エンジン   Trino / Spark など。SQL を受け取り、計画を立てて実行する
+      │ 「sales.orders はどこ？」
+      ▼
+② カタログ       表の名前 → 今の版のメタデータファイルの場所
+      │ s3://bucket/orders/metadata/00042-....metadata.json
+      ▼
+③ テーブル形式   メタデータ → スナップショット → マニフェスト一覧 → マニフェスト
+      │ 各データファイルのパーティション値と列の統計を見て、
+      │ dt = 2026-09-02 を含みうるファイルだけを残す
+      ▼
+④ ファイル形式   Parquet の末尾にあるメタデータを読み、
+      │ 行グループごとの最小値・最大値で、さらに読む範囲を絞る
+      ▼
+⑤ ストレージ     S3 に範囲指定の GET を出し、必要な列のバイトだけ取る
+```
+
+各層が決めていることを 1 行ずつにすると、次のようになります。
+
+| 層 | 決めていること | この例での答え |
+| --- | --- | --- |
+| 計算エンジン | どう計算するか（計画、並列化、集計） | `amount` 列だけ読み、合計を取る |
+| カタログ | 名前からどこへ行くか | `sales.orders` の今のメタデータはこのファイル |
+| テーブル形式 | **どのファイルの集まりが、今のテーブルか** | この版に属するファイルはこの一覧。うち該当日を含むのはこれ |
+| ファイル形式 | 1 つのファイルの中で、値をどう並べるか | `amount` 列はこの位置、この行グループは値の範囲外 |
+| ストレージ | バイト列をどこに、どれだけ確実に置くか | このキーのこの範囲のバイト |
+
+③ の根拠は仕様にあります。テーブルの状態はメタデータファイルに保持され、変更のたびに新しいメタデータファイルを作って古いものと**不可分に差し替え**ます。データファイルはマニフェストが追跡し、マニフェストの各行はファイルのパーティション値と統計（metrics）を持ちます（[Iceberg spec: Overview](https://iceberg.apache.org/spec/#overview)）。④ は、Parquet がファイル末尾にメタデータを書き、列の最小値・最大値をいくつかの粒度で持つことによります（[parquet-format](https://github.com/apache/parquet-format)）。⑤ は、S3 の GetObject が指定したバイト範囲だけを返せることによります（[GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)）。
+
+**読み飛ばしは 2 段階で起きます。** ファイル単位の絞り込みはテーブル形式の仕事、ファイルの中の絞り込みはファイル形式の仕事です。どちらも「統計を見て、読まなくてよいものを外す」という同じ発想ですが、持ち主の層が違います。
+
+## 似た言葉を区別する
+
+| 組 | 区別 |
+| --- | --- |
+| ファイル形式 と テーブル形式 | ファイル形式（Parquet、ORC、Avro）は**1 つのファイルの中身**の並べ方。テーブル形式（Iceberg、Delta Lake、Hudi）は**多数のファイルのうちどれが今のテーブルか**の記録の仕方。テーブル形式はファイル形式を置き換えず、その上に載る |
+| カタログ と メタストア | カタログは「表の名前 → 表の実体の場所とスキーマ」を引く台帳の総称。メタストアは Hive の世界でのカタログの呼び名で、Hive metastore（HMS）が代表。AWS Glue Data Catalog は HMS の代替として使える（[AWS Glue](https://docs.aws.amazon.com/glue/latest/dg/components-overview.html)） |
+| テーブル形式 と エンジン | テーブル形式は**データの置き方の約束（仕様）**で、それ自体は計算しない。エンジンはその約束に従って読み書きするプログラム。1 つの Iceberg テーブルを Spark で書き、Trino で読める |
+| OLTP と OLAP | OLTP（Online Transaction Processing）は 1 件ずつの読み書きを大量にさばく処理（注文の登録など）。OLAP（Online Analytical Processing）は大量の行をまとめて集計する処理（月別売上など）。データレイクは OLAP 側の仕組み |
+| 行指向 と 列指向 | 行指向は 1 行の値を隣り合わせに置く（CSV、Avro）。列指向は 1 列の値を隣り合わせに置く（Parquet、ORC）。一部の列だけを大量に読む集計では列指向が有利 |
+| ストレージと計算の分離 | データを置く場所（S3 など）と計算する機械（エンジンのクラスタ）を別々に用意し、別々に増減させる構成。論文も、Lakehouse はこの構成のクラウドに向くと述べている |
+| オープンテーブル形式 | 仕様が公開され、複数のエンジンが読み書きできるテーブル形式。Iceberg、Delta Lake、Hudi の 3 つがこう呼ばれる |
+
+行指向と列指向の違いは、次の図が分かりやすいです。
+
+```
+表:  id | user | amount
+      1 | a    | 300
+      2 | b    | 500
+
+行指向:  [1, a, 300] [2, b, 500]         ← 1 行を取り出すのが速い
+列指向:  [1, 2] [a, b] [300, 500]         ← amount だけ読むなら 3 つ目の塊だけ
+```
+
+カタログとテーブル形式の境目は、形式によって位置が違います。Iceberg は、カタログが持つ「今のメタデータファイルへのポインタ」を比較して交換（check-and-put）することでコミットを成立させます（[Iceberg spec: Metastore Tables](https://iceberg.apache.org/spec/#metastore-tables)）。一方 Delta Lake のプロトコルは、メタデータをすべてデータの隣に置き、読むだけなら別のメタストアを要らなくすることを設計目標に挙げています（[Delta PROTOCOL.md](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)）。ただし執筆時点のプロトコルには、カタログがコミット成否の判定役になる「catalog-managed tables」という機能も加わっています。**「カタログは名前を引くだけの層」とは言い切れない**ことを覚えておくと、第 4 回で混乱せずに済みます。
+
+## 「Hive」が 3 つの層に出てくる理由
+
+資料の図では、Hive が Metadata と Table spec に現れ、Computing の Spark や Trino もしばしば「Hive のテーブル」を読みます。これは、Apache Hive がもともと 3 つの部品の組だったからです。Trino の Hive コネクタの説明がこの分解をそのまま書いています（[Trino: Hive connector](https://trino.io/docs/current/connector/hive.html)）。
+
+| Hive の部品 | 属する層 | 中身 |
+| --- | --- | --- |
+| HiveQL とその実行系 | 計算エンジン | SQL を MapReduce や Tez の上で実行する |
+| Hive metastore（HMS） | カタログ | 表・パーティションとファイルの対応を、MySQL などのデータベースに保持する |
+| Hive 形式のテーブル | テーブル形式 | 表はディレクトリ、パーティションはその下のサブディレクトリ |
+
+Trino は、このうちデータとメタデータの 2 つだけを使い、HiveQL や Hive の実行環境は使わないと明記しています。**Hive というエンジンを使わなくても、Hive metastore と Hive 形式のテーブルは使われ続けてきた**ので、名前だけが 3 つの層に残っています。
+
+3 つ目の「Hive 形式」は、Hive のチュートリアルにある「Hive のパーティションは HDFS のディレクトリに対応する」という一文に尽きます（[Hive Tutorial](https://cwiki.apache.org/confluence/display/Hive/Tutorial)）。パーティションとは、ある列の値ごとにデータを分けて置くことです。同じチュートリアルは、パーティションの中をさらに列のハッシュ値で分ける**バケット**も説明しています。パーティションはディレクトリ名で見分け、バケットはハッシュで決まるファイルで見分ける、という違いです。
+
+<Callout type="warn" title="Hive にも ACID テーブルはあります">
+  「Hive 形式にはトランザクションが無い」は、ディレクトリとファイルだけで表を表す従来の形についての話です。Hive 自体は ORC のテーブルに対して ACID を提供する機能を持っています（[Apache Hive](https://hive.apache.org/)）。ただしそれは Hive の中の仕組みで、エンジンをまたいで共有する前提の Iceberg などとは位置づけが違います。
+</Callout>
+
+## 手を動かす：テーブル＝ディレクトリ
+
+Hive 形式のテーブルを、手元で作って読んでみます。pyarrow 25.0.1 と duckdb 1.5.5 を使いました。3 日分の注文を、日付ごとのディレクトリに Parquet で書きます。
+
+```python
+import os, random
+import pyarrow as pa, pyarrow.parquet as pq
+
+random.seed(0)
+for day in ["2026-09-01", "2026-09-02", "2026-09-03"]:
+    d = f"orders/dt={day}"
+    os.makedirs(d)
+    t = pa.table({
+        "order_id": list(range(1000)),
+        "user_id": [random.randint(1, 100) for _ in range(1000)],
+        "amount": [random.randint(100, 5000) for _ in range(1000)],
+    })
+    pq.write_table(t, f"{d}/part-0.parquet")
+```
+
+```
+orders/dt=2026-09-01/part-0.parquet 12541 bytes
+orders/dt=2026-09-02/part-0.parquet 12566 bytes
+orders/dt=2026-09-03/part-0.parquet 12570 bytes
+```
+
+`dt` という列はファイルの中にありません。DuckDB に `hive_partitioning = true` を付けて読むと、**ディレクトリ名 `dt=...` から列が復元されます**（[DuckDB: Hive Partitioning](https://duckdb.org/docs/current/data/partitioning/hive_partitioning.html)）。
+
+```
+parquet_schema('orders/dt=2026-09-01/part-0.parquet') の列:  order_id, user_id, amount
+DESCRIBE SELECT * FROM read_parquet('orders/*/*.parquet', hive_partitioning = true):
+  order_id BIGINT / user_id BIGINT / amount BIGINT / dt DATE
+```
+
+次に、条件なしと、1 日だけに絞った集計を `EXPLAIN ANALYZE` で比べます。
+
+```sql
+SELECT sum(amount) FROM read_parquet('orders/*/*.parquet', hive_partitioning = true)
+WHERE dt = '2026-09-02';
+```
+
+```
+-- 条件なし                  -- WHERE dt = '2026-09-02'
+│  TABLE_SCAN           │    │  TABLE_SCAN                 │
+│  READ_PARQUET         │    │  READ_PARQUET               │
+│  Projections: amount  │    │  Projections: amount        │
+│  Total Files Read: 3  │    │  File Filters:              │
+│                       │    │  (dt = '2026-09-02'::DATE)  │
+│      3,000 rows       │    │  Scanning Files: 1/3        │
+                             │  Total Files Read: 1        │
+                             │  orders/dt=2026-09-02/...   │
+                             │      1,000 rows             │
+```
+
+**ファイルを開く前に、パス名だけで 3 つのうち 2 つを外しています。** これがパーティションの刈り込み（partition pruning）です。`Projections: amount` は、列指向のファイルから `amount` 列だけを読んでいることを示します。ファイルの中の統計も見ておきます。
+
+```
+parquet_metadata('orders/dt=2026-09-02/part-0.parquet')
+│ order_id │ 0 │ 0   │ 999  │
+│ user_id  │ 0 │ 1   │ 100  │
+│ amount   │ 0 │ 101 │ 4987 │     ← 列, 行グループ番号, 最小値, 最大値
+```
+
+`WHERE amount > 5000` なら、この行グループは中身を読まずに外せます。これが ① 〜 ⑤ の ④ にあたります（第 3 回で詳しく扱います）。
+
+ここまでは順調です。では、9 月 2 日の分を訂正するジョブが、**新しいファイルを書き終え、古いファイルをまだ消していない瞬間**に誰かがクエリを実行したらどうなるでしょうか。
+
+```python
+t = pq.read_table("orders/dt=2026-09-02/part-0.parquet")
+pq.write_table(t, "orders/dt=2026-09-02/part-1.parquet")   # 書き直した版
+```
+
+```
+┌────────────┬───────┬───────┐
+│     dt     │   n   │ files │
+├────────────┼───────┼───────┤
+│ 2026-09-01 │  1000 │     1 │
+│ 2026-09-02 │  2000 │     2 │
+│ 2026-09-03 │  1000 │     1 │
+└────────────┴───────┴───────┘
+```
+
+9 月 2 日の注文が 2 倍に数えられました。DuckDB が悪いのではありません。**Hive 形式では「ディレクトリの中にあるファイルがテーブルである」ことしか決まっておらず、どのファイル一覧が今の正しいテーブルなのかを保証する仕組みがどこにも無い**のです。書きかけのファイル、消し忘れたファイル、書き込みに失敗したジョブの残骸も、置いてあれば読まれます。ディレクトリ操作の意味は<a href={`${import.meta.env.BASE_URL}lowlevel/ll-49-filesystem/`}>ファイルシステム</a>の回で扱いましたが、S3 の汎用バケットはファイルシステムのような階層を持たない平らな構造で、`dt=2026-09-02/` はキーの名前の一部にすぎません（[S3: フォルダの扱い](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-folders.html)）。Iceberg の仕様も、ファイルシステムの名前変更に頼るコミット方式はオブジェクトストアでは安全でないとして非推奨にしています（[Iceberg spec: File System Tables](https://iceberg.apache.org/spec/#file-system-tables)）。
+
+**論文の言う「どのオブジェクトがある版のテーブルに属するかを定めるメタデータ層」は、まさにこの穴を埋めるものです。** ファイル一覧を別に記録し、その記録の差し替えを 1 回の不可分な操作にすれば、読み手は「古い 1 本」か「新しい 1 本」のどちらかだけを見ることになります。
+
+## 資料の 4 つの課題はどの層の問題か
+
+資料は、従来のデータレイクの課題を 4 つ、共通のユースケースを 4 つ挙げています。どの層の問題かに振り分けると、**ほとんどがテーブル形式の層に集まります**。
+
+| 資料の課題・ユースケース | 主な層 | なぜその層か | 扱う回 |
+| --- | --- | --- | --- |
+| 小さいファイルが増えて遅くなる | ストレージ + テーブル形式 | 1 ファイルごとに要求と一覧のコストがかかる（ストレージ）。まとめ直しても読み手を壊さない仕組みが要る（テーブル形式） | 第 2 回、第 6 回 |
+| 編集・削除が苦手 | テーブル形式 | Parquet は書いたら変えられない。どの行を消したかを別に記録する必要がある | 第 5 回、第 6 回 |
+| 同時アクセス時の整合性がない | テーブル形式 + カタログ | 上の実験の問題。版の差し替えを不可分にし、その差し替えをカタログ等で調停する | 第 4 回、第 5 回 |
+| 過去の状態を復元できない | テーブル形式 | 過去の版のファイル一覧を残しておけば、過去のテーブルを読める（タイムトラベル） | 第 5 回 |
+| ストリームの取り込み | ストレージ + テーブル形式 | 頻繁な小さい書き込みが小さいファイルを生む | 第 6 回 |
+| CDC（UPSERT） | テーブル形式 | CDC（Change Data Capture）は元のデータベースの変更を順に取り出すこと。UPSERT は「あれば更新、無ければ挿入」。行単位の更新が要る | 第 6 回 |
+| 個人情報の削除 | テーブル形式 | 特定の行を期限内に確実に消す。古い版のファイルの後始末も要る | 第 6 回 |
+| データサイエンスの再現性 | テーブル形式 | 特定の版を指定して読む | 第 5 回 |
+
+ストレージとファイル形式は、課題の原因（書き換えられない、名前変更が不可分でない）を作る側で、解決の主役はテーブル形式です。資料が「新たなデータレイクフォーマット」を主題にしているのは、このためです。
+
+## 資料のあとで変わったこと
+
+資料は 2023 年 5 月時点のものです。この回の範囲で、執筆時点までに次の変化を一次資料で確認しました。
+
+- **Iceberg REST カタログ**：言語やエンジンごとにカタログの実装が必要になる問題を解くため、OpenAPI で定義した共通のカタログ API が作られました。仕様は「HMS に対する Hive の Thrift プロトコルに相当するもの」と説明しています（[REST Catalog Spec](https://iceberg.apache.org/rest-catalog-spec/)）。Iceberg 1.11.0 では、カタログのサーバー側でスキャン計画（読むファイルの決定）を行う機能が広がりました（[1.11.0 release](https://iceberg.apache.org/blog/apache-iceberg-1.11.0-release/)）。③ の仕事の一部がカタログへ移りうる、ということです
+- **Amazon S3 Tables**（2024 年 12 月 3 日発表）：Iceberg 形式のテーブルを置く専用のバケット種別（table bucket）で、コンパクション、スナップショット管理、参照されないファイルの削除を S3 が自動で行います（[What's New](https://aws.amazon.com/about-aws/whats-new/2024/12/amazon-s3-tables-apache-iceberg-tables-analytics-workloads/)、[S3 Tables](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables.html)）。ストレージの層がテーブル形式の運用まで引き受ける例です
+- **形式の相互運用**：Delta Lake の UniForm は、Delta のコミット後に Iceberg（や Hudi）のメタデータを非同期に生成し、1 組のデータファイルを複数の形式のクライアントから読めるようにします。ただし Iceberg・Hudi 側からは読み取り専用です（[UniForm](https://docs.delta.io/latest/delta-uniform.html)）。Apache XTable（旧 OneTable、執筆時点で Apache Incubator のプロジェクト）は、新しい形式ではなく、データファイルを複製せずにテーブル形式のメタデータを相互に変換する道具です（[Apache XTable](https://xtable.apache.org/)）。どちらも、**3 形式がいずれも Parquet のデータファイルとその上のメタデータ層で構成できる**ことを利用しています
+- **Tabular の買収**：資料で Iceberg の出資元とされていた Tabular は、Databricks が 2024 年 6 月 4 日に買収合意を発表しました（[Databricks blog](https://www.databricks.com/blog/databricks-tabular)）。Delta Lake を開発してきた会社が Iceberg の開発者の会社も抱えた形です
+- **Iceberg の仕様**：資料の時点の v1・v2 に加え、執筆時点では v3 まで採択済みで、v4 が策定中です（[Iceberg spec](https://iceberg.apache.org/spec/#format-versioning)）
+
+各形式の版や AWS の各サービスの対応状況は、第 4 回以降で確かめます。
+
+## この先の 5 回
+
+| 回 | 題材 | この回の地図でいうと |
+| --- | --- | --- |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a> | HDFS / S3 / GCS | ⑤。オブジェクトストアが保証すること・しないこと |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a> | CSV / JSON / Avro / Parquet / ORC | ④。行指向と列指向、統計による読み飛ばし |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a> | Hive metastore、Glue、REST カタログ / Spark・Flink・Trino・Presto・Redshift | ① と ② |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a> | Hive 形式の限界、Iceberg / Delta Lake / Hudi | ③。版の差し替えとタイムトラベル |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-table-ops/`}>更新・削除と運用</a> | CoW と MoR、コンパクション、CDC、3 形式の選び方 | ③ の運用 |
+
+## この回の用語
+
+Delta のトランザクションログは [PROTOCOL.md](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)、Hudi のタイムラインは[公式ドキュメント](https://hudi.apache.org/docs/timeline)の定義によります。
+
+| 層 | 用語 | 一言の意味 |
+| --- | --- | --- |
+| 全体 | Data Lake | 生のデータを安価なストレージに開かれた形式で置く構成 |
+| 全体 | Data Warehouse | 整形済みのデータを分析用に管理する専用のシステム |
+| 全体 | Lakehouse | Lake のストレージの上に、Warehouse の管理機能を載せた構成 |
+| 全体 | ETL | 取り出し・変換・読み込み。系から系へデータを移す処理 |
+| 全体 | OLTP / OLAP | 1 件ずつの読み書き / 大量の行の集計 |
+| 全体 | ACID | 不可分性・一貫性・分離性・永続性。トランザクションの 4 性質 |
+| 全体 | ストレージと計算の分離 | 置き場所と計算機を別々に用意し、別々に増減させること |
+| ストレージ | HDFS | Hadoop の分散ファイルシステム |
+| ストレージ | オブジェクトストア | キーでバイト列を出し入れする保存先。S3、GCS など |
+| ストレージ | 範囲指定の読み出し | オブジェクトの一部のバイトだけを取ること |
+| ファイル形式 | 行指向 / 列指向 | 1 行ずつ並べる / 1 列ずつ並べる |
+| ファイル形式 | Parquet / ORC | 列指向のファイル形式 |
+| ファイル形式 | Avro | 行指向のファイル形式。スキーマを伴う |
+| ファイル形式 | 行グループ | Parquet で、行をまとまりごとに区切った単位 |
+| ファイル形式 | 列の統計 | 最小値・最大値・null 数など。読み飛ばしの判断に使う |
+| テーブル形式 | テーブル形式 | どのファイルの集まりが今のテーブルかを記録する約束 |
+| テーブル形式 | オープンテーブル形式 | 仕様が公開され、複数エンジンが扱えるテーブル形式 |
+| テーブル形式 | Hive 形式 | 表＝ディレクトリ、パーティション＝サブディレクトリとする従来の形 |
+| テーブル形式 | パーティション | 列の値ごとにデータを分けて置くこと |
+| テーブル形式 | バケット | パーティションの中を、列のハッシュ値でさらに分けたもの |
+| テーブル形式 | パーティションの刈り込み | 条件に合わないパーティションを読まずに外すこと |
+| テーブル形式 | スナップショット | ある時点のテーブルの状態（ファイルの集まり） |
+| テーブル形式 | マニフェスト | Iceberg で、データファイルの一覧と各ファイルの統計を持つファイル |
+| テーブル形式 | トランザクションログ | Delta Lake で、各版の追加・削除ファイルを記録したログ |
+| テーブル形式 | タイムライン | Hudi で、テーブルに対する操作を時点ごとに記録したもの |
+| テーブル形式 | タイムトラベル | 過去の版を指定してテーブルを読むこと |
+| カタログ | カタログ | 表の名前から、実体の場所とスキーマを引く台帳 |
+| カタログ | Hive metastore（HMS） | Hive のカタログ。表・パーティションの情報を DB に持つ |
+| カタログ | AWS Glue Data Catalog | AWS のカタログ。HMS の代わりに使える |
+| カタログ | REST カタログ | Iceberg のカタログを HTTP の共通 API で扱う仕様 |
+| 計算エンジン | 計算エンジン | SQL などを受け取り、データを読んで計算するプログラム |
+| 計算エンジン | スキャン計画 | どのファイルのどこを読むかを決める段階 |
+
+## まとめ
+
+- 5 層はそれぞれ、**計算の仕方、名前の引き方、今のファイルの集まり、ファイルの中の並べ方、バイトの置き場所**を決めている
+- 1 本の SELECT は、カタログで場所を聞き、テーブル形式で読むファイルを決め、ファイル形式の統計で読み飛ばし、ストレージから必要なバイトだけ取る
+- ファイル形式は 1 ファイルの中身、テーブル形式はファイルの集まりの記録。**テーブル形式はファイル形式の上に載る**
+- 「Hive」はエンジン、メタストア、ディレクトリ型のテーブルの 3 つの部品の名前で、エンジン以外の 2 つが今も広く使われている
+- Hive 形式ではパス名だけでパーティションを刈り込めるが、**どれが今の正しいファイル一覧かを誰も保証しない**
+- 資料の 4 つの課題は、ほぼすべてテーブル形式の層で解かれる
+- Lakehouse とは、ストレージの上に「版ごとのファイル一覧を不可分に差し替えるメタデータ層」を置いた構成である
+- 資料のあと、REST カタログ、S3 Tables、形式間の相互運用が進み、層の境目は少しずつ動いている
+
+次の回では、いちばん下の層に降ります。実験で見た「ディレクトリ」は、HDFS では本物のディレクトリですが、S3 ではキーの名前の一部にすぎません。オブジェクトストアが何を保証し、何を保証しないのかを、<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で確かめます。

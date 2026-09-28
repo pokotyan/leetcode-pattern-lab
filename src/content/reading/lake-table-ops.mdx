@@ -1,0 +1,346 @@
+---
+title: 更新・削除と運用（Copy-on-Write・Merge-on-Read・コンパクション）
+description: 書き換えられないファイルの上で、1 行だけ直したり消したりするにはどうするのか。そして「消したはずのデータ」が本当に消えるのはいつなのか
+category: lake
+order: 19
+status: published
+topics:
+  - Copy-on-Write
+  - Merge-on-Read
+  - Deletion Vector
+  - Position Delete
+  - Equality Delete
+  - MERGE INTO
+  - Compaction
+  - VACUUM
+  - Expire Snapshots
+  - Orphan File
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: MERGE は「ソースの主キーの集合に、この行のキーが入っているか」を引く操作。等値削除を読むときも、削除キーの集合を作って 1 行ずつ照合する
+  - kind: article
+    slug: heap-topk
+    why: MoR の差分を読み時に合わせる処理や、ソート付きのコンパクションは、ソート済みの複数の列を 1 本にまとめる k-way merge と同じ形をしている
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 書き換えられないファイルの上で、1 行を消す
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a>では、Iceberg・Delta Lake・Hudi が「テーブルを構成するファイルの一覧」を原子的に差し替えることで、スナップショット（ある時点のテーブルの状態）を作る仕組みを見ました。
+
+今回はその上で、**行単位の更新・削除**をどう実現するかを扱います。前提は 2 つです。
+
+- オブジェクトストレージのオブジェクトは、一部だけを書き換えられない（<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>）
+- Parquet は列ごとに圧縮・エンコードされたファイルで、途中の 1 行だけを差し替える操作を持たない（<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>）
+
+つまり **1 行を消すにも、何かを新しく書くしかありません。** 何を書くかで、方針が 2 つに分かれます。
+
+## 2 つの方針：Copy-on-Write と Merge-on-Read
+
+**Copy-on-Write（CoW、書き込み時に複製）** は、対象の行を含むファイルを読み、その行を除いた（または直した）ファイルを丸ごと書き直す方式です。**Merge-on-Read（MoR、読み込み時に合成）** は、元のファイルには触らず「この行は消えた・この行はこう変わった」という差分だけを別に書き、読むときに元のファイルと合わせる方式です。
+
+```text
+                 Copy-on-Write                          Merge-on-Read
+  更新前   [file A: 25,000 行]                    [file A: 25,000 行]
+  DELETE   A を読み、1 行除いて書き直す           A はそのまま。差分を追記
+  更新後   [file A': 24,999 行]  (A は参照外へ)   [file A] + [差分: A の 5,000 行目は削除]
+  読み取り A' を読むだけ                          A を読み、差分を当てて 1 行捨てる
+```
+
+Hudi の公式文書は、2 つの方式の得失を次の表にまとめています（[Hudi: Table & Query Types](https://hudi.apache.org/docs/table_types)）。書き込みの増幅（write amplification）は「実際の変更 1 バイトあたり、ストレージに書くバイト数」、読み込みの増幅（read amplification）は「実データ 1 バイトあたりに読むバイト数」と定義されています。
+
+| 観点 | Copy-on-Write | Merge-on-Read |
+| --- | --- | --- |
+| 書き込みの遅延 | 大きい | 小さい |
+| 問い合わせの遅延 | 小さい | 大きい |
+| 更新のコスト | 大きい（ベースファイルを丸ごと書き直す） | 小さい（差分のログに追記する） |
+| ベースファイルの大きさ | 更新のコストを抑えるため小さめにする | 更新が安いので大きくできる |
+| 読み込みの増幅 | 0 | 変更された行数に比例 |
+| 書き込みの増幅 | 最大（書き込んだファイル群の大きさに比例） | 変更された行数に比例 |
+
+資料（2023 年）の表には「Data latency（鮮度）」の行がありましたが、現在の文書では鮮度は「スナップショット問い合わせと読み込み最適化問い合わせ」の比較（後述）のほうに移り、「Parquet file size」は「Base File Size」、新たに読み込みの増幅の行が加わっています。
+
+<Callout type="tip" title="LSM-tree と同じ取引">
+  MoR の発想は、読み物<a href={`${import.meta.env.BASE_URL}reading/db-index/`}>データベースの索引</a>の LSM-tree とほぼ同じです。**その場を書き換えずに差分を追記し、読むときに複数の層を合わせ、溜まったら統合する。** LSM の compaction にあたるのが、後で見るテーブル形式のコンパクションです。CoW は、1 行の更新のためにページ全体を書き直す B-tree に近い立場です。どちらも「読み・書き・容量のどれを犠牲にするか」の選択で、どちらかが常に優れているわけではありません。
+</Callout>
+
+## 各形式の実装
+
+### Iceberg：削除ファイルと削除ベクトル
+
+Iceberg の仕様では、行単位の削除は仕様 v2 で加わりました。v2 は「不変のファイルを書き直さずに個々の行を削除・置換できる」ように、**削除ファイル（delete file）** を導入しています（[Iceberg Table Spec: Format Versioning](https://iceberg.apache.org/spec/#format-versioning)）。削除の表し方は 3 種類です（[Row-level Deletes](https://iceberg.apache.org/spec/#row-level-deletes)、[Delete Formats](https://iceberg.apache.org/spec/#delete-formats)）。
+
+| 表し方 | 何を記録するか | 版 |
+| --- | --- | --- |
+| 位置削除ファイル（position delete file） | データファイルのパスと、ファイル内の行番号（0 始まり）の組 | v2。**v3 では非推奨で、新たに追加してはならない** |
+| 等値削除ファイル（equality delete file） | 1 つ以上の列の値（例: `id = 5`）。一致する行をすべて削除扱いにする | v2 以降 |
+| 削除ベクトル（deletion vector、DV） | 1 つのデータファイルについて、削除された行番号をビットマップで表したもの | v3 以降 |
+
+位置削除は「どのファイルの何行目か」を知っている書き手しか書けません。等値削除は値だけで書けるので、書き手はデータファイルを読まずに済みますが、そのぶん読み手が全行と照合する負担を負います。v3 の削除ベクトルは、Puffin というファイルに `deletion-vector-v1` 形式で格納され、32 ビットの Roaring bitmap（疎なビット集合を圧縮して持つ構造）の集まりで行番号を表します。**1 つのデータファイルにつき、1 スナップショットで削除ベクトルは高々 1 つ**で、新しい削除は既存のベクトルに合流させる決まりです（[Deletion Vectors](https://iceberg.apache.org/spec/#deletion-vectors)）。読み手が見るべき差分が 1 ファイル 1 個に限られる、という点が位置削除ファイルとの違いです。
+
+どちらの方式で書くかは、テーブルのプロパティ `write.delete.mode`・`write.update.mode`・`write.merge.mode` で選び、既定はすべて `copy-on-write` です（[Iceberg: Configuration](https://iceberg.apache.org/docs/latest/configuration/#write-properties)）。ただしエンジンによっては従いません。Athena は「copy-on-write をサポートしておらず、`UPDATE`・`MERGE INTO`・`DELETE FROM` は常に位置削除による merge-on-read になる」と明記しています（[Athena: Update Iceberg table data](https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-updating-iceberg-table-data.html)）。
+
+### Delta Lake：削除ベクトル
+
+Delta Lake の既定は CoW で、1 行消すとそのファイルを書き直します。**削除ベクトル（deletion vectors）** を有効にすると、行を「削除済み」と印を付けるだけで済み、Parquet を書き直しません（[Delta: Deletion Vectors](https://docs.delta.io/latest/delta-deletion-vectors.html)）。Delta の削除ベクトルはトランザクションログの `add` / `remove` に付く属性で、「論理的には削除済みだが物理的にはファイルに残っている行」を示します。有効化にはテーブルのプロトコルを reader version 3・writer version 7 に上げ、`deletionVectors` 機能を宣言する必要があります（[PROTOCOL.md: Deletion Vectors](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors)）。Spark 版 Delta Lake での対応は、`DELETE` が 2.4.0、`UPDATE` が 3.0.0（既定で有効になったのは 3.1.0）、`MERGE` が 3.1.0 からです。
+
+### Hudi：ベースファイルとログファイル
+
+Hudi はテーブルを作るときに型を選びます。**CoW テーブル**では更新・削除のたびにファイルグループ（同じレコードの集まりを担当するファイル群）の中に新しいベースファイルができ、ログファイルは書かれません。**MoR テーブル**では更新・削除をログファイルに書き、問い合わせのときにベースファイルと動的に合成します。ベースファイルは列指向（既定は Parquet）、ログファイルは行指向の差分です（[Hudi: Table & Query Types](https://hudi.apache.org/docs/table_types)、[Configurations](https://hudi.apache.org/docs/configurations/)）。
+
+問い合わせの種類は次のとおりです。資料の「Read Optimized View / Realtime View / Incremental View」は、Hudi 0.5.1 から「view」ではなく「query」と呼ばれるようになっています（[Athena: Query Apache Hudi datasets](https://docs.aws.amazon.com/athena/latest/ug/querying-hudi.html)）。
+
+| 問い合わせ | 見えるもの | 使えるテーブル |
+| --- | --- | --- |
+| スナップショット（snapshot） | 最新のコミット時点。MoR ではベースとログを合成する（旧称: Realtime View） | CoW・MoR |
+| 読み込み最適化（read optimized） | コンパクション済みのベースファイルだけ。速いが最新の差分は含まない | MoR |
+| 増分（incremental） | ある時点以降に書かれた変更だけ | CoW・MoR |
+| タイムトラベル（time travel） | 過去のある時点のスナップショット | CoW・MoR |
+
+## 実験 1：Delta の DELETE と MERGE で、何が書き直されるか
+
+delta-rs（Rust で書かれた Delta Lake の実装。Python からは `deltalake` パッケージとして使う）の 1.6.6 で、10 万行（2.5 万行 × 4 ファイル）の表に `DELETE` と `MERGE` を実行し、`_delta_log` の該当コミットに書かれた `add` / `remove` を表示しました。
+
+```python
+dt.delete("id = 30000")
+(dt.merge(src, predicate="t.id = s.id", source_alias="s", target_alias="t")
+   .when_matched_update_all().when_not_matched_insert_all().execute())
+```
+
+```text
+== DELETE WHERE id = 30000 ==
+metrics {'num_added_files': 1, 'num_removed_files': 1, 'num_deleted_rows': 1, 'num_copied_rows': 24999, ...}
+  add    part-00000-7... numRecords=24999 min_id=25000 max_id=49999
+  remove part-00000-0...
+
+== MERGE (id 99990..100009: 10 件更新 + 10 件挿入) ==
+metrics {'num_source_rows': 20, 'num_target_rows_inserted': 10, 'num_target_rows_updated': 10,
+         'num_target_rows_copied': 24990, 'num_target_files_added': 1, 'num_target_files_removed': 1, ...}
+  add    part-00000-1... numRecords=25010 min_id=75000 max_id=100009
+  remove part-00000-4...
+rows now 100009
+physical parquet files 6 live files 4
+```
+
+**1 行を消すために 24,999 行を書き写し**、20 行の MERGE のために 24,990 行を書き写しています。これが CoW の書き込みの増幅です。一方で、触ったのは該当するファイル 1 本だけで、ほかの 3 本は `add` / `remove` に現れません。ファイルごとの最小値・最大値（`min_id` / `max_id`）で対象外と分かるファイルは読みもしない、という前回見た統計の使い方がここでも効いています。最後の行は、**表から見えるファイルは 4 本でも、ディスク上には 6 本ある**ことを示しています。`remove` されたファイルは、まだ消えていません。
+
+同じ表を `delta.enableDeletionVectors = true` で作り直すと、プロトコルは reader 3 / writer 7 に上がり `deletionVectors` 機能も宣言されましたが、`DELETE` は同じく 99,999 行を書き写し、`add` に削除ベクトルは付きませんでした。**delta-rs は削除ベクトルを読めるが、書く側はまだ CoW だけ**で、書き込み側への対応は執筆時点で未解決の課題になっています（[delta-rs issue #4512](https://github.com/delta-io/delta-rs/issues/4512)）。削除ベクトルの効果を試すには Spark 版の Delta Lake が要ります。
+
+## MERGE INTO と CDC の取り込み
+
+**MERGE INTO**（UPSERT とも呼ぶ。キーが一致すれば更新、なければ挿入）は、ソースとターゲットをキーで突き合わせる結合です。**CDC（Change Data Capture、変更データの取り込み）** は、業務データベースの変更（挿入・更新・削除）を順に取り出してデータレイクへ反映することで、取り込み側では MERGE の連続になります。
+
+CDC を取り込むと、ターゲットは小さな更新を高い頻度で受けます。CoW では毎回ファイルを書き直すので増幅が大きく、MoR では書き込みが軽いぶん、差分が溜まるほど読みが重くなり、定期的なコンパクションが欠かせません。逆に、テーブルから変更を取り出す側の機能もあります。Delta の Change Data Feed（`delta.enableChangeDataFeed`、`_change_type` 列で insert / update_preimage / update_postimage / delete を区別する。[Delta: Change data feed](https://docs.delta.io/latest/delta-change-data-feed.html)）、Iceberg の `create_changelog_view` 手続き（[Spark Procedures](https://iceberg.apache.org/docs/latest/spark-procedures/#create_changelog_view)）、Hudi の増分問い合わせと CDC 問い合わせ（`hoodie.table.cdc.enabled`、0.13.0 から）です。
+
+資料が挙げた 4 つのユースケースを、どの機能で満たすかにまとめると次のようになります。
+
+| ユースケース | 要る性質 | 主に使う機能 |
+| --- | --- | --- |
+| ストリームの取り込み | 小さい書き込みを速く・小さいファイルを溜めない | 追記の原子的なコミット、MoR、コンパクション・クラスタリング |
+| CDC（UPSERT） | キーでの更新・削除、取り込み中も読める | MERGE INTO、CoW / MoR、Hudi のレコードキーと索引 |
+| 個人情報の削除 | 期限内に行を消し、物理的にも消える | DELETE、削除ベクトルの適用、スナップショットの失効・VACUUM・clean |
+| 再現性（データサイエンス） | 過去の状態をそのまま読める | タイムトラベル、タグ・ブランチ、保持期間の設定 |
+
+**3 行目と 4 行目は正反対を求めています。** 過去を読めるようにするほど、消したはずのデータが残ります。次の節はこの衝突の話です。
+
+## 個人情報の削除：DELETE しても消えていない
+
+実験 1 の最後で見たとおり、DELETE は「新しいスナップショットからそのファイルを外す」だけで、古いファイルは古いスナップショットのために残ります。**タイムトラベルができるということは、消した行が物理的に残っているということです。**
+
+delta-rs で、100 行ずつの追記を 50 回行い、`id = 4242` を DELETE し、`optimize.compact()` でまとめ、`vacuum` を段階的に試しました。
+
+```text
+50 回追記後: version=49 有効ファイル=50 物理ファイル=50
+id=4242 を DELETE: version=50 最新版で見える件数=0
+compact: {'numFilesAdded': 1, 'numFilesRemoved': 50, 'totalConsideredFiles': 50}
+compact 後: version=51 有効ファイル=1 物理ファイル=52
+タイムトラベル version=49: [{'id': 4242, 'email': 'u4242@example.com'}]
+vacuum(dry_run, 既定の保持期間) で消える候補: 0
+vacuum(retention_hours=0) -> DeltaError Generic error: Invalid retention period, minimum retention
+  for vacuum is configured to be greater than 168 hours, got 0 hours
+vacuum(retention_hours=0, enforce_retention_duration=False): 削除=51 物理ファイル=1
+タイムトラベル再試行 -> FileNotFoundError Object at location .../tbl_small/part-00000-91f0073b-64f0...
+_delta_log のコミット数: 54
+```
+
+コンパクションで有効ファイルは 1 本になりましたが、物理ファイルは元の 50 本 + DELETE で書き直した 1 本 + まとめた 1 本の 52 本に**増えています**。最新版では `id = 4242` は見えないのに、version 49 へのタイムトラベルでは**メールアドレスごと読めます**。`vacuum` は既定の保持期間（168 時間 = 7 日）より新しい不要ファイルを消さず、保持期間 0 も既定では拒否されます。検査を外して初めて 51 本が消え、タイムトラベルはファイルが無くて失敗しました。
+
+Delta の文書も、ファイルの保持期間の既定は 7 日（`delta.deletedFileRetentionDuration`）で、保持期間より古い版へのタイムトラベルは VACUUM 後にできなくなると書いています（[Delta: Table utility commands](https://docs.delta.io/latest/delta-utility.html)）。**VACUUM が消すのはデータファイルだけで、ログは消しません。** ログはチェックポイントの後に `delta.logRetentionDuration`（既定 30 日）を過ぎたものから消えます。実験の最後の行で `_delta_log` に 54 個のコミットが残っているのはこのためです（VACUUM 自身も開始と終了の 2 コミットを書きます）。
+
+各形式で、行を物理的に消すまでの手順は次のとおりです。
+
+| 形式 | 論理削除 | 差分を適用して書き直す | 古い版とファイルを消す |
+| --- | --- | --- | --- |
+| Iceberg | `DELETE`（CoW または削除ファイル・DV） | `rewrite_data_files`（削除ファイルを合わせて書き直す） | `expire_snapshots` → 参照されなくなったファイルを削除。取りこぼしは `remove_orphan_files` |
+| Delta Lake | `DELETE`（CoW または DV） | DV を使ったなら `REORG TABLE ... APPLY (PURGE)` | `VACUUM`（既定 7 日より古い不要ファイル）。ログは `delta.logRetentionDuration` |
+| Hudi | `DELETE`（CoW は書き直し、MoR はログに記録） | MoR はコンパクション | cleaner（既定は `KEEP_LATEST_COMMITS`、直近 10 コミットを保持し、コミットごとに自動実行） |
+
+根拠は [Iceberg: Maintenance](https://iceberg.apache.org/docs/latest/maintenance/)、[Delta: Deletion Vectors](https://docs.delta.io/latest/delta-deletion-vectors.html)、[Hudi: Cleaning](https://hudi.apache.org/docs/cleaning) です。Iceberg の既定の保持設定は `history.expire.max-snapshot-age-ms` が 5 日、`history.expire.min-snapshots-to-keep` が 1 です（[Configuration](https://iceberg.apache.org/docs/latest/configuration/#table-behavior-properties)）。
+
+<Callout type="warn" title="「期限内に消す」は、保持期間から逆算する">
+  個人情報の削除を 30 日以内に完了する、という要件があるなら、**DELETE の実行日 + 差分の適用 + 保持期間 + 削除処理の間隔**が 30 日に収まる必要があります。タイムトラベルの保持期間を長くするほど、この足し算は苦しくなります。削除ベクトルや削除ファイルを使っている場合、書き直し（`REORG ... PURGE`、`rewrite_data_files`、コンパクション）を経ないと、元の行は現在のスナップショットが参照するファイルの中に残ったままです。
+
+  もう 1 つの落とし穴は**メタデータの中の値**です。実験の `_delta_log` の `add` には、ファイルごとの列統計として `{'email': 'u4200@example.com'}` のような最小値・最大値がそのまま書かれていました。Iceberg のマニフェストにも `lower_bounds` / `upper_bounds` があります（[Manifests](https://iceberg.apache.org/spec/#manifests)）。たまたま境界の値だった個人情報は、データファイルを消してもメタデータに残りえます。統計を取る列を絞る、ログやメタデータの保持期間も要件に含める、といった対処が要ります。
+</Callout>
+
+## 実験 3：pyiceberg の delete は何を書くか
+
+pyiceberg 0.12.0（Iceberg の Python 実装）で、SqlCatalog（SQLite にカタログを置く）とローカルの warehouse を使い、2.5 万行 × 4 ファイルの表をテーブルプロパティ `write.delete.mode = merge-on-read` で作ってから削除しました。
+
+```text
+warning: Merge on read is not yet supported, falling back to copy-on-write
+snapshot ... overwrite {'added-data-files': '1', 'deleted-data-files': '1', 'added-delete-files': None,
+                        'added-records': '24999', 'deleted-records': '25000'}
+最新の件数 99999
+削除ファイルを持つタスク 0 物理データファイル 5
+古いスナップショットで id=30000: [{'id': 30000, 'email': 'u30000@example.com'}]
+
+== 全行が一致するファイルの delete（id < 25000） ==
+snapshot delete {'deleted-data-files': '1', 'added-data-files': None, 'deleted-records': '25000'}
+```
+
+**pyiceberg は merge-on-read を指定しても警告を出して CoW で書きます。** 位置削除ファイルは作られず、1 行消すためにファイルを書き直した `overwrite` スナップショットができました。ファイルの全行が条件に一致する場合は、書き直さずにファイルを外すだけの `delete` スナップショットになります。この 2 段の動きは実装のコードそのものです（[pyiceberg/table/\_\_init\_\_.py の `Transaction.delete`](https://github.com/apache/iceberg-python/blob/pyiceberg-0.12.0/pyiceberg/table/__init__.py)）。なお、読む側は位置削除を適用できます（同じコードのコメントに「Applying the positional deletes if they are there」とあります）。
+
+続いて `table.maintenance.expire_snapshots().older_than(...)` を実行しました。
+
+```text
+スナップショット数 6 -> 1, 物理データファイル 5
+古いスナップショット -> ValueError Snapshot not found: 3565170984986977083
+
+00000-0-4bbb0 rows 25000  (どのスナップショットからも参照なし)
+00000-0-754c8 rows 25000 id=30000 を含む (どのスナップショットからも参照なし)
+```
+
+スナップショットはメタデータから消え、タイムトラベルはできなくなりました。**しかしデータファイルは 5 本とも残り、`id = 30000` を含むファイルもディスク上にあります。** pyiceberg 0.12.0 の `ExpireSnapshots` はメタデータからスナップショットを外す更新だけを行い、ファイルの削除はしません。Java 版の `expireSnapshots` や Spark の `expire_snapshots` 手続きは不要になったデータファイルを削除します（[Iceberg: Maintenance](https://iceberg.apache.org/docs/latest/maintenance/#expire-snapshots)）。**「タイムトラベルで読めない」と「物理的に消えた」は別の事柄**で、使う実装ごとに確かめる必要があります。この状態のファイルを片付けるのが、次に見る孤立ファイルの削除です。
+
+## 小さいファイルとコンパクション
+
+実験 2 の 50 回の追記のように、ストリームの取り込みは小さなファイルを大量に作ります。Iceberg の文書は、小さいファイルが多いとマニフェストのメタデータが増え、ファイルを開くコストで問い合わせが遅くなると述べています（[Maintenance: Compact data files](https://iceberg.apache.org/docs/latest/maintenance/#compact-data-files)）。MoR では、これに加えて差分が溜まります。対処は、ファイルを書き直してまとめる**コンパクション**です。まとめ方にはいくつかの戦略があります。
+
+- **bin-packing（詰め合わせ）**: 目標の大きさになるよう小さいファイルを束ねる。並びは変えない
+- **ソート**: 指定した列で並べ直して書く。その列での絞り込みで、統計によるファイルの読み飛ばしが効くようになる
+- **Z-order**: 複数の列の値を 1 つの値に混ぜ合わせて並べる。複数の列で同時に絞り込む場合に効く
+
+Iceberg の `rewrite_data_files` は `binpack`（既定）と `sort` を持ち、`sort_order` に `zorder(c1,c2)` や `hilbert(c1,c2)` を書けます（[Spark Procedures: rewrite_data_files](https://iceberg.apache.org/docs/latest/spark-procedures/#rewrite_data_files)）。Delta は `OPTIMIZE`（1.2.0 から）、Z-order（2.0.0 から）、自動コンパクション（3.1.0 から）を持ち（[Delta: Optimizations](https://docs.delta.io/latest/optimizations-oss.html)）、さらにパーティションと Z-order の代わりに使う liquid clustering（3.1.0 から。クラスタリングの列を後から変えても既存データは書き直さない）があります（[Delta: Liquid clustering](https://docs.delta.io/latest/delta-clustering.html)）。Hudi では、差分をベースファイルに合わせるのが**コンパクション**（MoR のみ。既定では 10 回のデルタコミットごと、非同期）、ソートキーで並べ直してファイルもまとめるのが**クラスタリング**と、名前が分かれています（[Hudi: Compaction](https://hudi.apache.org/docs/compaction)、[Clustering](https://hudi.apache.org/docs/clustering)）。
+
+ほかにも定期的な作業が 2 つあります。1 つは**孤立ファイル（orphan file）の削除**で、失敗したジョブの書きかけなど、どのメタデータからも参照されないファイルを消します。Iceberg の `remove_orphan_files` は既定で 3 日より古いものだけを対象にし、これより短くすると**書き込み中のファイルを消してテーブルを壊しうる**と注意書きがあります（[Maintenance: Delete orphan files](https://iceberg.apache.org/docs/latest/maintenance/#delete-orphan-files)）。もう 1 つは**マニフェストの書き直し**（`rewrite_manifests`）で、書き込みの順序と問い合わせの絞り込みが合わないとき、データファイルをマニフェストに入れ直して、計画の段階で読み飛ばせる範囲を広げます。
+
+### 誰がいつ動かすか
+
+これらを自前で定期実行するのは手間なので、管理サービスが肩代わりする例が増えています。執筆時点で公式文書から確かめられたものを挙げます。
+
+| サービス | 対象 | 自動で行うこと |
+| --- | --- | --- |
+| Amazon S3 Tables | テーブルバケット内の Iceberg テーブル | 既定で有効。コンパクション（目標 512MB、戦略は auto / binpack / sort / z-order）、スナップショット管理（最小 1 個・最大 120 時間）、参照されないファイルの削除（3 日で非現行扱い、さらに 10 日で削除） |
+| AWS Glue Data Catalog のテーブル最適化 | Glue カタログ上の Iceberg テーブル | 有効にしたテーブルで、コンパクション（binpack / sort / Z-order）、スナップショットの保持、孤立ファイルの削除 |
+| Athena | Iceberg テーブル | 自動ではなく手動。`OPTIMIZE ... REWRITE DATA USING BIN_PACK` と `VACUUM`（スナップショットの失効と孤立ファイルの削除） |
+| Hudi | Hudi テーブル | 書き手自身がテーブルサービス（clean、コンパクション、クラスタリング）をインラインまたは非同期で動かす |
+
+根拠は [S3 Tables: Maintenance for tables](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-maintenance.html)、[Maintenance for table buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-table-buckets-maintenance.html)、[Glue: Optimizing Iceberg tables](https://docs.aws.amazon.com/glue/latest/dg/table-optimizers.html)、[Athena: Optimize Iceberg tables](https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-data-optimization.html)、[Hudi: Apache Hudi Stack](https://hudi.apache.org/docs/hudi_stack) です。S3 Tables では、テーブルプロパティに `history.expire.*` を設定したり、利用者定義のタグ・ブランチを作ったりすると、**スナップショット管理がテーブル全体で失敗する**と書かれています。「再現性のためにタグを打つ」と「自動の失効」がぶつかる具体例です。
+
+## 同時書き込みの衝突
+
+テーブル形式は楽観的並行制御（optimistic concurrency control。ロックを取らずに作業し、コミットの時点で衝突を検査する方式）を使います。Iceberg の仕様は、衝突して失敗した書き手が再試行してよい条件を次のように定めています（[Commit Conflict Resolution and Retry](https://iceberg.apache.org/spec/#commit-conflict-resolution-and-retry)）。
+
+- 追記は条件なしで再適用できる
+- コンパクションのような置換は、**消そうとしているファイルがまだテーブルに残っていること**を確かめる
+- 特定のファイルを消す削除も同様。式による削除（`WHERE timestamp < X`）は常に再適用できる
+
+**同じファイルを 2 人が消そうとすれば、後の 1 人は失敗します。** コンパクションが 50 本を 1 本に置き換えている間に、取り込みの MERGE がそのうちの 1 本を書き直していれば、どちらかがやり直しです。Delta の文書も、INSERT どうしは衝突しない一方、UPDATE / DELETE / MERGE どうし、およびそれらとコンパクションは衝突しうると表にしています（[Delta: Concurrency control](https://docs.delta.io/latest/concurrency-control.html)）。Hudi は単一の書き手、ロックを使う楽観的並行制御、1.0 からの非ブロッキング並行制御（NBCC。MoR で単純バケット索引を使う場合に限る）を選べ、クラスタリング中のファイルグループへの更新は既定で拒否します（[Hudi: Concurrency Control](https://hudi.apache.org/docs/concurrency_control)、[Clustering](https://hudi.apache.org/docs/clustering)）。
+
+delta-rs で、同じ version 0 を読んだ 2 つの書き手に別々の行を DELETE させると、後の書き手は失敗しました。追記どうしは両方とも通ります。
+
+```text
+A: DELETE id=1 -> version 1
+B: DELETE id=2 -> CommitFailedError Failed to commit transaction: Commit failed: a concurrent transactions added new data.
+Help: This transaction's query must be rerun to include the new data. Also, if you don't care to require
+this check to pass in the future, the isolation level can be set to Snapshot Isolation.
+C: append -> version 2
+D: append -> version 3
+```
+
+1 ファイルの表なので、A と B は同じファイルを書き直そうとしていました。運用では、**コンパクションを取り込みの少ない時間帯やパーティションに寄せる**、取り込みとコンパクションで触るパーティションを分ける、といった配置で衝突を減らします。
+
+## 3 形式の比較と選び方
+
+資料（2023 年）の比較表を、執筆時点の公式文書で確かめ直しました。
+
+| 項目 | Hudi | Iceberg | Delta Lake |
+| --- | --- | --- | --- |
+| 最新版（GitHub のリリース） | 1.2.1 | 1.11.0（仕様は v1〜v3 が確定、v4 は策定中） | 4.4.0 |
+| 行単位の更新・削除 | CoW / MoR テーブル | CoW、位置・等値削除、v3 の DV | CoW、DV |
+| スキーマ進化（資料: Hudi・Delta は Limited） | 列の追加と型の昇格。`hoodie.schema.on.read.enable` で名前変更・削除・並べ替えも | 追加・削除・名前変更・並べ替えをファイルを書き直さずに | 列の追加、列マッピングを有効にすれば名前変更・削除、型の拡張（3.2 で試験提供、4.0 で正式） |
+| パーティションの変更 | 文書で確認できず | パーティション進化（メタデータだけの操作） | liquid clustering でクラスタリングの列を後から変更 |
+| 増分・変更の読み出し | 増分問い合わせ、CDC 問い合わせ | `create_changelog_view` | Change Data Feed |
+| 背景での並べ直し（資料: Hudi のみ Y） | クラスタリング | `rewrite_data_files`（sort / zorder / hilbert）、管理サービスの自動実行 | liquid clustering、自動コンパクション |
+| 複数の書き手 | OCC、NBCC | 楽観的並行制御 | 楽観的並行制御 |
+
+根拠は各節で挙げた文書に加え、[Iceberg: Evolution](https://iceberg.apache.org/docs/latest/evolution/)、[Delta: Table batch reads and writes](https://docs.delta.io/latest/delta-batch.html)、[Delta: Type widening](https://docs.delta.io/latest/delta-type-widening.html)、[Hudi: Schema Evolution](https://hudi.apache.org/docs/schema_evolution) です。**資料の「Delta のスキーマ進化は Limited」は、列マッピングと型の拡張により現在は当てはまりにくくなっています。** Hudi も読み時のスキーマ進化を有効にすれば列の名前変更・削除ができます。資料の「High Throughput Streaming」の行は、同じ基準で比べた一次資料が見つからないため評価し直していません。
+
+**相互運用**の手段も増えました。Delta の UniForm（Universal Format）は、Delta テーブルに Iceberg（一般提供）や Hudi（プレビュー）のメタデータも書き、それらのクライアントから**読み取りだけ**を可能にします。ただし削除ベクトルを有効にしたテーブルでは使えません（[Delta: UniForm](https://docs.delta.io/latest/delta-uniform.html)、PROTOCOL.md の IcebergCompatV2 も「削除ベクトルが有効でないこと」を要件にしている）。Apache XTable は新しい形式ではなく、既存のメタデータを読んで他の形式のメタデータを書き出す変換器で、データファイルは複製しません（[Apache XTable](https://xtable.apache.org/)）。
+
+**エンジン側の対応**は、執筆時点の公式文書で次のとおりでした。
+
+| エンジン | Iceberg | Delta Lake | Hudi |
+| --- | --- | --- | --- |
+| Athena（engine v3） | 読み書き（書き込みは常に MoR の位置削除、作成・操作は v2 のみ）、タイムトラベル、`OPTIMIZE` / `VACUUM` | 読み取りのみ（DV は読める）、タイムトラベルなし | 読み取りのみ（0.14.0 / 0.15.0）、増分問い合わせなし |
+| Redshift | v1〜v3 を読み、`CREATE TABLE`・`INSERT`・`DELETE`・`UPDATE`・`MERGE` で書ける。タイムトラベルなし | Spectrum でマニフェストを生成して読む | Spectrum で CoW テーブル（0.5.2〜0.11.1）を読む |
+| EMR 7.14.0 | Iceberg 1.10.1-amzn-1 を同梱 | Delta 3.3.2-amzn-3 を同梱 | Hudi 1.0.2-amzn-3 を同梱 |
+| Snowflake | Snowflake 管理・外部カタログ管理の両方に書き込み（v2 / v3） | Delta のファイルから Iceberg テーブルを作れる（制限あり） | 確認できず |
+| BigQuery | Iceberg 管理テーブルで DML（同時に走る変更の DML は 1 本） | 確認できず | 確認できず |
+
+根拠は [Athena: Iceberg](https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg.html)、[Athena: Delta Lake](https://docs.aws.amazon.com/athena/latest/ug/delta-lake-tables.html)、[Athena: Hudi の制限](https://docs.aws.amazon.com/athena/latest/ug/querying-hudi-in-athena-considerations-and-limitations.html)、[Redshift: Iceberg](https://docs.aws.amazon.com/redshift/latest/dg/querying-iceberg.html)、[Redshift: Iceberg への書き込み](https://docs.aws.amazon.com/redshift/latest/dg/iceberg-writes-sql-syntax.html)、[Redshift Spectrum: External tables](https://docs.aws.amazon.com/redshift/latest/dg/c-spectrum-external-tables.html)、[EMR 7.14.0](https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-7140-release.html)、[Snowflake: Apache Iceberg tables](https://docs.snowflake.com/en/user-guide/tables-iceberg)、[BigQuery: Iceberg managed tables](https://docs.cloud.google.com/bigquery/docs/iceberg-tables) です。資料の時点では「Redshift は Iceberg の外部表を未サポート」「EMR は Delta をネイティブに未サポート」でしたが、どちらも変わっています。
+
+資料の「選び方の例」（Hudi: 複数の AWS サービスで柔軟に管理したい・高スループットのストリーミングや CDC。Delta: Databricks を使っている。Iceberg: 複雑で巨大なテーブル・読み込み中心・Athena で書き込みたい）を、いまの状況で見直すと次のようになります。
+
+- **複数の AWS サービスで扱いたい**: 上の表のとおり、読み書きの両方で最も広く対応しているのは Iceberg になった。S3 Tables と Glue の自動最適化も Iceberg だけが対象
+- **高スループットの取り込み・CDC**: Hudi の MoR・非同期テーブルサービス・NBCC は引き続き有力な候補。ただし Iceberg（MoR、v3 の DV）と Delta（DV）も同じ問題に手を打っており、Hudi だけの特長とは言えなくなった
+- **Databricks を使っている**: Delta が自然な選択であることは変わらない。UniForm で Iceberg のクライアントに読ませる道もある（DV との併用不可に注意）
+- **Athena で書き込みたい**: 執筆時点でも Iceberg だけ。Delta と Hudi は Athena からは読み取りのみ
+
+どれを選んでも、**スナップショットの失効・孤立ファイルの削除・コンパクションを誰がいつ動かすか**を先に決めておくことが、形式の選択と同じくらい結果を左右します。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| Copy-on-Write（CoW） | 変更のたびに、該当する行を含むファイルを丸ごと書き直す方式 |
+| Merge-on-Read（MoR） | 差分だけを別に書き、読むときに元のファイルと合わせる方式 |
+| 書き込みの増幅 | 実際の変更 1 バイトあたり、ストレージに書くバイト数 |
+| 位置削除ファイル | 「どのファイルの何行目を消したか」を並べた Iceberg の削除ファイル。v3 で非推奨 |
+| 等値削除ファイル | 「この列がこの値の行を消した」を並べた Iceberg の削除ファイル |
+| 削除ベクトル（DV） | 1 つのデータファイルの削除済み行番号を表すビットマップ（Iceberg v3、Delta） |
+| ベースファイル / ログファイル | Hudi で、列指向の本体と、行指向の差分 |
+| 読み込み最適化問い合わせ | Hudi MoR で、ベースファイルだけを読む速いが少し古い問い合わせ |
+| MERGE INTO（UPSERT） | キーが一致すれば更新、なければ挿入する操作 |
+| CDC | 業務データベースの変更を順に取り出し、別の場所へ反映すること |
+| コンパクション | 小さいファイルや差分を書き直してまとめる作業。Hudi では差分の統合だけを指す |
+| クラスタリング | ソートキーなどでデータを並べ直し、読み飛ばしを効きやすくする作業 |
+| スナップショットの失効 | 古いスナップショットをメタデータから外し、不要になったファイルを消せる状態にすること（Iceberg の expire_snapshots、Delta の VACUUM、Hudi の clean が相当） |
+| 孤立ファイル | どのメタデータからも参照されていないファイル |
+| 楽観的並行制御 | ロックを取らずに作業し、コミット時に衝突を検査して、負けた側がやり直す方式 |
+
+## 6 本の振り返り
+
+| 回 | 資料の層 | 問い | 答えの核 |
+| --- | --- | --- | --- |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-map/`}>データレイクの地図</a> | 全体 | 5 つの層は何を分担しているか | 置き場所・ファイル形式・テーブル形式・カタログ・計算エンジンは独立に選べる部品 |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a> | Storage | HDFS と S3 / GCS は何が違うか | オブジェクトは安く大量に置けるが、一部だけを書き換えられない。上の層はこれを前提に組まれる |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a> | File format | なぜ分析には列指向か | 列ごとにまとめて圧縮し、統計で読み飛ばす。代わりに 1 行の書き換えはできない |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a> | Metadata + Computing | 「テーブル」はどこに定義されているか | カタログが名前と現在の位置を持ち、エンジンはそれを引いて読む |
+| <a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a> | Table spec | ファイルの集まりにどう ACID を与えるか | ファイルの一覧を原子的に差し替えてスナップショットを作る |
+| 更新・削除と運用（この回） | Table spec の運用 | 不変のファイルで行をどう直し、どう消すか | 書き直すか差分を書くか。そして古い版を消す作業までが「削除」 |
+
+## まとめ
+
+- オブジェクトストレージも Parquet もその場で書き換えられないので、行の更新・削除は「ファイルを書き直す（CoW）」か「差分を書いて読むときに合わせる（MoR）」かのどちらかになる
+- CoW は書き込みの増幅が大きく、MoR は読み込みの増幅が大きい。実験では 1 行の DELETE で 24,999 行が書き写された
+- Iceberg は位置削除・等値削除・v3 の削除ベクトル、Delta は削除ベクトル、Hudi は MoR テーブルのログファイルで MoR を実現する。既定や対応はエンジンごとに違い、delta-rs も pyiceberg も書き込みは CoW だった
+- DELETE は新しいスナップショットからファイルを外すだけで、古いファイルは残る。タイムトラベルで消した行が読めるのはそのため
+- 物理的に消すには、差分の適用（書き直し）と、スナップショットの失効・VACUUM・clean・孤立ファイルの削除が要る。保持期間と削除の期限は逆算して設計し、メタデータ内の統計値にも注意する
+- 小さいファイルと溜まった差分はコンパクションでまとめる。S3 Tables や Glue のように管理サービスが自動で動かす例もあるが、取り込みとの衝突やタグとの干渉は残る
+- 3 形式の差は 2023 年から縮まり、エンジン側の対応は Iceberg に広く寄っている。形式の選択と同じくらい、運用の作業を誰がいつ動かすかが重要になる
+
+6 本を通して見ると、データレイクの新しい仕組みはどれも「**安く大量に置けるが、書き換えられない**」という置き場所の性質から出発していました。列指向のファイルは読みを速くする代わりに書き換えを捨て、テーブル形式はファイルの一覧を差し替えることで整合性と過去の版を手に入れ、更新と削除は書き直しか差分かの取引になり、最後にその副産物である古いファイルを片付ける運用が残ります。資料の 5 層の図は、この一連の取引を上から順に積み上げたものとして読むことができます。

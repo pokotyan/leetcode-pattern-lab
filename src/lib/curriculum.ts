@@ -155,6 +155,11 @@ export const READING_SECTIONS: Section[] = [
     title: 'ウェブの現実',
     summary: 'ブラウザの中で起きている差分計算と、避けて通れない security の型',
   },
+  {
+    id: 'lake',
+    title: 'データレイクの中身',
+    summary: 'オブジェクトストレージに置いたファイルの山を、表として読み書きするための層。置き場所、ファイル形式、カタログと計算エンジン、そして Iceberg・Delta Lake・Hudi が行の更新とタイムトラベルを実現する仕組み',
+  },
 ]
 
 export const readingSectionById = new Map(READING_SECTIONS.map((s) => [s.id, s]))

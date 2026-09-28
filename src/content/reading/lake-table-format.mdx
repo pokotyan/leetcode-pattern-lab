@@ -1,0 +1,408 @@
+---
+title: テーブル形式の中身（Iceberg・Delta Lake・Hudi）
+description: ファイルの山を、原子的に書き換えられ、過去の版を読め、同時に書いても壊れない「表」にするには何が要るのか。3 つのテーブル形式が、ファイルの一覧をどこに置き、その差し替えをどう 1 回の操作にしているかを見ます
+category: lake
+order: 18
+status: published
+topics:
+  - Apache Iceberg
+  - Delta Lake
+  - Apache Hudi
+  - Snapshot
+  - Manifest
+  - Transaction Log
+  - Timeline
+  - Optimistic Concurrency Control
+  - Hidden Partitioning
+  - Schema Evolution
+  - Time Travel
+basedOn:
+  - kind: article
+    slug: prefix-sum
+    why: Delta のチェックポイントは「版 v までの変更を足し込んだ結果」。任意の版の状態を、直前のチェックポイントに差分のコミットだけを足して求める
+  - kind: article
+    slug: hash-counting
+    why: Hudi の索引は「レコードキー → ファイルグループ」の対応表。キーから置き場所を引ければ、更新のたびに全ファイルを突き合わせずに済む
+---
+
+import Callout from '../../components/Callout.astro'
+
+## ファイルの山を「表」にしたい
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>では、カタログが「今の版はこれ」というポインタを 1 つ持ち、それを差し替えるところまでを見ました。今回はポインタの先を開けます。問いは 1 つです。
+
+> オブジェクトストレージに置いた Parquet ファイルの山を、どうすればデータベースの表のように、**原子的に書き換えられ、過去の版を読め、同時に書いても壊れない**ものにできるか
+
+ここで原子的（atomic）とは、変更が「全部反映されるか、まったく反映されないか」のどちらかで、途中の状態が誰にも見えないことを指します。データベースの ACID（Atomicity・Consistency・Isolation・Durability。原子性・一貫性・分離性・永続性）の A です。
+
+## Hive 形式のテーブルが約束していないこと
+
+Hive 形式のテーブルは、**ディレクトリを表とみなし、その下のサブディレクトリ（`dt=2026-09-02/` など）をパーティションとみなす**だけの取り決めです。パーティションとは、列の値ごとにデータを分けて置く単位のことです。第 1 回の<a href={`${import.meta.env.BASE_URL}reading/lake-map/`}>データレイクの地図</a>の実験では、訂正用のファイルを書き終えて古いファイルを消す前にクエリが走り、1 日分の注文が 2 倍に数えられました。Iceberg の文書は、Hive 形式の問題を次のようにまとめています（[Iceberg: Reliability](https://iceberg.apache.org/docs/latest/reliability/)、[Iceberg: Partitioning](https://iceberg.apache.org/docs/latest/partitioning/)）。
+
+| 限界 | 何が起きるか |
+| --- | --- |
+| 書き込み途中のファイルが読まれる | ディレクトリにあるファイルがすべて表の中身とみなされる。書きかけ、消し忘れ、失敗したジョブの残骸も読まれる |
+| LIST に頼る | 表の状態を知るには、ディレクトリを一覧（LIST）するしかない。パーティションが増えると、計画を立てるだけで O(n) 回の一覧呼び出しが要る |
+| 複数ファイルの差し替えが原子的でない | パーティションはメタストア、ファイルはファイルシステムと 2 か所で管理するため、表の中身を原子的に変える方法がない |
+| パーティション列を利用者が意識する | `event_time` と `event_date` の関係を Hive は知らない。書き手が正しい値を作り、読み手が `WHERE event_date = ...` を自分で書く必要がある。書式を間違えても、エラーではなく誤った結果になる |
+
+オブジェクトストレージに rename（名前の付け替え）やディレクトリが無いことは、<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で見たとおりです。
+
+## 共通の考え方：一覧を別に持ち、差し替えを 1 回にする
+
+Iceberg、Delta Lake、Hudi の 3 つ（テーブル形式と総称します）は、細部は違っても同じ発想に立っています。
+
+**表の中身を「ファイルの一覧」として別に記録し、その一覧の差し替えを 1 回の原子的な操作にする。**
+
+```
+          「今の版」を指す 1 か所           版ごとのファイル一覧           データファイル（書いたら変えない）
+          ┌──────────────┐        ┌──────────────────┐
+  読み手 ─▶ │  版 3 を指す  │ ─────▶ │ 版 3: a, b, c    │ ─────▶  a.parquet  b.parquet
+          └──────────────┘        │ 版 2: a, b       │         c.parquet  (d.parquet ← 書きかけ)
+               ▲                  │ 版 1: a          │
+  書き手 ────────┘ 差し替えは 1 回の原子的な操作   └──────────────────┘
+```
+
+データファイルは一度書いたら変更しません。書き手はまず新しいファイルを書き、次に新しい一覧を書き、最後に「今の版」を 1 回で切り替えます。切り替える前のファイル（図の `d.parquet`）は、どの一覧にも載っていないので誰にも読まれません。
+
+これは低レイヤ第 74 回の<a href={`${import.meta.env.BASE_URL}lowlevel/ll-74-db-wal-mvcc/`}>WAL と MVCC</a>で見た MVCC（Multi-Version Concurrency Control。多版同時実行制御）と同じ形です。行の古い版を残し、読み手は自分のスナップショットに見える版だけを選ぶ。テーブル形式では、**版の単位が行ではなくファイルの一覧**になり、スナップショット（ある時点の表の状態）はその一覧 1 つで表されます。古い一覧を残しておけば、過去の版がそのまま読めます。これがタイムトラベルです。そして MVCC の VACUUM と同じく、どの版からも参照されなくなったファイルを片付ける作業が要ります。これは次回に回します。
+
+3 つの違いは、**一覧をどういう形で置くか**と、**「1 回の原子的な操作」を何で実現するか**にあります。
+
+## Apache Iceberg：メタデータの木
+
+Iceberg の表の状態は、次の木で表されます（[Iceberg Table Spec: Overview](https://iceberg.apache.org/spec/#overview)）。
+
+```
+カタログ ── metadata_location ─▶ 00003-....metadata.json   スキーマ、パーティション仕様、スナップショットの一覧
+                                   │ current-snapshot-id
+                                   ▼
+                              スナップショット ─▶ マニフェストリスト snap-....avro   マニフェストごとの件数とパーティションの範囲
+                                                    ├─▶ マニフェスト ....-m0.avro   データファイル 1 本につき 1 行（パス、件数、列の統計）
+                                                    │      └─▶ data/....parquet
+                                                    └─▶ マニフェスト ....-m0.avro ─▶ data/....parquet
+```
+
+- **メタデータファイル**（`metadata.json`）: 表の状態の根。変更のたびに新しいファイルが作られ、古いものと原子的に差し替えられます
+- **スナップショット**: ある時点の表の中身。1 つのマニフェストリストを指します
+- **マニフェストリスト**（manifest list、マニフェストの一覧）: そのスナップショットを構成するマニフェストの一覧と、それぞれの統計
+- **マニフェスト**（manifest）: データファイルの一覧。1 行ごとにファイルのパス、パーティションの値、列ごとの統計を持ちます。変わらないマニフェストはスナップショットの間で使い回されます
+
+### 実験 1：3 回追記して、木を覗く
+
+pyiceberg 0.12.0 の `SqlCatalog`（sqlite をカタログに使う実装）と、ローカルのファイルシステムを置き場所にして、3 行ずつ 3 回追記しました。表示では UUID の一部を `...` で省いています。
+
+```python
+cat = SqlCatalog("local", uri=f"sqlite:///{W}/catalog.db", warehouse=f"file://{W}")
+t = cat.create_table("shop.orders", schema=schema)   # order_id, amount, ts
+for i in range(3):
+    t.append(pa.table({"order_id": [i*100+1, i*100+2, i*100+3], ...}))
+```
+
+```
+wh
+├── catalog.db
+└── shop
+    └── orders
+        ├── data
+        │   ├── 00000-0-b407a407-....parquet
+        │   └── ...（計 3 本）
+        └── metadata
+            ├── 00000-cfbeee9b-....metadata.json      ← 作成直後（空の表）
+            ├── 00001-22345d0c-....metadata.json
+            ├── 00002-cbb86dd5-....metadata.json
+            ├── 00003-752c7abb-....metadata.json      ← 今の版
+            ├── b407a407-...-m0.avro                  ← マニフェスト（ほかに 2 本）
+            ├── ...
+            ├── snap-77132433870666302-0-b407a407-....avro   ← マニフェストリスト（ほかに 2 本）
+            └── ...
+```
+
+追記 1 回ごとに、データファイル、マニフェスト、マニフェストリスト、メタデータファイルが 1 つずつ増えています。**既存のファイルは 1 つも書き換えられていません。** 最新の `metadata.json` の中身を抜き出します。
+
+```
+format-version: 2  current-snapshot-id: 77132433870666302
+schema fields: [(1, 'order_id', 'long'), (2, 'amount', 'long'), (3, 'ts', 'timestamp')]
+{'snapshot-id': 4378537216324847614, 'parent': None,                'seq': 1, 'manifest-list': 'metadata/snap-4378...avro', 'total-records': '3'}
+{'snapshot-id': 4055987301511025558, 'parent': 4378537216324847614, 'seq': 2, 'manifest-list': 'metadata/snap-4055...avro', 'total-records': '6'}
+{'snapshot-id': 77132433870666302,   'parent': 4055987301511025558, 'seq': 3, 'manifest-list': 'metadata/snap-7713...avro', 'total-records': '9'}
+```
+
+スナップショットは親を指す連鎖になっており、`current-snapshot-id` が最後の 1 つを指しています。今のマニフェストリストは 3 つのマニフェストを列挙し、各マニフェストにはデータファイル 1 本分の行があります。マニフェストは Avro 形式なので、fastavro で読みました。
+
+```
+# manifest list: metadata/snap-77132433870666302-0-b407a407-....avro
+ manifest metadata/b407a407-...-m0.avro seq 3 added_files 1
+ manifest metadata/d9dde767-...-m0.avro seq 2 added_files 1
+ manifest metadata/fcdebb02-...-m0.avro seq 1 added_files 1
+
+# manifest: metadata/b407a407-...-m0.avro
+ status 1 file data/00000-0-b407a407-....parquet record_count 3
+   id=1 order_id  lower=c900000000000000 (201)  upper=cb00000000000000 (203)
+   id=2 amount    lower=1e00000000000000 (30)  upper=5a00000000000000 (90)
+# manifest: metadata/fcdebb02-...-m0.avro
+ status 1 file data/00000-0-fcdebb02-....parquet record_count 3
+   id=1 order_id  lower=0100000000000000 (1)  upper=0300000000000000 (3)
+   ...
+```
+
+`lower_bounds` と `upper_bounds` は、列 ID をキーにした「そのファイル内の最小値と最大値」です。`long` は 8 バイトのリトルエンディアンで格納すると仕様が定めており（[Appendix D: Binary single-value serialization](https://iceberg.apache.org/spec/#binary-single-value-serialization)）、`c900...` は 201 です。この統計があるので、**データファイルを開かずに、読む必要のないファイルを外せます。** 実際、条件なしの計画は 3 本でしたが、`order_id >= 200` では上限が 3 と 103 のファイルが計画の段階で外れ、`00000-0-b407a407-....parquet` の 1 本だけが残りました。ファイルの中の行グループ単位の読み飛ばしは<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>の仕事で、こちらはその 1 段手前、ファイル単位の読み飛ばしです。
+
+### コミット：ポインタの比較交換
+
+カタログの `catalog.db` には、表 1 つにつき 1 行があり、`metadata_location` が `00003-....metadata.json` を指しています。コミットとは、このポインタを「読み込んだときの値のままなら、新しい値に換える」操作です。仕様はこれを check-and-put と呼び、失敗したら別の書き手が先に `V+1` を作ったということなので、最初からやり直すと定めています（[Iceberg spec: Metastore Tables](https://iceberg.apache.org/spec/#metastore-tables)）。比較して一致したときだけ交換するこの操作は、一般に CAS（compare-and-swap）と呼ばれます。pyiceberg の `SqlCatalog` が `WHERE metadata_location = 読み込んだときの値` という条件付きの UPDATE でこれを実装していることは、前回の実験で確かめました。
+
+この方式は楽観的並行制御（optimistic concurrency control）です。ロックを取らずに新しいメタデータを作り、差し替えの瞬間にだけ衝突を検出します（[Iceberg spec: Optimistic Concurrency](https://iceberg.apache.org/spec/#optimistic-concurrency)）。失敗した書き手は最新の版を読み直し、再適用できる条件を満たしていれば再試行します。追記は無条件に再適用でき、ファイルを置き換える操作は「消すはずのファイルがまだ表に残っているか」を確かめる、と仕様は定めています（[Commit Conflict Resolution and Retry](https://iceberg.apache.org/spec/#commit-conflict-resolution-and-retry)）。更新や削除どうしの衝突は次回の<a href={`${import.meta.env.BASE_URL}reading/lake-table-ops/`}>更新・削除と運用</a>で扱います。
+
+pyiceberg は既定で自動的に再試行するので、表のプロパティ `commit.retry.num-retries` を 0 にして、同じ版を読んだ 2 つの書き手 A と B に追記させました。
+
+```
+A committed
+B: CommitFailedException - Requirement failed: branch main has changed: expected id 3644240035724349508, found 7184546894675582077
+```
+
+B は「自分が読んだときの `main` ブランチはこのスナップショットだった」という前提条件をコミットに付けており、それが崩れていたので拒否されました。再試行を有効にした既定の設定では、同じ状況で `Commit failed due to a concurrent update, retrying (1/4) in 100 ms` と表示されたあと、B のスナップショットが A のスナップショットを親として積まれました。
+
+<Callout type="warn" title="rename によるコミットは非推奨">
+  仕様には、カタログを使わず、ファイルシステムの原子的な rename で `v<V+1>.metadata.json` を作る方式（File System Tables）も載っています。しかし仕様は、この方式を**オブジェクトストアでもローカルのファイルシステムでも安全でない**として非推奨とし、版 4 で削除すると明記しています（[Iceberg spec: File System Tables](https://iceberg.apache.org/spec/#file-system-tables)）。Iceberg のコミットは、カタログの存在を前提にしていると考えてください。
+</Callout>
+
+### 隠れたパーティションとパーティション進化
+
+Iceberg では、パーティションを**列の値に変換（transform）をかけた結果**として表の設定に持ちます。変換には `identity`（値そのまま）、`bucket[N]`（ハッシュ値を N で割った余り）、`truncate[W]`（幅 W で切り詰め）、`year` / `month` / `day` / `hour` などがあります（[Partition Transforms](https://iceberg.apache.org/spec/#partition-transforms)）。`ts` 列に `day` をかけた表を作り、3 行を追記しました。
+
+```
+data/ts_day=2026-01-01 ['00000-0-f13d2c28-....parquet']
+data/ts_day=2026-01-02 ['00000-1-f13d2c28-....parquet']
+files planned: ['ts_day=2026-01-02/00000-1-f13d2c28-....parquet']     ← 条件は ts >= '2026-01-02T00:00:00'
+```
+
+書き手は `ts_day` という列を作っていませんし、読み手の条件も `ts` に対するものです。**Iceberg が `ts` から日付を計算し、`ts` の条件を日付の条件に翻訳して、ファイルを外しています。** これが隠れたパーティション（hidden partitioning）です。計画に使われるのはディレクトリ名ではなく、マニフェストに記録されたパーティションの値です。
+
+パーティションの切り方を後から変えること（パーティション進化）もできます。変えると新しいパーティション仕様が ID 付きで追加され、以後のファイルは新しい仕様で書かれ、古いファイルは古い仕様のまま残ります（[Partition Evolution](https://iceberg.apache.org/spec/#partition-evolution)）。クエリは列の条件で書かれているので、書き直す必要がありません。
+
+### スキーマ進化は、名前ではなく列 ID で
+
+上の `metadata.json` では、列に 1、2、3 の ID が振られていました。この ID は Parquet ファイルの中にも書かれています。パーティションの実験の表で `amount` を `amount_jpy` に改名してから読むと、ファイルを 1 つも書き直していないのに、値は新しい名前で返りました。
+
+```
+Parquet の列: [('order_id', {b'PARQUET:field_id': b'1'}), ('amount', {b'PARQUET:field_id': b'2'}), ('ts', {b'PARQUET:field_id': b'3'})]
+改名後の表:   [[1, "order_id"], [2, "amount_jpy"], [3, "ts"]]
+   order_id  amount_jpy                  ts
+0         1          10 2026-01-01 09:00:00
+```
+
+仕様は、データファイルの列を**ID で選ぶ**と定めています（[Column Projection](https://iceberg.apache.org/spec/#column-projection)）。名前で対応付けると、列を消して同じ名前の列を足したときに、古いファイルの値が新しい列として読めてしまいます。新しい列には新しい ID が振られるので、この事故が起きません。低レイヤ第 66 回の<a href={`${import.meta.env.BASE_URL}lowlevel/ll-66-protobuf-wire/`}>Protobuf のワイヤ形式</a>で、フィールドを名前ではなく番号で送り、消した番号を再利用しない規則を見たのと同じ発想です。
+
+### タイムトラベル
+
+過去のスナップショットの ID を指定すれば、その時点のファイル一覧で読めます。時刻で指定する場合、仕様は `snapshot-log`（どのスナップショットがいつ「今の版」だったかの記録）を使うよう求めています（[Point in Time Reads](https://iceberg.apache.org/spec/#point-in-time-reads-time-travel)）。
+
+```
+current: 9 rows
+snapshot_id=s1: 3 rows          ← order_id 1, 2, 3 だけ
+as of s2.timestamp_ms -> True 6 rows
+```
+
+### 仕様の版
+
+Iceberg の仕様は版番号を持ち、執筆時点では版 1〜3 が完成・採用済み、版 4 は策定中で未採用です（[Format Versioning](https://iceberg.apache.org/spec/#format-versioning)）。
+
+| 版 | 主な追加 |
+| --- | --- |
+| 1 | Parquet・Avro・ORC の不変ファイルで分析用の表を管理する |
+| 2 | 行単位の削除（削除ファイル）。書き手への要件の厳格化 |
+| 3 | ナノ秒のタイムスタンプ、`variant`・`geometry`・`geography` などの型、列の既定値、複数の列を取る変換、行の系譜（row lineage）、バイナリの削除ベクトル、表の暗号鍵 |
+| 4（策定中） | メタデータ内の相対パスなど、メタデータ構造の見直し |
+
+今回の実験の表は `format-version: 2` でした。削除ファイルと削除ベクトルの中身は次回扱います。
+
+## Delta Lake：連番のコミットログ
+
+Delta Lake は、表の直下に `_delta_log/` というディレクトリを置き、**変更 1 回ごとに連番の JSON ファイルを 1 つ足していきます。** ファイル名は版番号を 20 桁にゼロ埋めしたもので、このファイルが原子性の単位です（[Delta PROTOCOL.md: Delta Log Entries](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#delta-log-entries)）。Iceberg と違い、読むだけならメタストアを必要としない「自己記述的」な作りが設計目標に挙がっています。データファイルは Parquet です。プロトコルは `metaData` の `format.provider` にファイルの符号化の名前を書くと定め、型の対応表や列の対応付けの規定も Parquet を前提にしています（[PROTOCOL.md: Change Metadata](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#change-metadata)）。下の実験でも `provider` は `parquet` でした。
+
+### 実験 2：3 回書いて、ログを読む
+
+deltalake 1.6.6（Rust 実装の delta-rs の Python 版）で 3 行ずつ 3 回追記すると、表の直下に Parquet が 3 本、`_delta_log/` に `00000000000000000000.json` から `00000000000000000002.json` までの 3 本ができました。各 JSON ファイルは 1 行 1 アクション（action）の形式です。版 0 には表の定義も入ります（長い行は `...` で省略）。
+
+```
+{"commitInfo":{"timestamp":1790574097789,"operation":"WRITE","operationParameters":{"mode":"Append"},...}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"71ebf94f-...","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"order_id\",...","partitionColumns":[],...}}
+{"add":{"path":"part-00000-1ade1b88-...-c000.snappy.parquet","partitionValues":{},"size":841,"dataChange":true,"stats":"{\"numRecords\":3,\"minValues\":{\"order_id\":1,\"amount\":10},\"maxValues\":{\"order_id\":3,\"amount\":30},\"nullCount\":{...}}",...}}
+```
+
+| アクション | 意味 |
+| --- | --- |
+| `add` | このファイルを表に加える。`stats` に件数と列ごとの最小値・最大値・NULL の数を持つ |
+| `remove` | このファイルを表から外す（ファイル自体はすぐには消さない） |
+| `metaData` | スキーマ、パーティション列、表のプロパティ |
+| `protocol` | 読み書きに必要なプロトコルの版と、テーブル機能 |
+| `commitInfo` | 誰が何をしたかの記録（表の状態には影響しない） |
+
+版 1 と版 2 には `commitInfo` と `add` が 1 行ずつあるだけです。**版 v の表は、版 0 から v までのアクションを順に適用した結果**です。`add` の `stats` は、Iceberg のマニフェストの `lower_bounds` / `upper_bounds` と同じ役割を、JSON の中で果たしています。
+
+同じ表に 2 回追記したあと（版 3、版 4）、`DELETE ... WHERE order_id <= 3` を実行すると、版 5 に `remove` が 1 行書かれました。Parquet ファイルはディスクに残ったままで、`DeltaTable(P, version=4)` と版を指定すれば、消す前の行も読めます。これが Delta のタイムトラベルです。
+
+```
+{"commitInfo":{"timestamp":1790574097881,"operation":"DELETE","operationParameters":{"predicate":"order_id <= 3"},"readVersion":4,...}}
+{"remove":{"path":"part-00000-1ade1b88-...-c000.snappy.parquet","dataChange":true,"deletionTimestamp":1790574097880,...,"size":841}}
+```
+
+### チェックポイント
+
+版が 1 万になれば、JSON を 1 万個読み直すことになります。そこで、ある版までのアクションを畳み込んだ結果を Parquet で書いたものがチェックポイントです。仕様は、読み手はできるだけ新しいチェックポイントを使うべきだとしつつ、**チェックポイントの有無や頻度を前提にしてはならない**と定めています（[PROTOCOL.md: Checkpoints](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoints)）。頻度は実装の既定値で決まり、Spark 用の Delta Lake では `delta.checkpointInterval` の既定値が 10 です（[DeltaConfig.scala](https://github.com/delta-io/delta/blob/master/spark/src/main/scala/org/apache/spark/sql/delta/DeltaConfig.scala)）。一方 delta-rs の既定値は 100 で（[delta-rs: table/config.rs](https://github.com/delta-io/delta-rs/blob/main/crates/core/src/table/config.rs)）、実験でも版 11 まで書いてチェックポイントは作られませんでした。手で作ると次のようになります。
+
+```
+00000000000000000011.checkpoint.parquet
+['add', 'remove', 'metaData', 'protocol', 'txn', 'domainMetadata', 'sidecar']
+{"version":11,"size":13,"sizeInBytes":16240,"numOfAddFiles":10}      ← _delta_log/_last_checkpoint
+```
+
+読み手は `_last_checkpoint` で最新のチェックポイントを知り、そこから後の JSON だけを足して今の状態を組み立てます。
+
+### コミット：「次の番号のファイルを、無ければ作る」
+
+Delta のコミットは、次の版番号のファイルを作ることです。2 人が同時に同じ番号を作ろうとしたら、片方だけが成功しなければなりません。Delta の文書は、ストレージに求める性質として、ファイルが丸ごと見えるか見えないかのどちらかであること（atomic visibility）、一覧が一貫していること（consistent listing）に加えて、**最終的な場所にファイルを作れる書き手が 1 人だけであること（mutual exclusion、相互排除）**を挙げています（[Delta Lake: Storage configuration](https://docs.delta.io/latest/delta-storage.html)）。プロトコルも、書き手は既存のログを決して上書きしてはならないと定めています（[PROTOCOL.md: Creation of New Log Entries](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#creation-of-new-log-entries)）。
+
+この性質は put-if-absent（無ければ書く）と呼ばれます。delta-rs の既定のログストアは、一時ファイルを書いてから「行き先が既にあれば失敗する rename」で版のファイルに移し、失敗を「その版は既にある」と解釈しています（[delta-rs: logstore/mod.rs](https://github.com/delta-io/delta-rs/blob/main/crates/core/src/logstore/mod.rs) の `write_commit_entry`）。
+
+実験では、書き手 A が版 5 を読んだあと、別の書き手になりすまして版 6 のファイルを先に作り、それから A に追記させました。
+
+```
+A read version 5
+latest version 7
+v6: {"commitInfo": {"timestamp": 0, "operation": "OTHER-WRITER"}}
+```
+
+A は版 6 を上書きせず、版 7 として書きました。delta-rs のソースを読むと、コミットの前に最新の版を確かめ、間に入ったコミットと衝突しないかを検査してから次の番号に書き、番号の取り合いに負けたときに再試行します（[delta-rs: kernel/transaction/mod.rs](https://github.com/delta-io/delta-rs/blob/main/crates/core/src/kernel/transaction/mod.rs)）。版 6 は `commitInfo` だけで衝突しないので、そのまま通りました。一方、同じ版を読んだ 2 人が同じ行を DELETE すると、後の 1 人は `CommitFailedError - ... a concurrent transaction deleted data this operation read.` で失敗しました。衝突の検査の詳細は次回扱います。
+
+<Callout type="note" title="S3 と相互排除：DynamoDB から条件付き書き込みへ">
+  S3 には長く「既にあれば失敗する書き込み」がありませんでした。そのため Spark 用の Delta Lake は、既定では S3 への同時書き込みを 1 つの Spark ドライバからに限り、複数クラスタから書くには、DynamoDB で相互排除を補う `S3DynamoDBLogStore` を設定するよう案内しています。執筆時点の文書にも「S3 は相互排除を提供していない」という記述が残っています（[Delta Lake: Storage configuration](https://docs.delta.io/latest/delta-storage.html)）。
+
+  その後、2024 年 8 月 20 日に S3 は `If-None-Match` ヘッダによる条件付き書き込みに対応しました（[AWS What's New](https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes/)、[S3: conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)）。delta-rs は 1.0.0 で DynamoDB のログストアを削除し、S3 の条件付き書き込みを既定の方式にしました。ただしこの結果、DynamoDB で調停する Spark の書き手と delta-rs の書き手が同じ表に書く構成は成り立たなくなった、と告知しています（[delta-rs Discussion #4482](https://github.com/delta-io/delta-rs/discussions/4482)）。**同じ表に書くすべての書き手が、同じ排除の手段を使っていること**が条件です。
+</Callout>
+
+### テーブル機能、列の対応付け、UniForm
+
+`protocol` アクションは、読み手と書き手に必要なプロトコルの版を示します。読み手の版 3・書き手の版 7 では、版番号に加えて `readerFeatures` / `writerFeatures` という**テーブル機能**（table features）の名前の一覧を持ち、クライアントは一覧のすべてを実装していなければ読み書きしてはなりません（[PROTOCOL.md: Table Features](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#table-features)）。機能を 1 つ足すたびに全員の版を上げる必要がなくなります。
+
+Delta のスキーマは、既定では列を**名前**で Parquet と対応付けます。改名や列の削除をファイルの書き直しなしで行うには、テーブル機能の 1 つである列の対応付け（column mapping）を有効にします。すると各列に物理名と 32 ビットの ID が割り当てられ、スキーマの表示名と切り離されます（[PROTOCOL.md: Column Mapping](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping)）。Iceberg が最初から ID で持っているものを、Delta は機能として後から加えたわけです。
+
+UniForm（Universal Format）は、Delta の表に Iceberg（と、プレビューの Hudi）のメタデータを非同期に生成し、同じ Parquet ファイルを Iceberg のクライアントから読めるようにする機能です（[Delta Lake: UniForm](https://docs.delta.io/latest/delta-uniform.html)）。3 形式とも「Parquet の山 + メタデータの層」なので、メタデータだけを翻訳すればデータは 1 組で済みます。
+
+## Apache Hudi：タイムラインとレコードキー
+
+Hudi は Spark や Flink から書くのが基本で、手元で動かすには Spark の環境が要ります。**今回は Hudi の実験は行わず、公式文書のディレクトリ構成と仕様を引用して説明します。** 以下は執筆時点の文書（1.2.1）に基づきます。
+
+Hudi の仕様が示す表の構成は次のとおりです（[Hudi: Tech Specs](https://hudi.apache.org/learn/tech-specs)。抜粋し、一部の行をまとめています）。
+
+```
+/data/hudi_trips/                  <-- Base Path
+├── .hoodie/                       <-- Meta Path
+│   ├── hoodie.properties          <-- Table Configs
+│   ├── metadata/                  <-- Metadata table (a Hudi MoR table itself)
+│   │   └── files/  column_stats/  record_index/  ...
+│   └── timeline/                  <-- Active timeline (per-instant files)
+│       └── history/               <-- LSM timeline history (compacted parquet)
+└── americas/brazil/sao_paulo/     <-- Partition Path
+    └── [data_files]
+```
+
+### タイムライン：instant の状態遷移
+
+Hudi は表への変更を、**タイムライン**上の action として記録します。各 action は、要求された時刻（requested instant。トランザクション ID を兼ねる）と完了した時刻（completed instant）を持ち、`REQUESTED → INFLIGHT → COMPLETED` と状態を進めます。遷移は `<要求時刻>.<action>.<状態>`、完了時は `<要求時刻>_<完了時刻>.<action>` という名前のファイルで記録され、その原子性はストレージの原子的な操作（S3 なら PUT）に頼ります（[Hudi: Timeline](https://hudi.apache.org/docs/timeline)）。
+
+| action | 意味 |
+| --- | --- |
+| `COMMIT` | レコードの一括書き込みを、ベースファイル（列指向のファイル）に原子的に反映する |
+| `DELTA_COMMIT` | MoR の表への書き込み。一部または全部を差分のログファイルに書く |
+| `REPLACE_COMMIT` | ファイルグループの集合を別の集合に原子的に置き換える（上書き、クラスタリング） |
+| `COMPACTION` | ログファイルの差分をベースファイルに合流させる |
+| `CLEANS` | 不要になった古いファイルスライスを消す |
+| `ROLLBACK` / `SAVEPOINT` / `RESTORE` | 失敗した書き込みの取り消し / 消させない印 / その印への復元 |
+
+MoR（Merge-on-Read）と CoW（Copy-on-Write）の違い、コンパクションの中身は次回扱います。
+
+### レコードキーとファイルグループ
+
+Hudi が他の 2 つと大きく違うのは、**各レコードが一意のキー（レコードキー）を持ち、キーごとに置き場所が決まっている**ことです。パーティションの中のファイルはファイルグループ（file group、ファイル ID で識別されるまとまり）に分かれ、1 つのレコードキーは、ある時点でちょうど 1 つのファイルグループに属します。ファイルグループの中は、ベースファイルとそれに続くログファイルの組（ファイルスライス、file slice）が時間順に並んだものです（[Hudi: Storage Layouts](https://hudi.apache.org/docs/storage_layouts)）。
+
+```
+パーティション americas/brazil/sao_paulo/
+  ファイルグループ fg-1:  [スライス t1: base@t1 + log, log]  [スライス t5: base@t5]
+  ファイルグループ fg-2:  [スライス t3: base@t3 + log]
+  索引:  record_key "trip-42" → fg-1
+```
+
+キーからファイルグループを引く仕組みが**索引**（index）です。Hudi の文書は、索引があれば更新のたびに表全体と突き合わせる必要がなく、更新は該当するファイルグループのベースファイルとだけ合流すればよい、と説明しています（[Hudi: Indexes](https://hudi.apache.org/docs/indexes)）。索引は `.hoodie/metadata/` のメタデータ表（それ自体が Hudi の MoR 表）に置かれ、ブルームフィルタや、キーごとの対応を持つレコード索引（record index）などの種類があります。Iceberg と Delta が「ファイルの一覧」を管理するのに対し、Hudi は**「キーの居場所」まで管理する**設計で、主キーによる UPSERT（あれば更新、無ければ挿入）を軸にしています。
+
+### 同時に書く
+
+Hudi は書き手どうしの調停に、楽観的並行制御と分散ロックを組み合わせます。書き手はロックを握った短い区間で、自分より後に完了した action を調べ、同じファイルグループに書いたものがあれば中止します（[Hudi: Tech Specs](https://hudi.apache.org/learn/tech-specs)）。ロックの提供元には外部のサービスのほか、`.hoodie/` の 1 つのロックファイルへの条件付き書き込みで排他を取るストレージベースのロック（1.0.2 から）もあり、S3・GCS・Azure に対応しています（[Hudi: Concurrency Control](https://hudi.apache.org/docs/concurrency_control)）。Iceberg がカタログの比較交換、Delta が版のファイルの put-if-absent を原子性の根拠にするのに対し、Hudi はタイムラインのファイルの原子的な書き込みとロックの組み合わせです。
+
+### Hudi 1.0 で変わったこと
+
+Hudi 1.0.0（2024 年 12 月の発表）は、形式に大きな変更を含む版です（[Hudi 1.0.0 release notes](https://hudi.apache.org/releases/release-1.0)）。
+
+- タイムラインを `.hoodie/timeline/` に移し、「アクティブ」と「アーカイブ」の二分をやめて、完了した action の履歴を **LSM 木**（新しいものを上の層に追記し、下の層へまとめ直していく構造。<a href={`${import.meta.env.BASE_URL}reading/db-index/`}>データベースの索引</a>を参照）の Parquet ファイル群として持つようにした
+- 完了した instant のファイルに完了時刻を含めた。コミットのメタデータを Avro に統一した
+- 表の版 8 を導入。1.0 は旧形式（表の版 6）でも書ける
+- 非ブロッキング並行制御（NBCC）、二次索引を追加
+
+スキーマについては、Hudi は既定では書き込み時に後方互換な変更（NULL 可の列を末尾に足す、型を広げる）だけを受け付けます。改名などは、実験的機能の「読み取り時のスキーマ進化」（`hoodie.schema.on.read.enable=true`）を有効にした場合に限られます（[Hudi: Schema Evolution](https://hudi.apache.org/docs/schema_evolution)）。
+
+## 3 つを並べる
+
+```
+Iceberg                         Delta Lake                        Hudi
+カタログ: ポインタ 1 つ           _delta_log/                       .hoodie/timeline/
+  │ CAS で差し替え                 000...000.json  ┐                 t1.commit.requested
+  ▼                               000...001.json  │ 連番、           t1.commit.inflight
+metadata.json                     000...002.json  │ put-if-absent    t1_t2.commit       ← 完了
+  └ スナップショット                000...010.checkpoint.parquet      .hoodie/metadata/
+     └ マニフェストリスト                                               files / column_stats / record_index
+        └ マニフェスト（列統計）    add/remove（stats 付き）            ファイルグループ → ファイルスライス
+           └ data/*.parquet          └ *.parquet                        └ base + log
+```
+
+| 観点 | Iceberg | Delta Lake | Hudi |
+| --- | --- | --- | --- |
+| メタデータの置き方 | `metadata.json` を根とする木。マニフェストはスナップショット間で共有 | 連番の JSON（差分）と Parquet のチェックポイント | タイムラインの instant ファイルと、メタデータ表（Hudi の表） |
+| コミットの原子性の根拠 | カタログのポインタの比較交換（check-and-put） | 次の版のファイルの put-if-absent（相互排除） | タイムラインへの原子的な書き込み + 分散ロック |
+| 並行制御 | 楽観的。失敗したら最新版に再適用して再試行 | 楽観的。間のコミットとの衝突を検査して次の番号へ | 楽観的 + ロック。MVCC で表サービスと分離、NBCC も選べる |
+| スキーマ進化の鍵 | 列 ID（最初から） | 既定は名前。列の対応付けを有効にすると物理名と ID | 既定は Avro 互換の書き込み時進化。改名は実験的機能 |
+| パーティション | 隠れたパーティション（変換）と進化 | パーティション列（値をそのまま使う） | パーティションパス + レコードキー |
+| 特徴 | 統計の階層によるファイルの読み飛ばし、隠れたパーティション | 読むだけならメタストア不要、単純なログ | レコードキーの索引による UPSERT |
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| テーブル形式 | ファイルの集まりのうち、どれが今の表かを記録する仕様。Iceberg、Delta Lake、Hudi |
+| スナップショット | ある時点の表の状態。テーブル形式ではファイルの一覧 1 つで表される |
+| メタデータファイル / マニフェストリスト / マニフェスト（Iceberg） | 表の状態の根 / スナップショットを構成するマニフェストの一覧 / データファイルの一覧（列の統計付き） |
+| check-and-put（CAS） | 今の値が期待どおりのときだけ書き換える操作。Iceberg のコミットの土台 |
+| 楽観的並行制御 | ロックを取らずに作業し、確定の瞬間にだけ衝突を検出して、負けたらやり直す方式 |
+| 隠れたパーティション | `day(ts)` や `bucket(N, id)` などの変換でパーティションを切り、利用者にパーティション列を意識させない仕組み |
+| 列 ID | 列に振る不変の番号。名前が変わっても同じ列を指す |
+| タイムトラベル | 過去のスナップショットや版を指定して読むこと |
+| トランザクションログ / アクション（Delta） | `_delta_log/` の連番 JSON / その 1 行（`add`、`remove`、`metaData`、`protocol` など） |
+| チェックポイント（Delta） | ある版までのアクションを畳み込んだ Parquet。ログの読み直しを省く |
+| put-if-absent / 相互排除 | 無ければ書き、あれば失敗する書き込み。ある名前のファイルを作れるのは 1 人だけ |
+| テーブル機能 / UniForm（Delta） | 読み書きに必要な機能名の一覧 / Iceberg などのメタデータを生成して他形式から読めるようにする機能 |
+| タイムライン / instant（Hudi） | 表への action の記録 / その 1 件。requested → inflight → completed と進む |
+| レコードキー / 索引（Hudi） | レコードを一意に識別するキー / キーからファイルグループを引く仕組み |
+| ファイルグループ / ファイルスライス（Hudi） | ファイル ID で識別されるまとまり / その中のベースファイルとログファイルの 1 組 |
+
+## まとめ
+
+- Hive 形式は「ディレクトリにあるファイルが表」としか決めておらず、書きかけのファイルが読まれ、LIST に頼り、複数ファイルの差し替えが原子的でなく、パーティション列を利用者が意識する必要があった
+- テーブル形式の共通の発想は、**ファイルの一覧を別に記録し、その差し替えを 1 回の原子的な操作にする**こと。版の単位がファイルの一覧になった MVCC と読める
+- Iceberg は `metadata.json` → スナップショット → マニフェストリスト → マニフェストの木を持ち、コミットはカタログのポインタの比較交換。マニフェストの列統計でファイルを開かずに読み飛ばせる
+- Iceberg は列を ID で、パーティションを変換で表すので、改名やパーティションの変更にファイルの書き直しもクエリの書き換えも要らない
+- Delta Lake は連番の JSON コミットとチェックポイントで表を表し、コミットは「次の番号のファイルを、無ければ作る」相互排除に頼る。S3 ではこれが DynamoDB から条件付き書き込みへ移りつつある
+- Hudi はタイムラインの instant で変更を記録し、レコードキーの索引で「キーの居場所」まで管理する。1.0 でタイムラインは LSM 木になった
+- どの形式でも、過去の版のファイルは残っているので読める（タイムトラベル）。その代わり、いつ片付けるかを決める必要がある
+
+どの形式も、データファイルは一度書いたら変えません。では、1 行だけを直したいとき、1 人分の個人情報を消したいときはどうするのでしょうか。ファイルごと書き直すのか、「消した」という印を別に書くのか。小さなファイルが溜まったら、残しておいた古い版はいつ消すのか。次回の<a href={`${import.meta.env.BASE_URL}reading/lake-table-ops/`}>更新・削除と運用</a>で、CoW と MoR、削除ファイル、コンパクション、スナップショットの失効を扱い、3 つの形式の選び方をまとめます。
