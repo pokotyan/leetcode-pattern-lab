@@ -1,0 +1,461 @@
+---
+title: DKIM
+description: メールに付いた署名は、何を約束しているのか。DKIM-Signature ヘッダを 1 タグずつ読み、DNS に置く公開鍵、正規化、署名するヘッダの選び方、l= の落とし穴、鍵の入れ替えを手元で確かめ、最後に「DKIM が pass でも差出人が本物とは限らない」理由を見ます
+chapter: mail
+order: 7
+status: published
+topics:
+  - DKIM
+  - DKIM-Signature
+  - セレクタ / _domainkey
+  - 正規化（simple / relaxed）
+  - 過剰署名（oversigning）
+  - l= タグ
+  - Ed25519-SHA256
+  - 鍵のローテーション
+  - ARC
+requires:
+  - ll-127-spf
+  - ll-97-signature
+  - ll-98-key-format
+---
+
+import Callout from '../../components/Callout.astro'
+
+## その署名は何を約束しているのか
+
+前回の SPF は、**送ってきたサーバの IP アドレス**を見て、MAIL FROM のドメインが送信を許しているかを確かめる仕組みでした。IP アドレスで判断するので、メールが転送されて別のサーバから届くと壊れます。そして、利用者が見る From: には触れません。
+
+**DKIM**（DomainKeys Identified Mail、[RFC 6376](https://www.rfc-editor.org/rfc/rfc6376.html)、2011 年、STD 76）は発想が逆です。経路ではなく**メッセージそのものに署名**を付け、公開鍵を DNS に置きます。どのサーバを経由して届いても、中身が変わっていなければ検証できます。
+
+では、検証に成功したとき何が分かったのでしょうか。RFC 6376 の冒頭はこう書いています。
+
+> DKIM permits a person, role, or organization that owns the signing domain to claim some responsibility for a message by associating the domain with the message.
+
+**「署名したドメインが、このメッセージに何らかの責任を持つと表明した」**。言っているのはこれだけです。From: のドメインと同じかどうかは、DKIM の関心の外にあります。第 97 回で見た「署名は『この鍵で署名された』としか言わない」の、メール版です。
+
+この回では、署名を手で作って壊しながら、その「これだけ」の中身を正確に見ていきます。
+
+## 全体の流れ
+
+```
+ 送信側（署名者）                 DNS                        受信側（検証者）
+ ────────────────               ─────                       ────────────────
+ 1. 本文を正規化して
+    ハッシュ → bh=
+ 2. 選んだヘッダ + DKIM-Signature
+    を正規化して秘密鍵で署名 → b=
+ 3. DKIM-Signature を先頭に付けて送る  ───── メッセージ ─────▶ 4. d= と s= を読む
+                                  s._domainkey.d  TXT  ◀── 5. 公開鍵を引く
+                                  "v=DKIM1; k=rsa; p=..." ─▶ 6. bh と b= を検証
+```
+
+鍵の持ち主を確かめる仕組み（第 101 回の証明書の連鎖）はありません。**「そのドメインの DNS に置いてある鍵だから、そのドメインの鍵だ」**という、DNS への信頼がそのまま根になります。
+
+## DKIM-Signature を読む
+
+手元で作った署名です（作り方は後の「手元で確かめる」で見ます）。ドメインは `example.test` です。
+
+```
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.test;
+ i=@example.test; q=dns/txt; s=sel2026; t=1790597218; h=from : to :
+ subject : date : message-id;
+ bh=0CKZbUg5prXcpRmNim09r/tuQmfJHpKfW3+/0sZ0FzM=;
+ b=CTEiK6RNZmaoHZeAzF1q/VapF6c3/Cu+TDEksUNHO3FWcLJKYVEykkYPq4MOtApXqQuI2
+ OOcXwTYgT8uNUjvTlld2ochXLVgDFlnVSFLlqdtCgPv0p2V+ydyez2i9gZP4mmVSPufJY52
+ ...
+From: Alice <alice@example.test>
+To: bob@example.org
+Subject: invoice
+```
+
+`タグ=値` を `;` で並べた形です。タグの意味は [RFC 6376 3.5](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.5) で決まっています。
+
+| タグ | 必須 | 意味 |
+| --- | --- | --- |
+| `v` | 必須 | 版。いまは `1` |
+| `a` | 必須 | アルゴリズム。`rsa-sha256` か `ed25519-sha256` |
+| `d` | 必須 | **署名したドメイン**（SDID）。責任を負う主体 |
+| `s` | 必須 | **セレクタ**。`d=` の中のどの鍵か |
+| `h` | 必須 | 署名に含めたヘッダの名前の並び |
+| `bh` | 必須 | 正規化した本文のハッシュ（base64） |
+| `b` | 必須 | 署名そのもの（base64） |
+| `c` | 任意 | 正規化の方式。`ヘッダ/本文`。省略すると `simple/simple` |
+| `i` | 任意 | 利用者や役割の識別子（AUID）。`d=` と同じかその下位のドメイン |
+| `t` | 任意 | 署名した時刻（UNIX 時刻） |
+| `x` | 任意 | 有効期限（UNIX 時刻）。過ぎたら無効と扱ってよい |
+| `l` | 任意 | 署名した本文の長さ（バイト数）。**後で見るとおり危険** |
+| `q` | 任意 | 鍵の引き方。`dns/txt` だけが定義されている |
+
+必須は 7 つで、残りは省略できます。**`d=` と `s=` の 2 つで公開鍵の場所が決まり、`bh=` と `b=` の 2 つが検証の対象**、と覚えると読みやすくなります。
+
+## 公開鍵を DNS に置く
+
+### セレクタと `_domainkey`
+
+公開鍵は、`s=` と `d=` から組み立てた名前の TXT に置きます（[RFC 6376 3.6.2.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.6.2.1)）。
+
+```
+s=sel2026, d=example.test  →  sel2026._domainkey.example.test  TXT
+```
+
+**セレクタ**があるおかげで、1 つのドメインが鍵を何本でも持てます。社内のメールサーバ用、配信サービス用、テスト用と、送信元ごとに鍵を分けられ、1 本が漏れても他を止めずに済みます。`_domainkey` がアンダースコアで始まるのは、第 58 回で見たとおり、ホスト名と衝突させないための慣習です。
+
+実在のドメインで引いてみます（執筆時点、2026 年 9 月）。
+
+```
+$ dig +short TXT s1._domainkey.github.com
+s1.domainkey.u51742174.wl175.sendgrid.net.
+"k=rsa; t=s; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyn3fMCVpb7ry..." "NHjpVw5PtXESA9KBg/evSRk5..."
+```
+
+1 行目は CNAME です。github.com はこのセレクタの鍵を、**配信サービスの側のゾーンに置かせています**。鍵の生成も入れ替えも配信サービスが行い、github.com は CNAME を 1 行書くだけで済みます。第 132 回で見る「DKIM の CNAME 委任」がこれです。
+
+### 鍵の記録のタグ
+
+鍵の TXT にもタグがあります（[RFC 6376 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.6.1)）。
+
+| タグ | 意味 |
+| --- | --- |
+| `v` | `DKIM1`。書くなら先頭に |
+| `k` | 鍵の種類。省略時は `rsa`。ほかに `ed25519` |
+| `p` | **公開鍵**（base64）。**空なら「この鍵は失効した」** |
+| `t` | フラグ。`y` はテスト中、`s` は `i=` のドメインが `d=` と完全に一致することを求める |
+| `h`、`s`、`n` | 使ってよいハッシュ、用途の種類、人間向けのメモ |
+
+上の github.com の鍵には `t=s` が付いています。
+
+`p=` が空の例も、実際に見つかります。
+
+```
+$ dig TXT 20230601._domainkey.gmail.com +noall +answer
+20230601._domainkey.gmail.com. 3600 IN	TXT	"v=DKIM1; k=rsa; p="
+```
+
+RFC 6376 は **`p=` が空なら、その鍵は失効している**と定めています。消すのではなく空にしておけば、「知らないセレクタ」ではなく「取り消した鍵」だとはっきり伝わります。
+
+### p= の中身は第 98 回の SPKI
+
+`p=` の base64 を戻して、第 98 回の道具で読んでみます。
+
+```
+$ dig +short TXT s1._domainkey.github.com | grep '"' | tr -d '" \n' \
+    | sed 's/.*p=//; s/;.*//' | base64 -d > k.der
+$ openssl asn1parse -inform DER -in k.der | head -4
+    0:d=0  hl=4 l= 290 cons: SEQUENCE
+    4:d=1  hl=2 l=  13 cons: SEQUENCE
+    6:d=2  hl=2 l=   9 prim: OBJECT            :rsaEncryption
+   17:d=2  hl=2 l=   0 prim: NULL
+$ openssl pkey -pubin -inform DER -in k.der -noout -text | head -1
+Public-Key: (2048 bit)
+```
+
+アルゴリズムの識別子 `rsaEncryption` から始まる、**SubjectPublicKeyInfo（SPKI）の DER** です。`openssl pkey -pubout` で出した `PUBLIC KEY` の PEM から、先頭と末尾の行と改行を取り除けば、そのまま `p=` になります。
+
+<Callout type="note" title="仕様の本文と実際の形がずれている">
+  RFC 6376 3.6.1 の本文は、RSA の `p=` を「DER にした RSAPublicKey」（第 98 回の PKCS#1 の形）と書いています。
+  しかし付録 C の手順が出力するのは SPKI で、実装の多くも SPKI を使っています。
+  この食い違いは [Erratum 3017](https://errata.rfc-editor.org/eid3017) として報告され、「文書の改訂時に扱う」という扱いになっています。
+  検証側は両方を受け付けるのが無難で、署名側は SPKI を出しておけば困りません。
+</Callout>
+
+### 255 バイトの壁
+
+2048 ビットの RSA の SPKI は 294 バイトで、base64 にすると 392 文字になります。第 58 回で見たとおり、**TXT の 1 つの文字列は 255 バイトまで**です。そこで、1 つのレコードの中に文字列を複数並べます。
+
+```python
+>>> import dns.resolver     # dnspython
+>>> [[len(x) for x in r.strings] for r in dns.resolver.resolve('s1._domainkey.github.com', 'TXT')]
+[[255, 151]]
+```
+
+RFC 6376 は、**複数の文字列は間に何も挟まずに連結してから使う**と定めています（[3.6.2.2](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.6.2.2)）。DNS 事業者の管理画面によっては、長い値を自動で分割するもの、1 つの文字列として入れようとして失敗するもの、分割した継ぎ目に空白を入れてしまうものがあります。**2048 ビットに上げたら検証が失敗し始めた**、という事故の多くはここで起きます。
+
+## 何に署名するのか: bh と b=
+
+署名は 2 段階で作ります（[RFC 6376 3.7](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.7)）。
+
+```
+1. 本文 ──正規化──▶ SHA-256 ──base64──▶ bh=
+
+2. h= に並べたヘッダ（正規化）
+   + DKIM-Signature 自身（b= の値を空にして正規化、末尾の CRLF なし）
+      ──秘密鍵で署名──▶ b=
+```
+
+本文は `bh=` を通して間接的に署名されます。そして **DKIM-Signature ヘッダ自身も署名の対象**なので、`d=` や `s=`、`h=`、`bh=` を書き換えれば `b=` の検証が失敗します。
+
+`bh=` は手で計算し直せます。手元の例では本文に行末の空白などがないので、正規化しても元のままです。
+
+```python
+body = b"Please pay 100 yen.\r\nThanks.\r\n"
+base64.b64encode(hashlib.sha256(body).digest())
+# 0CKZbUg5prXcpRmNim09r/tuQmfJHpKfW3+/0sZ0FzM=   ← 署名の bh= と一致
+```
+
+## 正規化: simple と relaxed
+
+メールは途中のサーバで、意味を変えない範囲の書き換えを受けがちです。長いヘッダの折り返し、空白の詰め直し、ヘッダ名の大文字小文字、本文末尾の空行。1 バイトでも変われば署名は壊れるので、**ハッシュの前に決まった形に揃える**のが**正規化**（canonicalization）です。`c=ヘッダの方式/本文の方式` で指定します（[RFC 6376 3.4](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.4)）。
+
+| | simple | relaxed |
+| --- | --- | --- |
+| ヘッダ | 何も変えない | 名前を小文字に、折り返しを戻し、連続する空白を 1 つに、値の末尾とコロンの前後の空白を削る |
+| 本文 | 末尾の空行だけを 1 つの CRLF にまとめる | それに加えて、行末の空白を無視し、行の中の連続する空白を 1 つにする |
+
+どの書き換えがどの方式で許されるかを、実際に署名して確かめた結果です。
+
+```
+変更                                     simple/simple relaxed/simple relaxed/relaxed
+変更なし                                 pass            pass            pass
+Subject: invoice -> Subject:  invoice    fail            pass            pass
+Subject -> SUBJECT (ヘッダ名の大文字)     fail            pass            pass
+Subject を 2 行に折り返す                fail            pass            pass
+本文の行末に空白を足す                   fail            fail            pass
+本文の末尾に空行を足す                   pass            pass            pass
+本文の 100 -> 900                        fail            fail            fail
+invoice -> invoicE（ヘッダの値）         fail            fail            fail
+```
+
+**relaxed でも、値の文字そのものが変われば壊れます**。relaxed が許すのは空白と折り返しと名前の大文字小文字だけで、内容の改ざんは見逃しません。
+
+中継するサーバがヘッダを折り返し直すことはありうるので、ヘッダには `relaxed` を選ぶのが無難です。
+
+<Callout type="warn" title="よくある誤解: 正規化しているから、途中で書き換えられても大丈夫">
+  正規化が吸収するのは空白と折り返しだけです。
+  件名の先頭に `[list]` を足す、本文の末尾に配信停止の案内を足す、文字コードを変換し直す（第 125 回）、
+  といった書き換えは、どの方式でも署名を壊します。
+  後の「転送とメーリングリスト」で、これが実際に大きな問題になっている様子を見ます。
+</Callout>
+
+## どのヘッダに署名するか
+
+### From は必須、ほかは署名者が選ぶ
+
+`h=` に何を並べるかは署名者が決めます。決まっているのは 1 つだけで、**From: は必ず署名する**（[RFC 6376 5.4](https://www.rfc-editor.org/rfc/rfc6376.html#section-5.4)）。そのほか、Subject、Date、To、Cc、Message-ID、Reply-To、MIME 関係のヘッダなど、**意味を持ち、途中で変わらないはずのもの**を並べるのが普通です。
+
+逆に、途中で足されたり書き換えられたりするものは入れません。`Received:` は中継のたびに増え、`Return-Path:` は最後に受け取ったサーバが付けます（第 122 回）。これらを入れると、正しいメールでも壊れます。
+
+### 同じヘッダが 2 つあるとき
+
+ここに落とし穴があります。From: や Subject: は、規則の上では 1 つしか置けないヘッダですが、**2 つ並べたメッセージを作ること自体はできます**。
+
+`h=` に同じ名前が 1 回だけ書かれていたら、検証者はどちらを使うのか。RFC 6376 は、**同じ名前が複数あれば下から順に使う**と決めています（[5.4.2](https://www.rfc-editor.org/rfc/rfc6376.html#section-5.4.2)）。また、`h=` には**署名した時点で存在しなかった名前も書いてよく、それは「空」として署名される**とも定めています（[3.5](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.5)）。
+
+この 2 つの規則を組み合わせると、次のことが起きます。署名済みのメッセージの**上に** 2 つめの Subject: を足した場合です。
+
+```
+h= has subject once   h=from:to:subject:date:message-id
+  上に 2 つめの Subject を足す   -> pass      ← 検証は下の本物を使う
+  下に 2 つめの Subject を足す   -> fail
+h= has subject twice  h=from:to:subject:date:message-id:subject
+  上に 2 つめの Subject を足す   -> fail      ← 2 回めの subject は「無いはず」の 1 つめを縛る
+  下に 2 つめの Subject を足す   -> fail
+```
+
+1 回だけ署名した場合、上に足された偽の件名は署名の対象外なのに、検証は pass します。そして RFC 6376 [8.15](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.15) が注記しているとおり、**メールソフトが上と下のどちらを表示するかは決まっていません**。
+
+対策は、**実際の数より 1 回多く `h=` に書く**ことです。これを**過剰署名**（oversigning）と呼びます。2 回めの `subject` は、署名した時点では存在しなかった「2 つめの Subject」を空として縛るので、後から足されると検証が失敗します。RFC 6376 [5.4.2](https://www.rfc-editor.org/rfc/rfc6376.html#section-5.4.2) も、同じヘッダの複数の出現を署名したいなら、その名前を `h=` に複数回書くよう定めています。
+
+手元で使った dkimpy は、`include_headers` を指定しないとき **From を自動で過剰署名**します（後で見る Ed25519 の例の `h=` の末尾に `from` がもう 1 つ付いています）。さらに**検証する側でも From を 1 回余分に数える**ので、From: を上に足す攻撃は、署名の仕方によらず失敗しました。上の実験で Subject を使ったのはそのためです。
+
+<Callout type="warn" title="よくある誤解: From に署名しているから From は守られている">
+  From: を `h=` に 1 回書いただけでは、2 つめの From: を足されたメッセージでも検証が通ることがあります。
+  守られるのは「下から数えて 1 つめの From: が変わっていない」ことだけです。
+  From、Subject、To などの 1 つしか置けないヘッダは、`h=` に 1 回多く書いて過剰署名します。
+  受け取る側でも、1 つしか置けないヘッダが複数あるメッセージは、署名とは別に疑うべきです。
+</Callout>
+
+## l= タグ: 署名していない続き
+
+`l=` は「本文の先頭から何バイトまでを署名したか」を示します。メーリングリストが本文の末尾に案内を足しても署名が壊れないように、という意図で用意されました。
+
+実際に `l=` 付きで署名し、本文の後ろに文を足してみます。
+
+```
+DKIM-Signature: ... i=@example.test; l=30; q=dns/txt; s=sel2026; ...
+
+l= あり、本文の後ろに追記:  pass
+l= なし、本文の後ろに追記:  fail
+```
+
+足したのは「振込先が変わりました」という 1 行です。**`l=` があると、署名の範囲外に何を足しても pass します**。受け取った利用者には、署名されたメールの続きと区別がつきません。
+
+さらに厄介なのは、足すのが文だけではないことです。RFC 6376 [8.2](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.2) は、MIME の構造（第 125 回）を書き換えたり、メールソフトの HTML の緩い解釈を突いたりして、**利用者の目には元の内容を完全に置き換えてしまえる**と述べ、署名者はこのタグの使用に極めて慎重であるべきだとしています。
+
+<Callout type="warn" title="よくある誤解: l= を付けておけば転送に強くなって便利">
+  `l=` が守るのは「先頭から何バイト」だけで、その後ろは誰でも書き足せます。
+  署名する側は `l=` を付けない。
+  検証する側は、`l=` より後ろに内容があるメッセージを、署名されていない部分を含むものとして扱う。
+  これが今の実務の考え方です。
+</Callout>
+
+## 鍵の長さとアルゴリズム
+
+RFC 6376 の後、アルゴリズムの要件は [RFC 8301](https://www.rfc-editor.org/rfc/rfc8301.html)（2018 年）で改められました。
+
+- `rsa-sha1` は、署名にも検証にも**使ってはならない**
+- 署名者は RSA の鍵を**少なくとも 1024 ビット**にしなければならず、**2048 ビット以上にすべき**
+- 検証者は 1024〜4096 ビットの鍵を検証できなければならず、1024 ビット未満の鍵を有効と見なしてはならない
+
+Google Workspace の設定手順も [2048 ビットを勧めています](https://knowledge.workspace.google.com/admin/security/set-up-dkim)。ただし、**1024 ビットの鍵は執筆時点でもまだ公開されています**。
+
+```
+$ dig +short TXT k1._domainkey.mailchimp.com | ... | openssl pkey -pubin -inform DER -noout -text | head -1
+Public-Key: (1024 bit)
+```
+
+もう 1 つの選択肢が **Ed25519**（[RFC 8463](https://www.rfc-editor.org/rfc/rfc8463.html)、2018 年）です。アルゴリズム名は `ed25519-sha256`、鍵の記録は `k=ed25519` で、`p=` は SPKI ではなく**32 バイトの生の公開鍵を base64 にした 44 文字**です。
+
+```
+v=DKIM1; k=ed25519; p=0NxMBU5E+BK+RbXXsUZ3ctO5TF1LAHbVmHWVN4TmHOc=
+DKIM-Signature: v=1; a=ed25519-sha256; ... s=ed2026; ... h=from : to :
+ subject : date : message-id : from; ...
+```
+
+鍵が短いので **255 バイトの壁と無縁**で、署名も 64 バイト（base64 で 88 文字）です。ただし、検証する側が対応していなければ意味がありません。RFC 8463 自身が、**RSA の署名と Ed25519 の署名を別のセレクタで並べて付ける**移行の仕方を想定しています。検証者は、検証できるほうを使えば済みます。
+
+## 鍵を入れ替える
+
+鍵はいつか入れ替えます。漏えいの疑いがあるとき、鍵を長くするとき、担当者や配信サービスが変わるとき。ここでセレクタが効きます。RFC 6376 [3.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.1) は、`january2005` から `february2005` へ移るなら、**移行の間は両方の公開鍵を DNS に並べておけばよい**と書いています。
+
+```
+1. 新しいセレクタ（sel2027）の公開鍵を DNS に足す
+2. TTL（第 60 回）が過ぎるのを待つ
+3. 署名を新しい鍵に切り替える
+4. 古い鍵で署名したメールが届き終わるのを待つ（キューでの再送は数日かかりうる。第 123 回）
+5. 古いセレクタの p= を空にする（失効）
+```
+
+第 110 回の JWKS の「足す、待つ、切り替える、待つ、外す」と同じ順番です。**同じセレクタの鍵を上書きする**と、まだ届いていない古い署名のメールが一斉に失敗します。
+
+<Callout type="note" title="失効しても、過去のメールの署名は取り消せない">
+  鍵の失効は、この先に届くメールの検証を止めるだけです。
+  秘密鍵が漏れていたなら、漏れた鍵で署名されたメールは、失効前に検証された時点で pass と記録されています。
+  RFC 6376 も [8.7](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.7) で、鍵の失効には限界があると述べています。
+</Callout>
+
+## DKIM が保証するもの、しないもの
+
+ここまでを、DKIM が pass したとき何が言えるかにまとめます。
+
+| 言えること | 言えないこと |
+| --- | --- |
+| `d=` のドメインの DNS にある鍵で署名された | `d=` が From: のドメインと同じである |
+| `h=` のヘッダ（の下から数えた分）と、本文（`l=` があればその範囲）は署名時から変わっていない | 署名されていないヘッダや、`l=` の後ろが本物である |
+| `d=` のドメインがこのメッセージに責任を持つと表明した | そのドメインが信頼できる、内容が正しい |
+| | このメッセージが初めて届いた（再送されたものではない） |
+
+1 行目の右が、この回で最も大事なことです。**`d=` と From: は無関係**です。`d=attacker.example` で署名されたメールの From: が `ceo@yourcompany.example` でも、DKIM としては何の問題もなく pass します。
+
+<Callout type="warn" title="よくある誤解: DKIM が pass なら、差出人は本物">
+  DKIM の検証が確かめるのは `d=` のドメインの鍵で署名されたことだけで、利用者が見る From: とは結びついていません。
+  From: と `d=` が「揃っている」ことを求めるのは、次回の DMARC の役目です。
+  メールの詳細ヘッダに `dkim=pass` と書いてあっても、`header.d=` が何のドメインかを見なければ意味がありません。
+</Callout>
+
+最後の行も見落とされがちです。署名されたメールは、**そのまま別の宛先へ何度でも送り直せます**。自分のアカウントから 1 通だけ正規に送ったメールを、宛先だけ変えて大量にばらまいても、署名は壊れません（エンベロープの宛先は署名の外にあるからです。第 122 回）。RFC 6376 も [8.6](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.6) で、署名は再送やスパムの対策にならないと述べています。
+
+## 転送とメーリングリスト
+
+SPF は転送で壊れ、DKIM は転送でも壊れない、と冒頭で述べました。それは**中身を変えずに転送した場合**の話です。メーリングリストは多くの場合、中身を変えます。
+
+```
+元のメール:    Subject: 会議の件           ← d=example.test が署名
+リストを通過:  Subject: [team] 会議の件    ← 件名に接頭辞
+              本文の末尾に「配信停止はこちら」
+              → 署名が壊れる。SPF はリストのサーバで判定され、元の From: とは揃わない
+```
+
+こうした間接的な経路で認証が壊れる問題は、[RFC 7960](https://www.rfc-editor.org/rfc/rfc7960.html)（2016 年）にまとまっています。次回の DMARC で From: のドメインが `p=reject` を宣言していると、**正しいメーリングリストの配送が受け取りを拒否される**ことになります。
+
+これに対する継ぎ足しが **ARC**（Authenticated Received Chain、[RFC 8617](https://www.rfc-editor.org/rfc/rfc8617.html)、2019 年）です。中継する各サーバが、次の 3 つのヘッダを 1 組として付けます。
+
+| ヘッダ | 中身 |
+| --- | --- |
+| `ARC-Authentication-Results` | 自分が受け取った時点での SPF・DKIM・DMARC の判定結果 |
+| `ARC-Message-Signature` | その時点のメッセージへの、DKIM とほぼ同じ形の署名 |
+| `ARC-Seal` | ここまでの ARC のヘッダの組全体への署名。`cv=` に前の連鎖の検証結果（`none` / `pass` / `fail`） |
+
+組には `i=1`、`i=2` と番号が振られ、上限は 50 です。最後に受け取った側は、「リストのサーバが受け取った時点では DKIM が pass していた」という**証言**を、証言者の署名付きで読めます。
+
+<Callout type="note" title="ARC は実験的な RFC で、信頼の判断は受け取る側に任されている">
+  RFC 8617 は Standards Track ではなく **Experimental** です。
+  そして ARC が確かめるのは「どの中継者がその証言をしたか」までで、その中継者を信じるかどうかは受け取る側の方針次第だと、RFC 自身が述べています。
+  誰でも ARC のヘッダは付けられるので、知らない中継者の「元は pass でした」を鵜呑みにはできません。
+</Callout>
+
+## 手元で確かめる
+
+ここまでの実験は、すべて手元で完結します。DNS を引く代わりに、検証する関数に「DNS の答え」を渡すので、実在のドメインにもメールサーバにも触れません。
+
+作業ディレクトリに venv を作り、[dkimpy](https://pypi.org/project/dkimpy/) を入れます。Ed25519 の署名には PyNaCl も要ります。
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install dkimpy cryptography pynacl dnspython   # dkimpy 1.1.8、cryptography 50.0.1 で確認
+```
+
+鍵を作り、`p=` を組み立てて、偽の DNS に置きます。
+
+```python
+import base64, dkim
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization as s
+
+key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+priv = key.private_bytes(s.Encoding.PEM, s.PrivateFormat.TraditionalOpenSSL, s.NoEncryption())
+spki = key.public_key().public_bytes(s.Encoding.DER, s.PublicFormat.SubjectPublicKeyInfo)
+p = base64.b64encode(spki).decode()          # 392 文字。第 98 回の SPKI
+
+ZONE = {b"sel2026._domainkey.example.test.": f"v=DKIM1; k=rsa; p={p}".encode()}
+def dnsfunc(name, timeout=5):
+    return ZONE.get(name if name.endswith(b".") else name + b".")
+```
+
+署名と検証は 1 行ずつです。
+
+```python
+MSG = (b"From: Alice <alice@example.test>\r\nTo: bob@example.org\r\n"
+       b"Subject: invoice\r\nDate: Mon, 28 Sep 2026 10:00:00 +0900\r\n"
+       b"Message-ID: <1@example.test>\r\n\r\n"
+       b"Please pay 100 yen.\r\nThanks.\r\n")
+
+def sign(msg, c, **kw):
+    return dkim.sign(msg, b"sel2026", b"example.test", priv, canonicalize=c,
+                     include_headers=[b"from", b"to", b"subject", b"date", b"message-id"], **kw) + msg
+
+m = sign(MSG, (b"relaxed", b"relaxed"))
+dkim.verify(m, dnsfunc=dnsfunc)                    # True
+dkim.verify(m.replace(b"100", b"900"), dnsfunc=dnsfunc)   # False
+```
+
+正規化の表は、`sign` の `c` を 3 通りに変え、メッセージに 1 か所ずつ手を加えて `verify` した結果です。`l=` は `sign(..., length=True)` で、過剰署名は `include_headers` の末尾に `b"subject"` をもう 1 つ足して確かめました。
+
+自分の組織のドメインがあれば、届いたメールの `DKIM-Signature` から `s=` と `d=` を読み、`dig TXT <s>._domainkey.<d>` で鍵を引いて、長さと `p=` の形を確かめてみてください。**配信サービスごとにセレクタが並んでいる**のが見えるはずです。
+
+## DKIM は何と組み合わさって意味を持つか
+
+| 部品 | 役目 | 見た回 |
+| --- | --- | --- |
+| 署名（RSA、Ed25519） | 中身が変わっていないこと、この鍵で署名されたこと | 第 97 回 |
+| 鍵の形式（SPKI、base64） | `p=` に公開鍵を載せる | 第 98 回 |
+| ハッシュ（SHA-256） | 本文を `bh=` に縮める | 第 94 回 |
+| DNS（TXT、CNAME、TTL） | 公開鍵を配る。委任と入れ替え | 第 58 回、第 60 回 |
+| DNSSEC | 引いた鍵が DNS の途中で差し替えられていないこと | 第 61 回 |
+| メッセージの形式 | どのヘッダが 1 つだけか、MIME の構造 | 第 125 回 |
+| DMARC | `d=` と From: を結びつける | 第 129 回 |
+
+DKIM の信頼の根は DNS です。DNSSEC のないゾーンでは、DNS の応答を偽造できる攻撃者が偽の鍵を渡せば、検証は偽の署名を pass させます（第 61 回）。そして、From: と結びつけるまでは、利用者にとって意味のある主張にはなりません。
+
+## まとめ
+
+- DKIM はメッセージに署名し、公開鍵を `<s>._domainkey.<d>` の TXT に置く。経路ではなく中身を確かめるので、中身を変えない転送では壊れない
+- 署名は 2 段階。本文のハッシュを `bh=` に入れ、`h=` のヘッダと DKIM-Signature 自身（`b=` を空にしたもの）に署名して `b=` にする
+- `p=` の中身は実際には SPKI の DER の base64。空の `p=` は失効。2048 ビットの RSA の鍵は 255 バイトを超えるので、TXT の文字列を分けて並べ、連結して使う
+- 正規化 relaxed が吸収するのは空白、折り返し、ヘッダ名の大文字小文字だけ。件名の接頭辞や本文への追記は署名を壊す
+- 同じ名前のヘッダは下から数えて使うので、1 回だけの署名では上に足された偽のヘッダを見逃す。1 つしか置けないヘッダは過剰署名する
+- `l=` は署名の範囲外への追記をすべて通す。署名者は付けない
+- `rsa-sha1` は禁止、RSA は 2048 ビット以上が推奨。Ed25519 は RSA と並べて付ける。鍵の入れ替えはセレクタを変えて並行運用する
+- **DKIM が言うのは「`d=` のドメインが責任を持つ」ことだけで、From: とは無関係**。再送も防がない。メーリングリストで壊れる問題への継ぎ足しが ARC で、実験的な RFC にとどまる
+
+SPF は MAIL FROM を、DKIM は `d=` を確かめました。どちらも、利用者が画面で見る From: には触れていません。次の第 129 回では、From: のドメインとこの 2 つを「揃える」ことを求めて、初めて差出人の表示と結びつける DMARC を見ます。

@@ -51,7 +51,7 @@ search shop.svc.cluster.local svc.cluster.local cluster.local
 options ndots:5
 ```
 
-`ndots:5` になっているのは、`api.shop`（ドット 1 個）や `api.shop.svc`（ドット 2 個）のような短い名前でもクラスタ内の Service を引けるようにするためです。仕組みそのものは第 105 回で扱います。
+`ndots:5` になっているのは、`api.shop`（ドット 1 個）や `api.shop.svc`（ドット 2 個）のような短い名前でもクラスタ内の Service を引けるようにするためです。仕組みそのものは第 154 回で扱います。
 
 問題は、この設定のまま**外部の名前**を引いたときです。`api.example.com` はドットが 2 個しかないので、「短い名前」とみなされます。
 
