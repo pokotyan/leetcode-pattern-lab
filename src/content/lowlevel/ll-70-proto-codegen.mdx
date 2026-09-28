@@ -1,0 +1,364 @@
+---
+title: コードを生成する、スキーマを配る
+description: .proto から各言語のコードはどう作られ、それを別のチームや別の会社にどう届けるのか。使う側が自分で生成するやり方と、生成済みのパッケージを配るやり方は、何を引き換えにしているのでしょうか
+chapter: rpc
+order: 7
+status: published
+topics:
+  - protoc プラグイン
+  - CodeGeneratorRequest
+  - FileDescriptorSet
+  - protoc-gen-go-grpc
+  - buf breaking
+  - Buf Schema Registry
+  - Generated SDKs
+  - サーバリフレクション
+requires:
+  - ll-66-protobuf-wire
+  - ll-68-grpc-wire
+---
+
+import Callout from '../../components/Callout.astro'
+
+第 66 回から前回まで、`.proto` の定義が線の上でどんなバイト列になり（第 66・67 回）、gRPC がそれを HTTP/2 にどう載せ（第 68 回）、失敗をどう返すか（第 69 回）を見てきました。どの回も、手元に `.proto` と、そこから作ったコードがある前提でした。
+
+では、そのコードは誰がどうやって作るのでしょうか。サーバを書くチームは `.proto` を持っていますが、呼び出す側は別のチーム、別のリポジトリ、ときには別の会社です。**`.proto` を渡して各自で生成してもらうのか、生成したものを配るのか。** この回では、生成の仕組みを手で確かめてから、配り方の選択肢がそれぞれ何を引き換えにしているかを見ます。
+
+## protoc は二つに分かれている
+
+```
+ order.proto ─▶ [ 前半: 構文解析・名前解決 ] ─▶ FileDescriptorProto の集まり
+                                                   │
+                    ┌──────────────────────────────┼─────────────────────┐
+                    ▼                              ▼                     ▼
+            [ C++ の生成器 ]              [ protoc-gen-go ]      [ protoc-gen-hello ]
+            protoc に組み込み              別の実行ファイル         別の実行ファイル
+```
+
+前半は `.proto` を読み、`import` をたどり、型名を完全修飾名に解決して、**スキーマそのものを Protobuf のメッセージ（`FileDescriptorProto`）で表したもの**を作ります。その型は [descriptor.proto](https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/descriptor.proto) に定義され、複数のファイル分をまとめたものが `FileDescriptorSet` です。`protoc --descriptor_set_out` で前半の結果だけを書き出せます。
+
+後半は言語ごとのコードを出します。C++ や Java などの生成器は `protoc` に組み込まれていますが、それ以外は**別の実行ファイル（プラグイン）**です。取り決めは [plugin.proto](https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/compiler/plugin.proto) の冒頭にあります。
+
+- プラグインは `protoc-gen-$NAME` という名前の実行ファイルで、`--${NAME}_out` を指定すると使われる
+- `protoc` は `CodeGeneratorRequest` を Protobuf でエンコードして、プラグインの**標準入力**に書く
+- プラグインは `CodeGeneratorResponse`（作るファイルの名前と中身の一覧）を**標準出力**に書く
+
+第 105 回で見た CNI と同じ形です。あちらは JSON、こちらは Protobuf という違いはあっても、**実行ファイルを起動し、標準入出力でデータをやり取りする**という、第 30 回のローダと第 42 回の fd の上にそのまま乗った取り決めです。[protobuf.dev](https://protobuf.dev/reference/other/) も、プラグインはどの言語で書いてもよいとしています。`protoc` 本体に手を入れずに、生成できる言語を外から足せます。
+
+## 実験: 30 行のプラグインを書く
+
+対象は次の `.proto` です。
+
+```protobuf
+syntax = "proto3";
+package shop.v1;
+import "google/protobuf/timestamp.proto";
+
+message Order {
+  string id = 1;
+  repeated Item items = 2;
+  int64 total_yen = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+message Item { string sku = 1; int32 quantity = 2; }
+message GetOrderRequest { string id = 1; }
+
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+}
+```
+
+プラグインは、メッセージごとにフィールドの番号・名前・型を並べたテキストを出すだけにします。Python の `protobuf` パッケージには `plugin.proto` から生成済みの `plugin_pb2` が入っています。
+
+```python
+#!/usr/bin/env python3
+import sys
+from google.protobuf.compiler import plugin_pb2
+from google.protobuf.descriptor_pb2 import FieldDescriptorProto as F
+
+TYPES = {v: k[5:].lower() for k, v in F.Type.items()}
+
+req = plugin_pb2.CodeGeneratorRequest.FromString(sys.stdin.buffer.read())
+res = plugin_pb2.CodeGeneratorResponse()
+res.supported_features = plugin_pb2.CodeGeneratorResponse.FEATURE_PROTO3_OPTIONAL
+
+for proto in req.proto_file:
+    if proto.name not in req.file_to_generate:
+        continue
+    lines = [f"# {proto.name} (param={req.parameter!r})"]
+    for msg in proto.message_type:
+        lines.append(f"message {msg.name}")
+        for f in msg.field:
+            rep = "repeated " if f.label == F.LABEL_REPEATED else ""
+            t = f.type_name or TYPES[f.type]
+            lines.append(f"  {f.number:>2}  {f.name}: {rep}{t}")
+    for svc in proto.service:
+        for m in svc.method:
+            lines.append(f"rpc {svc.name}.{m.name}({m.input_type}) -> {m.output_type}")
+    out = res.file.add()
+    out.name = proto.name.replace(".proto", ".fields.txt")
+    out.content = "\n".join(lines) + "\n"
+
+sys.stdout.buffer.write(res.SerializeToString())
+```
+
+`protoc-gen-hello` という名前で保存して実行権限を付け、呼び出します。`--hello_out=` の `:` より前は、プラグインに渡すパラメータです。
+
+```
+$ protoc -I proto --plugin=protoc-gen-hello=./protoc-gen-hello \
+    --hello_out=lang=ja:out shop/v1/order.proto
+$ cat out/shop/v1/order.fields.txt
+# shop/v1/order.proto (param='lang=ja')
+message Order
+   1  id: string
+   2  items: repeated .shop.v1.Item
+   3  total_yen: int64
+...
+rpc OrderService.GetOrder(.shop.v1.GetOrderRequest) -> .shop.v1.Order
+```
+
+ファイルを書いたのは `protoc` です。プラグインは名前と中身を返しただけで、出力先の `out/` を知りません。
+
+### 標準入力に何が届いているか
+
+標準入力をファイルに保存して何も出力しないプラグイン（`cat > request.bin` だけのシェルスクリプト）に差し替えます。空の出力は、**ファイルを 1 つも含まない正しい `CodeGeneratorResponse`** として受け取られ、`protoc` は正常に終わりました。第 66 回で見たとおり、長さ 0 のバイト列は「すべてのフィールドが既定値」のメッセージだからです。
+
+`xxd` で見ると、先頭は `0a 13 73 68 6f 70 ...`、つまりフィールド 1（`file_to_generate`）の長さ 19 の文字列 `shop/v1/order.proto` で、第 66 回の読み方がそのまま通じます。`protoc` 自身に `plugin.proto` を渡せば、テキスト形式に戻せます。
+
+```
+$ protoc -I /opt/homebrew/include \
+    --decode=google.protobuf.compiler.CodeGeneratorRequest \
+    google/protobuf/compiler/plugin.proto < request.bin
+file_to_generate: "shop/v1/order.proto"
+...
+proto_file {
+  name: "google/protobuf/timestamp.proto"
+  ...
+proto_file {
+  name: "shop/v1/order.proto"
+  package: "shop.v1"
+  dependency: "google/protobuf/timestamp.proto"
+  message_type {
+    name: "Order"
+    ...
+    field {
+      name: "items"
+      ...
+      type_name: ".shop.v1.Item"
+      ...
+    field {
+      name: "total_yen"
+      ...
+      json_name: "totalYen"
+  ...
+```
+
+- **`proto_file` には import したファイルもすべて入る。** 依存されるファイルが先に並びます（`plugin.proto` はトポロジカル順と定めています）。生成するのは `file_to_generate` に挙がったものだけです。import を足す前は 848 バイトだった要求が、足した後は 7,353 バイトになりました
+- **型名は完全修飾名に解決済み**（`.shop.v1.Item`）。プラグインは名前の探索を実装しなくてよい
+- **`json_name` も計算済み。** どの言語の生成器でも JSON のキーが `totalYen` に揃うのは、前半が決めて渡しているからです
+
+**プラグインが受け取るのは `.proto` の文字列ではなく、解析の済んだスキーマの記述です。** この記述は、最後の節でもう一度出てきます。
+
+## メッセージとサービスは別の生成器
+
+Go では、メッセージの型を出す `protoc-gen-go` と、gRPC のサービスを出す `protoc-gen-go-grpc` が別のプラグインで、別々にインストールします（[gRPC Go Quick start](https://grpc.io/docs/languages/go/quickstart/)）。
+
+`protoc` に `--go_out` と `--go-grpc_out` を並べて渡すと（`go_package` を書いていないので `--go_opt=M...` で Go のパッケージも与えます）、2 つのファイルができました。
+
+| ファイル | 生成器 | 中身 |
+| --- | --- | --- |
+| `order.pb.go`（261 行） | protoc-gen-go v1.36.12 | `Order` などの構造体、`GetTotalYen()` などの getter、スキーマの記述 |
+| `order_grpc.pb.go`（121 行） | protoc-gen-go-grpc 1.6.2 | クライアントのスタブ `OrderServiceClient`、サーバが実装する `OrderServiceServer` |
+
+スタブの中身は薄く、第 68 回の `:path` にあたる `"/shop.v1.OrderService/GetOrder"` を定数として持ち、汎用の `c.cc.Invoke(ctx, 定数, in, out, ...)` に渡すだけです。**線の上の形はメッセージのコードとランタイムが、呼び出しの枠は gRPC のランタイムが持ち、サービスの生成器はその間を型で結んでいます。** 分かれているので、同じメッセージの型の上に [Connect](https://connectrpc.com/docs/introduction/) のスタブを出す `protoc-gen-connect-go` を組み合わせることもできます。
+
+生成されたファイルの先頭のコメントには、`// Code generated by protoc-gen-go. DO NOT EDIT.` に続いて、生成に使った `protoc-gen-go v1.36.12` と `protoc v3.19.4` の版が記録されています。**同じ `.proto` から作ったコードでも、誰がどの版の生成器で作ったかで中身が変わる。** ここから配り方の問題が始まります。
+
+## 生成物を誰が持つか
+
+| | やり方 | 使う側に要るもの | 生成器の版を揃えるのは |
+| --- | --- | --- | --- |
+| (a) | 使う側が `.proto` を取ってきて生成（コピー、git submodule、subtree） | protoc と生成器、生成の手順 | 使う側それぞれ（揃わない） |
+| (b) | 提供側が生成物をリポジトリにコミット | 生成物を取り込む手段 | 提供側 |
+| (c) | 提供側の CI が言語ごとのパッケージを社内レジストリに公開 | パッケージマネージャ | 提供側 |
+| (d) | BSR にモジュールを push し、Generated SDKs を使ってもらう | パッケージマネージャ | BSR のプラグインの版 |
+
+(a) は最も素直で、submodule ならどのコミットのスキーマを使っているかも明確です。ただし、言語が 5 つ、使う側のチームが 10 あれば、生成の手順も 10 通りできます。(b) は使う側が生成器を持たずに済みますが、**生成物の差分がレビューに混ざります**。スキーマが変わらなくても、生成器の版が上がるだけで上の先頭の行が全ファイルで変わります。(c) は、使う側が普段どおり依存を足すだけで済み、提供側がバージョン番号に semver の意味を持たせられます。代わりに、言語の数だけ公開の仕組みを保守します。(d) は (c) の仕組みをサービスとして借りる形です。
+
+## buf: 検査と生成をまとめる
+
+どの形でも、提供側は「壊していないか確かめる」「生成する」を繰り返します。これを 1 つの CLI にまとめたのが [Buf](https://buf.build/docs/) です。手元に無かったので npm の `@bufbuild/buf` から入れました（執筆時点で 1.73.0）。buf は `protoc` を呼ばず、自前のコンパイラで前半を行います。
+
+設定の `buf.yaml` では、`modules` に `.proto` を置いたディレクトリ（ここでは `proto`）を書いて 1 つの**モジュール**とし、`lint` と `breaking` に規則の組（既定は `STANDARD` と `FILE`）を書きます。他のモジュールへの依存は `deps` に `buf.build/owner/module` の形で書き、`buf dep update` で解決した結果が `buf.lock` に固定されます。`deps` に書けるのは BSR 上のモジュールだけです（[buf.yaml v2](https://buf.build/docs/configuration/v2/buf-yaml/)）。
+
+`buf lint` は、`RPC response type "Order" should be named "GetOrderResponse" or "OrderServiceGetOrderResponse".` と応答の型の名前を指摘しました。規則 `RPC_RESPONSE_STANDARD_NAME` の理由は、RPC の間でメッセージを共有すると、その変更が参照するすべての RPC に波及するから、と説明されています（[Lint rules](https://buf.build/docs/lint/rules/)）。
+
+### buf breaking: 第 66 回の規則を機械で確かめる
+
+第 66 回で見たとおり、**フィールド番号は線の上の名前**です。番号を変えると、古いクライアントが送った値を新しいサーバは知らないフィールドとして読み飛ばし、エラーにもならず値が消えます。`main` ブランチにコミットしておき、作業ツリーで番号を 3 から 5 に変えて比べます。
+
+```
+$ git diff
+-  int64 total_yen = 3;
++  int64 total_yen = 5;
+$ buf breaking --against '.git#branch=main'
+proto/shop/v1/order.proto:7:1:Previously present field "3" with name "total_yen" on message "Order" was deleted.
+$ echo $?
+100
+```
+
+番号の変更は、線の上から見れば**古いフィールドを消して新しいフィールドを足す**ことなので、「3 番が消えた」と報告されます。終了コードが 0 でないので、CI で取り込みを止められます。番号 6 のフィールドを足すだけなら、何も報告されず 0 でした。
+
+名前だけを `total_price` に変えた場合は、規則の組で結果が分かれました。既定の `FILE` では `changed name from "total_yen" to "total_price"` と `json_name` の変更の 2 件が報告され、`--config` で `WIRE` に切り替えると何も報告されず終了コードは 0 でした。
+
+| 規則の組 | 守るもの（[Breaking change detection](https://buf.build/docs/breaking/)） |
+| --- | --- |
+| `FILE`（既定） | ファイル単位で、生成されたコードを壊さない |
+| `PACKAGE` | パッケージ単位で、生成されたコードを壊さない |
+| `WIRE_JSON` | バイナリのワイヤ形式と JSON の形式を壊さない |
+| `WIRE` | バイナリのワイヤ形式だけを壊さない |
+
+名前の変更はバイナリの上では何も変えませんが、JSON ではキーが変わり、生成されたコードでは `GetTotalYen()` が消えます。**どの組を選ぶかは、このスキーマが誰にどの形で使われているかの宣言です。** 生成したコードを配るなら `FILE` が要ります。
+
+### buf generate と remote plugins
+
+生成の手順は `buf.gen.yaml` に書きます。先ほどの `protoc-gen-hello` もそのまま並べられます。
+
+```yaml
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: example.com/gen/go
+plugins:
+  - local: ../protoc-gen-hello
+    out: gen/hello
+    opt: lang=ja
+  - remote: buf.build/protocolbuffers/go:v1.36.11
+    out: gen/go
+    opt: paths=source_relative
+```
+
+`local` は手元の実行ファイル、`remote` は BSR 上の生成器です（[buf.gen.yaml v2](https://buf.build/docs/configuration/v2/buf-gen-yaml/)）。remote では、BSR が入力を生成器の実行環境に送り、サーバ上で動かした結果を手元に書きます（[Remote plugins](https://buf.build/docs/bsr/remote-plugins/)）。`managed` は、`go_package` のような言語ごとのオプションを `.proto` に書かずに生成の側から与える仕組みです。
+
+`buf generate` を実行すると、`gen/hello/` に先ほどと同じテキストが、`gen/go/` に `order.pb.go` ができました（`buf.build/grpc/go` を足せば `order_grpc.pb.go` も同様に出ます）。`order.pb.go` の先頭は `protoc-gen-go v1.36.11`、`protoc (unknown)` です。ログインせずに公開の生成器が使えました。手元の protoc-gen-go は v1.36.12 でも、**生成に使われたのは `buf.gen.yaml` で固定した v1.36.11** です。この固定はリポジトリにコミットされるので、誰が実行しても同じ版になります。代わりに、生成のたびにスキーマが外部のサーバに送られます。
+
+## BSR の Generated SDKs: 生成済みのパッケージを配る
+
+[Generated SDKs](https://buf.build/docs/bsr/generated-sdks/) は、BSR が Buf のモジュールとプラグインの組から作る、言語ごとのパッケージです。使う側は `protoc` も生成器も持たず、普段のパッケージマネージャで入れます。執筆時点で案内されている入手先は、Go、npm、Maven / Gradle、Swift、Python、Cargo、NuGet、CMake です。名前はモジュールとプラグインの組で決まり、npm なら `@buf/{モジュールの所有者}_{モジュール名}.{プラグインの所有者}_{プラグイン名}`（レジストリは `https://buf.build/gen/npm/v1`、[npm](https://buf.build/docs/bsr/generated-sdks/npm/)）、Go なら `buf.build/gen/go/{組織}/{モジュール名}/{プラグインの所有者}/{プラグイン名}` です（[Go](https://buf.build/docs/bsr/generated-sdks/go/)）。
+
+### 実験: 認証なしで公開モジュールの SDK を入れる
+
+ログインもトークンの設定もしない状態で、空のディレクトリから試しました。
+
+```
+$ npm view @buf/googleapis_googleapis.bufbuild_es --registry https://buf.build/gen/npm/v1/
+@buf/googleapis_googleapis.bufbuild_es@2.15.0-20260414192239-c17df5b2beca.1 | Apache-2.0 | deps: none | versions: 5440
+$ echo '@buf:registry=https://buf.build/gen/npm/v1/' > .npmrc
+$ npm install @buf/googleapis_googleapis.bufbuild_es
+added 2 packages in 1s
+```
+
+入ったのは生成済みの `.js` と `.d.ts` で、ランタイムの `@bufbuild/protobuf` が peerDependencies として一緒に入りました。`google.type.Date` を作って `toBinary` すると `08ea0f1009181c` が出ます。`08 ea 0f` がフィールド 1 の varint で 2026 と、第 66 回の形そのままです。
+
+Go でも取れました。Python も `pip index versions --index-url https://buf.build/gen/python` で版の一覧が返りました。
+
+```
+$ go get buf.build/gen/go/connectrpc/eliza/grpc/go@latest
+go: buf.build/gen/go/connectrpc/eliza/grpc/go@v1.6.2-20230913231627-233fca715f49.1 requires go >= 1.25; switching to go1.26.8
+go: added buf.build/gen/go/connectrpc/eliza/grpc/go v1.6.2-20230913231627-233fca715f49.1
+```
+
+一方、googleapis の Go の SDK は取れませんでした。
+
+```
+$ go list -m buf.build/gen/go/googleapis/googleapis/protocolbuffers/go@latest
+... 404 Not Found ...
+	Generated SDK for buf.build/googleapis/googleapis is not available.
+	Please use the pre-generated code from https://pkg.go.dev/google.golang.org/genproto/googleapis instead.
+```
+
+ドキュメントにも、これは意図して生成していないとあり、Google 自身が公開するパッケージを使うよう案内されています。**同じスキーマから生成済みのパッケージを配る者が複数いると、どれを正規とするかを決める必要がある**ことを示す例です。
+
+### バージョン番号は何を表すか
+
+```
+2.15.0 - 20260414192239 - c17df5b2beca . 1
+└─┬──┘   └─────┬──────┘   └────┬─────┘   └┬┘
+プラグインの版  モジュールのコミット時刻  コミット ID の先頭 12 文字  プラグインの改訂番号
+```
+
+ドキュメントはこれを `PLUGIN_VERSION-MODULE_TIMESTAMP-COMMIT_ID.PLUGIN_REVISION` と説明しています。Python では、Python の版の書式に合わせた `36.2.0.1.20230913231627+233fca715f49` という並びでした。
+
+**先頭の `2.15.0` はスキーマの版ではなく、生成器の版です。** スキーマの変更は後ろの時刻とコミット ID にしか現れず、互換性を壊しても先頭は上がりません。npm は依存を `^2.15.0-20260414192239-c17df5b2beca.1` と保存したので、この範囲が何に合うかを確かめました。
+
+```
+$ npx semver -r '^2.15.0-20260414192239-c17df5b2beca.1' \
+    2.15.0-20260501000000-aaaaaaaaaaaa.1 2.16.0-20260501000000-aaaaaaaaaaaa.1 \
+    2.15.0-20260101000000-bbbbbbbbbbbb.1 2.16.0
+2.15.0-20260501000000-aaaaaaaaaaaa.1
+2.16.0
+```
+
+後半は semver の**プレリリース**の部分なので、同じ `2.15.0` のうち時刻の新しいものには合い、生成器が上がった `2.16.0-...` には合いません。この範囲は「同じ生成器で作った、より新しいスキーマ」を受け入れます。**スキーマが互換を壊していても、`npm update` で入ってきます。** 固定したいなら、`@commit-...` や `@label-...` の指定かロックファイルに頼ることになります。
+
+| 利点 | 引き換えにしているもの |
+| --- | --- |
+| 使う側に protoc も生成器も要らない | ビルドが外部のサービスに依存する |
+| 生成器の版が BSR 側で揃う | 生成のオプションを使う側は選べない。名前に現れるのはモジュールとプラグインの組だけ |
+| push すれば全言語の新しい版が用意される | バージョン番号がスキーマの互換性を表さない。互換は `buf breaking` で別に守る |
+| コミットやラベルごとに版があり、固定できる | 非公開のモジュールでは、使う側すべてに認証の設定が要る（npm は `.npmrc` の `_authToken`、Go は `.netrc` と `GOPRIVATE`） |
+
+表に入れにくい点が二つあります。一つは、**生成済みのパッケージは、生成器とランタイムの要求を使う側に持ち込む**ことです。上の `go get` は SDK の `go.mod` が `go 1.25` を要求していたため、手元の go 1.24 ではツールチェーンの切り替えが起き、`GOTOOLCHAIN=local` で切り替えを禁じると失敗しました。自分で生成するなら、版を自分の環境に合わせて選べます。もう一つは、多くの入手先で**最初に要求されたときに生成してキャッシュする**ことです。Cargo だけは、索引にすべての版のチェックサムが要るため、先に生成します（[Cargo](https://buf.build/docs/bsr/generated-sdks/cargo/)）。
+
+## 生成せずに使う道
+
+プラグインの実験で見たとおり、生成の材料はスキーマの記述です。**記述を実行時に手に入れれば、生成しなくても読み書きできます。** `protoc --descriptor_set_out` で書き出した `FileDescriptorSet` を Python の `descriptor_pool` に読み込み、メッセージのクラスを実行時に作ります。
+
+```python
+fds = descriptor_pb2.FileDescriptorSet.FromString(open("order.binpb", "rb").read())
+pool = descriptor_pool.DescriptorPool()
+for f in fds.file:
+    pool.Add(f)
+Order = message_factory.GetMessageClass(pool.FindMessageTypeByName("shop.v1.Order"))
+o = Order(id="A-1", total_yen=1200)
+o.items.add(sku="pen", quantity=2)
+print(o.SerializeToString().hex(" "))   # 0a 03 41 2d 31 12 07 0a 03 70 65 6e 10 02 18 b0 09
+```
+
+`order_pb2.py` はどこにもありませんが、第 66 回の形のバイト列が出ました。Java の `DynamicMessage` も同じ考え方です。
+
+記述を**サーバ自身に尋ねる**のが[サーバリフレクション](https://grpc.io/docs/guides/reflection/)です。サーバが標準化された RPC サービスで、公開しているサービスと、要求・応答で使うすべての型の定義を返します。grpcurl はこれを使い、`.proto` を持たずに呼べます。公開のテスト用サーバで試すと、`grpcurl grpcb.in:9001 list` でサービスの一覧が、`describe hello.HelloService` で `rpc SayHello ( .hello.HelloRequest ) returns ( .hello.HelloResponse );` などの定義が返り、そのまま呼び出せました。
+
+```
+$ grpcurl -d '{"greeting":"proto"}' grpcb.in:9001 hello.HelloService/SayHello
+{
+  "reply": "hello proto"
+}
+```
+
+ただし、リフレクションは既定では有効でなく、サーバの実装者が明示的に有効にするものです。定義を外に見せないために有効にしない公開 API もあります。型の付いたコードが手に入るわけではないので、アプリケーションを書く手段ではなく、調査とデバッグのための道です。
+
+## どれを選ぶか
+
+| 軸 | 各自で生成 (a) に寄る | 配る (b)(c)(d) に寄る |
+| --- | --- | --- |
+| 組織の境界 | 同じリポジトリ、同じチーム | 別のチーム、別の会社 |
+| 言語の数 | 1〜2 言語 | 多い。使う側の言語を提供側が選べない |
+| 変更の頻度 | 低い。取り込みを手で回せる | 高い。手で追うと遅れる |
+
+これに、**バージョン番号に何を語らせたいか**が加わります。(c) と (d) は使う側から見ればどちらも「パッケージマネージャで入れる」ですが、社外に API を公開し、使う側が semver で互換を判断する前提なら意味のある番号を付けられる (c) が、社内でスキーマを頻繁に変えて常に最新を追う前提なら公開の仕組みを持たずに済む (d) が合います。どの形を選んでも、スキーマを壊していないかの検査は、配り方とは別に要ります。
+
+## まとめ
+
+- `protoc` は、`.proto` を解析してスキーマの記述（`FileDescriptorProto`）を作る前半と、言語ごとのコードを出す後半に分かれている
+- プラグインは `protoc-gen-NAME` という実行ファイルで、標準入力に `CodeGeneratorRequest`、標準出力に `CodeGeneratorResponse` を Protobuf でやり取りする。CNI と同じ「実行ファイル + 標準入出力」の取り決め
+- プラグインが受け取るのは解析済みの記述で、import したファイル、完全修飾の型名、`json_name` まで入っている
+- Go ではメッセージの生成器（protoc-gen-go）とサービスの生成器（protoc-gen-go-grpc）が分かれている。生成物には生成器の版が記録される
+- 配り方は、各自で生成、生成物をコミット、社内レジストリに公開、BSR の Generated SDKs の四つ。違いは、生成器の版を誰が揃えるか、番号に意味を持たせられるか、公開の仕組みを誰が保守するか
+- `buf breaking` は番号の変更を「番号が消えた」として検出する。名前の変更は `FILE` では破壊、`WIRE` では無害と判定され、規則の組の選択が使われ方の宣言になる
+- Generated SDKs は公開モジュールなら認証なしで取れたが、番号の先頭は生成器の版で、npm の `^` の範囲は互換を壊した新しいスキーマも受け入れる
+- 記述を実行時に手に入れれば、動的メッセージやサーバリフレクションで生成せずに扱える
+
+次回は、ここまでで作ったものを本番で動かします。1 本の HTTP/2 接続に要求を集める gRPC は、第 105 回で見た「振り分けは接続の最初にしか決まらない」という L4 の性質と相性が悪く、振り分けや接続の寿命をどう扱うかが最初の論点になります。

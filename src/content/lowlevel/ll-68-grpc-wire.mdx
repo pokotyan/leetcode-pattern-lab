@@ -1,0 +1,355 @@
+---
+title: gRPC は HTTP/2 の上で何をしているか
+description: 「関数を呼ぶように別のサービスを呼ぶ」gRPC は、線の上では何をしているのでしょうか。1 回の呼び出しを HTTP/2 のストリーム 1 本、Protobuf のメッセージを 5 バイトの枠、結果をトレーラとして読み、curl だけで gRPC サーバを呼んでみます
+chapter: rpc
+order: 5
+status: published
+topics:
+  - gRPC
+  - Length-Prefixed-Message
+  - トレーラ（grpc-status / grpc-message）
+  - Trailers-Only
+  - grpc-timeout / デッドライン
+  - メタデータ（-bin）
+  - RST_STREAM(CANCEL)
+  - gRPC-Web
+  - Connect プロトコル
+  - サーバリフレクション
+requires:
+  - ll-64-http2-frame
+  - ll-66-protobuf-wire
+---
+
+import Callout from '../../components/Callout.astro'
+
+第 64 回では HTTP/2 をフレームの単位で読みました。1 本の TCP 接続の上に番号付きのストリームを多重化し、ヘッダを HPACK で縮め、WINDOW_UPDATE で流量を調整し、RST_STREAM で 1 本だけを止め、GOAWAY で接続ごと店じまいする仕組みです。第 66・67 回では、構造を持ったデータを Protobuf でバイト列にする方法を見ました。
+
+gRPC は、この 2 つを組み合わせたものです。では、その組み合わせ方は具体的にどうなっているのでしょうか。`stub.SayHello(request)` と書いたとき、HTTP/2 のどのフレームに何が載るのか。関数の戻り値やエラーは、HTTP のどこで返ってくるのか。この回では gRPC の仕様書 [PROTOCOL-HTTP2.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md) を読み、最後は**専用のクライアントを使わず、curl だけで gRPC サーバを呼びます**。
+
+## RPC という考え方
+
+RPC（remote procedure call）は、**別のプロセスや別のマシンにある処理を、手元の関数と同じ形で呼ぶ**という考え方です。呼ぶ側は引数を渡して戻り値を受け取るだけで、途中の接続やバイト列への変換は、生成されたコード（スタブ）とライブラリが引き受けます。
+
+呼び出しの形は、IDL（インタフェース定義言語）で先に決めます。gRPC では通常、Protobuf の `.proto` に `service` と `rpc` を書きます。この回の実験では、次の定義を使います。
+
+```protobuf
+syntax = "proto3";
+
+package demo.v1;
+
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);       // 1 回送って 1 回受け取る
+  rpc Count(CountRequest) returns (stream CountReply);   // 1 回送って何回も受け取る
+}
+
+message HelloRequest { string name = 1; }
+message HelloReply   { string message = 1; }
+message CountRequest { int32 upto = 1; }
+message CountReply   { int32 n = 1; }
+```
+
+`python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. greeter.proto` を実行すると、メッセージの型（`greeter_pb2.py`）と、サーバの基底クラスとクライアントのスタブ（`greeter_pb2_grpc.py`）が生成されます。生成とスキーマの配布は第 70 回で扱い、ここでは**線の上でどう表れるか**だけを追います。
+
+## 1 回の呼び出しは 1 本のストリーム
+
+gRPC の中心にある対応は単純です。**1 回の RPC は、HTTP/2 のストリーム 1 本です。** 仕様は、呼び出しの識別子として HTTP/2 のストリーム ID をそのまま使うと定めています（[PROTOCOL-HTTP2.md: Stream Identification](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#http2-transport-mapping)）。同じ接続の上で 100 回呼べば、ストリームが 100 本開いて閉じます。仕様の例に倣うと、正常な unary 呼び出しのフレームは次のようになります。
+
+```
+クライアント → サーバ                      サーバ → クライアント
+HEADERS   :method POST                    HEADERS   :status 200
+          :path /demo.v1.Greeter/SayHello           content-type application/grpc
+          content-type application/grpc   DATA      <5 バイトの枠 + HelloReply>
+          te trailers                     HEADERS   grpc-status 0      (END_STREAM)
+          grpc-timeout 1500m
+DATA      <5 バイトの枠 + HelloRequest>  (END_STREAM)
+```
+
+**応答は HEADERS で始まり、HEADERS で終わります。** 最後の HEADERS がトレーラで、ここに呼び出しの結果が入ります。
+
+## リクエストのヘッダ
+
+リクエストヘッダの主な項目は、仕様の Call-Definition に並んでいます（[PROTOCOL-HTTP2.md: Requests](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests)）。
+
+| ヘッダ | 値 | 意味 |
+| --- | --- | --- |
+| `:method` | `POST` 固定 | 呼び出しの種類によらず常に POST |
+| `:path` | `/demo.v1.Greeter/SayHello` | `/` パッケージ名 `.` サービス名 `/` メソッド名。大文字と小文字を区別する |
+| `content-type` | `application/grpc`、`application/grpc+proto` など | `application/grpc` で始まらなければ、サーバは 415 を返すべき（SHOULD）とされる |
+| `te` | `trailers` | 仕様上の用途は「互換性の無いプロキシを見つけるため」 |
+| `grpc-timeout` | `1500m` など | 残り時間。省略すると無期限 |
+| `grpc-encoding` | `gzip` など | メッセージ本体の圧縮方式 |
+| `grpc-accept-encoding` | `identity, deflate, gzip` など | 受け取れる圧縮方式の一覧 |
+
+`te: trailers` は、HTTP/2 で `te` ヘッダに許される唯一の値でもあります（[RFC 9113 8.2.2](https://datatracker.ietf.org/doc/html/rfc9113#section-8.2.2)）。
+
+`grpc-timeout` は、最大 8 桁の正の整数と 1 文字の単位でできています。単位は `H`（時）、`M`（分）、`S`（秒）、`m`（ミリ秒）、`u`（マイクロ秒）、`n`（ナノ秒）です。**`M` と `m` で分とミリ秒が分かれる**ので、手で書くときは注意が要ります。
+
+`:path` は、`.proto` の `package` とサービス名とメソッド名から機械的に決まります（[PROTOCOL-HTTP2.md: Appendix A](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#appendix-a---grpc-for-protobuf)）。**URL の設計をする余地は無く、スキーマがそのまま住所になります。** 第 105 回で見たとおり Kubernetes の Service の振り分けは接続単位ですが、第 106 回のようにリクエスト単位で働く L7 のプロキシは、この `:path` を読めば、どのメソッドの呼び出しかが分かります。
+
+## メッセージの枠: 5 バイトの前置き
+
+メッセージの本体は DATA フレームで送ります。ただし、Protobuf のバイト列をそのまま置くのではなく、**5 バイトの前置きを付けます**。仕様ではこれを Length-Prefixed-Message と呼びます（[PROTOCOL-HTTP2.md: Requests](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests)）。
+
+```
++----------+-------------------------------+------------------------+
+| 圧縮     | 長さ（4 バイト、ビッグエンディアン） | Protobuf のメッセージ本体 |
+| 1 バイト |                               |                        |
++----------+-------------------------------+------------------------+
+```
+
+圧縮フラグが 1 なら、本体は `grpc-encoding` で宣言した方式で圧縮されています。0 なら無圧縮です。`grpc-encoding` を送っていなければ、フラグは必ず 0 です。長さは第 3 回で見たビッグエンディアンの 32 ビット整数です。
+
+`HelloRequest{name: "pokotyan"}` を包むと、15 バイトになります。
+
+```
+00                                  圧縮フラグ = 0
+00 00 00 0a                         長さ = 10
+0a 08 70 6f 6b 6f 74 79 61 6e       フィールド 1、長さ 8、"pokotyan"（第 66 回の形式）
+```
+
+なぜ長さが要るのでしょうか。HTTP/2 の DATA フレームにも長さはあります。しかし、仕様ははっきり次のように書いています。**DATA フレームの境界は Length-Prefixed-Message の境界と無関係で、実装はその位置が揃っていると仮定してはならない**（[PROTOCOL-HTTP2.md: Data Frames](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#data-frames)）。途中のプロキシは DATA を分けたりまとめたりしてよく、1 つのメッセージがフロー制御の窓より大きければ、どのみち複数のフレームに分かれます。第 57 回の DNS over TCP で 2 バイトの長さを前に置いたのと同じ理由で、**区切りは自分で持つ**必要があります。
+
+リクエストの終わりは、最後の DATA フレームの END_STREAM フラグで表します。送るデータが残っていなくても、終わりを伝えるために空の DATA フレームに END_STREAM を立てて送ります。
+
+## 応答とトレーラ
+
+応答の最初の HEADERS は `:status 200` と `content-type` を運びます。そのあとに、リクエストと同じ形式のメッセージが続きます。そして最後の HEADERS、つまり**トレーラ**に次の項目が入ります（[PROTOCOL-HTTP2.md: Responses](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#responses)）。
+
+| トレーラ | 意味 |
+| --- | --- |
+| `grpc-status` | 結果のコード。10 進数の文字列。0 は OK |
+| `grpc-message` | 人が読む説明。UTF-8 にしたうえでパーセントエンコードする |
+| `grpc-status-details-bin` | 詳細なエラー情報（`google.rpc.Status`）。OK のときは付けない |
+
+**`grpc-status` は、成功のときにも必ず送ります。** HTTP の `:status` は、呼び出しが失敗したときにも 200 のままです。つまり、gRPC の成否は `:status` を見ても分からず、トレーラまで読んで初めて決まります。
+
+結果をトレーラに置くのは、ストリーミングのためです。何件も送ったあとで失敗が分かることがあり、そのときにはもうヘッダを送り終えています。最後に結果を書ける場所として、HTTP のトレーラを使っています。
+
+エラーがすぐに分かる場合は、メッセージも最初の HEADERS も省き、**`:status`、`content-type`、`grpc-status` を 1 つの HEADERS にまとめて END_STREAM を立てて返せます**。これを **Trailers-Only** 応答と呼びます。存在しないメソッドを呼んだときなどが、この形になります。
+
+`grpc-message` のパーセントエンコードは、エンコードしなくてよい文字を「空白と表示可能な ASCII のうち `%` 以外」と定めています。HTTP/2 のヘッダ値には任意のバイト列を入れられないので、日本語などは UTF-8 のバイトを `%XX` にして送ります。コードの一覧と、エラーの詳細の載せ方は第 69 回で扱います。
+
+## 4 種類の RPC は、同じストリームの使い方の違い
+
+gRPC には 4 種類の呼び出しがあります（[Core concepts](https://grpc.io/docs/what-is-grpc/core-concepts/)）。線の上では、**1 本のストリームの上で、それぞれの向きに何個のメッセージを流すか**の違いにすぎません。
+
+| 種類 | `.proto` | クライアント → サーバ | サーバ → クライアント |
+| --- | --- | --- | --- |
+| unary | `rpc A(Req) returns (Res)` | メッセージ 1 個 + END_STREAM | ヘッダ、メッセージ 1 個、トレーラ |
+| server streaming | `returns (stream Res)` | メッセージ 1 個 + END_STREAM | ヘッダ、メッセージ n 個、トレーラ |
+| client streaming | `rpc A(stream Req)` | メッセージ n 個 + END_STREAM | ヘッダ、メッセージ 1 個、トレーラ |
+| bidirectional | 両方に `stream` | メッセージ n 個 + END_STREAM | ヘッダ、メッセージ n 個、トレーラ |
+
+HTTP/2 のストリームは両方向に独立して流れるので、bidirectional でも特別な仕組みは要りません。Core concepts は、双方向の 2 つの流れは独立に動き、それぞれの流れの中では順序が保たれると説明しています。
+
+ストリーミングで効いてくるのが、第 64 回で見た HTTP/2 の**フロー制御**です。受け取る側がメッセージを読まずにいると、窓が開かないので送る側は DATA を送れなくなります。gRPC のライブラリはこれを書き込みの呼び出しの待ちとして表し、[Flow Control](https://grpc.io/docs/guides/flow-control/) のガイドは「必要に応じて、gRPC は書き込みの呼び出しから戻る前に待つ」と書いています。**アプリケーションの背圧は、HTTP/2 の窓でそのまま実現されています。** 第 54 回の TCP の受信窓と同じ考え方を、ストリームごとに重ねた形です。
+
+## メタデータ
+
+認証トークンやリクエスト ID のような、引数とは別の付随情報は**メタデータ**として送ります。線の上では、ただの HTTP/2 のヘッダ（とトレーラ）です（[Metadata](https://grpc.io/docs/guides/metadata/)）。
+
+- キーに使える文字は `0-9 a-z _ - .` です。大文字と小文字は区別しません。
+- キーが **`-bin` で終わるものは、値をバイナリとして扱います。** HTTP/2 のヘッダ値には任意のバイト列を入れられないので、ライブラリが base64 で包んで送り、受け取った側で戻します。仕様は、パディングの有無を問わず受け付け、送るときはパディング無しにするよう求めています（[PROTOCOL-HTTP2.md: Requests](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests)）。
+- **`grpc-` で始まるキーは gRPC 自身のために予約されていて**、アプリケーションは使えません。
+- ヘッダの合計の大きさは、サーバが制限してよく、既定は 8 KiB が推奨されています。
+- トレーラとして送るメタデータもあります。トレーラを送るのはサーバだけです。
+
+## デッドラインとキャンセル
+
+gRPC は既定ではデッドラインを設定しません（[Deadlines](https://grpc.io/docs/guides/deadlines/)）。設定しなければ、応答の無いサーバを永遠に待ち続けることになります。
+
+クライアントが決めるのは「いつまでに」という時刻ですが、**線の上に載せるのは相対時間の `grpc-timeout` です。** Deadlines のガイドによると、gRPC はデッドラインを、経過した時間を差し引いたタイムアウトに変換して送ります。マシンの時計がずれていても、「あと何ミリ秒」なら意味が変わらないからです。サービス A が B を呼び、B が C を呼ぶとき、B が受け取った残り時間から自分の処理時間を引いて C に渡せば、**期限は下流へ縮みながら伝わります**。
+
+期限を過ぎると、クライアントは `DEADLINE_EXCEEDED` で呼び出しを終えます。サーバ側では呼び出しが自動的にキャンセルされます。クライアントが途中でやめたい場合も同じで、どちらの側もいつでも呼び出しをキャンセルできます（[Core concepts](https://grpc.io/docs/what-is-grpc/core-concepts/)）。線の上では、これは**そのストリームへの RST_STREAM** です。gRPC の仕様は、クライアントが送る RST_STREAM の CANCEL（コード 8）を呼び出しのキャンセルに対応づけています（[PROTOCOL-HTTP2.md: Errors](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#errors)）。第 64 回で見たとおり、RST_STREAM は同じ接続のほかのストリームには影響しません。
+
+ただし、**キャンセルはサーバのコードを止めません。** Deadlines のガイドは、長く動く処理ではキャンセルされたかを定期的に確かめ、処理をやめるのはサーバのアプリケーションの責任だとしています。Core concepts も、キャンセルより前に行った変更は取り消されないと注意しています。
+
+## 手元で確かめる: grpcurl
+
+Python の grpcio（執筆時点で 1.80）で、平文のサーバを `127.0.0.1:50768` に立てました。`SayHello` はメタデータと残り時間を表示し、トレーラに `x-served-by: demo` を付けて返します。名前が空なら `INVALID_ARGUMENT` を、名前が `slow` なら 2 秒待ってから返します。`Count` は 0.1 秒おきに 1 から `upto` までを返します。
+
+まず grpcurl で呼びます。`-plaintext` は TLS を使わない指定、`-v` はヘッダとトレーラを表示する指定です。
+
+```
+$ grpcurl -plaintext -v -H 'x-request-id: abc123' -max-time 5 \
+    -d '{"name":"pokotyan"}' 127.0.0.1:50768 demo.v1.Greeter/SayHello
+
+...
+Response headers received:
+content-type: application/grpc
+grpc-accept-encoding: identity, deflate, gzip
+
+Response contents:
+{
+  "message": "Hello, pokotyan"
+}
+Response trailers received:
+x-served-by: demo
+```
+
+サーバ側では、`-H` で付けた `x-request-id` がメタデータとして読め、`-max-time 5` は `context.time_remaining()` の `4.996850967407227`（秒）として届いていました。
+
+名前を空にして呼ぶと、grpcurl は `Response headers received: (empty)` と表示し、`content-type: application/grpc` をトレーラの側に並べ、`Code: InvalidArgument`、`Message: 名前が空です` で終わりました。ヘッダとトレーラが 1 つの HEADERS にまとまった Trailers-Only 応答だからです。
+
+grpcurl は `.proto` を渡さなくても、メソッドの型を知っていました。サーバが**サーバリフレクション**という gRPC のサービスを一緒に公開していて、grpcurl はまずそこにスキーマを尋ねているからです（[GRPC Server Reflection Protocol](https://github.com/grpc/grpc/blob/master/doc/server-reflection.md)）。`grpcurl -plaintext 127.0.0.1:50768 list` を実行すると、`demo.v1.Greeter` と並んで `grpc.reflection.v1alpha.ServerReflection` が表示されます。スキーマを配る方法としてのリフレクションは第 70 回で扱います。
+
+## 手元で確かめる: curl で直接呼ぶ
+
+grpcurl が何をしているかを見るために、今度は curl で呼びます。`--http2-prior-knowledge` は、TLS も HTTP/1.1 からのアップグレードも使わず、最初から HTTP/2 で話す指定です。5 バイトの枠を付けたリクエストは、先ほどの 15 バイトを Python で書き出して `req.bin` にしました。
+
+```
+$ curl -sS --http2-prior-knowledge -v --data-binary @req.bin \
+    -H 'content-type: application/grpc' -H 'te: trailers' \
+    http://127.0.0.1:50768/demo.v1.Greeter/SayHello --output resp.bin
+* [HTTP/2] [1] [:path: /demo.v1.Greeter/SayHello]
+...
+< HTTP/2 200
+< content-type: application/grpc
+< grpc-accept-encoding: identity, deflate, gzip
+<
+< grpc-status: 0
+< grpc-message:
+< x-served-by: demo
+
+$ xxd resp.bin
+00000000: 0000 0000 110a 0f48 656c 6c6f 2c20 706f  .......Hello, po
+00000010: 6b6f 7479 616e                           kotyan
+```
+
+curl は、ヘッダのあとの空行に続けてトレーラを表示します。**成功でも `grpc-status: 0` がトレーラに入っています。** 応答の本体は、圧縮フラグ 0、長さ `0x11` = 17、`HelloReply` の 17 バイトです。
+
+`Count` を `upto: 3` で呼ぶと、同じ形の枠が 3 つ連続して届きます。
+
+```
+$ xxd count_resp.bin
+00000000: 0000 0000 0208 0100 0000 0002 0802 0000  ................
+00000010: 0000 0208 03                             .....
+```
+
+`00 00000002 08 01`、`00 00000002 08 02`、`00 00000002 08 03` の 7 バイトずつで、`n` が 1、2、3 です。**ストリーミングの応答は、枠を並べた 1 つの本体にすぎません。** クライアントのライブラリは、先頭の 5 バイトで長さを読み、その分を切り出して 1 件ずつ渡しています。
+
+次に、存在しないメソッドを呼びます。
+
+```
+$ curl ... http://127.0.0.1:50768/demo.v1.Greeter/SayGoodbye --output un.bin
+< HTTP/2 200
+< content-type: application/grpc
+< grpc-status: 12
+< grpc-message: Method not found!
+<
+```
+
+**HTTP としては 200 で、`grpc-status` は 12（UNIMPLEMENTED）です。** `grpc-status` が空行の前、つまり最初の HEADERS に入っていて、本体は 0 バイトでした。Trailers-Only 応答です。HTTP のステータスだけを見る監視や、200 を成功として数えるロードバランサは、これを成功と誤って数えます。
+
+名前を空にしたリクエスト（長さ 0 の枠、`00 00 00 00 00`）では、日本語の説明がパーセントエンコードされて届きました。
+
+```
+< grpc-status: 3
+< grpc-message: %E5%90%8D%E5%89%8D%E3%81%8C%E7%A9%BA%E3%81%A7%E3%81%99
+```
+
+`%E5%90%8D` が「名」の UTF-8 の 3 バイトで、全体で「名前が空です」です。`-H 'te: trailers'` を外すと、サーバは `grpc-status: 2`、`grpc-message: Missing :te header` を返しました。
+
+<Callout type="warn" title="415 を返すかどうかは実装次第">
+  仕様は、`content-type` が `application/grpc` で始まらなければ 415 を返すべき（SHOULD）としています。
+  しかし手元の grpcio 1.80 のサーバは、`content-type: text/plain` で同じ 15 バイトを送っても、
+  200 と `grpc-status: 0` で普通に応答しました。SHOULD は必須ではないので、実装ごとに確かめる必要があります。
+</Callout>
+
+仕様の「DATA フレームの境界とメッセージの境界は無関係」も確かめます。Python の `h2` ライブラリで HTTP/2 のクライアントを直接書き、同じ 15 バイトを **4 バイトずつ、4 つの DATA フレームに分けて**送りました。
+
+```
+sent DATA 00 00 00 00
+sent DATA 0a 0a 08 70
+sent DATA 6f 6b 6f 74
+sent DATA 79 61 6e
+headers : [(b':status', b'200'), (b'content-type', b'application/grpc'), ...]
+data    : 00 00 00 00 11 0a 0f 48 65 6c 6c 6f 2c 20 70 6f 6b 6f 74 79 61 6e
+trailers: [(b'grpc-status', b'0'), (b'grpc-message', b''), (b'x-served-by', b'demo')]
+```
+
+長さの欄が途中で切れていても、サーバは枠を組み立て直して正しく応答しました。逆に、同じ 15 バイトを HTTP/1.1 の POST として `nc` で送ると、サーバは HTTP/1.1 の応答を返さず、HTTP/2 の SETTINGS フレーム（長さ `0x18`、型 `04`）と WINDOW_UPDATE（型 `08`）の 46 バイトを返しただけでした。**このサーバは、HTTP/2 以外を話しません。**
+
+## 手元で確かめる: 送られたヘッダとデッドライン
+
+grpcio のクライアントが実際にどんなヘッダを送るかは、上の `h2` で書いた小さな HTTP/2 サーバ（受け取ったものを表示して `grpc-status: 12` を返すだけ）に向けて呼ぶと見えます。クライアントでは `timeout=1.5` を指定し、メタデータに `x-request-id` と、4 バイトのバイナリ `00 01 fe ff` を値に持つ `trace-bin` を付けました。
+
+```
+RequestReceived 1
+    :path = /demo.v1.Greeter/SayHello
+    ...
+    content-type = application/grpc
+    te = trailers
+    grpc-accept-encoding = identity, deflate, gzip
+    grpc-timeout = 1500m
+    user-agent = grpc-python/1.80.0 grpc-c/53.0.0 (osx; chttp2)
+    x-request-id = abc123
+    trace-bin = AAH+/w
+```
+
+1.5 秒は `1500m`（ミリ秒）で送られ、`-bin` の値はパディング無しの base64（`AAH+/w`）になっています。独自のメタデータは、gRPC が定めるヘッダの後ろに置かれています。
+
+次に、この表示用サーバの手前に中継役のサーバを置き、grpcurl から `-max-time 1.5` で中継役を呼びました。中継役は 0.2 秒待ってから、受け取った残り時間（`context.time_remaining()`）をそのまま `timeout` に渡して下流を呼ぶようにしました。
+
+```
+relay received, remaining: 1.494
+relay calls downstream with: 1.293
+    grpc-timeout = 1300m        ← 下流が受け取ったヘッダ
+```
+
+1.5 秒の期限が、中継役で使った時間の分だけ縮んで下流に届いています（1.293 秒は `1300m` に丸めて送られていました）。Python の grpcio では、この引き継ぎを自分で書く必要がありました。
+
+最後に、期限切れとキャンセルをフレームで見ます。grpc-core には、環境変数 `GRPC_TRACE` で内部の動作をログに出す仕組みがあります。`GRPC_TRACE=http GRPC_VERBOSITY=debug` を付けて、サーバとクライアントを動かしました。`timeout=0.3` で `slow` を呼ぶと、次のようになります（抜粋）。
+
+```
+# クライアント
+chttp2_transport.cc:1903] perform_stream_op[...]:  CANCEL:DEADLINE_EXCEEDED:Deadline Exceeded {grpc_status:4}
+chttp2_transport.cc:1080] W:... CLIENT [ipv4:127.0.0.1:50768] state IDLE -> WRITING [RST_STREAM]
+error: StatusCode.DEADLINE_EXCEEDED Deadline Exceeded
+
+# サーバ
+parsing.cc:343] INCOMING[...]: HEADERS:END_HEADERS len:231 id:0x00000001
+parsing.cc:343] INCOMING[...]: DATA:END_STREAM len:11 id:0x00000001
+time_remaining: 0.2974071502685547
+parsing.cc:343] INCOMING[...]: RST_STREAM len:4 id:0x00000001
+frame_rst_stream.cc:123] [...] received RST_STREAM(reason=8)
+slow: is_active = False    ← 2 秒の sleep が終わってから表示
+```
+
+0.3 秒でクライアントが諦め、ストリーム 1 に RST_STREAM を送り、サーバは理由 8（CANCEL）を受け取りました。一方、サーバの `SayHello` は 2 秒の `sleep` を最後まで続け、終わってから `is_active()` が偽になっていたことを知っただけです。**キャンセルはサーバのコードを止めない**、という前の節の注意がそのまま現れています。`Count` を 2 件受け取ったところで `cancel()` した場合も、7 バイトの DATA が 2 つ届いたあとにクライアントが RST_STREAM を送り、サーバは同じく `reason=8` を記録しました。
+
+## ブラウザからは直接話せない
+
+ここまでの仕組みには、ブラウザにとって都合の悪い点が 2 つあります。
+1. **ブラウザの API は HTTP/2 のフレームを扱わせません。** HTTP/2 を使うかどうかも、どのフレームを送るかも、ブラウザが決めます。gRPC の [ブログ](https://grpc.io/blog/state-of-grpc-web/) は、リクエストを十分細かく制御できるブラウザの API が無いと説明しています。
+2. **ブラウザは応答のトレーラを JavaScript に渡しません**（[Buf のブログ](https://buf.build/blog/grpc-web-failed-the-web)）。`grpc-status` はトレーラにあるので、成功か失敗かが分かりません。
+
+そこで作られたのが **gRPC-Web** です（[PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md)）。枠の形式はそのまま使い、違いは次のとおりです。
+
+- HTTP/2 に依存せず、HTTP/1.1 でも動く。ストリームの終わりは本体の終わり（EOF）で表す
+- `content-type` は `application/grpc-web`（`+proto` など）。base64 にした `application/grpc-web-text` もある
+- **トレーラを本体の最後の枠として送る。** 枠の先頭バイトの最上位ビットが 1（`0x80`）ならトレーラで、中身は `grpc-status: 0\r\n` のような HTTP/1 形式のヘッダの並び
+
+ブラウザが話すのは gRPC-Web なので、普通の gRPC サーバとの間で変換する役が要ります。代表が Envoy の gRPC-Web フィルタで、gRPC-Web のクライアントを gRPC のサーバにつなぐものです（[Envoy](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/grpc_web_filter)）。クライアントストリーミングと双方向ストリーミングについて、PROTOCOL-WEB.md は、ブラウザの Streams API の実装を待って対応するとしています。
+
+**Connect プロトコル**は、別の答え方をしました（[Connect Protocol Reference](https://connectrpc.com/docs/protocol/)）。
+
+- unary は、枠の無い Protobuf か **JSON をそのまま本体に置いた普通の POST**。`content-type` は `application/proto` か `application/json` で、`connect-protocol-version: 1` を付ける
+- unary の失敗は、意味のある HTTP ステータス（未実装なら 501 など）と JSON のエラー本体で返す。副作用の無いメソッドは GET でも呼べる
+- ストリーミングは gRPC と同じ 5 バイトの枠を使い、フラグの 2 番目のビット（`0x02`）で最後のメッセージ（EndStreamResponse）を示す
+- **HTTP のトレーラを一切使わない。** 双方向ストリーミングには HTTP/2 が要るが、それ以外は HTTP/1.1 でも動く
+
+Connect の実装は、同じサーバで gRPC と gRPC-Web も受け付けられるように作られています（[Multi-protocol support](https://connectrpc.com/docs/multi-protocol/)）。gRPC の設計そのものではなく、**結果をどこに書くか**が、ブラウザとの相性を分けています。
+
+## まとめ
+
+- gRPC の 1 回の呼び出しは HTTP/2 のストリーム 1 本。リクエストは常に POST で、`:path` は `/パッケージ.サービス/メソッド`
+- リクエストヘッダには `content-type: application/grpc`、`te: trailers`、残り時間の `grpc-timeout`（`1500m` のように単位 1 文字を付ける）などが入る
+- メッセージは「圧縮フラグ 1 バイト + ビッグエンディアンの長さ 4 バイト + 本体」の枠に入れる。DATA フレームの境界とは無関係で、ストリーミングは枠を並べるだけ
+- 結果はトレーラの `grpc-status` と `grpc-message`（パーセントエンコード）で返る。HTTP の `:status` は失敗でも 200。すぐ失敗する場合は Trailers-Only 応答になる
+- 4 種類の RPC は、1 本のストリームの各方向に流すメッセージの数の違い。背圧は HTTP/2 のフロー制御がそのまま担う
+- メタデータはただのヘッダ。`-bin` で終わるキーの値は base64 で運び、`grpc-` で始まるキーは予約されている
+- デッドラインは相対時間で送り、各段で使った時間を引いて下流へ渡す。期限切れやキャンセルは RST_STREAM(CANCEL) になるが、サーバのコードは自分で止める必要がある
+- ブラウザはフレームを制御できずトレーラも読めないので、トレーラを本体に埋める gRPC-Web か、トレーラを使わない Connect プロトコルを使う
+
+この回では、失敗を `grpc-status` の数字としてだけ見てきました。12 は UNIMPLEMENTED、4 は DEADLINE_EXCEEDED でしたが、ほかにどんなコードがあり、どれを再試行してよく、`grpc-status-details-bin` には何を詰めるのか。次の第 69 回では、**gRPC のエラー**を扱います。

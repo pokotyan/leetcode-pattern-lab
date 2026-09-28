@@ -1,0 +1,330 @@
+---
+title: gRPC を本番で動かす
+description: Pod を 5 個に増やしたのに、なぜ 1 個だけが忙しいのか。デッドラインを付けない呼び出しは、いつまで待つのか。長く生きる 1 本の接続を前提にした gRPC が、振り分け、死活の確認、再試行、接続の終わらせ方で何を必要とするのかを見る
+chapter: rpc
+order: 8
+status: published
+topics:
+  - pick_first / round_robin
+  - サービス設定（service config）
+  - MAX_CONNECTION_AGE
+  - keepalive / too_many_pings
+  - デッドライン
+  - retryPolicy / hedging
+  - retry throttling
+  - 接続のバックオフ
+  - grpc.health.v1
+requires:
+  - ll-68-grpc-wire
+  - ll-69-grpc-error
+  - ll-105-k8s-service
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 動いたあとに起きること
+
+前回までで、gRPC の呼び出しが HTTP/2 のストリームにどう載るか（第 68 回）、失敗がどう伝わるか（第 69 回）、スキーマからコードをどう作って配るか（第 70 回）を見ました。手元で 1 つのクライアントと 1 つのサーバをつなぐ限り、これで困ることはありません。
+
+困るのは、サーバが複数になり、入れ替わり、途中にロードバランサや NAT が挟まったときです。
+
+| 本番で見える症状 | この回で見る原因 |
+| --- | --- |
+| Pod を増やしても、古い Pod だけが忙しい | 接続単位の振り分けと、長く生きる 1 本の接続 |
+| しばらく使わなかった接続で、最初の呼び出しだけ失敗する | 途中の機器がアイドルな接続を黙って捨てている |
+| 接続が `too_many_pings` で切られる | クライアントの keepalive がサーバの許容より頻繁 |
+| 下流が遅くなると、上流のスレッドが尽きる | デッドラインを付けていない |
+| 障害のときに、負荷が数倍に膨らむ | 再試行が段ごとに掛け算になる |
+
+どれも、gRPC が **1 本の HTTP/2 接続を長く使い回す**ことから来ています。この回では、その前提から順に見ていきます。
+
+## Pod を増やしても散らない
+
+第 105 回で、Kubernetes の Service は**接続の最初の 1 回だけ**振り分け先を決め、以後は conntrack が同じ Pod に書き換え続けると見ました。HTTP/2 では、1 本の接続に多数のリクエストをストリームとして流します（第 64 回）。組み合わせると、次のようになります。
+
+```
+ クライアント ── 1 本の TCP 接続 ──→ ClusterIP ──DNAT──→ Pod A   ← 全部ここ
+                  （ストリーム 1, 3, 5, 7, ...）             Pod B   ← 何も来ない
+                                                            Pod C   ← 何も来ない
+```
+
+gRPC の設計文書は、振り分けを**呼び出し単位で行うもの**と位置付けています（[Load Balancing in gRPC](https://github.com/grpc/grpc/blob/master/doc/load-balancing.md)）。
+
+> Load-balancing within gRPC happens on a per-call basis, not a per-connection basis.
+
+一方で、サーバ側の接続管理を定めた gRFC A9 は、L4 のロードバランサは呼び出しではなく TCP 接続を振り分けるので、HTTP/2 のクライアントが接続を開けたままにすると、忙しいノードや新しいノードに負荷を素早く移せない、とはっきり書いています（[gRFC A9](https://github.com/grpc/proposal/blob/master/A9-server-side-conn-mgt.md)）。
+
+解決の方向は 4 つあります。
+
+| 方向 | やり方 | 代償 |
+| --- | --- | --- |
+| クライアントで振り分ける | 全サーバのアドレスを知り、全員と接続を張って呼び出しごとに選ぶ | クライアントが名前解決と振り分けを持つ |
+| L7 のプロキシを挟む | HTTP/2 を理解するプロキシがストリームごとに振り分ける | 1 段増える。メッシュなら Pod ごとにプロキシ（第 106 回） |
+| 制御面から配る（xDS） | 振り分け先と規則を、別のサーバがクライアントに配り続ける | 制御面を運用する |
+| サーバが定期的に切る | 接続に寿命を設け、張り直しのたびに L4 の振り分けをやり直させる | 張り直しのコスト。偏りは残る |
+
+### クライアント側の振り分けと、既定の pick_first
+
+gRPC のクライアントは、名前解決で得た**アドレスの一覧**を LB ポリシーに渡し、LB ポリシーが呼び出しごとに接続を選びます。ところが、**既定の LB ポリシーは振り分けをしません**。
+
+> This is the default LB policy if the service config does not specify any LB policy. ... it will set the channel's state to READY, and then all RPCs sent on the channel will be sent to that address.
+
+既定の `pick_first` は、一覧を先頭から順に試し、最初につながった 1 つに全部を送ります。複数のアドレスを渡すだけでは散りません。散らすには `round_robin` を選びます。`round_robin` は一覧の全アドレスと接続を張り、READY なものを順に使います（同上）。
+
+実際に確かめます。同じサービスを 3 つのポートで立て、応答に自分のポートを入れて返させます（Python、grpcio 1.80。コード生成は使わず、バイト列をそのまま返す汎用のハンドラで書きました）。クライアントは宛先を `ipv4:127.0.0.1:50061,127.0.0.1:50062,127.0.0.1:50063` とし、1 本のチャネルで 30 回呼びます。`ipv4:` は、C-core 系の実装が持つ「アドレスを直接並べる」リゾルバです（[gRPC Name Resolution](https://github.com/grpc/grpc/blob/master/doc/naming.md)）。2 回目は、チャネルの引数 `grpc.service_config` に `{"loadBalancingConfig": [{"round_robin": {}}]}` を渡しました。
+
+```
+pick_first（既定） {'port=50061': 30}
+round_robin {'port=50061': 10, 'port=50062': 10, 'port=50063': 10}
+```
+
+**アドレスを 3 つ知っていても、既定のままでは 30 回すべてが先頭の 1 つに行きます。** 設定を 1 行足すと、10 回ずつに散ります。
+
+Kubernetes でこれを使うには、クライアントが Pod のアドレスを全部知る必要があります。ClusterIP の Service では DNS が仮想 IP を 1 つ返すだけなので、`round_robin` にしても接続は 1 本です。**ヘッドレス Service**（`clusterIP: None`）にすると、DNS が Pod のアドレスをそのまま A / AAAA レコードで返します（[Kubernetes Docs](https://kubernetes.io/docs/concepts/services-networking/service/#headless-services)）。クライアントは `dns:///api.shop.svc.cluster.local:50051` のように `dns` のリゾルバで引き、`round_robin` と組み合わせます。
+
+### 名前はいつ引き直されるか
+
+ヘッドレス Service で散らせても、Pod が増えたことにクライアントが気づかなければ、新しい Pod には来ません。ここで第 60 回の TTL が効いてくる、と考えたくなりますが、gRPC の DNS リゾルバは**TTL が切れたから引き直す、という作りにはなっていません**。grpc-go の実装は、引けたあとは次の引き直しの要求（`ResolveNow`）が来るまで待ち、しかも前回から最低 30 秒は空けます（[grpc-go dns_resolver.go](https://github.com/grpc/grpc-go/blob/master/internal/resolver/dns/dns_resolver.go)）。C-core にも同じ 30 秒の下限があります（[channel_arg_names.h](https://github.com/grpc/grpc/blob/master/include/grpc/impl/channel_arg_names.h) の `grpc.dns_min_time_between_resolutions_ms`）。
+
+引き直しを求めるのは、主に**接続が切れたとき**です。grpc-go のチャネルは、接続を失うたびにリゾルバへ引き直しを求めます（[grpc-go clientconn.go](https://github.com/grpc/grpc-go/blob/master/clientconn.go) の `Refresh the name resolver on any connection loss.`）。裏返せば、どの接続も健全なまま使われ続けると、Pod が増えても一覧は更新されません。これが、次に見るサーバ側の接続の寿命が必要になる理由の 1 つです。
+
+### サービス設定: 振る舞いをサーバの持ち主が配る
+
+さきほどの `loadBalancingConfig` は、**サービス設定**（service config）という仕組みの一部です。LB ポリシー、メソッドごとのタイムアウト、再試行の方針などを JSON で書き、クライアントに使わせます（[Service Config in gRPC](https://github.com/grpc/grpc/blob/master/doc/service_config.md)）。
+
+```json
+{
+  "loadBalancingConfig": [ { "round_robin": {} } ],
+  "methodConfig": [
+    { "name": [ { "service": "foo", "method": "bar" } ], "timeout": "1.000000001s" }
+  ]
+}
+```
+
+要点は、これが**名前解決の結果として返ってくる**ことです。サービス設定はサーバ名に結び付いていて、リゾルバがアドレスと一緒に返します。DNS なら `_grpc_config.<サーバ名>` の TXT レコードに `grpc_config=` で始まる文字列として置く方式が定められています（[gRFC A2](https://github.com/grpc/proposal/blob/master/A2-service-configs-in-dns.md)）。クライアントのコードに書いた値（実験の `grpc.service_config`）は、リゾルバが設定を返さなかったときの既定値として使われます（[channel_arg_names.h](https://github.com/grpc/grpc/blob/master/include/grpc/impl/channel_arg_names.h)）。
+
+**サーバの持ち主が、クライアントを作り直させずに振る舞いを変えられる**。サービス設定の狙いはここにあります。
+
+これを押し進めたものが **xDS** です。Envoy が設定を受け取るための API 群で、gRPC のクライアントも直接話せます。LDS、RDS、CDS、EDS の順にたどって、ルーティング、振り分けの方針、エンドポイントの一覧を受け取り、RDS の内容からサービス設定を組み立てます（[gRFC A27](https://github.com/grpc/proposal/blob/master/A27-xds-global-load-balancing.md)）。どの制御面につなぐかは、環境変数 `GRPC_XDS_BOOTSTRAP` が指すファイルに書きます（同上）。
+
+別のサーバに振り分け先を問い合わせる、この形を **lookaside**（横に置く）方式と呼びます。gRPC が以前から持っていた `grpclb` も同じ発想でしたが、現在は非推奨で、xDS が勧められています（[Load Balancing in gRPC](https://github.com/grpc/grpc/blob/master/doc/load-balancing.md)）。プロキシを挟まずに、メッシュと同じ制御面から設定を受け取れるので、プロキシの 1 段を省けます。
+
+## 接続に寿命を設ける
+
+クライアントを変えられない場合でも、サーバ側で打てる手があります。gRFC A9 の `MAX_CONNECTION_AGE` は、**接続が一定時間を超えたら、サーバから丁寧に閉じる**設定です（[gRFC A9](https://github.com/grpc/proposal/blob/master/A9-server-side-conn-mgt.md)）。
+
+既定は無限です。仲間に、呼び出しの無い時間で閉じる `MAX_CONNECTION_IDLE` と、閉じ始めてから処理中の呼び出しを待つ上限の `MAX_CONNECTION_AGE_GRACE` があります。閉じるときは GOAWAY（エラーコード `NO_ERROR`、デバッグ情報 `max_age`）を送り、処理中の呼び出しは最後まで終えさせます。クライアントは次の呼び出しのために接続を張り直し、そのとき L4 の振り分けと名前解決がやり直されます。寿命には接続ごとに ±10% の揺らぎが足され、一斉に張り直す波が同じ周期で繰り返されないようにしています（同上）。
+
+Python のサーバで `grpc.max_connection_age_ms` を 2 秒にし、1 秒おきに呼ぶクライアントが見る相手のアドレス（サーバから見たクライアントのポート）を記録しました。
+
+```
+t= 0.0s  peer=ipv4:127.0.0.1:50717
+t= 3.0s  peer=ipv4:127.0.0.1:50724
+t= 6.0s  peer=ipv4:127.0.0.1:50734
+t= 9.0s  peer=ipv4:127.0.0.1:50740
+```
+
+クライアントのコードは同じチャネルで呼んでいるだけですが、**約 3 秒ごとに下の TCP 接続が入れ替わっています**。寿命の 2 秒で閉じられたあと、`pick_first` は接続を IDLE にし、次の呼び出しが来たときに張り直す（[Load Balancing in gRPC](https://github.com/grpc/grpc/blob/master/doc/load-balancing.md)）ので、入れ替わりは次の呼び出しの時刻に揃います。呼び出しは 1 回も失敗していません。
+
+`GRPC_TRACE=http` で C-core のトレースを出すと、閉じ方が見えます（抜粋）。
+
+```
+SERVER ... Graceful shutdown: Sending initial GOAWAY.
+INCOMING[...]: GOAWAY len:15 id:0x00000000
+transport ... got goaway with last stream id 2147483647
+... GOAWAY received; Error code: 0; Debug Text: max_age; reason=got_goaway
+SERVER ... Graceful shutdown: Ping received. Sending final GOAWAY with stream_id:5
+```
+
+GOAWAY は 2 回送られています。1 回目は最後のストリーム ID を 2<sup>31</sup> − 1 にして「これから閉じる」とだけ伝え、PING の往復で相手が受け取ったことを確かめてから、2 回目で実際に処理した最後のストリーム ID（ここでは 5）を伝えます。**1 回目の GOAWAY とすれ違いに送られてきたストリームを取りこぼさない**ための手順で、A9 が 2<sup>31</sup> − 1 から始めることを勧めているのもこのためです。
+
+Pod を止めるときの手順（preStop で待ち、TERM で GOAWAY を送る）は第 107 回で見ました。gRPC のサーバ実装は、この「新しい呼び出しを断り、処理中のものは待ち、期限を過ぎたら打ち切る」を **graceful shutdown** として持っています（[gRPC Guides](https://grpc.io/docs/guides/server-graceful-stop/)）。Python なら `server.stop(grace)` の引数が、その待ち時間です。
+
+## 死んだ接続を見つける: keepalive
+
+長く生きる接続には、もう 1 つ問題があります。**相手が消えても、書き込まない限り気づけない**ことです。gRFC A8 は、TCP は書き込みが無ければ相手の消滅を検出せず、書き込みがあっても検出に何分もかかると指摘し、さらに途中の L4 のプロキシがアイドルな接続を黙って切ることを挙げています（[gRFC A8](https://github.com/grpc/proposal/blob/master/A8-client-side-keepalive.md)）。例として挙げられているのは、Google Cloud のロードバランサの 10 分、AWS ELB の 60 秒です。途中の NAT やロードバランサが対応表を捨てたあとの最初の呼び出しは、どこにも届かず、TCP の再送が尽きるまで待たされます。
+
+gRPC の keepalive は、HTTP/2 の **PING フレーム**を定期的に送り、一定時間内に ACK が返らなければ接続を捨てます（[Keepalive User Guide](https://github.com/grpc/grpc/blob/master/doc/keepalive.md)）。途中の機器のアイドルタイムアウトより短い間隔で PING が流れていれば、対応表も捨てられません。C-core の既定値は次のとおりです（同上）。
+
+| 設定（チャネル引数） | クライアント | サーバ |
+| --- | --- | --- |
+| `KEEPALIVE_TIME_MS`（PING の間隔） | INT_MAX（無効） | 2 時間 |
+| `KEEPALIVE_TIMEOUT_MS`（ACK を待つ時間） | 20 秒 | 20 秒 |
+| `KEEPALIVE_PERMIT_WITHOUT_CALLS`（呼び出しが無くても送るか） | 無効 | 無効 |
+| `HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS`（許容する最短間隔） | ― | 5 分 |
+| `HTTP2_MAX_PING_STRIKES`（違反を何回まで許すか） | ― | 2 |
+
+**クライアントの keepalive は既定で無効**です。そして、有効にするときは**サーバの許容に合わせなければなりません**。PING は安く見えますが、A8 は 100 万台の端末が 10 秒ごとに PING を送れば毎秒 10 万回になる、と注意しています。そのためサーバは、許容より頻繁な PING を「違反」として数え、上限を超えたら GOAWAY でエラーコード `ENHANCE_YOUR_CALM`、デバッグ情報 `too_many_pings` を返して接続を切ります（[gRFC A8](https://github.com/grpc/proposal/blob/master/A8-client-side-keepalive.md)）。
+
+既定のサーバに、1 秒ごとに PING を送るクライアントをつないでみました（`grpc.keepalive_time_ms=1000`、呼び出しが無くても送る設定）。
+
+```
+... CLIENT [ipv4:127.0.0.1:50061] state IDLE -> WRITING [KEEPALIVE_PING]   14:05:05.61
+... CLIENT [ipv4:127.0.0.1:50061] state IDLE -> WRITING [KEEPALIVE_PING]   14:05:06.62
+... CLIENT [ipv4:127.0.0.1:50061] state IDLE -> WRITING [KEEPALIVE_PING]   14:05:07.62
+E... Received a GOAWAY with error code ENHANCE_YOUR_CALM and debug data equal to
+     "too_many_pings". Current keepalive time (before throttling): 1000ms
+... Debug Text: too_many_pings [grpc.internal.keepalive_throttling='2000']
+```
+
+（時刻は読みやすいように行末へ移しました。）違反を 2 回まで許し、3 回目の PING で切られています。直後の `keepalive_throttling='2000'` は、A8 が定める「`too_many_pings` を受けたら、そのチャネルの以後の接続では間隔を 2 倍にする」動作です。
+
+<Callout type="warn" title="keepalive はサーバの持ち主と決める">
+  keepalive の間隔は、**途中の機器のアイドルタイムアウトより短く、サーバが許す最短間隔より長く**なければなりません。
+  gRPC のガイドも、クライアントの作者はサービスの持ち主と調整するよう求めています（[gRPC Guides](https://grpc.io/docs/guides/keepalive/)）。
+  A8 はクライアントに 10 秒未満の間隔を使わせないよう定めていますが、
+  手元の Python（C-core）では 1 秒の指定がそのまま使われました。下限は実装に頼らず、自分で守る必要があります。
+</Callout>
+
+## 待つ時間に上限を付ける: デッドライン
+
+gRPC は、呼び出しにデッドラインを付けなければ**いつまでも待ちます**（[gRPC Guides](https://grpc.io/docs/guides/deadlines/)）。
+
+> By default, gRPC does not set a deadline which means it is possible for a client to end up waiting for a response effectively forever.
+
+下流が詰まると、上流では応答を待つ呼び出しが溜まり続け、スレッドやメモリが尽きたところで上流ごと倒れます。第 54 回の背圧は TCP が送り手を止める仕組みでしたが、**呼び出しの待ちには、止める仕組みが既定では何もありません**。
+
+3 秒かかるサーバを、0.5 秒のデッドラインで呼ぶとこうなります。
+
+```
+StatusCode.DEADLINE_EXCEEDED Deadline Exceeded (0.51s)
+```
+
+デッドラインは `grpc-timeout` ヘッダで相手にも伝わり（[gRPC over HTTP2](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)、第 68 回）、サーバは残り時間を知ることができます。受けた呼び出しの中から下流を呼ぶときは、**残り時間をそのまま下流のデッドラインにする**のが基本です。これを伝播と呼び、Java と Go は既定で行い、C++ は明示的に有効にする必要があります（[gRPC Guides](https://grpc.io/docs/guides/deadlines/)）。gRPC はデッドラインを時刻ではなく経過時間を差し引いた残り時間として送るので、サーバ間の時計がずれていても成り立ちます（同上）。Python では、受けた呼び出しの `context.time_remaining()` を次の呼び出しの `timeout` に渡します。伝播しないと、呼び出し元が諦めたあとも、下流は誰も待っていない仕事を続けます。
+
+## 再試行: 1 回の呼び出しに見せる
+
+一時的な失敗を吸収するために、gRPC は**サービス設定に書く再試行**を持っています（[gRFC A6](https://github.com/grpc/proposal/blob/master/A6-client-retries.md)）。
+
+```json
+"retryPolicy": {
+  "maxAttempts": 4,
+  "initialBackoff": "0.1s",
+  "maxBackoff": "1s",
+  "backoffMultiplier": 2,
+  "retryableStatusCodes": ["UNAVAILABLE"]
+}
+```
+
+- `maxAttempts` は最初の 1 回を含む回数。5 を超える値は 5 として扱われる
+- n 回目の再試行までの待ちは `min(initialBackoff × backoffMultiplier^(n−1), maxBackoff)` に、0.8〜1.2 倍の揺らぎを掛けたもの
+- `retryableStatusCodes` に挙げたコードで失敗したときだけ再試行する
+
+最初の 2 回は `UNAVAILABLE` を返し、3 回目で成功するサーバを作り、上の設定で呼びました。サーバは、再試行のたびにクライアントが付ける `grpc-previous-rpc-attempts` メタデータ（同上）を応答に入れて返します。
+
+```
+アプリが見た結果: port=50061 peer=ipv4:127.0.0.1:50745 prev_attempts=2 (0.31s)
+サーバが受けた回数: 3
+retryPolicy なし: StatusCode.UNAVAILABLE attempt 1: not yet
+サーバが受けた回数: 1
+```
+
+**アプリのコードは 1 回呼んで 1 回成功しただけ**ですが、サーバには 3 回届いています。0.31 秒は、0.1 秒前後と 0.2 秒前後の 2 回の待ちの合計です。再試行はチャネルと LB ポリシーの間で行われるので、`round_robin` なら再試行ごとに別のサーバを選べます（同上）。再試行が許されるのは、応答ヘッダを受け取る前までです。サーバのメタデータがアプリに渡ったあとは、やり直すとアプリから見える状態が食い違うため、その呼び出しは確定（committed）したものとして扱われます（同上）。
+
+### 透過的な再試行
+
+設定しなくても行われる再試行もあります（同上）。設定した `retryPolicy` が扱うのは、サーバのアプリが見て失敗した場合だけです。**クライアントから出ていない**失敗はデッドラインまで、**サーバのライブラリには届いたがアプリは見ていない**失敗は 1 回だけ、設定と関係なく自動で再試行されます。後者は、`REFUSED_STREAM` の RST_STREAM を受けたときや、GOAWAY の最後のストリーム ID より後ろのストリームだったときです。**サーバのアプリが見ていないことが確実なので、送り直しても安全**です。透過的な再試行は `maxAttempts` にも、次に見る throttling の失敗の数にも入りません。前の節で GOAWAY の 2 段の手順を見ましたが、その取りこぼしをクライアントが拾う仕組みがこれです。
+
+### 再試行の嵐を止める
+
+第 63 回では、引けない名前への再試行がリゾルバを押し潰す例を、第 106 回では、段ごとの再試行が掛け算になるリトライストームを見ました。A6 は、クライアントごとに**再試行を止める仕組み**を用意しています（同上）。
+
+```json
+"retryThrottling": { "maxTokens": 10, "tokenRatio": 0.1 }
+```
+
+サーバ名ごとにトークンを `maxTokens` から始め、失敗するたびに 1 減らし、成功するたびに `tokenRatio` 増やします。トークンが `maxTokens / 2` 以下になると、再試行も hedging もしなくなります。この設定なら、失敗 1 回分を取り戻すのに成功が 10 回要ります。**失敗が増えてきたら、再試行をやめて失敗をそのまま返す**わけです。数えるのは再試行の対象になるコードの失敗だけで、`INVALID_ARGUMENT` のような要求側の誤りは含めません。
+
+### hedging
+
+A6 にはもう 1 つ、**hedging** という方針があります。失敗を待たずに、`hedgingDelay` ごとに同じ呼び出しを追加で送り、最初に成功した応答を採って残りを取り消します（同上）。遅い 1 台に引きずられる裾の遅延を削れますが、**同じ操作が複数のサーバで実行される**ので、何度実行しても結果が変わらない操作にしか使えません。なお、A6 の冒頭の実装状況の欄と C-core のチャネル引数の説明によれば、執筆時点では C-core（Python などが使う）は hedging を実装しておらず、設定しても無視されます（[channel_arg_names.h](https://github.com/grpc/grpc/blob/master/include/grpc/impl/channel_arg_names.h)）。
+
+## つながらないときの待ち方: 接続のバックオフ
+
+呼び出しの再試行とは別に、**接続そのもの**の張り直しにも決まった待ち方があります（[Connection Backoff](https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md)）。
+
+最初の失敗のあとに 1 秒（`INITIAL_BACKOFF`）待ち、失敗のたびに 1.6 倍（`MULTIPLIER`）し、±20% の揺らぎ（`JITTER`）を加え、上限は 120 秒（`MAX_BACKOFF`）です。1 回の試行には最低 20 秒（`MIN_CONNECT_TIMEOUT`）を与えます。待ちは 1、1.6、2.56、4.1、……と伸び、12 回目の待ちで 120 秒の上限に達します。揺らぎがあるのは、同時に切れた大量のクライアントが**同じ瞬間に一斉につなぎに来ない**ためです。待ち時間は、サーバから SETTINGS フレームを受け取った時点、つまり接続が確かに受け入れられた時点で初期値に戻ります（同上）。
+
+つながらない間の呼び出しは、既定では待たずに `UNAVAILABLE` で即座に失敗します。つながるまで待たせたい呼び出しには wait-for-ready を指定します（[gRPC Guides](https://grpc.io/docs/guides/wait-for-ready/)）。
+
+## 仕事を受けられるか: ヘルスチェック
+
+gRPC には、ヘルスチェック用のサービスが決められています（[GRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)）。
+
+```protobuf
+package grpc.health.v1;
+
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+// status: UNKNOWN / SERVING / NOT_SERVING / SERVICE_UNKNOWN（Watch だけで使う）
+```
+
+`Check` は 1 回だけ尋ね、`Watch` は現在の状態をすぐ返したあと、変わるたびに送り続けます。サービス名を空文字列にすると、サーバ全体の状態を尋ねる約束です。
+
+この同じサービスを、2 種類の相手が呼びます。
+
+- **Kubernetes の kubelet**。probe の種類として `grpc: { port: ... }` を書くと、この `Check` を呼んで判定します（[Kubernetes Docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)）。readiness と liveness の意味は第 107 回で見たとおりです
+- **gRPC のクライアント自身**。サービス設定に `"healthCheckConfig": {"serviceName": "..."}` を書くと、接続を張るたびに `Watch` を呼び、健全と返ってくるまでその接続には呼び出しを送らず、不健全に変わったら送るのをやめます（[gRPC Guides](https://grpc.io/docs/guides/health-checking/)）。`pick_first` のように意味を持たないポリシーでは使われません
+
+後者は、Kubernetes が EndpointSlice から Pod を外すのを待たずに、**クライアントが自分で外せる**という点で速く効きます。
+
+## 大きなものを送る: メッセージの上限と流量
+
+C-core の受信側のメッセージの上限は、既定で **4 MiB**（4 × 1024 × 1024 バイト）です。送信側には上限がありません（[grpc_types.h](https://github.com/grpc/grpc/blob/master/include/grpc/impl/grpc_types.h)、[channel_arg_names.h](https://github.com/grpc/grpc/blob/master/include/grpc/impl/channel_arg_names.h)）。上限のちょうど前後を送ると、こうなります。
+
+```
+4194204 OK
+4194305 StatusCode.RESOURCE_EXHAUSTED SERVER: Received message larger than max (4194305 vs. 4194304)
+```
+
+上限は `grpc.max_receive_message_length` で上げられますが、**1 つのメッセージは受け取り切るまでメモリに載る**ので、上げるほど 1 回の呼び出しが握るメモリも増えます。大きなデータは、ストリーミングの呼び出しにして小さなメッセージに分けて送るのが筋です。
+
+分けて送れば、第 64 回の HTTP/2 のフロー制御が効きます。ここで第 54 回の帯域遅延積が再び現れます。**ストリームの窓が帯域 × RTT より小さいと、回線が空いていても速度が出ません。** gRPC は、データを受け取るたびに BDP 測定用の PING を送り、その ACK が返るまでに受け取ったバイト数から帯域遅延積を見積もり、窓が足りなければ見積もりの 2 倍に広げます。grpc-go ではこの自動調整が既定で有効で、窓の上限は 4MB です（[gRPC Blog](https://grpc.io/blog/grpc-go-perf-improvements/)）。C-core にも BDP の測定があり、既定で有効です（[channel_arg_names.h](https://github.com/grpc/grpc/blob/master/include/grpc/impl/channel_arg_names.h) の `grpc.http2.bdp_probe`）。窓の大きさを手で固定すると、この自動調整は止まります（[gRPC Blog](https://grpc.io/blog/grpc-go-perf-improvements/)）。
+
+## 観測する
+
+ここまでの問題は、ほとんどがログに「UNAVAILABLE」や「DEADLINE_EXCEEDED」としか出ません。だから、**呼び出しごとの結果を数える**ことが最初の手がかりになります。
+
+gRPC は OpenTelemetry のメトリクスを組み込みで出せます（[gRPC Guides](https://grpc.io/docs/guides/opentelemetry-metrics/)）。アプリから見た 1 回の呼び出しの時間 `grpc.client.call.duration`、再試行を含む試行 1 回ずつの時間 `grpc.client.attempt.duration`、サーバから見た時間 `grpc.server.call.duration` などがあり、属性には `grpc.method` と `grpc.status` が付きます。**`grpc.status` ごとに分けて見る**と、`UNAVAILABLE` が増えたのか（つながらない、切られた）、`DEADLINE_EXCEEDED` が増えたのか（遅い）、`RESOURCE_EXHAUSTED` なのか（上限や流量制限）が区別できます。HTTP のステータスはほぼ常に 200 なので（第 69 回）、HTTP の層のメトリクスでは見えません。call と attempt の数の差を見れば、再試行の実験で見た「アプリには見えない再試行」がどれだけ起きているかが分かります。トレースとの組み合わせ方は第 112 回で扱います。
+
+## 使わない方がよい場面
+
+| 場面 | 理由 |
+| --- | --- |
+| ブラウザから直接呼ぶ | ブラウザの API はトレーラや HTTP/2 のフレームを直接扱えない。gRPC-Web などの変換を挟む必要がある（Envoy は変換用のフィルタを持つ。[Envoy Docs](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_protocols/grpc)） |
+| 人が読み書きしてデバッグしたい公開 API | 本文がバイナリで、スキーマが無いと読めない。curl 1 つで試せる手軽さが無い |
+| HTTP のキャッシュを効かせたい読み取り | メソッドは常に `POST`（[gRPC over HTTP2](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)）なので、CDN やブラウザのキャッシュがそのままでは効かない |
+
+gRPC が強いのは、**スキーマを共有できる者同士が、長く生きる接続で大量に呼び合う**、サービスの内側の通信です。
+
+## この章で見たもの
+
+第 11 章では、サービス同士が話すための層を、下から順に 8 回に分けて見てきました。
+
+| 回 | 見たもの |
+| --- | --- |
+| 第 64 回 | HTTP/2 は 1 本の TCP 接続を、フレームとストリームに分けて多重化する |
+| 第 65 回 | HTTP/3 は TCP の HOL ブロッキングを避けるため、UDP の上の QUIC に移った |
+| 第 66 回 | Protobuf のワイヤ形式は、番号とワイヤ型のタグと値の並び。名前は線に乗らないので、番号を守れば互換が保てる |
+| 第 67 回 | 値の有無、oneof、map、enum、well-known types。書けるものと書けないもの、JSON に写すときの違い |
+| 第 68 回 | gRPC は HTTP/2 のヘッダ、5 バイトの枠を付けたメッセージ、トレーラの組み合わせ |
+| 第 69 回 | 失敗はトレーラの grpc-status で伝わり、詳細は google.rpc.Status に詰める。HTTP のステータスは 200 のまま |
+| 第 70 回 | protoc とプラグインでコードを生成し、スキーマや生成済みの SDK を利用者に配る |
+| 第 71 回 | 長く生きる接続を前提に、振り分け、死活確認、デッドライン、再試行を組む |
+
+一貫していたのは、**1 本の接続を長く、多重に使う**という選択です。接続を張るコストを払わずに済み、速く呼び合えます。その代わりに、接続単位で振り分ける仕組みとは噛み合わず、途中の機器に黙って切られ、終わらせ方にも手順が要ります。本番で起きる問題の多くは、この選択の裏側です。
+
+## まとめ
+
+- gRPC の振り分けは呼び出し単位のつもりで作られているが、既定の `pick_first` は 1 つのアドレスに全部を送る。散らすには `round_robin` を選び、ヘッドレス Service で全 Pod のアドレスを渡す
+- サービス設定は、LB ポリシー、タイムアウト、再試行をサーバの持ち主が配る仕組み。DNS の TXT や xDS から届く
+- gRPC の DNS リゾルバは TTL で引き直さず、接続が切れたときなどに最短 30 秒の間隔で引き直す。`MAX_CONNECTION_AGE` で接続に寿命を設けると、振り分けと名前解決がやり直される
+- 接続の終わりは 2 段の GOAWAY。すれ違ったストリームは、透過的な再試行で拾われる
+- keepalive は途中の機器のアイドルタイムアウトより短く、サーバの許容より長く。頻繁すぎると `ENHANCE_YOUR_CALM` / `too_many_pings` で切られる
+- デッドラインは既定で無限。必ず付け、残り時間を下流に伝播する
+- 再試行はアプリから見えない。回数の上限、揺らぎのあるバックオフ、トークンによる停止を組み合わせ、hedging は冪等な操作に限る
+- 受信の上限は既定で 4 MiB。大きなデータはストリーミングで分け、流量は BDP の測定による窓の自動調整に任せる
+
+ここまでの 3 つの章で、データがネットワークを通って名前を引き、別のサービスに届くまでを見てきました。届いた先で、データの多くは最終的にデータベースに書き込まれます。次の第 12 章「データベースの中身」では、そのデータベースがディスクの上でデータをどう持っているのかを見ます。まずは、データベースがディスクを読み書きする単位である**ページ**と、ページをメモリに置いておく**バッファプール**からです。

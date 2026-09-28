@@ -1,0 +1,337 @@
+---
+title: HTTP/3 と QUIC
+description: HTTP/2 に残った TCP の HOL ブロッキングを、QUIC はどう取り除いたのか。ストリーム、パケット番号、接続 ID、内蔵された TLS 1.3 を実際のパケットで確かめ、HTTP/3 と QPACK が HTTP/2 から何を捨てたのかを見る
+chapter: rpc
+order: 2
+status: published
+topics:
+  - QUIC
+  - HTTP/3
+  - ストリーム ID
+  - パケット番号 / ACK 範囲
+  - 接続 ID / 接続移行
+  - 0-RTT / リプレイ
+  - QPACK
+  - Alt-Svc / HTTPS レコード
+  - UDP GSO / sendmmsg
+requires:
+  - ll-54-tcp-flow
+  - ll-55-packet-path
+  - ll-58-dns-records
+  - ll-64-http2-frame
+---
+
+import Callout from '../../components/Callout.astro'
+
+前回は、HTTP/2 が 1 本の TCP 接続の上にフレームとストリームを重ね、HPACK でヘッダを縮め、ストリームごとにフロー制御をかけていることを見ました。そして最後に、**TCP が 1 本のバイト列である以上、1 つのパケットが失われると無関係なストリームまで止まる**という問題が残りました。
+
+第 54 回では、QUIC がこれを UDP の上で作り直したことだけを予告しました。この回では、その中身に入ります。QUIC は TCP の何を、どう作り替えたのか。その上に載る HTTP/3 は、HTTP/2 から何を捨てたのか。手元で HTTP/3 を話し、パケットを復号して確かめます。
+
+## 層の組み替え
+
+最初に全体の形を比べます。
+
+| 仕事 | HTTP/2 の積み方 | HTTP/3 の積み方 |
+| --- | --- | --- |
+| HTTP の意味とヘッダ圧縮 | HTTP/2（HPACK） | HTTP/3（QPACK） |
+| ストリームとフロー制御 | HTTP/2 | QUIC |
+| 暗号化 | TLS 1.3 | QUIC（TLS 1.3 のハンドシェイクを内蔵） |
+| 再送と輻輳制御 | TCP（カーネル） | QUIC（ユーザ空間） |
+| ポート番号 | TCP | UDP（カーネル） |
+
+HTTP/2 がアプリケーションの層で持っていた**ストリームとフロー制御**は、QUIC に下ろされました。TCP がカーネルで持っていた**再送と輻輳制御**は、QUIC に上げられました。その結果、QUIC は**ユーザ空間のライブラリ**として動き、カーネルからは UDP のデータグラムしか見えません。
+
+## 手元で HTTP/3 を話す
+
+手元の curl（8.7.1）は HTTP/3 に対応していません。公式の `curlimages/curl` イメージ（執筆時点で 8.22.0）と Alpine の `curl` パッケージも、`--version` の `Features` に `HTTP3` がありませんでした。対応していたのは `alpine/curl-http3` イメージで、curl 8.11.0-DEV に BoringSSL と QUIC の実装 quiche 0.22.0 が組み込まれています。これで `https://cloudflare-quic.com/` を取得します（抜粋）。
+
+```
+$ curl -4 --http3-only -sv -o /dev/null https://cloudflare-quic.com/
+* Connected to cloudflare-quic.com (104.18.26.14) port 443
+* using HTTP/3
+* [HTTP/3] [0] OPENED stream for https://cloudflare-quic.com/
+* [HTTP/3] [0] [:method: GET]
+...
+< HTTP/3 200
+< priority: u=3,i=?0
+< alt-svc: h3=":443"; ma=86400
+```
+
+`[0]` はストリーム ID で、最初のリクエストは**ストリーム 0** に載りました。同じ URL を `--http2` で取得すると、TLS の ALPN で `curl offers h2,http/1.1` に対して `server accepted h2` となり、応答には同じ `alt-svc` が付いてきます。
+
+以下の節では、この通信を `tcpdump` で記録し、curl に `SSLKEYLOGFILE` で鍵を書き出させて `tshark` で復号したものを材料にします。Docker Desktop の中から東京の拠点（応答の `cf-ray` の末尾が `NRT`）へつないだ結果です。
+
+## ストリームごとに順序を守る
+
+QUIC のデータは **STREAM フレーム**に入り、フレームには**ストリーム ID とオフセット**が書かれています。受信側は、この 2 つを見て**ストリームごとに**データを並べ直します（[RFC 9000 2.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-2.2)）。ストリームの間の順序は保証しません。
+
+```
+TCP（HTTP/2）: 接続全体で 1 本の列
+  [A1][B1][A2]×[B2][A3]      A2 が失われると B2 も A3 も渡せない
+
+QUIC（HTTP/3）: ストリームごとに別の列
+  A: [A1]   [A2]×   [A3]     A は A2 の再送を待つ
+  B: [B1]   [B2]             B はそのまま渡せる
+```
+
+これが HOL ブロッキングを取り除く仕組みのすべてです。逆に言えば、**同じストリームの中では TCP と同じく待たされます**。1 つの大きな応答だけを取る通信では、QUIC にしても HOL ブロッキングは減りません。効くのは、多重化された複数のリクエストが同時に流れているときです。
+
+フロー制御も 2 段になっています。ストリームごとの上限（MAX_STREAM_DATA フレーム）と、接続全体の上限（MAX_DATA フレーム）です（[RFC 9000 4.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1)）。HTTP/2 の WINDOW_UPDATE が担っていた役目を、トランスポートが引き受けました。
+
+## ストリーム ID の下位 2 ビット
+
+ストリーム ID は 62 ビットの整数で、**下位 2 ビットが種類を表します**（[RFC 9000 2.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-2.1)）。
+
+| 下位 2 ビット | 種類 | 番号の並び |
+| --- | --- | --- |
+| 0x0 | クライアント起点・双方向 | 0, 4, 8, … |
+| 0x1 | サーバ起点・双方向 | 1, 5, 9, … |
+| 0x2 | クライアント起点・単方向 | 2, 6, 10, … |
+| 0x3 | サーバ起点・単方向 | 3, 7, 11, … |
+
+HTTP/2 では奇数か偶数かで起点だけを区別していました。QUIC はもう 1 ビットを使い、**単方向**のストリームも作れるようにしています。
+
+復号したパケットを並べると、この規則どおりに使われているのが見えます。
+
+```
+番号 送信元  パケットの種類      PN    中身
+ 1  client  Initial            0    CRYPTO（ClientHello）
+ 2  server  Initial            0    ACK, CRYPTO（ServerHello）
+ 5  server  Handshake          3    CRYPTO（Certificate, CertificateVerify, Finished）
+ 6  client  Initial+Handshake  1,0  ACK, CRYPTO（Finished）
+ 7  client  1-RTT              0    STREAM id=2   単方向、種類 0x00（制御）SETTINGS
+ 8  client  1-RTT              1    STREAM id=6   単方向、種類 0x02（QPACK エンコーダ）
+ 9  client  1-RTT              2    STREAM id=10  単方向、種類 0x03（QPACK デコーダ）
+10  client  1-RTT              3    STREAM id=0   双方向、HEADERS（GET /）、FIN
+11  server  1-RTT              4    HANDSHAKE_DONE, CRYPTO, STREAM id=3（制御）SETTINGS
+12  server  1-RTT              5    STREAM id=7   QPACK エンコーダ（13 番は id=11 のデコーダ）
+14  server  1-RTT              7    STREAM id=15  予約された種類
+17  server  1-RTT              9    STREAM id=0   応答の HEADERS と DATA
+```
+
+リクエストは双方向のストリーム 0 に 1 つだけです。それとは別に、**クライアントは単方向のストリームを 3 本、サーバは 4 本**開いています。これらが何なのかは、HTTP/3 の節で見ます。
+
+## パケット番号は使い回さない
+
+TCP のシーケンス番号は**バイト列の中の位置**です。再送するときも、同じ位置のデータは同じ番号で送り直します。すると、ACK が返ってきたとき、それが最初の送信に対するものか再送に対するものか区別できません。RTT の測定がずれ、無駄な再送かどうかの判断も難しくなります。これが **再送の曖昧さ**です。
+
+QUIC は 2 つの番号を分けました（[RFC 9002 4.2](https://www.rfc-editor.org/rfc/rfc9002.html#section-4.2)）。
+
+- **パケット番号**: 送った順番。同じ番号空間の中で必ず増え、**再送でも新しい番号を使う**
+- **ストリームのオフセット**: 届けるデータの位置。再送しても変わらない
+
+実際に確かめます。コンテナの中で、サーバから届く UDP パケットの 5% を `iptables` の `statistic` モジュールで捨て、同じ GET をもう一度実行しました。`tcpdump` は `iptables` より手前でパケットを見るので、捨てられたパケットも記録に残ります。同じオフセットのデータが 2 回送られた箇所を探すと、次のように見つかりました。
+
+```
+ストリーム 0 のオフセット   長さ    最初の送信          再送
+58839                    1154   PN 65（0.0834 秒）   PN 87（0.0933 秒）
+71533                    1154   PN 76               PN 88
+85381                    1154   PN 90               PN 128
+94613                    1154   PN 98               PN 129
+```
+
+**同じデータが、新しいパケット番号で送り直されています。**受信側の ACK は、どの番号を受け取ったかを範囲で返します。PN 65 と 76 が失われた直後の ACK フレームは、こう読めます（[RFC 9000 19.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.3)）。
+
+```
+Largest Acknowledged = 84, First ACK Range = 7        → 77〜84 を受け取った
+Gap = 0, ACK Range Length = 9                          → 76 が抜け、66〜75 を受け取った
+Gap = 0, ACK Range Length = 18                         → 65 が抜け、46〜64 を受け取った
+Gap = 0, ACK Range Length = 37                         → 45 が抜け、7〜44 を受け取った
+```
+
+TCP の SACK が一度に伝えられる範囲は 3 つ程度ですが、QUIC の ACK フレームは範囲をいくつでも並べられます（[RFC 9002 4.5](https://www.rfc-editor.org/rfc/rfc9002.html#section-4.5)）。また、一度 ACK したものを取り消すこと（SACK の reneging）は許されません。
+
+<Callout type="note" title="PN 45 はどこへ行ったのか">
+  45 は再送の一覧にありません。サーバは PN 44 の次に 46 を送っていて、ストリームのオフセットも連続していました。**45 は最初から使われていない番号**です（パケットを捨てずに記録した接続でも PN 111 が飛んでいました）。
+  RFC 9000 は、受け取っていないパケットを ACK して送信を煽る攻撃を見破るために、送信側がわざと番号を飛ばしてよいと定めています（[21.4](https://www.rfc-editor.org/rfc/rfc9000.html#section-21.4)）。番号が「送った順番」でしかないからこそできることです。
+</Callout>
+
+パケット番号の空間は、Initial、Handshake、アプリケーションデータ（0-RTT と 1-RTT）の **3 つ**に分かれています（[RFC 9000 12.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.3)）。先ほどの表で、クライアントの Initial の PN 0 と 1-RTT の PN 0 が両方あったのはこのためです。
+
+## 接続 ID と接続移行
+
+TCP の接続は、**送信元と宛先の IP アドレスとポートの 4 つ組**で識別されます。どれか 1 つでも変われば、別の接続です。Wi-Fi からモバイル回線に切り替わる、あるいは途中の NAT が対応表を張り替えて外側のポートが変わる（**NAT の張り替え**）と、TCP の接続は続けられません。
+
+QUIC は、パケットに **接続 ID** を書いて接続を識別します（[RFC 9000 5.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-5.1)）。**各側は、相手が自分宛てに使う ID を自分で選びます。**記録したパケットの先頭を読むと、ID が入れ替わる様子が見えます（[RFC 9000 17.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2)）。
+
+```
+クライアント → サーバ（最初の Initial、UDP のペイロード 1200 バイト）
+c9                      1100 1001: ロングヘッダ、種類 00 = Initial
+00 00 00 01             バージョン 1
+10  cb 60 ba 15 … 59 58 宛先 CID 16 バイト（クライアントが無作為に選んだ仮の値）
+14  1b c1 bf d8 … af 07 送信元 CID 20 バイト（クライアントが自分宛てに選んだ ID）
+
+サーバ → クライアント（Initial）
+cb  00 00 00 01
+14  1b c1 bf d8 … af 07 宛先 CID = クライアントが選んだ ID
+14  01 d0 19 18 … 56 71 送信元 CID = サーバが自分宛てに選んだ ID
+
+クライアント → サーバ（1-RTT、ショートヘッダ）
+42                      0100 0010: ショートヘッダ
+01 d0 19 18 … 56 71     宛先 CID だけ。長さは書かない（受け取る側は自分で選んだので知っている）
+```
+
+先頭の 1 バイトの下位ビットとパケット番号は、**ヘッダ保護**で暗号化されています（[RFC 9001 5.4](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.4)）。途中の機器からは、パケット番号すら読めません。
+
+クライアントの IP アドレスやポートが変わっても、サーバは接続 ID を見て同じ接続だと分かります（[RFC 9000 9](https://www.rfc-editor.org/rfc/rfc9000.html#section-9)）。ただし、新しいアドレスが本物かどうかは確かめる必要があります。サーバは新しい経路に **PATH_CHALLENGE** を送り、同じ値が PATH_RESPONSE で返ってくるのを待ちます。また、移行の前後で同じ ID を使い続けると、途中の観測者が 2 つの経路の通信を結び付けられてしまいます。そこで、**経路を変えるときは新しい接続 ID に切り替えます**（[RFC 9000 9.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-9.5)）。予備の ID は NEW_CONNECTION_ID フレームで事前に渡しておきます。
+
+移行できるのはクライアント側だけで、ハンドシェイクが終わるまでは移行できません。
+
+<Callout type="warn" title="4 つ組で振り分ける装置とは噛み合わない">
+  L4 のロードバランサが 4 つ組のハッシュで振り分けていると、クライアントのポートが変わった瞬間に別のサーバへ送られてしまいます。
+  接続 ID で移行が効くのは、振り分ける側も接続 ID を見る場合だけです。第 105 回で見た、長い接続と L4 の振り分けの問題の QUIC 版です。
+</Callout>
+
+## TLS 1.3 を中に入れる
+
+QUIC は TLS をその上に積むのではなく、**TLS 1.3 のハンドシェイクのメッセージだけを借りて**、QUIC の CRYPTO フレームで運びます（[RFC 9001 4](https://www.rfc-editor.org/rfc/rfc9001.html#section-4)）。TLS のレコード層は使わず、暗号化は QUIC のパケット単位で行います。
+
+先ほどの表の 1〜6 番がハンドシェイクです。ClientHello に対して、サーバは ServerHello から Finished までを 1 回で返し、クライアントが Finished を返すと同時に、7 番以降でリクエストを送り始めています。**TCP の 1 往復と TLS の 1 往復が、1 往復にまとまっています。**
+
+2 つの制約も記録に表れています。
+
+- **クライアントの最初のデータグラムは 1200 バイト以上**にしなければなりません（[RFC 9000 8.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1)）。送信元を偽った小さなパケットで、大きな応答を他人に送り付けさせる増幅攻撃を防ぐためです。アドレスを確かめるまで、サーバは**受け取った量の 3 倍までしか送れません**（[RFC 9000 8](https://www.rfc-editor.org/rfc/rfc9000.html#section-8)）。クライアントの Initial を大きくしておくほど、サーバは証明書を早く送り切れます。記録したどの接続でも、クライアントの最初のデータグラムは UDP のペイロードがちょうど 1200 バイトでした
+- **Initial パケットの鍵は、宛先 CID から誰でも計算できます**（[RFC 9001 5.2](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.2)）。暗号化はされていても秘匿にはならず、ClientHello の中の SNI は途中から読めます。これを隠すのが第 62 回で触れた ECH です
+
+### 0-RTT とリプレイ
+
+一度つないだことのあるサーバには、前回もらったチケットを使って、最初のパケットと一緒にリクエストを送れます（0-RTT）。ただし、**このデータは盗み取って送り直されても防げません**。RFC 9001 は、QUIC のフレームそのものはリプレイされても害がないが、**上に載ったアプリケーションのデータは別だ**と書いています（[RFC 9001 9.2](https://www.rfc-editor.org/rfc/rfc9001.html#section-9.2)）。
+
+HTTP での扱いは RFC 8470 が決めていて、HTTP/3 でもこれに従います（[RFC 9114 10.9](https://www.rfc-editor.org/rfc/rfc9114.html#section-10.9)）。クライアントは、他に情報がなければ `GET` のような**安全なメソッドだけ**を 0-RTT で送ってよく、安全かどうか分からないメソッドを送ってはいけません。サーバは、危険だと判断したリクエストを `425 Too Early` で断り、ハンドシェイクの完了後に送り直させられます（[RFC 8470](https://www.rfc-editor.org/rfc/rfc8470.html)）。 送り直されて困るのは、送金や注文のように副作用のある要求です。冪等な要求なら 2 回処理されても結果は変わりませんが、RFC 8470 は、メソッドの意味だけでは副作用の有無を確実に判断できないとして、既定を安全なメソッドに絞っています。gRPC の呼び出しは HTTP の上ではすべて `POST` です（[PROTOCOL-HTTP2.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)）。
+
+## HTTP/3: HTTP/2 から消えたもの
+
+QUIC がストリームとフロー制御を持ったので、HTTP/2 のフレームの多くは要らなくなりました（[RFC 9114 付録 A.2](https://www.rfc-editor.org/rfc/rfc9114.html#appendix-A.2)）。
+
+| HTTP/2 のフレーム | HTTP/3 では |
+| --- | --- |
+| DATA、HEADERS | 残る。パディングと優先度の欄は消えた |
+| RST_STREAM | 無い。QUIC の RESET_STREAM と STOP_SENDING が担う |
+| WINDOW_UPDATE | 無い。QUIC の MAX_STREAM_DATA / MAX_DATA が担う |
+| PING | 無い。QUIC の PING が担う |
+| CONTINUATION | 無い。大きな HEADERS をそのまま送れる |
+| PRIORITY | 無い。優先度は `Priority` ヘッダなどで伝える（[RFC 9218](https://www.rfc-editor.org/rfc/rfc9218.html)） |
+| SETTINGS、GOAWAY | 残る。ただし制御ストリームで送る |
+
+フレームはすでにストリームの上にあるので、**フレームのヘッダからストリーム ID とフラグが消えました**。ストリームの終わりは QUIC の FIN で分かるので、END_STREAM も要りません。HTTP/3 のフレームは「種類」と「長さ」だけです。GOAWAY はエラーコードを持たなくなり、サーバが送るときは「この ID 以上のリクエストは処理しない」という境界だけを示します（[RFC 9114 5.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.2)）。第 107 回で見た穏やかな切断は、HTTP/3 でも同じ考え方で成り立ちます。
+
+HTTP/2 でストリーム 0 に流していた接続全体の設定は、**制御ストリーム**に移りました。クライアント起点の双方向ストリームはすべてリクエストに使われ、それ以外の用途には単方向ストリームを使います。単方向ストリームは、先頭の数値で種類を示します（[RFC 9114 6.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2)、[RFC 9204 4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2)）。
+
+| 種類 | 用途 | 記録での ID（クライアント / サーバ） |
+| --- | --- | --- |
+| 0x00 | 制御ストリーム。最初のフレームは必ず SETTINGS。各側が 1 本ずつ持ち、相手を待たずに書き始められる | 2 / 3 |
+| 0x01 | サーバプッシュ | — |
+| 0x02 | QPACK エンコーダストリーム | 6 / 7 |
+| 0x03 | QPACK デコーダストリーム | 10 / 11 |
+
+サーバのストリーム 15 は、`0x1f × N + 0x21` という形の**予約された種類**でした。リクエストのストリーム 0 の先頭にも、同じ形の予約されたフレーム種別が 2 つ付いていて、片方の中身は ASCII で `GREASE is the word` でした。**未知の種類は無視せよ**という決まりを、実際に使って守らせるための仕掛けです（[RFC 9114 7.2.8](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8)）。守らない実装があると、将来の拡張が入れられなくなります。
+
+## QPACK: HPACK をそのまま使えない理由
+
+前回の HPACK は、接続全体で 1 つの**動的表**を両側で同じように育てる仕組みでした。ヘッダを送るたびに表に項目を足し、次からは番号で参照します。これが成り立つのは、**エンコードした順番どおりに、相手がデコードする**からです。
+
+QUIC ではストリームの間の順序が保証されません。ストリーム 4 のヘッダで表に足した項目を、ストリーム 8 のヘッダが参照したとします。ストリーム 4 のパケットが失われてストリーム 8 が先に届くと、デコーダは知らない番号を渡されます。HPACK のまま使えば、ヘッダの解読のところで HOL ブロッキングが復活します（[RFC 9204 1](https://www.rfc-editor.org/rfc/rfc9204.html#section-1)）。
+
+QPACK は、**表を書き換える命令を、専用の単方向ストリーム 1 本に集めました**（[RFC 9114 付録 A.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#appendix-A.2.2)）。
+
+```
+エンコーダストリーム: 表への追加命令（1 本なので順序が保たれる）  ──→ 相手のデコーダ
+デコーダストリーム:   「この節を処理した」「表のここまで反映した」 ──→ 相手のエンコーダ
+リクエストのストリーム: 表を参照するだけ。書き換えない
+```
+
+各ヘッダの先頭には **Required Insert Count**（この節を解くには表に何件入っている必要があるか）が付きます。まだ足りなければ、そのストリームだけが待ちます（ブロック）。何本まで待たせてよいかは、デコーダが `SETTINGS_QPACK_BLOCKED_STREAMS` で上限を決めます（[RFC 9204 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)）。**圧縮率を取るか、待たされない安全を取るかを、エンコーダが選べる**設計です。
+
+`SETTINGS_QPACK_MAX_TABLE_CAPACITY` と `SETTINGS_QPACK_BLOCKED_STREAMS` の既定値は、どちらも **0** です（[RFC 9204 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5)）。記録した SETTINGS では、curl は予約された値しか送らず、サーバも `max_field_section_size` 以外を設定していませんでした。つまりこの接続では**動的表は使われていません**。リクエストの HEADERS 37 バイトを手で読むと、静的表の参照とリテラルだけでできています。QPACK の静的表は HPACK と違って 0 から数え、並びも作り直されています（[RFC 9204 付録 A](https://www.rfc-editor.org/rfc/rfc9204.html#appendix-A)）。
+
+```
+00 00         Required Insert Count = 0, Base = 0（動的表を参照しない）
+d1            静的表 17  :method: GET
+d7            静的表 23  :scheme: https
+50 8e …       静的表 0 の名前（:authority）+ ハフマン符号の値 14 バイト（cloudflare-quic.com）
+c1            静的表 1   :path: /
+5f 50 8c …    静的表 95 の名前（user-agent）+ 値 12 バイト（curl/8.11.0-DEV）
+dd            静的表 29  accept: */*
+```
+
+## HTTP/3 をどうやって見つけるか
+
+`https://` の URL には、HTTP/3 を使えるかどうかが書かれていません。見つけ方は 2 つあります。
+
+**Alt-Svc。** まず TCP で HTTP/2 か HTTP/1.1 を話し、応答の `Alt-Svc: h3=":443"; ma=86400` で「UDP の 443 番でも同じものを出している」と教えてもらいます（[RFC 9114 3.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-3.1.1)）。`ma` はこの情報を覚えておいてよい秒数で、省略すると 24 時間です（[RFC 7838](https://www.rfc-editor.org/rfc/rfc7838.html#section-3.1)）。最初の 1 回は必ず TCP を通ります。
+
+**HTTPS レコード。** 第 58 回で見たとおり、名前を引いた時点で `alpn` を受け取れます。手元で引くと次のとおりでした。
+
+```
+$ dig +short HTTPS cloudflare-quic.com
+1 . alpn="h3,h2" ipv4hint=104.18.26.14,104.18.27.14 ech=AEX+DQBB... ipv6hint=...
+```
+
+どちらの方法でも、UDP が途中で塞がれていれば QUIC の接続は失敗します。RFC 9114 は、その場合は **TCP の HTTP に切り替えるべきだ**と定めています（[RFC 9114 3.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-3.1)）。Google が 2016 年に YouTube の再生で測った値では、QUIC を試したクライアントの 4.4% が QUIC を使えず、多くは企業のファイアウォールの内側でした（[Langley ほか, SIGCOMM 2017](https://dl.acm.org/doi/10.1145/3098822.3098842) 7.2 節。IETF 標準化前の Google 版 QUIC での測定）。
+
+<Callout type="warn" title="全部落とすより、一部だけ落とすほうが害が大きい">
+  UDP を完全に塞げば、クライアントはすぐ TCP に切り替えます。
+  困るのは、ハンドシェイクの数パケットだけを通してから落とす、あるいは UDP の帯域を一定の割合に絞る装置です。
+  QUIC の接続が成立してしまうので切り替えが起きず、大きな損失を抱えたまま、タイムアウトを待つことになります。
+  RFC 9312 は、絞るなら**パケット単位ではなく流れ単位で**行うよう勧めています（[RFC 9312 4.6](https://www.rfc-editor.org/rfc/rfc9312.html#section-4.6)）。
+</Callout>
+
+## 実際に速くなったか
+
+同じ URL を `--http2` と `--http3-only` で交互に 15 回ずつ取得し、`-w` で `time_connect`、`time_appconnect`、`time_starttransfer` を出しました。名前解決の後からの経過時間の中央値です。QUIC には TCP の接続完了に当たる段階がないので（quiche を使う curl では `time_connect` が「サーバから最初のバイトを受け取った時刻」になります）、HTTP/3 の欄は空けています。
+
+| | TCP の接続完了 | ハンドシェイク完了（`time_appconnect`） | 最初のバイト（`time_starttransfer`） |
+| --- | --- | --- | --- |
+| HTTP/2 | 9.1 ms | 26.9 ms | 44.0 ms |
+| HTTP/3 | — | 21.2 ms | 43.9 ms |
+
+ハンドシェイクの完了は約 6ms 早くなりましたが、TCP の 1 往復（約 9ms）ぶんまるごとは縮んでいません。最初のバイトが届くまでの時間には差がありませんでした。拠点までの往復が 10ms 程度と短く、手元では往復 1 回の節約がほとんど見えない環境です。第 76 回で見たように、**往復の削減が効くのは往復が長い経路**です。
+
+## 費用: ユーザ空間で UDP を送る
+
+QUIC を選ぶ代わりに払うものがあります。**CPU** です。
+
+TCP では、アプリケーションが大きなデータを 1 回の `write` で渡せば、カーネルが MSS ごとに切り分け、TSO があれば NIC が切ります（第 55 回）。ACK の処理もカーネルの中で済みます。QUIC では、1 つの UDP データグラムに暗号化済みの 1 パケットを入れて送るので、素直に書くと **1 パケットごとに 1 回のシステムコール**になります。ACK もユーザ空間まで上がってきて処理されます。
+
+Linux には、これを減らす道具がそろっています。
+
+| 道具 | 何をするか |
+| --- | --- |
+| `sendmmsg` | 複数のデータグラムを 1 回のシステムコールで送る |
+| `UDP_SEGMENT`（Linux 4.18〜） | 大きなバッファを 1 回で渡し、カーネルか NIC に指定の大きさで切り分けさせる（UDP の GSO）（[udp(7)](https://man7.org/linux/man-pages/man7/udp.7.html)） |
+| `UDP_GRO`（Linux 5.0〜） | 受信側で連続したデータグラムを 1 つのバッファにまとめて渡す |
+
+Cloudflare の quiche での実験では、`sendmmsg`、GSO、その組み合わせと進めるごとに送信の速さが大きく伸びています（[Ghedini, 2019](https://calendar.perfplanet.com/2019/accelerating-udp-packet-transmission-for-quic/)）。どれくらい高くつくのかには、2 つの報告があります。
+
+- Google は、YouTube の配信で Google 版 QUIC のサーバの CPU 使用率が **TLS/TCP の約 3.5 倍**だったと報告しています。暗号、UDP の送受信、QUIC の状態管理が 3 大要因で、最適化の後も**約 2 倍**でした（[Langley ほか, SIGCOMM 2017](https://dl.acm.org/doi/10.1145/3098822.3098842) 6.7 節）
+- Fastly は、1 コアに制限した送信側で quicly を測り、最初は TLS 1.3 over TCP（466Mbps）の約 4 割の 196Mbps でした。**ACK の頻度を下げ、GSO でパケットをまとめ、パケットを大きくする**と 464Mbps まで上がり、TCP と並びました（[Oku, Iyengar, 2020](https://www.fastly.com/blog/measuring-quic-vs-tcp-computational-efficiency)）。理由として、TCP の ACK はカーネルの中で処理されるのに QUIC ではユーザ空間との往復が増えること、**カーネルが QUIC の接続の状態を持たないため、経路の検索などが毎パケット行われること**を挙げています
+
+**QUIC は本質的に遅いのではなく、カーネルの TCP が積み上げてきた最適化を、ユーザ空間とシステムコールの使い方で取り戻す必要がある**、というのが両者に共通する見方です。
+
+## gRPC と HTTP/3
+
+gRPC は HTTP/2 の上で定義されています（第 68 回で扱います）。HTTP/3 の上での扱いは、gRFC **G2: gRPC over HTTP/3** に書かれていて、状態は Implemented、実装は grpc-dotnet と記されています（[G2](https://github.com/grpc/proposal/blob/master/G2-http3-protocol.md)）。中身は、リクエストと応答の形は HTTP/2 のときと同じで、違うのはエラーコードの対応と、RST_STREAM の代わりに QUIC の RESET_STREAM を使うことです。
+
+執筆時点での各実装の状況は次のとおりです。
+
+| 実装 | HTTP/3 |
+| --- | --- |
+| grpc-dotnet | .NET 6 以降のクライアントが対応。サーバの `alt-svc` を見て自動で HTTP/3 に切り替える（[Microsoft Learn](https://learn.microsoft.com/en-us/aspnet/core/grpc/troubleshoot)） |
+| C-core（C++ など） | 汎用の対応は無い。要望の issue が 2019 年から open のまま（[grpc/grpc#19126](https://github.com/grpc/grpc/issues/19126)） |
+| grpc-go | トランスポートが HTTP/2 に固定されていて差し替えられない。QUIC 対応の要望はトランスポートの差し替えの issue に統合され、それが open のまま（[grpc/grpc-go#906](https://github.com/grpc/grpc-go/issues/906)） |
+| grpc-java | #19126 のメンテナの追記によれば、C++、Objective-C と同じく、モバイル向けの Cronet を通す経路でだけ使える |
+
+サーバ同士の通信で HTTP/3 の gRPC を使える場面は、まだ限られています。運用の面は第 71 回で扱います。
+
+## まとめ
+
+- QUIC は、TCP がカーネルで持っていた再送と輻輳制御、HTTP/2 が持っていたストリームとフロー制御を、UDP の上のユーザ空間にまとめた
+- 順序はストリームごとに守る。損失の影響はそのストリームだけに留まるが、同じストリームの中では待たされる
+- ストリーム ID の下位 2 ビットが、起点（クライアント / サーバ）と双方向 / 単方向を表す
+- パケット番号は送った順番で、再送にも新しい番号を使う。再送の曖昧さが消え、ACK は範囲をいくつでも並べられる
+- 接続は 4 つ組ではなく接続 ID で識別する。アドレスが変わっても続くが、経路ごとに ID を替え、新しい経路は確かめてから使う
+- TLS 1.3 のハンドシェイクを CRYPTO フレームで運び、接続と鍵を 1 往復で決める。0-RTT はリプレイを防げないので、安全なメソッドにだけ使う
+- HTTP/3 は RST_STREAM や WINDOW_UPDATE を QUIC に任せ、設定は制御ストリームで送る。QPACK は表の更新を 1 本のストリームに集めて、順序の問題を避けた
+- UDP が塞がれていれば TCP に戻る。CPU の費用は、GSO や `sendmmsg` でどれだけ取り戻せるかにかかっている
+
+ここまでの 2 回で、gRPC のメッセージを運ぶ入れ物を見ました。次回からは、その中身に入ります。Protocol Buffers のメッセージが、線の上ではどんなバイト列になるのかを、手で読みます。

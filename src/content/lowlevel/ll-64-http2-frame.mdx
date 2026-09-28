@@ -1,0 +1,350 @@
+---
+title: HTTP/2 をフレームで読む
+description: 1 本の TCP 接続に、どうやって複数のリクエストを同時に流すのか。9 バイトのフレームヘッダ、ストリーム、HPACK、2 段のフロー制御を、socket だけで gRPC のサーバと話しながら読み解きます
+chapter: rpc
+order: 1
+status: published
+topics:
+  - HTTP/2
+  - フレーム
+  - コネクションプリフェース
+  - h2 / h2c / ALPN
+  - ストリーム
+  - HPACK
+  - WINDOW_UPDATE
+  - RST_STREAM / GOAWAY
+  - Rapid Reset
+requires:
+  - ll-53-socket-tcp
+  - ll-54-tcp-flow
+---
+
+import Callout from '../../components/Callout.astro'
+
+## この章で見るもの
+
+第 9 章では、TCP がバイトの流れを相手に届ける仕組みを見ました。第 10 章では、その相手の IP アドレスを名前から引く仕組みを見ました。これで、どのサーバにも接続を張り、バイト列を送れるようになりました。
+
+しかし、サービス同士が実際にやり取りしているのは「バイト列」ではなく、**「この関数をこの引数で呼んで、結果を返してほしい」という依頼**です。依頼と結果をどう区切り、どう型を付け、失敗をどう伝え、どう運用するか。その取り決めの積み重ねが、この章の主題です。
+
+| 回 | 見るもの |
+| --- | --- |
+| 第 64 回（この回） | HTTP/2 は 1 本の TCP 接続をどう分けて使うのか |
+| 第 65 回 | TCP を QUIC に取り替えた HTTP/3 |
+| 第 66 回 | Protocol Buffers のワイヤ形式 |
+| 第 67 回 | Protobuf で何を表せるか |
+| 第 68 回 | gRPC は HTTP/2 の上で何をしているか |
+| 第 69 回 | gRPC のエラー |
+| 第 70 回 | コードを生成し、スキーマを配る |
+| 第 71 回 | gRPC を本番で動かす |
+
+運び方（HTTP/2、HTTP/3）、中身の書き方（Protobuf）、その 2 つを組み合わせた呼び出しの約束（gRPC）、そして失敗・配布・運用の順に進みます。この回はその土台として、**HTTP/2 を線の上のバイト列として読みます**。
+
+## HTTP/1.1 の何が足りなかったのか
+
+第 76 回（ブラウザの章）でも概観するとおり、HTTP/1.1 は接続を使い回せますが、**1 本の接続では、前の応答が返るまで次の応答を受け取れません**。リクエストを先に続けて送る「パイプライン」も仕様にはありますが、サーバは**受け取った順に応答を返さなければなりません**（[RFC 9112 9.3.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.3.2)）。先頭の遅い応答が、後ろを全部待たせます。並列にしたければ、接続の本数を増やすしかありません。
+
+もう 1 つは、ヘッダが**テキスト**であることです。区切りは改行で、長さは読んでみるまで分かりません。しかも同じ `user-agent` や `cookie` を、毎回そのまま送り直します。
+
+HTTP/2 はこの 2 つを、**意味（メソッド、ステータス、ヘッダ）は変えずに、線の上の形だけを作り直す**ことで解きました（[RFC 9113 1](https://www.rfc-editor.org/rfc/rfc9113.html#section-1)）。
+
+## すべてはフレーム
+
+HTTP/2 の接続を流れるものは、すべて**フレーム**です。フレームは固定 9 バイトのヘッダで始まります（[RFC 9113 4.1](https://www.rfc-editor.org/rfc/rfc9113.html#section-4.1)）。
+
+```
++-----------------------------------------------+
+|                 Length (24)                   |  ペイロードの長さ。9 バイトのヘッダは含まない
++---------------+---------------+---------------+
+|   Type (8)    |   Flags (8)   |
++-+-------------+---------------+-------------------------------+
+|R|                 Stream Identifier (31)                      |
++-+-------------------------------------------------------------+
+|                   Frame Payload ...                           |
++---------------------------------------------------------------+
+```
+
+第 57 回の DNS と同じく、**長さが先頭にある**ので、読む側は 9 バイト読んで長さを知り、その分だけ読めば 1 フレームが取り出せます。長さの欄は 24 ビットありますが、相手が `SETTINGS_MAX_FRAME_SIZE` で大きくしない限り、16,384 バイトを超えて送ってはいけません。ストリーム ID の前の 1 ビットは予約です。
+
+型は次のとおりです（[RFC 9113 6](https://www.rfc-editor.org/rfc/rfc9113.html#section-6)）。
+
+| 型 | 名前 | ストリーム | 役割 |
+| --- | --- | --- | --- |
+| 0x0 | DATA | 個別 | 本文。フロー制御の対象になる唯一の型 |
+| 0x1 | HEADERS | 個別 | ヘッダ（HPACK で圧縮したもの）。ストリームを開く |
+| 0x2 | PRIORITY | 個別 | 優先度。RFC 9113 で非推奨 |
+| 0x3 | RST_STREAM | 個別 | そのストリームだけを取り消す |
+| 0x4 | SETTINGS | 0 | 接続の設定を伝える。受け取ったら ACK を返す |
+| 0x5 | PUSH_PROMISE | 個別 | サーバプッシュの予告 |
+| 0x6 | PING | 0 | 往復の確認。同じ 8 バイトを ACK で返す |
+| 0x7 | GOAWAY | 0 | 接続を畳む |
+| 0x8 | WINDOW_UPDATE | 0 か個別 | フロー制御の窓を広げる |
+| 0x9 | CONTINUATION | 個別 | 1 フレームに収まらないヘッダの続き |
+
+フラグの意味は型ごとに決まります。よく使うのは **END_STREAM（0x1）**、**END_HEADERS（0x4）**、SETTINGS と PING の **ACK（0x1）** です。ストリーム 0 は**接続そのもの**を指し、SETTINGS や PING はそこに送ります。知らない型のフレームは、読み捨てることになっています。拡張の余地をここに残しているわけです。
+
+## 始め方: h2 と h2c
+
+HTTP/2 を話すかどうかは、接続の前に決めなければなりません（[RFC 9113 3](https://www.rfc-editor.org/rfc/rfc9113.html#section-3)）。
+
+- **https** では、TLS のハンドシェイクの中の **ALPN** で `h2` を選びます。ALPN は、TLS の上で何のプロトコルを話すかをハンドシェイクのついでに決める拡張です。第 58 回の HTTPS レコードの `alpn` は、これを DNS の段階で先に知らせるものでした
+- **http**（平文）では、相手が HTTP/2 を話すと**あらかじめ知っている**場合にだけ、いきなり HTTP/2 で話し始めます（prior knowledge）。この平文の HTTP/2 を **h2c** と呼びます
+
+`curl -v` で ALPN のやり取りが見えます。
+
+```
+$ curl -sv -o /dev/null https://www.google.com/ 2>&1 | grep -E "ALPN|HTTP/2"
+* ALPN: curl offers h2,http/1.1
+* ALPN: server accepted h2
+* [HTTP/2] [1] OPENED stream for https://www.google.com/
+```
+
+`[1]` はストリーム ID です。後で見るとおり、クライアントが最初に開くストリームは 1 番です。
+
+<Callout type="note" title="Upgrade による h2c は廃止された">
+  RFC 7540 には、HTTP/1.1 の `Upgrade: h2c` ヘッダで平文の接続を HTTP/2 に切り替える方法がありました。
+  RFC 9113 はこれを「広く使われなかった」として非推奨にしています（[RFC 9113 3.1](https://www.rfc-editor.org/rfc/rfc9113.html#section-3.1)）。
+  平文の HTTP/2 は、現在は prior knowledge だけです。
+  クラスタの内側で TLS を使わない gRPC は、この形で HTTP/2 を話しています。
+</Callout>
+
+どちらの場合も、接続の最初にクライアントは **24 バイトのプリフェース**を送り、続けて SETTINGS フレームを送ります（[RFC 9113 3.4](https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4)）。
+
+```
+PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n
+```
+
+HTTP/1.1 のリクエストに似た形をしているのは、**間違って HTTP/1.x のサーバに届いたとき、その先を処理させないため**です。この並びを受け取った HTTP/1.x のサーバや中継の多くは、その後ろをフレームとして処理しようとしません（RFC の注記）。サーバ側のプリフェースは、最初に送る SETTINGS フレームです。SETTINGS を受け取った側は、ACK フラグ付きの空の SETTINGS を返します。
+
+## socket だけで話しかける
+
+ここまでで、話しかけるのに必要なものは揃いました。相手には、grpcio（1.80）の `grpc.server` にサービスを 1 つも登録せず、`add_insecure_port("127.0.0.1:50051")` で起動しただけのサーバを使います。gRPC は h2c を話すので、平文の socket で直接つながります。フレームを組む関数と読む関数は、それぞれ数行です。
+
+```python
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+def frame(ftype, flags, stream_id, payload=b""):
+    head = struct.pack("!I", len(payload))[1:]           # 長さは 24 ビット
+    head += struct.pack("!BBI", ftype, flags, stream_id & 0x7FFFFFFF)
+    return head + payload
+
+def read_frame(s):
+    head = recv_exact(s, 9)                              # 第 57 回と同じ「読み切る」関数
+    length = int.from_bytes(head[0:3], "big")
+    stream_id = struct.unpack("!I", head[5:9])[0] & 0x7FFFFFFF
+    return head, head[3], head[4], stream_id, recv_exact(s, length)
+
+s = socket.create_connection(("127.0.0.1", 50051))
+s.sendall(PREFACE + frame(4, 0, 0))                      # プリフェースと空の SETTINGS
+```
+
+届いたフレームを順に表示し、SETTINGS には ACK を返し、続けて PING を 1 つ送ります。角括弧の中が 9 バイトのヘッダそのものです（手元の実行結果）。
+
+```
+>> [00 00 00 04 00 00 00 00 00] SETTINGS      flags=0x00 stream=0 len=0
+<< [00 00 18 04 00 00 00 00 00] SETTINGS      flags=0x00 stream=0 len=24  INITIAL_WINDOW_SIZE=4194304 MAX_FRAME_SIZE=4194304 MAX_HEADER_LIST_SIZE=16384 (grpc 独自 0xfe03)=1
+>> [00 00 00 04 01 00 00 00 00] SETTINGS      flags=0x01 stream=0 len=0  ACK
+<< [00 00 04 08 00 00 00 00 00] WINDOW_UPDATE flags=0x00 stream=0 len=4  increment=4128769
+<< [00 00 00 04 01 00 00 00 00] SETTINGS      flags=0x01 stream=0 len=0  ACK
+>> [00 00 08 06 00 00 00 00 00] PING          flags=0x00 stream=0 len=8  68656c6c6f2d6832
+<< [00 00 08 06 01 00 00 00 00] PING          flags=0x01 stream=0 len=8  ACK 68656c6c6f2d6832
+```
+
+サーバの SETTINGS は 24 バイトで、1 項目 6 バイト（識別子 2 バイト、値 4 バイト）が 4 つ並んでいます（[RFC 9113 6.5.1](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.1)）。
+
+| 項目 | 既定値 | このサーバの値 |
+| --- | --- | --- |
+| INITIAL_WINDOW_SIZE（0x4） | 65,535 | 4,194,304 |
+| MAX_FRAME_SIZE（0x5） | 16,384 | 4,194,304 |
+| MAX_HEADER_LIST_SIZE（0x6） | 無制限 | 16,384 |
+| 0xfe03 | — | 1 |
+
+既定値は [RFC 9113 6.5.2](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2) のものです。0xfe03 は RFC にない識別子で、gRPC の実装が独自に使っている `GRPC_ALLOW_TRUE_BINARY_METADATA` です（[grpc の http2_settings.h](https://github.com/grpc/grpc/blob/master/src/core/ext/transport/chttp2/transport/http2_settings.h)）。**知らない識別子は無視する**決まりなので、他の実装と話しても壊れません。
+
+PING の 8 バイトは何を入れてもよく、相手は同じ 8 バイトに ACK を立てて返します。接続が生きているか、往復に何ミリ秒かかるかを、アプリケーションのリクエストを使わずに調べられます。実験の途中では、サーバの側からも PING が何度か届きました。gRPC は、帯域遅延積（第 54 回）を見積もるために PING を使います（既定で有効な `grpc.http2.bdp_probe`、[channel_arg_names.h](https://github.com/grpc/grpc/blob/master/include/grpc/impl/channel_arg_names.h)）。
+
+## ストリーム: 1 本の接続の中の番号付きの流れ
+
+1 組のリクエストと応答は、1 本の**ストリーム**に載ります。ストリームは 31 ビットの ID で区別され、**クライアントが開くものは奇数、サーバが開くものは偶数**です。新しいストリームの ID は、それまで開いたどれよりも大きくなければならず、使い回しはできません（[RFC 9113 5.1.1](https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1)）。
+
+状態の遷移を 1 往復に絞って描くと次のようになります（全体は [RFC 9113 5.1](https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1) の図）。
+
+```
+クライアントから見たストリーム 1
+
+  idle ── HEADERS を送る ──→ open ── END_STREAM を送る ──→ half-closed (local)
+                                                                 │
+                                          END_STREAM を受け取る  │
+                                                                 ↓
+                               （どの状態からでも RST_STREAM で） closed
+```
+
+**END_STREAM は「この向きにはもう送らない」という印**です。両方の向きで END_STREAM が済むか、どちらかが RST_STREAM を送ると、ストリームは閉じます。
+
+多重化とは、**異なるストリームのフレームを 1 本の接続の上で混ぜてよい**ということです。ストリーム 1 の DATA、ストリーム 3 の HEADERS、ストリーム 1 の次の DATA、という順に流れても、受け取る側は 9 バイトのヘッダのストリーム ID を見て振り分けます。HTTP/1.1 の「前の応答が終わるまで待つ」は、ここで消えます。同時に開いてよいストリームの数は、`SETTINGS_MAX_CONCURRENT_STREAMS` で相手が制限できます。
+
+例外が 1 つあります。**ヘッダのブロック（HEADERS と、それに続く CONTINUATION）の途中には、他のフレームを挟めません**（[RFC 9113 6.10](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10)）。次に見る HPACK が、接続全体で 1 つの状態を共有しているからです。
+
+## HPACK: ヘッダを表の番号で送る
+
+HEADERS フレームの中身は、ヘッダをテキストで並べたものではありません。**HPACK**（[RFC 7541](https://www.rfc-editor.org/rfc/rfc7541.html)）という形式で圧縮したブロックです。道具は 3 つです。
+
+| 道具 | 中身 |
+| --- | --- |
+| **静的表** | よく使うヘッダ 61 個を仕様で固定した表。1 番 `:authority`、3 番 `:method: POST`、6 番 `:scheme: http`、8 番 `:status: 200`、31 番 `content-type` など（[付録 A](https://www.rfc-editor.org/rfc/rfc7541.html#appendix-A)） |
+| **動的表** | 接続ごとに、送ったヘッダを覚えておく表。62 番から始まり、新しいものほど番号が小さい。上限は既定で 4,096 バイト（`SETTINGS_HEADER_TABLE_SIZE`） |
+| **ハフマン符号** | 文字の出現頻度に基づく、仕様で固定された符号表で文字列を縮める（[付録 B](https://www.rfc-editor.org/rfc/rfc7541.html#appendix-B)） |
+
+`:method` や `:path` のようにコロンで始まるのは**疑似ヘッダ**で、HTTP/1.1 のリクエスト行とステータス行に当たるものです。1 つのヘッダの表し方は、先頭のビットで決まります（[RFC 7541 6](https://www.rfc-editor.org/rfc/rfc7541.html#section-6)）。
+
+```
+1xxxxxxx   表の番号だけ（名前も値も表にある）         7 ビットの番号
+01xxxxxx   リテラル。この後、動的表に足す             6 ビットの番号（名前だけ表から。0 なら名前もリテラル）
+0000xxxx   リテラル。表に足さない                     4 ビットの番号
+0001xxxx   リテラル。表に足さず、中継でも足させない   4 ビットの番号
+```
+
+番号が前置ビットに収まらないときは、前置ビットをすべて 1 にして、残りを後ろのバイトに続けます（[RFC 7541 5.1](https://www.rfc-editor.org/rfc/rfc7541.html#section-5.1)）。文字列は「先頭 1 ビットがハフマンかどうか、残り 7 ビットが長さ」の後に本体を置きます。
+
+これで、gRPC のリクエストのヘッダを手で組めます。ハフマンは使わず、文字列はそのまま入れます。
+
+```python
+def lit(value):
+    data = value.encode()
+    return bytes([len(data)]) + data                # H = 0、長さ 7 ビット
+
+def headers_block(first):
+    block = bytes([0x80 | 3])                       # 3 番 = :method: POST
+    block += bytes([0x80 | 6])                      # 6 番 = :scheme: http
+    block += bytes([0x04]) + lit("/demo.Echo/Say")  # 名前は 4 番（:path）、値はリテラル、表に足さない
+    if first:
+        block += bytes([0x40 | 1]) + lit("127.0.0.1:50051")  # 名前は 1 番（:authority）、動的表に足す
+    else:
+        block += bytes([0x80 | 62])                 # 前回足した 62 番を 1 バイトで指す
+    block += bytes([0x0F, 0x10]) + lit("application/grpc")   # 31 番は 4 ビットに収まらない: 15 + 16
+    block += bytes([0x00]) + lit("te") + lit("trailers")     # 名前も値もリテラル
+    return block
+```
+
+`te: trailers` は、HTTP/2 で唯一許される接続固有のヘッダです（[RFC 9113 8.2.2](https://www.rfc-editor.org/rfc/rfc9113.html#section-8.2.2)）。gRPC がこれを必要とする理由と、後ろに付ける DATA の 5 バイトの意味は、第 68 回で扱います。このブロックを HEADERS（END_HEADERS）でストリーム 1 に、続けて DATA（END_STREAM）を送り、同じことをストリーム 3 でもう一度行いました。
+
+```
+--- stream 1: HEADERS 67 バイト
+    83 86 04 0e 2f 64 65 6d 6f 2e 45 63 68 6f 2f 53 61 79 41 0f 31 32 37 2e 30 2e 30 2e 31 3a ...
+<< [00 00 50 01 05 00 00 00 01] HEADERS       flags=0x05 stream=1 len=80  END_STREAM END_HEADERS
+     block=88 40 0c 63 6f 6e 74 65 6e 74 2d 74 79 70 65 10 61 70 70 ... 40 0b 67 72 70 63 2d 73 74 61 74 75 73 02 31 32 00 0c ...
+     :status: 200
+     content-type: application/grpc
+     grpc-status: 12
+     grpc-message: Method not found!
+--- stream 3: HEADERS 51 バイト
+    83 86 04 0e 2f 64 65 6d 6f 2e 45 63 68 6f 2f 53 61 79 be 0f 10 10 61 70 70 ...
+<< [00 00 04 08 00 00 00 00 00] WINDOW_UPDATE flags=0x00 stream=0 len=4  increment=5
+<< [00 00 23 01 05 00 00 00 03] HEADERS       flags=0x05 stream=3 len=35  END_STREAM END_HEADERS
+     block=88 bf be 00 0c 67 72 70 63 2d 6d 65 73 73 61 67 65 11 4d 65 74 68 6f 64 ...
+```
+
+サービスを登録していないので、サーバは「そのメソッドは無い」（grpc-status 12）と答えています。応答の表示は、ブロックを `hpack` ライブラリで復号したものです。読みどころは、**両方向で動的表が効いている**ことです。
+
+- リクエスト: 2 回目は `:authority` の 17 バイトが `be`（62 番）の 1 バイトになり、67 バイトが 51 バイトに縮んだ
+- 応答: 先頭の `88` は静的表の 8 番 `:status: 200`。1 回目は `40`（足すリテラル）で `content-type` と `grpc-status: 12` を送り、2 回目は `bf be` の 2 バイトで同じ 2 つを指して、80 バイトが 35 バイトに縮んだ
+
+動的表は接続ごとに 1 つで、送る側と受け取る側が**同じ順番で同じ更新をする**ことで揃っています。だからヘッダのブロックの途中に別のストリームを挟めず、フレームを 1 つ読み落とすと、その後のヘッダがすべて読めなくなります。
+
+ハフマンを使えば、リテラルはさらに縮みます。`application/grpc` の 16 バイトは、ハフマン符号では 11 バイトです（`hpack` の符号器で確かめた値）。
+
+<Callout type="warn" title="なぜ gzip で圧縮しなかったのか">
+  HTTP/2 の前身の SPDY は、ヘッダを DEFLATE（gzip と同じ方式）で圧縮していました。
+  これに対して **CRIME** という攻撃が示されました。
+  攻撃者は、自分が選んだ文字列を秘密の Cookie と同じ圧縮の文脈に混ぜて送らせ、暗号文の長さを観察します。
+  推測が 1 文字当たると、繰り返しとして縮むので暗号文が短くなる。これを繰り返せば、Cookie を 1 文字ずつ当てられます。
+
+  HPACK は、表との一致を**ヘッダの値全体**でしか取りません。推測は丸ごと当たるか外れるかになり、
+  1 文字ずつ当てることはできなくなります（[RFC 7541 1](https://www.rfc-editor.org/rfc/rfc7541.html#section-1)、[7.1](https://www.rfc-editor.org/rfc/rfc7541.html#section-7.1)）。
+  それでも短い値や推測しやすい値は危ういので、`authorization` のような値は動的表に入れない
+  `0001xxxx`（never indexed）で送る選択肢が用意されています。
+</Callout>
+
+## フロー制御: 窓は 2 段、TCP と合わせて 3 段
+
+第 54 回で、TCP は受信ウィンドウで「相手が読むより速く送らない」ようにしていると見ました。HTTP/2 は、その上にもう一度フロー制御を持っています（[RFC 9113 5.2](https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2)）。
+
+理由は多重化です。1 本の接続に 100 本のストリームが載っているとき、受け取る側が**そのうち 1 本だけ**読めなくなることがあります。TCP の窓で止めると、他の 99 本まで止まります。そこで HTTP/2 は、**ストリームごとの窓**と**接続全体の窓**の 2 段を持ち、DATA を送るには両方に空きが要るようにしました。
+
+```
+送れる DATA の量 = min(ストリームの窓, 接続の窓)      ← HTTP/2 の 2 段
+その下で TCP が min(rwnd, cwnd) で送る                ← 第 54 回の TCP の窓
+```
+
+- 窓の初期値は、ストリームも接続も **65,535 バイト**（[RFC 9113 6.9.2](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2)）
+- 対象になるのは **DATA だけ**です。SETTINGS や WINDOW_UPDATE が窓に詰まって届かない、ということは起きません
+- 受け取った側は、読んだ分を WINDOW_UPDATE で返します。**送ってよい量を貸す、クレジットの方式**です
+- ストリームの窓の初期値は `SETTINGS_INITIAL_WINDOW_SIZE` で変えられますが、**接続の窓は WINDOW_UPDATE でしか広げられません**
+
+実験の出力をもう一度見ると、この動きがそのまま出ています。サーバは SETTINGS でストリームの窓を 4,194,304 に上げ、直後に接続の窓を `increment=4128769` で広げていました。4,194,304 − 65,535 = 4,128,769 なので、**初期値の 65,535 に足して、接続の窓も 4MiB に揃えた**ことになります。また、5 バイトの DATA を送るたびに、ストリーム 0 への `increment=5` が返ってきました。使った 5 バイト分の貸しを返しているわけです。
+
+<Callout type="tip" title="窓が小さいと、TCP が速くても遅い">
+  HTTP/2 の窓も、帯域遅延積（第 54 回）より小さければ速度を縛ります（[RFC 9113 5.2.3](https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.3)）。
+  初期値の 65,535 バイトのままだと、RTT 100 ミリ秒の経路では 1 ストリームあたり約 5 Mbps が上限です。
+  TCP のウィンドウスケールを効かせても、その上の HTTP/2 の窓で詰まります。gRPC が窓を大きく取り、PING で帯域遅延積を見積もるのはこのためです。
+  なお HTTP/2 のフロー制御は**1 ホップごと**で、プロキシを挟めば、その両側で別々に窓が働きます。
+</Callout>
+
+## 1 本だけ取り消す、接続ごと畳む
+
+**RST_STREAM** は、4 バイトのエラーコードだけを持つフレームで、**そのストリームだけ**を即座に閉じます（[RFC 9113 6.4](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.4)）。利用者がページを離れた、呼び出しのタイムアウトが過ぎた、というときに、接続を切らずにそのリクエストだけを取り消せます。実験でも、ストリーム 5 に HEADERS を送った直後に RST_STREAM（CANCEL = 0x8）を送ると、サーバからは何も返らず、その後も接続はそのまま使えました。
+
+**GOAWAY** は接続全体に対するもので、「この接続ではもう新しいストリームを受け付けない」と伝えます。中身は**最後に処理した（かもしれない）ストリーム ID** とエラーコードです（[RFC 9113 6.8](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.8)）。受け取った側は、その ID より大きいストリームは処理されていないと分かるので、**別の接続で安全にやり直せます**。
+
+RFC は、行儀のよい終わり方として 2 段の手順を勧めています。まず最後の ID を 2³¹−1 にした GOAWAY で「もうすぐ閉じる」と予告し、少なくとも 1 往復待ってから、本当の最後の ID を入れた GOAWAY を送ります。予告と入れ違いに送られてきたリクエストを取りこぼさないためです。gRPC のサーバに SIGTERM を送り、`server.stop(grace=5)` を呼ばせると、そのとおりのフレームが届きました。
+
+```
+--- サーバに SIGTERM を送る
+<< [00 00 17 07 00 00 00 00 00] GOAWAY  flags=0x00 stream=0 len=23  last_stream_id=2147483647 error_code=0 debug=b'Server shutdown'
+<< [00 00 08 06 00 00 00 00 00] PING    flags=0x00 stream=0 len=8  aba7623280750dec
+<< [00 00 17 07 00 00 00 00 00] GOAWAY  flags=0x00 stream=0 len=23  last_stream_id=0 error_code=0 debug=b'Server shutdown'
+  ( ConnectionError )
+```
+
+1 回目は 2147483647（2³¹−1）と NO_ERROR、間に PING で 1 往復を確かめ、2 回目は最後の ID が 0（この接続ではストリームを 1 本も開いていない）です。その後、接続が閉じられました。これは第 107 回のローリングアップデートで、Pod を止めるときに使う手順そのものです。
+
+<Callout type="warn" title="取り消せることが攻撃になる: Rapid Reset">
+  RST_STREAM は安く送れますが、受け取った側は、そのリクエストの処理をすでに始めているかもしれません。
+  **HTTP/2 Rapid Reset**（[CVE-2023-44487](https://nvd.nist.gov/vuln/detail/CVE-2023-44487)）は、
+  HEADERS を送った直後に RST_STREAM で取り消すことを大量に繰り返す攻撃です。
+  取り消したストリームは同時に開いている数に数えられないので、`MAX_CONCURRENT_STREAMS` の制限をすり抜けて、
+  1 本の接続から際限なくリクエストを始めさせられます。Google は、毎秒 3 億 9800 万リクエストを超える攻撃を観測したと報告しています（[Google Cloud](https://cloud.google.com/blog/products/identity-security/how-it-works-the-novel-http2-rapid-reset-ddos-attack)）。
+  対策の中心は、接続ごとに取り消しの割合などを数え、度を越した接続を GOAWAY で閉じることです（同じ記事）。
+</Callout>
+
+## 優先度は作り直された
+
+RFC 7540 の HTTP/2 には、ストリームの依存関係と重みで優先度を木構造として伝える仕組みがありました。しかし複雑すぎて実装がばらつき、多くのサーバはこの合図を無視していました。RFC 9113 はこの仕組みを**非推奨**にしています（[RFC 9113 5.3](https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3)）。代わりに勧められているのが [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218.html) の方式で、`Priority` ヘッダ（または PRIORITY_UPDATE フレーム）に、緊急度 `u`（0〜7、既定 3）と、少しずつ返してよいかを示す `i` を書くだけの単純なものです。HTTP/3 でも同じ形で使えます。
+
+## 残った問題: TCP の HOL ブロッキング
+
+HTTP/2 は、HTTP の層での「前が終わるまで待つ」を取り除きました。しかし、その下の TCP は第 54 回で見たとおり **1 本のバイト列**です。
+
+```
+ストリーム 1 の DATA ─┐
+ストリーム 3 の DATA ─┼─→ TCP のセグメント  [A][B][×][D][E]
+ストリーム 5 の DATA ─┘                           ↑ 1 つ失われる
+
+TCP は [×] が再送されて届くまで、[D][E] をアプリケーションに渡さない
+→ [D][E] がストリーム 3 と 5 のものでも、HTTP/2 は読めない
+```
+
+損失が 1 つあると、**無関係なストリームまで全部待たされます**。HTTP/1.1 で 6 本の接続を張っていれば止まるのは 1 本でしたが、HTTP/2 は 1 本にまとめたぶん、影響が接続全体に及びます。フレームの形をいくら工夫しても、これは TCP の約束なので直せません。
+
+## まとめ
+
+- HTTP/2 は HTTP の意味を変えずに、線の上の形をバイナリのフレームに作り直した
+- フレームは 9 バイトのヘッダ（長さ 24 ビット、型、フラグ、ストリーム ID 31 ビット）で始まる。ストリーム 0 は接続そのもの
+- https では ALPN の `h2` で、平文では prior knowledge の h2c で始める。最初にプリフェースと SETTINGS を交換し、SETTINGS には ACK を返す
+- クライアントのストリームは奇数で、使い回さない。END_STREAM で片方向を閉じ、異なるストリームのフレームを混ぜて流すのが多重化
+- HPACK は静的表・動的表・ハフマンでヘッダを縮める。値全体でしか一致を取らないのは CRIME への対策
+- フロー制御はストリームと接続の 2 段で、初期値は 65,535 バイト。DATA だけが対象で、WINDOW_UPDATE で窓を返す。その下で TCP の窓も働く
+- RST_STREAM は 1 本だけを取り消し、GOAWAY は最後の ID を示して接続を畳む。取り消しの安さは Rapid Reset の攻撃にも使われた
+- 1 本の TCP に多重化したので、TCP の HOL ブロッキングは接続全体に及ぶ
+
+次の回では、この最後の問題に対する答えを見ます。TCP をやめて、**UDP の上にストリームごとに独立した順序を持つ QUIC** を置き、その上で HTTP を話す HTTP/3 です。

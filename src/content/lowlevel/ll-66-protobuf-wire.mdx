@@ -1,0 +1,386 @@
+---
+title: Protocol Buffers のワイヤ形式
+description: スキーマを持たない受け手に 30 バイトのメッセージを渡したら、何が読めて何が読めないのか。varint とタグの組み立てを 1 バイトずつ読み、そこから互換性の規則を導きます
+chapter: rpc
+order: 3
+status: published
+topics:
+  - Protocol Buffers
+  - varint
+  - タグ（フィールド番号とワイヤ型）
+  - ZigZag 符号化
+  - LEN（長さ前置）
+  - packed repeated
+  - 未知のフィールド
+  - reserved
+  - 決定的でないシリアライズ
+requires:
+  - ll-03-endian
+  - ll-02-twos-complement
+  - ll-05-text
+  - ll-65-http3-quic
+---
+
+import Callout from '../../components/Callout.astro'
+
+前回までの 2 回で、HTTP/2 と HTTP/3 がバイト列を**どう運ぶか**を見ました。フレームに分け、ストリームに番号を振り、QUIC では失われたパケットの影響を 1 本のストリームに閉じ込めます。
+
+しかし、運ばれる DATA フレームの中身については、まだ何も決めていません。サービス同士が「ユーザー 150 番の名前は yuki」と伝えるとき、その事実はどんなバイト列になるのでしょうか。この回からは**運ばれる中身**に移ります。題材は、gRPC が標準で使う **Protocol Buffers**（以下 protobuf）です。小さなメッセージを実際に符号化し、出てきたバイト列を 1 バイトずつ読み解きます。
+
+## なぜバイナリなのか
+
+同じ中身は JSON でも書けます。JSON は人間が読め、スキーマが無くても受け手が構造を知ることができ、ブラウザや `curl` でそのまま扱えます。protobuf の公式の概要も、自身を「JSON に似ているが、より小さく速い」と紹介しています（[Overview](https://protobuf.dev/overview/)）。
+
+違いは、**何を線に乗せ、何を受け手に預けるか**の分担にあります。
+
+| | JSON | protobuf（バイナリ） |
+| --- | --- | --- |
+| フィールドの名前 | 毎回送る（`"name":`） | 送らない。番号だけを送る |
+| 数値 | 10 進の文字列（`305419896`） | 2 進（varint か固定長） |
+| 構造の手がかり | 括弧・引用符・カンマ | 長さの前置 |
+| 読むのに必要なもの | データだけ | データと `.proto`（スキーマ） |
+
+名前を送らず、数を 2 進のまま送るので、小さくなります。受け手は区切り文字を探して文字を 1 つずつ調べる代わりに、長さを読んでその分だけ進めばよいので、解析も軽くなります。第 57 回の DNS が名前を「長さ + ラベル」で書いたのと同じ考え方です。
+
+代わりに、**データだけでは意味が完全には分かりません**。公式の概要も「メッセージは自分自身を記述しない。対応する `.proto` が無ければ完全には解釈できない」と明記しています（[When are Protocol Buffers not a Good Fit?](https://protobuf.dev/overview/#not-good-fit)）。どちらが優れているかではなく、**スキーマを双方が共有できる場面では、その共有を前提に削れるものを削った**形式だと考えるのが適切です。
+
+## 最初の 3 バイト
+
+公式の解説は、`int32 a = 1;` だけを持つメッセージの `a` に 150 を入れた例から始まります。結果は **`08 96 01` の 3 バイト**です（[Encoding: A Simple Message](https://protobuf.dev/programming-guides/encoding/#simple)）。`08` がタグ（どのフィールドか、どう読むか）、`96 01` が値の 150 です。
+
+## varint: 7 ビットずつ、最上位ビットは「続きがある」
+
+protobuf の整数の多くは **varint**（可変長整数）で書かれます。規則は 2 つだけです（[Encoding: Base 128 Varints](https://protobuf.dev/programming-guides/encoding/#varints)）。
+
+- 各バイトの**下位 7 ビットが値**の一部
+- **最上位ビット（MSB）が 1 なら、次のバイトも同じ数の続き**。0 なら、そのバイトで終わり
+
+7 ビットの断片は**下位の断片から先に**並びます。150 を読むと次のとおりです。
+
+```
+96       01
+10010110 00000001        元のバイト
+ 0010110  0000001        MSB（続きの印）を落とす
+ 0000001  0010110        後ろの断片が上位。並べ替える
+   00000010010110  = 128 + 16 + 4 + 2 = 150
+```
+
+第 1 回で見たとおり、1 バイトで表せるのは 0〜255 です。varint はそのうち 1 ビットを「続きの印」に使うので、**1 バイトで 0〜127、2 バイトで 0〜16383** を表します。64 ビットの値は最大 10 バイトです。小さい数ほど短くなるので、ID や件数のように小さな値が多いデータで効きます。
+
+第 3 回のエンディアンと比べると、**varint は下位から並ぶという点でリトルエンディアンに近い**形をしています。ただしバイト単位ではなく 7 ビット単位で、長さも固定ではありません。一方、固定長の型（後述の `fixed32` や `double`）は、公式の早見表が「4 バイトの**リトルエンディアン**」と明記しています（[Condensed Reference Card](https://protobuf.dev/programming-guides/encoding/#cheat-sheet)）。第 3 回で見た「ネットワークはビッグエンディアン」という慣習には従っていません。
+
+前回の QUIC も可変長整数を使いますが、作りが違います。QUIC は**先頭バイトの上位 2 ビットで長さ（1・2・4・8 バイト）を示し、値はネットワークバイトオーダー**で置きます（[RFC 9000 16](https://datatracker.ietf.org/doc/html/rfc9000#section-16)）。長さが先頭で分かる代わりに 1 バイトで表せるのは 0〜63 で、protobuf は 1 バイトずつ MSB を見ながら読み進める代わりに 0〜127 を 1 バイトに収めます。
+
+## タグ: フィールド番号とワイヤ型
+
+メッセージは「タグ、値」の組の繰り返しです。**タグはそれ自体が varint** で、次の式で作ります（[Encoding: Message Structure](https://protobuf.dev/programming-guides/encoding/#structure)）。
+
+```
+タグ = (フィールド番号 << 3) | ワイヤ型
+```
+
+下位 3 ビットが**ワイヤ型**、残りがフィールド番号です。ワイヤ型は、値をどう読み飛ばすかを受け手に教えます。
+
+| ワイヤ型 | 名前 | 値の形 | 使う型 |
+| --- | --- | --- | --- |
+| 0 | VARINT | varint | int32, int64, uint32, uint64, sint32, sint64, bool, enum |
+| 1 | I64 | 8 バイト固定 | fixed64, sfixed64, double |
+| 2 | LEN | varint の長さ + その長さのバイト列 | string, bytes, 入れ子のメッセージ, packed repeated |
+| 3, 4 | SGROUP, EGROUP | （廃止された group の開始と終了） | 使わない |
+| 5 | I32 | 4 バイト固定 | fixed32, sfixed32, float |
+
+最初の例の `08` は `0000 1000` で、下位 3 ビットが 0（VARINT）、右に 3 ビットずらすと 1 です。つまり「**1 番のフィールド、値は varint**」と読めます。
+
+タグ自体が varint なので、番号が小さいほどタグは短くなります。**番号 1〜15 はタグが 1 バイト、16〜2047 は 2 バイト**です。フィールド番号に使えるのは 1〜536,870,911（2<sup>29</sup> − 1）で、32 ビットから 3 ビットをワイヤ型に取られた残りです（[proto3: Assigning Field Numbers](https://protobuf.dev/programming-guides/proto3/#assigning)）。公式が「よく使うフィールドには 1〜15 を使う」と勧めるのはこのためです。
+
+ワイヤ型の要点は、**型の詳細ではなく「読み飛ばし方」だけを書いている**ことです。受け手が知らない番号に出会っても、ワイヤ型を見れば値がどこで終わるかが分かり、次のタグへ進めます。この性質が、後で見る互換性の土台になります。
+
+## 実験: 30 バイトを手で読む
+
+手元で次のスキーマを用意しました（protobuf の Python ランタイム 7.36.2、`python3 -m grpc_tools.protoc` に同梱の libprotoc 35.1）。
+
+```proto
+syntax = "proto3";
+package lab;
+
+message Address { string city = 1; }
+
+message User {
+  int32 id = 1;
+  string name = 2;
+  repeated int32 scores = 3;
+  Address home = 4;
+  fixed32 flags = 5;
+  map<string, int32> tags = 6;
+}
+```
+
+`python3 -m grpc_tools.protoc -Iproto --python_out=gen proto/user.proto` で生成した `user_pb2` でメッセージを作り、`SerializeToString()` の結果を 16 進で表示します。
+
+```python
+u = user_pb2.User(id=150, name="yuki", scores=[1, 2, 300], flags=0x12345678)
+u.home.city = "東京"
+data = u.SerializeToString()
+print(len(data), "バイト")
+print(data.hex(" "))
+```
+
+```
+30 バイト
+08 96 01 12 04 79 75 6b 69 1a 04 01 02 ac 02 22 08 0a 06 e6 9d b1 e4 ba ac 2d 78 56 34 12
+```
+
+1 バイトずつ区切ると、次のようになります。
+
+```
+08                   タグ: 番号 1, VARINT           (1 << 3) | 0 = 0x08
+96 01                  値: 150
+12                   タグ: 番号 2, LEN              (2 << 3) | 2 = 0x12
+04                     長さ: 4
+79 75 6b 69            "yuki"
+1a                   タグ: 番号 3, LEN              (3 << 3) | 2 = 0x1a
+04                     長さ: 4
+01 02 ac 02            1, 2, 300（varint を 3 つ詰めたもの）
+22                   タグ: 番号 4, LEN              (4 << 3) | 2 = 0x22
+08                     長さ: 8
+0a 06 e6 9d b1 e4 ba ac   入れ子の Address: 番号 1, LEN, 長さ 6, "東京"
+2d                   タグ: 番号 5, I32              (5 << 3) | 5 = 0x2d
+78 56 34 12            0x12345678 をリトルエンディアンで 4 バイト
+```
+
+同じ内容を空白なしの JSON（`{"id":150,"name":"yuki","scores":[1,2,300],"home":{"city":"東京"},"flags":305419896}`）で書くと 86 バイトでした。差の大部分は、`"scores":` のような**名前**と、`305419896` を 9 文字の 10 進で書くことから来ています。protobuf 側では名前はどこにも出てきません。
+
+### 番号と値だけは、スキーマ無しでも読める
+
+`protoc --decode_raw` は、`.proto` を与えずにバイト列を解釈します。
+
+```
+$ python3 -m grpc_tools.protoc --decode_raw < user.bin
+1: 150
+2: "yuki"
+3: "\001\002\254\002"
+4 {
+  1: "\346\235\261\344\272\254"
+}
+5: 0x12345678
+```
+
+番号と値の区切りは正しく読めています。ワイヤ型が読み飛ばし方を教えるからです。一方で、**名前は一つも復元できません**。さらに、番号 3 は packed の整数列なのに文字列として、番号 4 は中身が偶然メッセージとして解釈できたので入れ子として表示されています。**LEN の中身が文字列か、bytes か、メッセージか、packed の列かは、線の上では区別できない**のです。`--decode=lab.User` でスキーマを渡すと、同じバイト列が `id: 150`、`scores: 1`、`scores: 2`、`scores: 300`、`home { city: ... }` と、名前付きで正しく読めます。
+
+### varint とタグを自分で読む
+
+ここまでの規則は、Python で 20 行ほどに収まります。
+
+```python
+def encode_varint(n):
+    n &= (1 << 64) - 1          # 負の数は 64 ビットの 2 の補数として扱う
+    out = bytearray()
+    while True:
+        low7, n = n & 0x7F, n >> 7
+        out.append(low7 | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+def decode_varint(buf, pos=0):
+    result = shift = 0
+    while True:
+        b = buf[pos]
+        result |= (b & 0x7F) << shift
+        pos, shift = pos + 1, shift + 7
+        if not b & 0x80:
+            return result, pos
+```
+
+符号化の結果は公式の例と一致し、`decode_varint` でタグを読んで下位 3 ビットで分岐するループを足すと、`user.bin` から `--decode_raw` と同じ番号・ワイヤ型・値の並びが得られました。
+
+```
+   1 -> 01
+ 150 -> 96 01
+ 300 -> ac 02
+  -1 -> ff ff ff ff ff ff ff ff ff 01
+```
+
+-1 が 10 バイトになる理由は、次の節で扱います。
+
+## 負の数: int32 の -1 は 10 バイト
+
+varint は符号なしの整数を書く方式です。では負の数はどうなるのでしょうか。`int32 a = 1; sint32 b = 2;` を持つメッセージで比べました。
+
+```
+   1  int32: 08 01                             sint32: 10 02
+  -1  int32: 08 ff ff ff ff ff ff ff ff ff 01  sint32: 10 01
+  -2  int32: 08 fe ff ff ff ff ff ff ff ff 01  sint32: 10 03
+  63  int32: 08 3f                             sint32: 10 7e
+ -64  int32: 08 c0 ff ff ff ff ff ff ff ff 01  sint32: 10 7f
+ -65  int32: 08 bf ff ff ff ff ff ff ff ff 01  sint32: 10 81 01
+```
+
+**`int32` の負の数は、どれも 10 バイト**です。`int32` と `int64` は負の数を 2 の補数で表し、**64 ビットの符号なし整数として見たときの値**を varint にします（[Encoding: Signed Integers](https://protobuf.dev/programming-guides/encoding/#signed-ints)）。第 2 回で見たとおり、2 の補数の -1 はすべてのビットが 1 です。64 ビットすべてが 1 の数を 7 ビットずつ切ると 10 個の断片になり、最上位の断片まで 0 になりません。32 ビットの型であっても 64 ビットに広げて書くので、結果として `int32` で書いた値を `int64` として読んでも同じ値になります。
+
+**`sint32` と `sint64` は ZigZag 符号化**を使います。0, -1, 1, -2, 2, … を 0, 1, 2, 3, 4, … に対応させ、**絶対値の小さい数を小さい符号なし整数に**写してから varint にします。
+
+```
+sint32: (n << 1) ^ (n >> 31)
+sint64: (n << 1) ^ (n >> 63)
+```
+
+`n >> 31` は算術シフトなので、負の数なら全ビット 1、正の数なら 0 になります。左に 1 ずらした値とこれを XOR すると、負の数は奇数に、正の数は偶数に移ります。公式の型の表も、`int32` について「負の数を符号化するのは非効率。負の値を取りやすいなら `sint32` を使う」と書いています（[proto3: Scalar Value Types](https://protobuf.dev/programming-guides/proto3/#scalar)）。
+
+<Callout type="warn" title="int32 と sint32 は線の上では別物">
+  どちらもワイヤ型は 0（VARINT）なので、受け手はタグだけでは区別できません。
+  実験で、`int32` の -1 のバイト列をそのまま `sint32` のフィールドとして読ませると
+  **-2147483648** になり、`sint32` の -1（`01`）を `int32` として読ませると **1** になりました。
+  エラーにはならず、黙って別の値になります。型を途中で `int32` から `sint32` に変えてはいけない理由がこれです。
+</Callout>
+
+## LEN: 文字列、bytes、入れ子、packed
+
+ワイヤ型 2 の LEN は、**varint の長さ**の後にその長さのバイト列を置きます（[Encoding: Length-Delimited Records](https://protobuf.dev/programming-guides/encoding/#length-types)）。長さは int32 の varint なので、文字列や bytes の上限は 2GB です。
+
+LEN に入るものは 4 種類ありますが、線の上ではどれも同じ形です。
+
+| 中身 | 扱い |
+| --- | --- |
+| `string` | **正しい UTF-8 でなければならない**（[Condensed Reference Card](https://protobuf.dev/programming-guides/encoding/#cheat-sheet)） |
+| `bytes` | 任意のバイト列 |
+| 入れ子のメッセージ | 中身は、それ自体が 1 つのメッセージの符号化（[Encoding: Submessages](https://protobuf.dev/programming-guides/encoding/#embedded)） |
+| packed repeated | 数値の要素を、タグ無しで詰めて並べたもの |
+
+`string` が UTF-8 であることは、第 5 回で見た「番号をどうバイトに落とすか」を protobuf が UTF-8 に固定しているということです。手元の Python では、`ff fe` という UTF-8 として不正なバイト列を同じ番号・同じワイヤ型で渡すと、`bytes` のフィールドなら読め、`string` のフィールドなら解析が失敗しました。
+
+```
+bytes で読む: b'\xff\xfe'
+string で読む: DecodeError Error parsing message with type 'lab.Blob': String field had bad UTF-8
+```
+
+**packed repeated** は、先ほどの `1a 04 01 02 ac 02` です。要素ごとにタグを付ける代わりに、1 つの LEN の中に値だけを詰めます。proto3 では、スカラーの数値型の `repeated` は**既定で packed** です（[proto3: Repeated Fields are Packed by Default](https://protobuf.dev/programming-guides/proto3/#use-packed)）。`string` やメッセージの `repeated` は、それ自体が長さを持つので packed にできず、要素ごとに 1 つのレコードになります。受け手は packed と packed でない形の**両方を受け付けなければならない**とされています（[Encoding: Repeated Elements](https://protobuf.dev/programming-guides/encoding/#repeated)）。
+
+`map` も、ワイヤの上では特別な形を持ちません。**`key = 1`、`value = 2` を持つ入れ子のメッセージの repeated** として書かれます（[Encoding: Maps](https://protobuf.dev/programming-guides/encoding/#maps)）。`tags = {"x": 1, "y": 2}` を入れると、番号 6 の LEN が 2 つ並びました。
+
+```
+32 05 0a 01 78 10 01    番号 6, LEN, 長さ 5: { 1: "x", 2: 1 }
+32 05 0a 01 79 10 02    番号 6, LEN, 長さ 5: { 1: "y", 2: 2 }
+```
+
+`map` や `oneof`、`optional` が言語の側でどんな意味を持つかは、第 67 回で扱います。
+
+## 名前は線に乗らない。番号がすべて
+
+ここまでのバイト列には、`id` も `name` も一度も出てきませんでした。**フィールドを識別するのは番号だけ**です。そこから、受け手の振る舞いについていくつかの規則が決まっています。
+
+**順序は自由。** 書き手がどの順でフィールドを並べても、受け手は受け付けなければなりません（[Encoding: Field Order](https://protobuf.dev/programming-guides/encoding/#order)）。番号 2 を先、番号 1 を後に置いたバイト列 `12 01 61 08 05` も、問題なく `id: 5, name: "a"` として読めました。
+
+**同じ番号が 2 回来たら、最後が勝つ。** 数値や文字列は最後の値を採り、入れ子のメッセージはマージし、repeated は連結します（[Encoding: Last One Wins](https://protobuf.dev/programming-guides/encoding/#last-one-wins)）。この規則から、**2 つのメッセージのバイト列を連結して読むと、それぞれ読んでマージした結果と同じになります**。実際に試しました。
+
+```python
+a = user_pb2.User(id=1, name="a", scores=[1], home={"city": "Osaka"})
+b = user_pb2.User(id=2, scores=[2])
+m = user_pb2.User.FromString(a.SerializeToString() + b.SerializeToString())
+print(m.id, m.name, list(m.scores), m.home.city)   # 2 a [1, 2] Osaka
+```
+
+`id` は後の 2 が勝ち、`b` が持たない `name` と `home` は `a` のまま残り、`scores` は連結されています。
+
+**無いフィールドは書かない。** 値が入っていないフィールドはレコードごと省かれます（[Encoding: Missing Elements](https://protobuf.dev/programming-guides/encoding/#optional)）。フィールドを数百持つメッセージでも、使っていなければバイト列は短いままです。
+
+## 未知のフィールドは保持される
+
+番号が分からないフィールドに出会った受け手は、ワイヤ型に従って読み飛ばせます。protobuf はさらに一歩進んで、**読み飛ばした分を捨てずに持っておき、再び書き出すときにそのまま出力します**。proto3 のメッセージも未知のフィールドを保持し、解析と出力の両方に含めます（[proto3: Unknown Fields](https://protobuf.dev/programming-guides/proto3/#unknowns)）。
+
+proto3 は当初、未知のフィールドを捨てていました。保持するように変わったのは 3.5.0 で、リリースノートには「proto3 でも、多くの言語の実装で未知のフィールドが既定で保持されるようになった」とあります（[v3.5.0 release notes](https://github.com/protocolbuffers/protobuf/releases/tag/v3.5.0)）。
+
+2 つの版を用意して確かめました。
+
+```proto
+message Profile { int32 id = 1; string name = 2; }                    // v1
+message Profile { int32 id = 1; string name = 2; string email = 3; }  // v2
+```
+
+新しい版で書き、古い版で読み、古い版のまま `name` だけ書き換えて書き出し、それを新しい版で読みます。
+
+```
+v2 が書いた: 08 07 12 04 79 75 6b 69 1a 0d 79 40 65 78 61 6d 70 6c 65 2e 63 6f 6d
+v1 で読む  : id: 7
+name: "yuki"
+
+未知      : 3 2 b'y@example.com'
+v1 が書き直す: 08 07 12 04 59 55 4b 49 1a 0d 79 40 65 78 61 6d 70 6c 65 2e 63 6f 6d
+v2 で読む  : id: 7
+name: "YUKI"
+email: "y@example.com"
+```
+
+古い版は `email` を知りませんが、番号 3・ワイヤ型 2 のレコードとして保持し、書き直したバイト列の末尾にそのまま残しました。**間に古い版のサービスが挟まっても、新しいフィールドが途中で消えません**。
+
+ただし、保持されるのはバイナリのまま扱う場合だけです。同じメッセージを `json_format.MessageToJson()` で JSON にすると `{"id": 7, "name": "YUKI"}` となり、`email` は消えました。
+
+公式も、JSON への変換や、フィールドを 1 つずつ別のメッセージに写す処理では未知のフィールドが失われるとしています（[proto3: Retaining Unknown Fields](https://protobuf.dev/programming-guides/proto3/#retaining)）。
+
+## ここから導かれる互換性の規則
+
+番号だけで識別し、未知のものは残す。この 2 つから、スキーマを変えるときの規則が決まります。公式の「Updating A Message Type」節を、ワイヤ形式の言葉で読み直します（[proto3: Updating A Message Type](https://protobuf.dev/programming-guides/proto3/#updating)）。
+
+**番号を変えない。** 番号がフィールドそのものなので、番号を変えることは「消して、別のフィールドを足す」ことと同じです。古い版と新しい版の間で値が伝わらなくなります。
+
+**番号を再利用しない。** フィールドを消した後、その番号を別の意味で使うと、古い版が書いた値を新しい版が別のフィールドとして読みます。ワイヤ形式には、どの定義で書かれたかを見分ける手段がありません。公式は起こりうる結果として、解析エラー（これが最善の場合）、個人情報の漏えい、データの破損を挙げています（[proto3: Consequences of Reusing Field Numbers](https://protobuf.dev/programming-guides/proto3/#consequences)）。消した番号は `reserved` に書き、コンパイラに再利用を止めさせます（[proto3: Reserved Field Numbers](https://protobuf.dev/programming-guides/proto3/#reserved-field-numbers)）。
+
+```proto
+message Profile {
+  reserved 3;
+  reserved "email";
+  int32 id = 1;
+  string name = 2;
+}
+```
+
+**フィールドを足す・消すのは安全。** 古い版には未知のフィールドとして見え、新しい版には値の無いフィールドとして見えます。
+
+**型の変更は、ワイヤ型と解釈が合うものだけ。** 公式が「条件付きで互換」とする主なものを、この回で見た仕組みと並べます（[proto3: Binary Wire-compatible Changes](https://protobuf.dev/programming-guides/proto3/#conditionally-safe-changes)）。
+
+| 変更 | 可否 | ワイヤ形式から見た理由 |
+| --- | --- | --- |
+| `int32` / `uint32` / `int64` / `uint64` / `bool` の相互 | 互換 | どれも同じ varint。収まらない値は C++ のキャストと同じく切り詰められる |
+| `sint32` と `sint64` | 互換 | どちらも ZigZag |
+| `sint32` と `int32` など | **非互換** | ワイヤ型は同じだが、ZigZag と 2 の補数で解釈が違う（上の実験） |
+| `string` と `bytes` | 互換 | どちらも LEN。ただし中身が正しい UTF-8 である場合に限る |
+| 入れ子のメッセージと `bytes` | 互換 | どちらも LEN。bytes の中身がそのメッセージの符号化である場合 |
+| `fixed32` と `sfixed32`、`fixed64` と `sfixed64` | 互換 | 同じ幅の固定長 |
+
+「互換」は**同じバイト列を読めるという意味で、値が失われないという保証ではありません**。`int64` の大きな値を `int32` で読めば上位のビットが落ちます。公式は、このような変更は全員に新しいスキーマが行き渡るまで範囲内の値だけを書くよう、展開を管理できる場合に限るべきだとしています。
+
+<Callout type="note" title="JSON で運ぶと、規則が逆になる">
+  名前が線に乗らないのは、バイナリ形式の話です。protobuf を JSON で表す ProtoJSON では、フィールドは**名前**で識別されます。
+  そのため規則が入れ替わり、番号の変更は ProtoJSON では安全（ただしバイナリでは危険なので勧めない）、
+  `int32` と `sint32` の変更も安全ですが、`string` と `bytes` の変更は安全ではありません
+  （[ProtoJSON Wire Safety](https://protobuf.dev/programming-guides/json/#json-wire-safety)）。
+  どちらの形式で運ぶかによって、守るべき規則が変わります。
+</Callout>
+
+互換性の検査を人の注意に頼らず機械で行う方法は、第 70 回で扱います。
+
+## 同じ内容が同じバイト列になるとは限らない
+
+ここまでの規則は、受け手に自由を与える一方で、書き手にも自由を与えています。フィールドの順序は決まっておらず、`map` の並び順も保証されず、未知のフィールドは既知のフィールドの後ろに書かれるのが普通です。
+
+公式は、**既定のシリアライズは決定的ではない**と明記しています。同じインスタンスを 2 回シリアライズしても同じバイト列になるとは限らず、`Hash(foo.SerializeAsString()) == Hash(foo.SerializeAsString())` のような比較さえ失敗しうるとしています（[Encoding: Implications](https://protobuf.dev/programming-guides/encoding/#implications)）。決定的なシリアライズを指定する選択肢（Python なら `SerializeToString(deterministic=True)`）もありますが、保証されるのは**同じバイナリの中で**同じ出力になることだけです。ライブラリの版やビルドの設定が変われば出力も変わります。
+
+さらに根本的な障害は、先ほど `--decode_raw` で見た曖昧さです。未知のフィールドの LEN が bytes なのかメッセージなのかは分からないので、中まで正規化することができません。公式はこれを理由に、**protobuf のシリアライズは正規形ではなく、正規形にすることもできない**と述べ、バイト列をハッシュのキーにしたり、フィンガープリントを取ったり、等しさの判定に使ったりしないよう勧めています（[Proto Serialization Is Not Canonical](https://protobuf.dev/programming-guides/serialization-not-canonical/)）。署名やキャッシュのキーが必要なら、フィールドを名指しした専用の関数で作ります。
+
+## 大きさの上限
+
+長さが int32 の varint で書かれることと対応して、**シリアライズしたメッセージは 2 GiB 未満**でなければなりません。多くの実装は、これを超えるメッセージのシリアライズや解析を拒否します（[Encoding: Size Limitations](https://protobuf.dev/programming-guides/encoding/#size-limit)、[Proto Limits](https://protobuf.dev/programming-guides/proto-limits/#total)）。
+
+ただし、2 GiB は実用上の目安ではありません。公式の概要は、protobuf が数 MB までのデータを想定しており、メッセージ全体を一度にメモリへ読み込む前提で作られていると述べています（[Overview](https://protobuf.dev/overview/#not-good-fit)）。大きなデータは、小さなメッセージに分けて流すほうが扱いやすくなります。gRPC がそのための仕組みとしてストリームを持つことは、第 68 回で見ます。
+
+## まとめ
+
+- protobuf のバイナリ形式は、名前を送らず番号だけを送る。受け手が `.proto` を共有していることを前提に、小ささと解析の軽さを得ている
+- varint は 7 ビットずつ下位から並べ、各バイトの最上位ビットで「続きがある」を示す。固定長の型はリトルエンディアン
+- タグは `(フィールド番号 << 3) | ワイヤ型` の varint。ワイヤ型 0・1・2・5 が読み飛ばし方を決め、3・4 は廃止された group
+- `int32` の負の数は 64 ビットに広げて書くので 10 バイトになる。負の値が多いなら ZigZag の `sint32`。両者を入れ替えると黙って値が変わる
+- LEN は長さ前置で、文字列（UTF-8 必須）、bytes、入れ子、packed repeated が同じ形になる。スキーマが無いと中身の種類は区別できない
+- 順序は自由、同じ番号は最後が勝ち、入れ子はマージされる。未知のフィールドはバイナリのまま扱う限り保持される
+- 互換性の規則はここから導かれる。番号を変えない、再利用しない（`reserved`）、ワイヤ型と解釈が一致する型の間でだけ変更する
+- シリアライズは決定的でも正規形でもない。バイト列を比較やハッシュに使わない。メッセージは 2 GiB 未満
+
+今回はワイヤの上の姿だけを見たので、`map` は「入れ子のメッセージの repeated」としか見えませんでした。`oneof` に至っては、線の上では普通のフィールドと区別がつきません（[Encoding: Oneofs](https://protobuf.dev/programming-guides/encoding/#oneofs)）。次の回では視点を `.proto` の側に戻し、`optional` による値の有無の区別、`oneof`、`map`、よく使われる型（well-known types）といった、protobuf で**何を表せるか**を見ていきます。

@@ -1,0 +1,347 @@
+---
+title: gRPC のエラー
+description: gRPC の失敗は、なぜ HTTP のステータスではなく意味の決まった 17 個のコードで表すのか、どのコードなら再試行してよいのか。コードと 1 行のメッセージに収まらない詳細は、トレーラのどこにどんな形で入るのかを、実際のバイト列で確かめます
+chapter: rpc
+order: 6
+status: published
+topics:
+  - gRPC ステータスコード
+  - INVALID_ARGUMENT / FAILED_PRECONDITION
+  - UNAVAILABLE と再試行
+  - retryPolicy
+  - google.rpc.Status
+  - grpc-status-details-bin
+  - ErrorInfo / BadRequest
+  - AIP-193
+  - HTTP ステータスとの対応
+requires:
+  - ll-68-grpc-wire
+  - ll-66-protobuf-wire
+---
+
+import Callout from '../../components/Callout.astro'
+
+前回は、gRPC の呼び出しの結果が HTTP/2 の**トレーラ**の `grpc-status` と `grpc-message` で返り、HTTP の `:status` は失敗したときも 200 のままであることを見ました。
+
+では、`grpc-status` にはどんな値が入り、サーバを書く側はどれを選べばよいのでしょうか。受け取った側は、その値を見て何を決めればよいのでしょうか。そして、「どの欄が、なぜ間違っているのか」のように数字 1 つと 1 行の文に収まらない情報は、どこで運ぶのでしょうか。この回では、gRPC のエラーの表し方と使い分けを、実際にトレーラを覗きながら見ます。
+
+## 17 個のコード
+
+gRPC のステータスコードは 0 から 16 までの **17 個**だけです（[statuscodes.md](https://github.com/grpc/grpc/blob/master/doc/statuscodes.md)、[google/rpc/code.proto](https://github.com/googleapis/googleapis/blob/master/google/rpc/code.proto)）。
+
+| 番号 | 名前 | 意味（要約） |
+| --- | --- | --- |
+| 0 | OK | 成功 |
+| 1 | CANCELLED | 呼び出しが取り消された。多くは呼び出し側による |
+| 2 | UNKNOWN | 分類できないエラー。情報の足りない API から来たエラーもここに入る |
+| 3 | INVALID_ARGUMENT | 引数そのものが不正。システムの状態によらない |
+| 4 | DEADLINE_EXCEEDED | 完了する前にデッドラインが切れた |
+| 5 | NOT_FOUND | 対象が見つからない |
+| 6 | ALREADY_EXISTS | 作ろうとした対象がすでにある |
+| 7 | PERMISSION_DENIED | 呼び出し元に権限がない |
+| 8 | RESOURCE_EXHAUSTED | 利用者ごとの割り当てやディスクなど、何かの資源が尽きた |
+| 9 | FAILED_PRECONDITION | システムが、その操作を実行できる状態にない |
+| 10 | ABORTED | 並行処理の衝突などで中断された |
+| 11 | OUT_OF_RANGE | 有効な範囲の外を指した |
+| 12 | UNIMPLEMENTED | その操作は実装されていない、または有効になっていない |
+| 13 | INTERNAL | 下位のシステムが保つべき不変条件が壊れた。深刻なエラー用 |
+| 14 | UNAVAILABLE | サービスが一時的に使えない |
+| 15 | DATA_LOSS | 回復できないデータの消失や破損 |
+| 16 | UNAUTHENTICATED | 有効な認証情報がない |
+
+HTTP のステータスと比べると、考え方の違いが見えます。HTTP のステータスは 3 桁の数で、**先頭の桁が 5 つの分類**を表します（[RFC 9110 15 節](https://www.rfc-editor.org/rfc/rfc9110#section-15)）。4xx は「送った側が悪い」、5xx は「サーバ側が失敗した」という、**責任の所在**による大分類です。知らない番号を受け取っても、先頭の桁で扱いを決められます。gRPC のコードにはそうした階層がなく、1 つ 1 つの意味が細かく決められています。そして後で見るように、その多くは「**受け取った側が次に何をすべきか**」で区別されています。直せば通るのか、待てば通るのか、もっと上の段からやり直すのか、です。
+
+## 紛らわしい組の使い分け
+
+コードの説明には、似たもの同士の選び方まで書かれています。複数が当てはまるなら**最も具体的なもの**を返します（`code.proto` の冒頭）。
+
+### INVALID_ARGUMENT と FAILED_PRECONDITION と OUT_OF_RANGE
+
+分かれ目は、**システムの状態が変われば通る可能性があるかどうか**です。
+
+- **INVALID_ARGUMENT**: システムの状態によらず不正な引数。形式の壊れたファイル名など
+- **FAILED_PRECONDITION**: 引数は正しいが、今のシステムの状態では実行できない。空でないディレクトリを消そうとした、など
+- **OUT_OF_RANGE**: 範囲の外。ファイルの末尾より先を読もうとした、など
+
+statuscodes.md の例では、32 ビットのファイルシステムで `[0, 2^32-1]` に入らないオフセットはどんな状態でも読めないので INVALID_ARGUMENT、今のファイルサイズより先のオフセットはファイルが伸びれば読めるので OUT_OF_RANGE です。FAILED_PRECONDITION と重なるときは **OUT_OF_RANGE を使う**よう勧めています。範囲を順にたどる呼び出し側が、「終わりに着いた」合図として使えるからです。
+
+### FAILED_PRECONDITION と ABORTED と UNAVAILABLE
+
+この 3 つには、選び方の指針がそのまま書かれています（[statuscodes.md](https://github.com/grpc/grpc/blob/master/doc/statuscodes.md)）。
+
+| コード | 使う場面 | 呼び出し側がすること |
+| --- | --- | --- |
+| UNAVAILABLE | 失敗した**その呼び出しだけ**をやり直せば済む | 間隔を空けて同じ呼び出しを再試行する |
+| ABORTED | **もっと上の段**からやり直すべき。例: 呼び出し側が指定した test-and-set が失敗した | 読み込みから書き込みまでの一連の流れを最初からやり直す |
+| FAILED_PRECONDITION | システムの状態が**明示的に直されるまで**再試行すべきでない | 状態を直す（ディレクトリの中身を消す、など）まで再試行しない |
+
+ABORTED は、第 37 回で見た CAS の失敗と同じ形です。「版番号が 7 のままなら書く」という更新が、間に別の書き込みが入って失敗したなら、同じ書き込みを送り直しても再び失敗します。読むところからやり直します。
+
+### NOT_FOUND と PERMISSION_DENIED
+
+権限のない利用者に NOT_FOUND と PERMISSION_DENIED を使い分けて返すと、その違いから**対象が存在するかどうか**が漏れます。存在を隠す方法について、2 つの資料は少し違うことを書いています。
+
+- **statuscodes.md**: 段階的な公開や非公開の許可リストのように、**ある種類の利用者全体**を断るなら NOT_FOUND を使ってよい。利用者ごとのアクセス制御のように、**同じ種類の中の一部**を断るなら PERMISSION_DENIED を使わなければならない
+- **AIP-193**: 権限がなければ、対象が**存在するかどうかにかかわらず** PERMISSION_DENIED を返さなければならない。そのため、権限の確認は存在の確認より**先に**行う。権限があって対象がないときだけ NOT_FOUND を返す（[AIP-193 Permission Denied](https://google.aip.dev/193)）
+
+どちらも、権限のない相手に存在の有無で違う答えを返さない点は共通です。なお、呼び出し元を**特定できない**なら UNAUTHENTICATED、資源を使い切ったことによる拒否なら RESOURCE_EXHAUSTED で、どちらにも PERMISSION_DENIED を使ってはなりません。
+
+### UNAVAILABLE と INTERNAL と UNKNOWN
+
+**UNAVAILABLE** は一時的な状態で、間隔を空けて再試行すれば直る見込みが高いものです。**INTERNAL** は下位のシステムが前提とする不変条件が壊れたことを表し、**深刻なエラーのために取っておく**コードです。**UNKNOWN** は分類できないエラーで、別の体系のエラーを写せなかったときや、十分な情報を返さない API から来たときに使います。
+
+### DEADLINE_EXCEEDED、CANCELLED、RESOURCE_EXHAUSTED
+
+**DEADLINE_EXCEEDED** には見落としやすい注意書きがあります。状態を変える操作では、**操作が成功していてもこのコードが返りうる**のです。サーバは成功を返したのに、その応答が遅れてデッドラインを過ぎた場合です。受け取っても「書き込まれなかった」とは言えません。**CANCELLED** は多くの場合、呼び出し側が取り消したときに返ります。**RESOURCE_EXHAUSTED** は利用者ごとの割り当ての超過からディスクの空き不足までを含み、どの資源が尽きたかはコードだけでは分かりません。
+
+## ライブラリが自分で返すコード
+
+`grpc-status` を書くのはサーバのアプリだけではありません。**gRPC のライブラリ自身**も、クライアント側とサーバ側の両方で、エラーを見つけるとステータスを作って返します。statuscodes.md に、その一覧があります。主なものを抜き出します。
+
+| 状況 | コード | 生成する側 |
+| --- | --- | --- |
+| クライアントのアプリが取り消した | CANCELLED | 両方 |
+| サーバが答える前にデッドラインが切れた | DEADLINE_EXCEEDED | 両方 |
+| サーバにそのメソッドがない | UNIMPLEMENTED | サーバ |
+| サーバが停止処理中、一部を送ったあとで接続が切れた | UNAVAILABLE | サーバ / クライアント |
+| サーバのアプリが例外を投げた | UNKNOWN | サーバ |
+| 送った、または受け取ったメッセージが上限を超えた | RESOURCE_EXHAUSTED | 両方 |
+| 応答の Protobuf を解析できなかった | INTERNAL | クライアント |
+
+逆に、INVALID_ARGUMENT、NOT_FOUND、ALREADY_EXISTS、FAILED_PRECONDITION、ABORTED、OUT_OF_RANGE、DATA_LOSS の 7 つは**ライブラリが決して生成しない**と明記されています。これらを受け取ったなら、**必ずどこかのアプリが返したもの**です。反対に UNAVAILABLE や DEADLINE_EXCEEDED は、アプリもライブラリも返すので、コードだけでは出どころを決められません。なお、アプリは 17 個以外の値を使ってはならず、範囲外の値を受け取ったライブラリはそのまま伝えるか UNKNOWN に変えます。
+
+<Callout type="warn" title="下流のコードをそのまま上流へ返さない">
+  サーバ B が処理の途中でサーバ C を呼び、C から INVALID_ARGUMENT を受け取ったとします。これを B の呼び出し元 A にそのまま返すと、A は「自分の引数が悪い」と受け取ります。
+  実際には、B が C への要求を誤って組み立てた、つまり **B の不具合**である可能性が高く、A に返すべきは INTERNAL です（[grpc-go#1150](https://github.com/grpc/grpc-go/issues/1150) での指摘）。
+  同じように、下流の UNAVAILABLE をそのまま返すと、上流が再試行し、下流でも再試行が起きて、呼び出しの回数が段数に応じて掛け算で増えかねません。コードは、**自分の呼び出し元から見た意味**に翻訳し直して返します。
+</Callout>
+
+## 再試行してよいコード
+
+どのコードなら再試行してよいかについて、statuscodes.md は「**すべてのアプリに共通する正解の一覧はない**」と書いています。同じコードをライブラリも返し、アプリも返すからです。
+
+目安になるのは、UNAVAILABLE の説明にある「再試行で直る見込みが高い。ただし**冪等でない操作**を再試行するのは常に安全とは限らない」という一文です。冪等とは、2 回実行しても 1 回と同じ結果になることです。gRFC A6（クライアント側の再試行）も、一般には**サービスが要求を処理しなかったことを示すコード**だけを再試行すべきだとしています。例えば、ユーザを消すメソッドが INTERNAL で失敗しても、消し終わってから失敗した可能性があります。冪等なメソッドなら再試行しても害はありませんが、そうでないなら、元の呼び出しが処理されていないとコードから言い切れる場合を除いて再試行すべきではありません（[gRFC A6](https://github.com/grpc/proposal/blob/master/A6-client-retries.md)）。
+
+gRPC のクライアントは、この判断を**サービス設定**（service config）の `retryPolicy` で受け取ります。A6 に載っている形はこうです。
+
+```json
+"retryPolicy": {
+  "maxAttempts": 4,
+  "initialBackoff": "0.1s",
+  "maxBackoff": "1s",
+  "backoffMultiplier": 2,
+  "retryableStatusCodes": ["UNAVAILABLE"]
+}
+```
+
+`maxAttempts` は最初の 1 回を含む回数で、5 より大きい値は 5 として扱われます。`retryableStatusCodes` のコードが返ったときだけ、指数的に伸びる間隔（±20% の揺らぎ付き）を空けて送り直します。サーバから応答ヘッダを受け取ったあとは、そのメタデータがすでにアプリに渡っているので再試行しません。
+
+これとは別に、**要求がサーバのアプリに届いていないことが確実な場合**（ストリームが `REFUSED_STREAM` で閉じられた、`GOAWAY` の最後のストリーム ID より後ろだった、など）は、ライブラリが設定と関係なく送り直します。再試行の間引き、`grpc-retry-pushback-ms` によるサーバからの指示、ヘッジングなど本番での運用は第 71 回で扱います。
+
+## gRPC の外から来た失敗
+
+クライアントとサーバの間のロードバランサやプロキシは、上流につながらないと、ふつうの HTTP の 503 を返すことがあります。その応答には `grpc-status` がありません。PROTOCOL-HTTP2.md は、こうした応答を受け取ることを想定し、クライアントが**ステータスを合成しなければならない**としています（[PROTOCOL-HTTP2.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)）。その対応表が [http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md) です。401 は UNAUTHENTICATED、403 は PERMISSION_DENIED、429・502・503・504 は UNAVAILABLE、表にないものは UNKNOWN です。手元で、どんな要求にも決まった HTTP ステータスを返すだけの HTTP/2 サーバを Go で書き、Python の gRPC クライアントから呼ぶと、表のとおりに合成されました。
+
+```
+HTTP 503 -> StatusCode.UNAVAILABLE | Received http2 header with status: 503
+HTTP 429 -> StatusCode.UNAVAILABLE | Received http2 header with status: 429
+HTTP 404 -> StatusCode.UNIMPLEMENTED | Received http2 header with status: 404
+HTTP 400 -> StatusCode.INTERNAL | Received http2 header with status: 400
+HTTP 500 -> StatusCode.UNKNOWN | Received http2 header with status: 500
+```
+
+この表は、**`grpc-status` がないときにだけ**使います。`grpc-status` があれば必ずそれを使い、サーバが HTTP の番号を決めるためにこの表を逆に使ってはならない、と書かれています。404 が UNIMPLEMENTED になるのは、gRPC ではパスがメソッド名そのものだからです。200 なのに UNKNOWN なのは、本当に成功したなら `grpc-status` があるはずだからです。`code.proto` にも各コードに「HTTP Mapping: 400 Bad Request」のような対応が書かれていますが（Google の API が HTTP と JSON で同じエラーを返すときに使う。[AIP-193](https://google.aip.dev/193)）、上の表はその逆ではありません。INVALID_ARGUMENT は 400 に写りますが、`grpc-status` のない 400 は INTERNAL になります。429 と 504 も、RESOURCE_EXHAUSTED や DEADLINE_EXCEEDED ではなく UNAVAILABLE です。
+
+## 標準のモデルの限界と google.rpc.Status
+
+ここまでの**標準のエラーモデル**で返せるのは、コードとメッセージの文字列の 2 つだけです（[grpc.io: Error handling](https://grpc.io/docs/guides/error/)）。INVALID_ARGUMENT が返っても、どの欄がなぜ悪いのかは、英語の文を人が読むしかありません。プログラムが文を解析して分岐するようになると、文言を直しただけで呼び出し側が壊れます。
+
+そこで Google が作った**リッチなエラーモデル**では、[`google.rpc.Status`](https://github.com/googleapis/googleapis/blob/master/google/rpc/status.proto) という Protobuf のメッセージでエラーを表します。
+
+```protobuf
+message Status {
+  int32 code = 1;                          // google.rpc.Code の値
+  string message = 2;                      // 開発者向けの英語のメッセージ
+  repeated google.protobuf.Any details = 3; // 詳細を表すメッセージの並び
+}
+```
+
+`details` の各要素は `Any` で、「型の URL」と「その型でシリアライズしたバイト列」の組です。どんな型のメッセージでも入れられます。
+
+この `Status` をシリアライズしたバイト列を、base64 にしてトレーラの **`grpc-status-details-bin`** に入れます。gRPC では、名前が `-bin` で終わるメタデータは値がバイナリで、ライブラリが base64 の符号化と復号を受け持ちます。PROTOCOL-HTTP2.md の付録には、Protobuf を使う gRPC ではこの欄の中身が `google.rpc.Status` であることが書かれています。そして、この中のコードは `grpc-status` と**矛盾してはならず、受け取った側がそれを確かめなければならない**、とされています。`grpc-status` と `grpc-message` も従来どおり入るので、リッチなモデルを知らないクライアントはそちらだけを読めば済みます。
+
+### details に入れる型
+
+よく使う型は [error_details.proto](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto) に定義されています。
+
+| 型 | 中身 | 用途 |
+| --- | --- | --- |
+| ErrorInfo | `reason`、`domain`、`metadata`（文字列の map） | 機械が読むための識別子 |
+| BadRequest | `field_violations`（欄のパス、説明、reason） | 要求のどの欄が悪いか |
+| RetryInfo | `retry_delay` | 再試行の前に少なくともこれだけ待つ |
+| QuotaFailure | `violations` | どの割り当てを超えたか |
+| PreconditionFailure | `violations` | どの前提条件を満たしていないか |
+| ResourceInfo | 資源の種類、名前、所有者、説明 | どの資源へのアクセスで失敗したか |
+| DebugInfo | `stack_entries`、`detail` | スタックトレースなどのデバッグ情報 |
+| LocalizedMessage | `locale`、`message` | 利用者に見せてよい、翻訳されたメッセージ |
+| Help | リンクの並び | 解決方法を説明した文書への URL |
+
+`ErrorInfo` の `reason` は 63 文字以内の大文字のスネークケース（`[A-Z][A-Z0-9_]+[A-Z0-9]`）で、`domain` はエラーを生んだサービスの名前などです。`reason` と `domain` の組が、そのエラーの種類を機械が見分けるための名前になります。
+
+## AIP-193 の方針
+
+Google の API 設計指針 [AIP-193](https://google.aip.dev/193) は、API のエラーでは `google.rpc.Status` を返し、コードは `google.rpc.Code` の値を使わなければならないとしたうえで、使い方を細かく決めています。要点を拾います。
+
+- `message` は**開発者向け**の、人が読むためのメッセージで、英語であるべき。利用者向けに翻訳したメッセージは `details` の `LocalizedMessage` で運ぶ
+- すべてのエラー応答は、`details` に **`ErrorInfo` を含めなければならない**。プログラムがエラーの特定の性質に対してコードを書けるようにするため
+- メッセージに埋め込んだ動的な値（資源名や地域など）は、`ErrorInfo.metadata` にも入れなければならない。機械がメッセージを解析せずに済むようにするため
+- 同じエラーには同じ（reason, domain）の組を使い、違うエラーに同じ組を使ってはならない。`details` の各型は 1 回までしか入れてはならない
+- メッセージは短く、次に何をすればよいかが分かるものにする。利用者が**内部の実装について知っていると仮定してはならない**
+- 以前から `ErrorInfo` を返してきた RPC なら `message` の文言を変えてよい。そうでなければ文言は変えず、`LocalizedMessage` を足す
+
+## 内部の詳細を外に漏らさない
+
+`message` は、呼び出し側のログや画面にそのまま出ていく文字列です。ここにスタックトレースや SQL 文、テーブル名を入れると、システムの内側の構造が外に漏れます。OWASP は、攻撃の最初の段階は相手の技術的な情報を集める偵察であり、予期しないエラーには一般的な応答だけを返し、詳細はサーバ側のログに残すよう勧めています（[OWASP Error Handling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html)）。
+
+`DebugInfo` はスタックトレースを入れるための型ですが、`error_details.proto` 自体は誰に返してよいかを定めていません。組織の外の利用者に返す応答に入れれば、`message` に書いたのと同じことです。入れるなら、社内の呼び出し元に限るなど、返す相手を絞ります。しかも、**アプリが何もしなくても漏れる**場合があります。次の実験で確かめます。
+
+## 手元で確かめる
+
+Python の grpcio 1.80 と grpcio-status 1.80 で、`CreateOrderRequest { item_id, quantity }` を受ける 2 つのメソッドを持つサーバを書きます。`CreateSimple` は `context.abort(grpc.StatusCode.INVALID_ARGUMENT, "quantity must be positive")` でコードとメッセージだけを、`CreateRich` は `ErrorInfo` と `BadRequest` を詰めた `google.rpc.Status` を返します。
+
+```python
+def CreateRich(self, request, context):
+    info = error_details_pb2.ErrorInfo(reason="INVALID_QUANTITY", domain="shop.example.com",
+                                       metadata={"quantity": str(request.quantity)})
+    bad = error_details_pb2.BadRequest(field_violations=[error_details_pb2.BadRequest.FieldViolation(
+        field="quantity", description="quantity must be positive", reason="QUANTITY_NOT_POSITIVE")])
+    details = []
+    for m in (info, bad):
+        a = any_pb2.Any(); a.Pack(m); details.append(a)
+    st = status_pb2.Status(code=code_pb2.INVALID_ARGUMENT,
+                           message="quantity must be positive", details=details)
+    context.abort_with_status(rpc_status.to_status(st))
+```
+
+`rpc_status.to_status` の実装は、`Status` をシリアライズしたバイト列を `grpc-status-details-bin` という名前のトレーラに入れているだけです。クライアント側の `rpc_status.from_call` はその逆で、取り出した `Status` のコードとメッセージが `grpc-status` や `grpc-message` と食い違えば例外を投げます。仕様の「受け取った側が確かめる」の実装です（[rpc_status.py](https://github.com/grpc/grpc/blob/master/src/python/grpcio_status/grpc_status/rpc_status.py)。執筆時点では EXPERIMENTAL と書かれた API）。
+
+`quantity=0` で `CreateRich` を呼び、`from_call` で取り出した結果です。`CreateSimple` のほうは、上の 2 行目まで（コードとメッセージ）しか得られません。
+
+```
+code   : StatusCode.INVALID_ARGUMENT
+details: quantity must be positive
+trailer: grpc-status-details-bin = <235 bytes>
+google.rpc.Status: code = 3  message = 'quantity must be positive'
+  [google.rpc.ErrorInfo]
+    reason: "INVALID_QUANTITY"
+    domain: "shop.example.com"
+    …
+  [google.rpc.BadRequest]
+    field_violations {
+    …
+```
+
+### 生のトレーラを見る
+
+grpcurl の `-v` では、トレーラの欄に `content-type` しか表示されませんでした。そこで `curl -v --http2-prior-knowledge` で、5 バイトの接頭部を付けた要求を直接送ります。
+
+```
+< HTTP/2 200
+< content-type: application/grpc
+< grpc-status: 3
+< grpc-message: quantity must be positive
+< grpc-status-details-bin: CAMSGXF1YW50aXR5IG11c3QgYmUgcG9zaXRpdmUaXwoodHlwZS5nb29nbGVh…（全 314 文字）
+```
+
+`:status` の 200 と `grpc-status` が 1 つのヘッダの塊に入った、第 68 回の Trailers-Only の形です。base64 に末尾の `=` がないのは、PROTOCOL-HTTP2.md が `-bin` の値を埋め草なしで送るよう勧めているからです（受け取る側は両方を受け付ける）。埋め草を補って復号すると 235 バイトになり、`from_call` の表示と一致します。`protoc --decode_raw` に通すと、型の情報なしでフィールド番号と値が読めます。
+
+```
+1: 3
+2: "quantity must be positive"
+3 {
+  1: "type.googleapis.com/google.rpc.ErrorInfo"
+  2 {
+    1: "INVALID_QUANTITY"
+    2: "shop.example.com"
+    3 {
+      1: "quantity"
+      2: "0"
+    }
+  }
+}
+3 {
+  1: "type.googleapis.com/google.rpc.BadRequest"
+  …
+}
+```
+
+1 が `code`、2 が `message`、3 が `details` の `Any` です。`Any` の中の 1 が型の URL、2 がその型のバイト列です。第 66 回で見たとおりワイヤ形式には型名が入らないので、**型の URL を横に添える**のが `Any` の役割です。grpcurl も、`-proto` に `error_details.proto` を渡せば details を JSON にして表示し、渡さなければ型が分からないので base64 のまま `@value` に出します。
+
+### ライブラリが返すコードと、漏れる例外
+
+次は、アプリのコードを通らないエラーです。サーバの受信上限はわざと 1024 バイトにしてあります。
+
+```
+=== Slow（2 秒眠る）を timeout=0.3 で呼ぶ
+code   : StatusCode.DEADLINE_EXCEEDED
+details: Deadline Exceeded
+=== item_id に 2000 文字を入れて呼ぶ
+code   : StatusCode.RESOURCE_EXHAUSTED
+details: SERVER: Received message larger than max (2005 vs. 1024)
+=== 登録していないサービス shop.v1.Unregistered/Ping を curl で呼ぶ
+HTTP/2 200
+content-type: application/grpc
+grpc-status: 12
+grpc-message: Method not found!
+=== サーバを止めてから呼ぶ
+code   : StatusCode.UNAVAILABLE
+details: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051: Failed to connect to remote host: Connection refused
+```
+
+DEADLINE_EXCEEDED はクライアントが時間切れを判断したもの、RESOURCE_EXHAUSTED と UNIMPLEMENTED はサーバのライブラリがアプリの手前で返したもの、UNAVAILABLE は接続を RST で断られた（第 53 回）のを受けてクライアントのライブラリが作ったものです。
+
+ハンドラで `RuntimeError('psycopg.errors.UndefinedTable: ...')` を投げたままにすると、こうなります。
+
+```
+ERROR:
+  Code: Unknown
+  Message: Exception calling application: psycopg.errors.UndefinedTable: relation "orders_v2" does not exist
+```
+
+表のとおり UNKNOWN ですが、**例外の文字列がそのまま呼び出し元に届いています**。データベースの製品名とテーブル名が外から読めます。サーバの入口で例外をまとめて捕まえ、詳細はログに残し、呼び出し元には中身を含まない INTERNAL などを返すのが安全です。
+
+最後に再試行です。最初の 2 回は UNAVAILABLE を返し、3 回目で成功するサーバを、先ほどの `retryPolicy` をサービス設定として渡したクライアントから 1 回だけ呼びました。サーバ側では、受け取ったメタデータの `grpc-previous-rpc-attempts`（再試行のときにライブラリが付ける、それまでの試行回数）を表示しています。
+
+```
+call 1: grpc-previous-rpc-attempts=None
+call 2: grpc-previous-rpc-attempts=1
+call 3: grpc-previous-rpc-attempts=2
+```
+
+アプリは 1 回呼んで成功を受け取っただけで、UNAVAILABLE の 2 回はライブラリが吸収しています。
+
+## 言語ごとの API と、HTTP/1.1 系のプロトコル
+
+リッチなモデルの API は言語ごとにあります。Go では `status.New(codes.ResourceExhausted, "...")` で作ったステータスに `WithDetails` で details を付け、受け取る側は `status.Convert(err).Details()` で取り出します（[grpc-go の例](https://github.com/grpc/grpc-go/tree/master/examples/features/error_details)）。Java では `io.grpc.protobuf.StatusProto` の `toStatusRuntimeException` と `fromThrowable` が同じ役割です（[StatusProto](https://grpc.github.io/grpc-java/javadoc/io/grpc/protobuf/StatusProto.html)）。grpc.io は、対応する言語として C++、Go、Java、Python、Ruby を挙げ、執筆時点では Node.js と grpc-web を未対応としています。
+
+HTTP/2 のトレーラを使えない環境向けのプロトコルでは、エラーの置き場所が変わります。
+
+- **gRPC-Web**: トレーラを応答の本体の最後に、先頭バイトの最上位ビットを 1 にした特別なフレームとして入れる。中身は HTTP/1 のヘッダと同じ `key: value` の並び（[PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md)）
+- **Connect**: 単項の呼び出しでは、**200 以外の HTTP ステータス**と `application/json` の本体（`code`、`message`、`details`）で返す。`unavailable` なら 503、`resource_exhausted` なら 429 のように対応が決まっていて、HTTP のステータスしか見ないプロキシやログでも失敗を数えられる。ストリーミングでは HTTP は 200 のまま、最後のメッセージの `error` に入れる（[Connect Protocol](https://connectrpc.com/docs/protocol/)）
+
+<Callout type="note" title="リッチなモデルの注意点">
+  grpc.io は、言語ごとの実装が揃っていないことがある、既存のプロキシやロガーからは details が見えない、トレーラの大きな details は先頭ブロッキングに影響し、最大ヘッダサイズのような上限にもかかる、と注意しています（[Error handling](https://grpc.io/docs/guides/error/)）。PROTOCOL-HTTP2.md は、クライアントがトレーラなどの大きさを制限してよいとし、既定値として 8 KiB を示しています。details には、原因を特定できるだけの識別子を短く入れます。
+</Callout>
+
+## まとめ
+
+- gRPC のステータスは 0〜16 の 17 個。HTTP のような責任の所在による大分類ではなく、1 つ 1 つの意味と、受け取った側がすべきことで区別されている
+- 引数が常に不正なら INVALID_ARGUMENT、状態が変われば通るなら FAILED_PRECONDITION、範囲の外なら OUT_OF_RANGE。その呼び出しだけやり直すなら UNAVAILABLE、上の段からなら ABORTED
+- 権限のない相手に存在の有無で違うコードを返さない。AIP-193 は、権限を先に確かめ、なければ常に PERMISSION_DENIED とする
+- ライブラリも UNAVAILABLE、DEADLINE_EXCEEDED、UNIMPLEMENTED、RESOURCE_EXHAUSTED、UNKNOWN などを返す。INVALID_ARGUMENT など 7 つはアプリしか返さない
+- 再試行してよいコードに共通の正解はない。UNAVAILABLE が典型だが、冪等でない操作には注意する。DEADLINE_EXCEEDED は成功していても返りうる
+- `grpc-status` のない HTTP の応答は、クライアントが対応表でコードを合成する（503 なら UNAVAILABLE、404 なら UNIMPLEMENTED）
+- 詳細は `google.rpc.Status` をシリアライズしてトレーラの `grpc-status-details-bin` に入れる。AIP-193 は ErrorInfo を必ず付け、message は開発者向けの英語とする
+- スタックトレースや SQL を message に入れない。捕まえ損ねた例外の文字列は、そのまま UNKNOWN のメッセージとして外へ出ていく
+
+ここまで、`.proto` のファイルから生成されたコードを当然のように使ってきました。`shop_pb2.py` はどうやって作られ、別のチームや別の言語の利用者には、スキーマと生成済みのコードをどう配ればよいのでしょうか。次回は、protoc の仕組みと、buf、BSR の生成済み SDK を見ます。
