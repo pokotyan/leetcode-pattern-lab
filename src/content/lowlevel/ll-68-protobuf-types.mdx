@@ -1,0 +1,330 @@
+---
+title: Protobuf で何を表せるか
+description: 「0 を送った」と「何も送っていない」を、Protobuf は区別できるのか。スカラー型、oneof、map、enum、well-known types、Editions、JSON への写し方を順に見て、スキーマ言語として書けることと書けないことの境目を確かめます
+chapter: rpc
+order: 4
+status: published
+topics:
+  - フィールドの存在（field presence）
+  - optional
+  - oneof
+  - map フィールド
+  - open enum / closed enum
+  - well-known types
+  - FieldMask
+  - Protobuf Editions
+  - ProtoJSON
+requires:
+  - ll-67-protobuf-wire
+---
+
+import Callout from '../../components/Callout.astro'
+
+前回は、Protobuf のメッセージが線の上でどんなバイト列になるかを見ました。フィールド番号とワイヤ型を詰めたタグ、varint、LEN、未知のフィールドを読み飛ばせる仕組みです。
+
+今回は同じものを、書く側から眺めます。`.proto` はデータの形を書くための言語です。では、**この言語でどこまでの形が書けて、どこから先は書けないのでしょうか。** たとえば「在庫を 0 にしたい」という更新と「在庫には触れない」という更新は、Protobuf の上で区別できるのでしょうか。
+
+実験には Python の protobuf 6.33 と、grpcio-tools に同梱された protoc（`libprotoc 33.5`）を使います。
+
+## スカラー型と、言語に着いたときの形
+
+スカラー型は 15 種類です（[Language Guide (proto3)](https://protobuf.dev/programming-guides/proto3/#scalar)）。
+
+| 系統 | 型 | 符号化（前回の復習） |
+| --- | --- | --- |
+| 浮動小数点 | `double` `float` | 固定 8 / 4 バイト |
+| 可変長の整数 | `int32` `int64` `uint32` `uint64` | varint。`int32` / `int64` の負数は 10 バイトになる |
+| 負数向けの整数 | `sint32` `sint64` | ZigZag してから varint |
+| 固定長の整数 | `fixed32` `fixed64` `sfixed32` `sfixed64` | 固定 4 / 8 バイト |
+| その他 | `bool` `string` `bytes` | `string` は UTF-8 か 7 ビット ASCII。どちらも 2^32 バイトまで |
+
+同じ型でも、生成されるコードでの形は言語ごとに違います。同じページの対応表では、Java には符号なし整数が無いので `uint64` は `long` になり、最上位ビットが符号ビットに入ります。PHP の `int64` は、64 ビット環境では `integer`、32 ビット環境では `string` です。
+
+表に JavaScript の列はありませんが、問題が最も大きいのはそこです。JavaScript の `number` は倍精度の浮動小数点数なので、整数を正確に持てるのは 2^53 − 1 までです。
+
+```
+$ node -e 'console.log(JSON.parse("{\"a\":12345678901234567}").a, Number.MAX_SAFE_INTEGER)'
+12345678901234568 9007199254740991
+```
+
+末尾の 7 が 8 に変わりました。エラーも警告もありません。**64 ビットの整数は、受け取る言語によっては黙って丸められます。** あとで見る JSON 形式が `int64` を文字列にするのはこのためです。
+
+## 「送られていない」と「0」を区別する
+
+proto3 でラベルを付けずに書いたスカラーのフィールドは、**暗黙の存在（implicit presence）**を持ちます。「既定値であること」と「設定されていないこと」を同じものとして扱う方式で、既定値（数値は 0、文字列は空、`bool` は false）はシリアライズされません（[Field Presence](https://protobuf.dev/programming-guides/field_presence/)）。言語ガイドも、パースしたあとでは**既定値が明示的に設定されたのか、単に設定されていないのかを見分ける方法が無い**と書いています（[Default Field Values](https://protobuf.dev/programming-guides/proto3/#default)）。
+
+`optional` を付けると、**明示的な存在（explicit presence）**になります。値と一緒に「設定されたかどうか」を持ち、0 でも設定されていれば送ります。proto3 で明示的な存在を持つのは、`optional` の単数フィールド、メッセージ型のフィールド、oneof のメンバーの 3 つです。次の `.proto` を以降の実験でも使います。
+
+```protobuf
+syntax = "proto3";
+package shop.v1;
+import "google/protobuf/timestamp.proto";
+enum Status { STATUS_UNSPECIFIED = 0; STATUS_ACTIVE = 1; STATUS_ARCHIVED = 2; }
+message Item {
+  string name = 1;
+  int32 stock = 2;                 // 暗黙の存在
+  optional int32 discount = 3;     // 明示的な存在
+  int64 price_micros = 4;
+  Status status = 5;
+  map<string, string> labels = 6;
+  google.protobuf.Timestamp update_time = 7;
+  Dimensions size = 8;
+  oneof owner { string user_id = 9; string group_id = 10; }
+}
+message Dimensions { int32 width = 1; int32 height = 2; }
+```
+
+```python
+>>> Item(stock=0).SerializeToString()
+b''
+>>> Item(stock=0).HasField("stock")
+Traceback (most recent call last): ...（省略）
+ValueError: Field shop.v1.Item.stock does not have presence.
+>>> b = Item(discount=0); b.SerializeToString(), b.HasField("discount"), Item().HasField("discount")
+(b'\x18\x00', True, False)
+```
+
+`stock` に 0 を入れたメッセージは **0 バイト**で、何も入れなかったメッセージと区別できません。Python では、存在を持たないフィールドに `HasField` を呼ぶこと自体が例外になります。`discount` は 0 でも `18 00`（フィールド 3、varint、値 0）が出て、`HasField` が True を返します。読み出した値はどちらも 0 で、**違いは「設定されたか」という 1 ビットの情報だけ**です。
+
+この差が実害になるのは部分的な更新です。Field Presence のページによれば、**暗黙の存在の既定値はマージのときにも写されません。** 明示的な存在なら、設定された値は既定値でも写されます。つまり `stock` が暗黙の存在のままだと、「在庫を 0 にする」という値を送っても、受け取った側がマージした時点で 0 は消え、元の在庫が残ります。
+
+解決の手段は 3 つあります。1 つ目は `optional int32 stock` として明示的な存在にすることで、言語ガイドも proto3 で `optional` を推奨しています。2 つ目は `google.protobuf.Int32Value` のようなラッパー型で包むこと、3 つ目は後で見る `FieldMask` で「変えるフィールド」を別に伝えることです。
+
+ラッパー型について、well-known types のリファレンスは「これらは現在では時代遅れ」と書き、使う理由は既存のメッセージとの互換性と、スカラーを `Any` に入れたい場合だけだとしています（[Well-Known Types](https://protobuf.dev/reference/protobuf/google.protobuf/)）。ラッパー型で存在を表せるのは、**メッセージ型のフィールドはラベルが無くても最初から存在を持つ**という性質を借りているからです。
+
+## oneof: どれか 1 つ
+
+`oneof` は、いくつかのフィールドのうち**高々 1 つだけ**が設定される形を書きます。型の言葉で言えば和型（直和）です。
+
+```python
+>>> c = Item(user_id="u-1"); c.WhichOneof("owner")
+'user_id'
+>>> c.group_id = "g-7"; c.WhichOneof("owner"), c.user_id
+('group_id', '')
+```
+
+`group_id` を設定した時点で `user_id` は消えました（[Oneof](https://protobuf.dev/programming-guides/proto3/#oneof)）。メンバーに既定値（0 や空文字列）を入れた場合も、どれが選ばれたかは記録され、ワイヤにも出ます。
+
+中に入れられるものには制限があります。`repeated` のフィールドを入れると protoc は `Fields in oneofs must not have labels (required / optional / repeated).`、map を入れると `Map fields are not allowed in oneofs.` と断ります。「タグの一覧」か「単一の文字列」かを選ばせたいときは、`repeated` を持つメッセージを別に定義して、それを oneof に入れます。oneof そのものを `repeated` にすることもできません。
+
+## map: 順序のない辞書
+
+`map<K, V>` にも制限がはっきりあります（[Maps](https://protobuf.dev/programming-guides/proto3/#maps)）。
+
+| 制限 | protoc の反応 |
+| --- | --- |
+| キーは整数型か `string` だけ | `Key in map fields cannot be float/double, bytes or message types.` / `... cannot be enum types.` |
+| 値に map は置けない | `map<string, map<string, int32>>` は構文エラー（`Expected ">".`） |
+| map を `repeated` にできない | `Field labels (required/optional/repeated) are not allowed on map fields.` |
+| 順序は未定義 | ワイヤ上の並びも、反復の順序も当てにできない |
+
+同じキーが 2 度現れたら、最後のものが使われます。map はワイヤの上では、キーをフィールド 1、値をフィールド 2 に持つメッセージの `repeated` と同じ形で、map を知らない実装でも読めるようになっています。制限の多くはこの成り立ちから来ています。入れ子の辞書が要るときは、値をメッセージにしてその中に map を置きます。
+
+## enum: 0 から始まる列挙
+
+proto3 の enum は、**最初の値が 0 でなければなりません**（`enum E { E_A = 1; }` は `The first enum value must be zero for open enums.` で拒否されます）。0 を数値の既定値として使うためです。言語ガイドは、その値を `ENUM_TYPE_NAME_UNSPECIFIED` のように名付け、「指定されていない」以外の意味を持たせないよう勧めています（[Enum Default Value](https://protobuf.dev/programming-guides/proto3/#enum-default)）。0 に `ACTIVE` のような意味を持たせると、送り忘れた `status` がすべて ACTIVE に見えるからです。
+
+値の名前の前置詞も飾りではありません。
+
+```
+enum Color { UNKNOWN = 0; RED = 1; }        ← 同じパッケージに 2 つの enum を置くと
+enum Size  { UNKNOWN = 0; LARGE = 1; }
+
+enum_clash.proto:3:50: "UNKNOWN" is already defined in "bad".
+enum_clash.proto:3:50: Note that enum values use C++ scoping rules, meaning that enum values are
+siblings of their type, not children of it.  Therefore, "UNKNOWN" must be unique within "bad", not just within "Size".
+```
+
+**enum の値の名前は、enum の中ではなく、それを囲むパッケージやメッセージの名前空間に置かれます。** そのため値の名前に型の名前を前置します（[AIP-126](https://google.aip.dev/126) も、衝突を避けるための前置に触れています）。言語ガイドには、将来の Edition でスコープ付きの enum に対応する予定だとも書かれています。
+
+### 知らない値が届いたら
+
+enum には **open と closed** の 2 種類があります（[Enum Behavior](https://protobuf.dev/programming-guides/enum/)）。
+
+| 種類 | 知らない値を受け取ったとき | 既定 |
+| --- | --- | --- |
+| open | その整数のままフィールドに入れる。アクセサは「設定済み」を返す | proto3 |
+| closed | フィールドには入れず、**未知のフィールドの集合**に回す。アクセサは「未設定」と既定値を返す | proto2 |
+
+新しいサーバが `STATUS_SUSPENDED = 3` を足し、古いクライアントがそれを受け取る状況を、手で作ったバイト列で再現します。closed のほうは、後述の Editions で `enum_type = CLOSED` を指定した `Paint` メッセージです。
+
+```python
+d = Item.FromString(bytes([0x28, 0x07]))    # フィールド 5（open enum の status）に 7
+p = Paint.FromString(bytes([0x08, 0x07]))   # フィールド 1（closed enum の color）に 7
+# 表示: d.status / p.color / p.HasField("color") / UnknownFieldSet(p) / SerializeToString()
+
+open enum :  status=7                                  再シリアライズ: b'(\x07'
+closed enum: color=0 HasField=False 未知のフィールド=[(1, 7)] 再シリアライズ: b'\x08\x07'
+```
+
+open では定義に無い 7 がそのまま入り、closed では未設定の 0 に見えて、7 は未知のフィールドに残りました。どちらも**シリアライズし直すと 7 は元どおり出ていきます**。中継するだけのプログラムが値を壊さないのは、前回見た未知のフィールドの仕組みのおかげです。
+
+<Callout type="warn" title="言語によって、仕様どおりに動かない">
+  Enum Behavior のページには言語ごとの適合状況が載っています。執筆時点では、仕様どおりに動くのは
+  PHP、Python（4.22.0 以降）、Objective-C（3.22.0 以降）、Swift です。
+  C#、Go、JSPB、Ruby は**すべての enum を open として**、Dart は**すべてを closed として**扱います。
+  C++、Java、Kotlin にも、proto2 と proto3 が混ざったときに closed として扱う不適合があります。
+  受け取る側は、知らない値が来ることを前提に `switch` の既定の分岐を書いておきます。
+</Callout>
+
+## 書けるもの、書けないもの
+
+入れ子のメッセージ定義も、自分自身を含む再帰的な型（木構造など）も書けます。一方で、プログラミング言語の型にあって Protobuf に無いものもあります。
+
+| 書きたいもの | Protobuf での扱い | よく使う代わりの書き方 |
+| --- | --- | --- |
+| 継承 | 無い | 共通部分をメッセージにして持たせる |
+| ジェネリクス（`Page<T>` など） | 無い | 型ごとにメッセージを書く。任意の型なら `Any` |
+| 和型 | oneof だけ。`repeated` と map は直接入らない | メッセージで包んでから入れる |
+| `repeated` の要素の null | 無い | 要素をメッセージにして、その中の存在で表す |
+| 必須の制約、値の範囲 | proto3 には無い | コメントや注釈で契約として書き、検証は別の仕組みに任せる |
+
+必須の制約は意図的に外されています。Dos and Don'ts は「required のフィールドを足してはならない。代わりに `// required` と書いて API の契約を文書にせよ」としています（[Dos and Don'ts](https://protobuf.dev/best-practices/dos-donts/)）。
+
+スキーマで表しきれないものは、**名前と番号の付け方の慣習**で補います。
+
+- **削除したフィールドの番号と名前を予約する。** `reserved 2; reserved "old";` と書けば、再利用しようとしたときに protoc が `Field "old" uses reserved number 2.` と止めます。番号の 19,000〜19,999 は実装用に予約済みで、最初から使えません。
+- **ページ分けは、応答に `string next_page_token` を置く。** 空なら最後のページで、クライアントは中身を解釈せず次の `page_token` に入れます（[AIP-158](https://google.aip.dev/158)）。
+- **リソースは `name` の文字列で識別する。** `publishers/{publisher}/books/{book}` のような階層を持つ名前です（[AIP-134](https://google.aip.dev/134)）。
+
+## 標準で用意された型
+
+`google.protobuf` パッケージには、どの API でも要りそうな型が用意されています（[Well-Known Types](https://protobuf.dev/reference/protobuf/google.protobuf/)）。Dos and Don'ts は、`int32 timestamp_seconds_since_epoch` のような自前の表現を作らず、これらを使うよう強く勧めています。下の表のあとで、`Any` に `Dimensions(width=3)` を詰め、`Struct` に大きな整数を入れてみます。
+
+| 型 | 表すもの | 押さえておく点 |
+| --- | --- | --- |
+| `Timestamp` | 時刻の一点 | 秒と 0〜999,999,999 のナノ秒。0001-01-01 から 9999-12-31 まで |
+| `Duration` | 時間の長さ | 符号付きの秒とナノ秒。およそ ±10,000 年 |
+| `Any` | 任意のメッセージ | シリアライズしたバイト列と、型を示す `type_url` の組 |
+| `Struct` / `Value` / `ListValue` | 任意の JSON | JSON のオブジェクト、値、配列に対応する |
+| `FieldMask` | フィールドの経路の一覧 | 次の節で使う |
+| `Empty` | 中身の無いメッセージ | 引数や戻り値の無い RPC に使う |
+
+```
+Any.type_url : type.googleapis.com/shop.v1.Dimensions   Any.value: b'\x08\x03'
+Any の JSON  : {"@type": "type.googleapis.com/shop.v1.Dimensions", "width": 3}
+Struct の JSON: {"tags": ["a", null], "ok": true, "n": 1.2345678901234568e+16}
+```
+
+`Any` の中身は、ただの `Dimensions` のバイト列（`08 03`）です。**読む側は `type_url` の最後の部分から型の名前を得て、その定義を知っていなければ中身を解釈できません。** 型の確認は実行時になります。
+
+`Struct` は、先ほどの JavaScript と同じ丸めを起こしました。`Value` の数値は `double` の `number_value` だからです。キーの並びが入れた順と違うのは、`Struct` の中身が map だからで、実行するたびに変わりえます（実際、同じコードを再実行すると順序が変わりました）。**`Struct` は JSON をそのまま運べる代わりに、JSON の弱点もそのまま持ち込みます。**
+
+## 部分更新と FieldMask
+
+「空にしたい」と「触らない」の区別に戻ります。Google の API 設計指針は、部分更新をする Update メソッドのリクエストに `google.protobuf.FieldMask update_mask` を置くよう定めています（[AIP-134](https://google.aip.dev/134)）。`UpdateItemRequest` なら、`Item item = 1;` と `google.protobuf.FieldMask update_mask = 2;` を並べる形です。
+
+well-known types のリファレンスによれば、**API はマスクに挙げたフィールドだけを変え、それ以外には触れない。既定値に戻したいフィールドは、マスクに入れたうえで既定値を送る。** 暗黙の存在のフィールドでも「0 にする」が言えます。Python の `FieldMask.MergeMessage` で確かめます。
+
+```python
+stored = Item(name="pen", stock=12, discount=5, labels={"color": "blue"}, size=Dimensions(width=10, height=20))
+patch = Item(name="PEN", stock=0, size=Dimensions(width=11))   # 在庫を 0 に。name は変えさせない
+naive = Item(); naive.CopyFrom(stored); naive.MergeFrom(patch)
+out = Item(); out.CopyFrom(stored); FieldMask(paths=["stock", "size.width"]).MergeMessage(patch, out)
+
+patch    : name: "PEN" size { width: 11 }
+MergeFrom: name: "PEN" stock: 12 discount: 5 labels { ... } size { width: 11 height: 20 }
+マスク    : name: "pen" discount: 5 labels { ... } size { width: 11 height: 20 }
+```
+
+`patch` の `stock` は暗黙の存在の 0 なので、表示にすら出ていません。普通の `MergeFrom` では、変えたくなかった `name` が書き換わり、変えたかった `stock` は 12 のままです。マスクを使うと、`name` は元のまま、`stock` は 0（既定値なので表示されない）、`size.width` だけが 11 になりました。JSON ではこのマスクは `"stock,size.width"` という 1 本の文字列です。
+
+経路が中間のメッセージや `repeated`、map を指すときは、当て方に選択肢があります。`MergeMessage` の引数を変えて、`stored` に当てた結果です（`labels` の 2 行は、何も入っていない `Item()` を当てたもの）。
+
+```
+['size'] {} -> ... size { width: 11 height: 20 }                                        既定ではメッセージはマージ
+['size'] {'replace_message_field': True} -> ... size { width: 11 }                      丸ごと置き換え
+['labels'] {} -> ... labels { key: "color" value: "blue" } size { width: 10 height: 20 }  空の map を送っても消えない
+['labels'] {'replace_repeated_field': True} -> name: "pen" stock: 12 discount: 5 size { width: 10 height: 20 }
+```
+
+**「空にする」を正しく伝えるには、マスクをサーバ側でどう当てるかまで決めておく必要があります。** 経路の書き間違い（`stok`）は `IsValidForDescriptor` が False を返すので、サーバは受け取ったマスクを最初に検証します。`repeated` のフィールドは経路の最後にしか置けない、という制限もあります。
+
+<Callout type="note" title="マスクが無いときの意味は、文書によって違う">
+  well-known types のリファレンスは、更新時にマスクが無ければ「全フィールドを指定したのと同じ」としています。
+  AIP-134 は、省かれたら「値が入っているフィールドだけ」を指定したものとして扱い、
+  全置き換えには特別な値 `*` を使うよう求めています。どちらに従うかは、その API の文書で確かめます。
+</Callout>
+
+## Editions: proto2 と proto3 を機能の組み合わせで書く
+
+存在の扱い、enum が open か closed か。ここまでに出てきた proto2 と proto3 の違いを、`syntax` の 2 択ではなく機能（feature）ごとの設定で書くのが **Editions** です（[Editions Overview](https://protobuf.dev/editions/overview/)）。先ほどの closed enum の実験は、次のファイルから生成しました。
+
+```protobuf
+edition = "2023";
+package shop.v1;
+enum Color { option features.enum_type = CLOSED; COLOR_UNSPECIFIED = 0; COLOR_RED = 1; }
+message Paint {
+  Color color = 1;                                       // 何も書かなければ明示的な存在
+  int32 count = 2 [features.field_presence = IMPLICIT];  // proto3 の無印と同じ
+}
+```
+
+主な機能の既定値は次のとおりです（[Feature Settings for Editions](https://protobuf.dev/editions/features/)）。
+
+| 機能 | proto2 | proto3 | Edition 2023 / 2024 |
+| --- | --- | --- | --- |
+| `field_presence` | `EXPLICIT` | `IMPLICIT`（`optional` なら明示的） | `EXPLICIT` |
+| `enum_type` | `CLOSED` | `OPEN` | `OPEN` |
+| `repeated_field_encoding` | `EXPANDED` | `PACKED` | `PACKED` |
+| `utf8_validation` | `NONE` | `VERIFY` | `VERIFY` |
+
+**Edition 2023 の既定は、proto3 に近いまま存在だけを明示的に戻したもの**です。`optional` を書かなくても `HasField` が使え、暗黙の存在が要るフィールドにだけ `IMPLICIT` を付けます。
+
+執筆時点で公開されている最新の Edition は 2024 で、命名規則を強制する `enforce_naming_style` と、シンボルの可視性を決める `default_symbol_visibility` が加わりました。手元の `libprotoc 33.5` は `edition = "2024"` を受け付け、`"2025"` には `Unknown edition "2025".` と返しました。古い `libprotoc 3.19.4` は `edition` という文そのものを知らず、構文エラーになります。**Editions を使えるかどうかは、スキーマを読むすべての道具の版で決まります。**
+
+## JSON に写す
+
+Protobuf には、JSON での正規の表現（ProtoJSON）も定められています（[ProtoJSON Format](https://protobuf.dev/programming-guides/json/)）。`name="pen"`、`stock=0`、`discount=0`、`price_micros=12345678901234567` などを入れた `Item` を `json_format.MessageToJson` に通し、続けて知らないキーを含む JSON を読ませました。
+
+```
+{
+  "name": "pen",
+  "discount": 0,
+  "priceMicros": "12345678901234567",
+  "status": "STATUS_ACTIVE",
+  "updateTime": "2026-09-28T01:02:03Z"
+}
+ParseError: Message type "shop.v1.Item" has no field named "colour" at "Item".
+```
+
+| 規則 | 出力のどこに出ているか |
+| --- | --- |
+| キーは lowerCamelCase。パーサは元の名前も受け付ける | `price_micros` → `priceMicros` |
+| `int64` / `uint64` / `fixed64` は 10 進の文字列 | `"12345678901234567"` |
+| enum は値の名前。知らない値は整数 | `"STATUS_ACTIVE"`。未知の 7 を入れたものは `{"status": 7}` になった |
+| 存在を持たないフィールドの既定値は出さない。存在を持つものは既定値でも出す | `stock` は消え、`discount: 0` は残る |
+| 未知のフィールドは既定でエラー。無視する設定も用意される | `colour` で `ParseError` |
+
+`int64` を文字列にする理由として、仕様は、多くの JSON 実装が数値を倍精度で解釈し、2^53 を超える整数を黙って丸めることを挙げています。
+
+**ワイヤ形式との最大の違いは、名前が形式の一部になることです。** バイナリにはフィールド番号しか載らないので、フィールドの名前を変えても互換性は壊れませんでした。JSON ではキーが名前そのものなので、名前を変えると古い読み手は新しいキーを知らず、既定の設定では**パースに失敗します**。逆に、フィールド番号の変更は JSON では安全ですが、バイナリでは壊れます。ProtoJSON の仕様も、名前を後から変えるのがずっと難しくなると書いており、Dos and Don'ts はテキスト形式や JSON をシステム間のやり取りに使わないよう勧めています。
+
+<Callout type="tip" title="enum の名前を変えるときは別名を挟む">
+  enum の値の名前も JSON に出ます。ProtoJSON の仕様は、同じ数値に新旧 2 つの名前を割り当て（`allow_alias`）、
+  別名を足して配る、並びを入れ替えて新しい名前で書き出す、古い名前を消す、という段階的な手順を示しています。
+</Callout>
+
+## ほかの IDL と比べる
+
+| 観点 | Protobuf | JSON Schema / OpenAPI | Avro | WIT（第 137 回） |
+| --- | --- | --- | --- | --- |
+| 主な目的 | 版の違う相手とのデータ交換 | JSON 文書の検証と API の記述 | データの保存と交換 | 同じプロセス内のコンポーネントの境界 |
+| 値の無さ | 存在（暗黙 / 明示的） | 必須かどうかと `null` を別々に書く | `["null", "string"]` のような和型 | `option<T>` |
+| 和型 | oneof（制限あり） | `oneOf` / `anyOf` | union | `variant` |
+| 互換性の拠り所 | フィールド番号 | キーの名前 | 書いた側のスキーマ | 型そのもの |
+
+OpenAPI 3.1 のスキーマは JSON Schema Draft 2020-12 の上位集合で、`int64` という形式名もありますが、線の上に載るのは JSON の数値です（[OpenAPI 3.1.0](https://spec.openapis.org/oas/v3.1.0.html)）。Avro のバイナリには型の情報もフィールド名も含まれないので、読む側は書いた側のスキーマを手に入れ、自分のスキーマとの対応を解決してから読みます（[Avro Specification](https://avro.apache.org/docs/1.12.0/specification/)）。Protobuf はその中間で、フィールド番号とワイヤ型だけをデータに埋め込み、スキーマ無しでも読み飛ばしと中継ができるようにしています。WIT は `option` や `result` を型として持ち、表現力では上回りますが、版の違う相手と長く付き合うことを主題にしてはいません。
+
+## まとめ
+
+- スカラーは 15 種類。64 ビットの整数は、倍精度でしか数を持てない言語では黙って丸められる
+- proto3 の無印のスカラーは暗黙の存在で、0 や空文字列は送られない。「0 にした」と「送っていない」は区別できず、マージでも既定値は写されない
+- `optional`（Edition 2023 以降では既定）で明示的な存在になり、0 でも送られて `HasField` で確かめられる。ラッパー型は公式には時代遅れの扱い
+- oneof は和型だが、`repeated` と map は直接入れられない。map のキーは整数と文字列だけで、値に map は置けず、順序も無い
+- enum の先頭は 0 で `*_UNSPECIFIED` にする。値の名前は囲む名前空間に置かれるので前置詞を付ける。知らない値の扱いは open と closed で違い、言語ごとの実装もずれている
+- 継承、ジェネリクス、必須の制約は書けない。予約、`next_page_token`、リソース名といった慣習と、well-known types で補う
+- 部分更新は `update_mask` で「どのフィールドを変えるか」を別に伝える。入れ子や `repeated` の当て方はサーバ側で決めておく
+- ProtoJSON では名前が形式の一部になる。`int64` は文字列、既定値は省かれ、未知のフィールドは既定でエラー。バイナリでは安全だった名前の変更が互換性を壊す
+
+ここまでの 2 回で、メッセージを書き、バイト列にするところまでを見ました。次の第 69 回では、そのバイト列が **gRPC の呼び出しとして HTTP/2 の上をどう流れるか**を見ます。メッセージの前に付く 5 バイト、パスになるサービス名とメソッド名、そして結果を運ぶトレーラです。

@@ -1,0 +1,377 @@
+---
+title: 守るためのレスポンスヘッダ
+description: XSS の穴は、どれだけ気をつけても 1 つは残る。残ったときに被害を小さくするため、サーバは応答のヘッダで「このページでは何を許すか」をブラウザに宣言できます。CSP、Trusted Types、frame-ancestors、nosniff、Clear-Site-Data が何を防ぎ、何を防がないかを、XSS を含む小さなページで確かめます
+chapter: websec
+order: 7
+status: published
+topics:
+  - Content-Security-Policy
+  - nonce / strict-dynamic
+  - 許可リスト型の CSP
+  - Report-Only と report-to
+  - Trusted Types
+  - クリックジャッキング / frame-ancestors
+  - X-Content-Type-Options
+  - X-XSS-Protection
+  - Clear-Site-Data
+requires:
+  - ll-90-request-headers
+  - ll-110-session-cookie
+  - ll-79-html-parse
+  - ll-77-navigation
+  - ll-105-tls-ops
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 穴が 1 つ残ったとき、何が起きるか
+
+XSS（攻撃者の JavaScript が被害者のページのオリジンで動いてしまうこと）が起きると、HttpOnly も SameSite も CSRF の対策も、ほとんど役に立たなくなります（第 110 回で詳しく見ます）。スクリプトは**そのページの住人として**要求を送れるからです。
+
+XSS の本来の対策は、出力のたびに正しくエスケープすることです。ただ、テンプレート、フロントエンドのフレームワーク、古い画面、外部のウィジェットと経路が多く、**大きなアプリで 1 つも穴を残さないのは難しい**。そこで、穴が残ったときに「注入された文字列を、ブラウザがスクリプトとして実行しない」ようにする二段目の守りが欲しくなります。
+
+その二段目は、サーバが**応答のヘッダでブラウザに指示を出す**形で作られています。Cookie の属性もブラウザへの指示です（第 110 回）。この回のヘッダも同じで、**守られるのはブラウザの中の利用者**です。攻撃者が自分の curl で送る要求には、何の制限にもなりません。
+
+| ヘッダ | ブラウザに頼むこと | 主に防ぐもの |
+| --- | --- | --- |
+| `Content-Security-Policy`（CSP） | どのスクリプトを実行してよいか、どこから読み込んでよいか | XSS の実行 |
+| CSP の `require-trusted-types-for` | 危険な DOM の API に、ただの文字列を渡させない | DOM を経由した XSS |
+| CSP の `frame-ancestors`、`X-Frame-Options` | このページを誰の iframe に入れてよいか | クリックジャッキング |
+| `X-Content-Type-Options: nosniff` | `Content-Type` を信じ、中身から種類を推測しない | テキストや画像をスクリプトとして実行させる攻撃 |
+| `Permissions-Policy` | カメラや位置情報などの機能を、このページと iframe に許すか | 埋め込んだ第三者による機能の悪用 |
+| `Cache-Control` | この応答をどこに保存してよいか | 共有のキャッシュからの個人情報の漏れ |
+| `Clear-Site-Data` | このサイトの Cookie や保存領域を消せ | ログアウト後に端末に残るデータ |
+
+## CSP の骨組み
+
+CSP は、応答に付けた `Content-Security-Policy` ヘッダで、ページが読み込んでよい資源と実行してよいスクリプトを宣言する仕組みです。仕様は W3C の [Content Security Policy Level 3](https://www.w3.org/TR/CSP3/)（執筆時点で 2026 年 9 月 16 日付の Working Draft）です。
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.example; img-src *
+                         └──────┬────────┘ └───────────────┬──────────────────┘ └──┬──┘
+                           既定の許可            スクリプトの許可              画像は何でも
+```
+
+- `;` で区切った 1 つ 1 つが**ディレクティブ**。`script-src`、`style-src`、`img-src`、`connect-src`（fetch などの接続先）のように、資源の種類ごとにある
+- 種類ごとのディレクティブが無ければ `default-src` が代わりに使われる
+- 値は**送り元のリスト**。`'self'`（同じオリジン）、ホスト名、`https:` のようなスキーム、そして後で見る nonce とハッシュ
+
+大事なのは、CSP が既定で**インラインのスクリプトを禁じる**ことです。`script-src` を書いた時点で、HTML に直接書いた `<script>…</script>`、`onclick="..."` のような属性、`javascript:` の URL は実行されなくなります。
+
+なぜインラインを禁じるのか。第 79 回で見たとおり、HTML の構文解析器は、サーバが意図して書いた `<script>` と、エスケープし損ねた利用者の入力から生まれた `<script>` を**区別できません**。どちらも同じバイト列から同じ要素になります。だから「インラインは全部だめ」にしない限り、注入されたスクリプトも実行されてしまいます。
+
+これを元に戻すのが `'unsafe-inline'` です。書けば既存のインラインのスクリプトは動きますが、**注入されたものも同じ理由で動きます**。名前のとおり、XSS に対する CSP の効き目をほぼ打ち消すキーワードです。
+
+## 許可リスト型の CSP が破られやすい理由
+
+最初に思いつく CSP は、「スクリプトは自分のサイトと、使っている CDN からだけ」と**ドメインを並べる**形です。これを許可リスト型と呼びます。
+
+Google の研究者らは 2016 年に、約 100 億ページの調査から、**集めた CSP の 94.72% が XSS に対して迂回できた**と報告しました（Weichselbaum ほか, [CSP Is Dead, Long Live CSP!](https://research.google/pubs/csp-is-dead-long-live-csp-on-the-insecurity-of-whitelists-and-the-future-of-content-security-policy/), ACM CCS 2016）。理由は、許可したドメインの上に、**攻撃者が中身を選べるスクリプト**が置かれていることが多いからです。
+
+- **JSONP のエンドポイント**: `/api?callback=名前` のように、呼び出す関数名を URL で渡すと、`名前({...})` を JavaScript として返す。`callback` に任意の式を書けば、許可されたドメインから任意のコードが返ってくる
+- **大きな CDN や共有のホスト**: 1 つのドメインに無数のライブラリが置かれていて、その中に、ページの属性を読んでコードを実行するものがある
+- **利用者がファイルを上げられる場所**: 許可したドメインに、攻撃者が自分の `.js` を置ける
+
+CSP の仕様自身も、ホストやパスに基づくポリシーは「正しく書くのが難しい」とし、網羅して書いた一覧は脆く保守しにくいと述べています（[CSP3 8.2](https://w3c.github.io/webappsec-csp/#strict-dynamic-usage)）。web.dev も許可リスト型は多くの手直しが要り、攻撃者に迂回されうるとして、次の形を勧めています（[web.dev: Strict CSP](https://web.dev/articles/strict-csp)）。
+
+## nonce とハッシュ: 「どこから」ではなく「どれを」許す
+
+破られにくい CSP は、ドメインではなく**個々のスクリプトに印を付けて**許します。
+
+```
+Content-Security-Policy: script-src 'nonce-R4nd0m...' 'strict-dynamic'; object-src 'none'; base-uri 'none'
+
+<script nonce="R4nd0m...">  ← 印が合うので実行される
+<script>                     ← 印が無いので実行されない（注入されたものはここに入る）
+```
+
+- **nonce**: 応答ごとに作る乱数。サーバは同じ値をヘッダと、自分が書いた `<script>` の `nonce` 属性の両方に入れる。攻撃者は応答を見る前にこの値を知らないので、注入した `<script>` に正しい値を付けられない。仕様は、**ポリシーを送るたびに新しい値を作ること**（MUST）、128 ビット以上で暗号用の乱数から作ること（SHOULD）を求めています（[CSP3 7.1](https://w3c.github.io/webappsec-csp/#security-nonces)）
+- **ハッシュ**: `'sha256-...'` と書き、中身のハッシュが一致するインラインのスクリプトだけを許す。中身が変わらない静的なページ向け
+- **`'strict-dynamic'`**: nonce やハッシュで許されたスクリプトが、`document.createElement('script')` で追加したスクリプトも許す。代わりに、ホストやスキームの指定、`'self'`、`'unsafe-inline'` は無視される（[CSP3 8.2](https://w3c.github.io/webappsec-csp/#strict-dynamic-usage)）。ライブラリが自分の依存を読み込む動作を、ドメインを並べずに通すための仕組み
+- `object-src 'none'` は古いプラグインを、`base-uri 'none'` は `<base>` の注入で相対 URL の読み込み先をすり替える攻撃を止める（web.dev）
+
+`'strict-dynamic'` で許されるのは、スクリプトの中から要素を作って足したものだけです。HTML の構文解析器が作った `<script>`（注入されたものはこちら）は、nonce が無い限り許されません。
+
+nonce があると `'unsafe-inline'` は無視される、という決まりもあります（[CSP3 6.7.3.2](https://w3c.github.io/webappsec-csp/#allow-all-inline)）。そのため `'unsafe-inline' 'nonce-...' 'strict-dynamic' https:` と並べておくと、nonce を知らない古いブラウザでは緩い動作に、新しいブラウザでは nonce だけの動作になります。後方互換のための書き方で、新しいブラウザで `'unsafe-inline'` が効いているわけではありません。
+
+## 段階的に入れる: Report-Only と違反報告
+
+いきなり CSP を強制すると、見落としていたインラインのスクリプトで画面が壊れます。そこで、まず**止めずに報告だけさせる**ヘッダから始めます。
+
+```
+Content-Security-Policy-Report-Only: script-src 'nonce-...' 'strict-dynamic'; report-to csp
+Reporting-Endpoints: csp="https://example.com/csp-reports"
+```
+
+- `Content-Security-Policy-Report-Only` は、違反を報告するが止めない。報告を見ながらページを直し、出なくなったら `Content-Security-Policy` に切り替える（[web.dev](https://web.dev/articles/strict-csp)）
+- 報告先の指定は 2 通りある。古い `report-uri` は URL を直接書く。新しい `report-to` は、`Reporting-Endpoints` ヘッダで付けた名前を指す（Reporting API を使う）
+- 仕様は `report-uri` を非推奨とし、**`report-to` があれば `report-uri` は無視する**と定めたうえで、互換のために両方書くことを勧めています（[CSP3 6.5.1](https://w3c.github.io/webappsec-csp/#directive-report-uri)）
+- `report-to` は、Firefox が 2026 年 3 月の 149 で CSP の報告に Reporting API を使うようになり（[Firefox 149 for developers](https://developer.mozilla.org/en-US/docs/Mozilla/Firefox/Releases/149)）、執筆時点（2026 年 9 月）で MDN は主要ブラウザで使える（Baseline 2026）としています（[MDN: report-to](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/report-to)）
+
+`report-uri`、`frame-ancestors`、`sandbox` は `<meta http-equiv>` で書いた CSP では効かず、Report-Only も `<meta>` では使えません（[CSP3 3.3](https://www.w3.org/TR/CSP3/)）。CSP は HTTP のヘッダで送るのが基本です。
+
+## 手元で確かめる: XSS のあるページに CSP を段階的に付ける
+
+Python の `http.server` で、127.0.0.1:18192 に次のページを返すサーバを書きました。
+
+- `/page?name=...` は、`name` を**エスケープせずに** `<h1>Hello, ...</h1>` に埋め込む（反射型の XSS）
+- ページには正規のインラインのスクリプトが 1 つあり、`/widget.js` を `createElement('script')` で読み込む。さらに、URL の `#` 以降を `innerHTML` に入れる（DOM を経由した XSS）
+- `/jsonp?callback=...` は、`callback` をそのまま関数名にして JavaScript を返す
+- 注入したコードが動くと `/pwned?how=経路` に要求が来るので、サーバのログで分かる
+
+注入したのは次の 3 つと、`#` 以降の 1 つです。
+
+```html
+<script>fetch('/pwned?how=inline')</script>
+<script src="/jsonp?callback=fetch('/pwned?how=jsonp');void"></script>
+<img src=x onerror="fetch('/pwned?how=onerror')">
+#<img src=x onerror="fetch('/pwned?how=dom')">
+```
+
+これを、`stage` の値で CSP を変えながら、Playwright で操作するヘッドレスの Chrome（153.0.8010.54、独立したプロファイル）で開きました。
+
+| stage | ヘッダ |
+| --- | --- |
+| 0 | なし |
+| 1 | `Content-Security-Policy: script-src 'self'`（許可リスト型） |
+| 2 | `Content-Security-Policy: script-src 'nonce-…' 'strict-dynamic'; object-src 'none'; base-uri 'none'` |
+| 3 | stage 2 と同じ中身を `Content-Security-Policy-Report-Only` で |
+| 4 | stage 2 ＋ `require-trusted-types-for 'script'` |
+| 5 | stage 4 ＋ `trusted-types app`（ページ側でポリシー `app` を作る） |
+| 6 | stage 2 と同じ中身を Report-Only で、報告先は `report-uri` だけ |
+| 7 | stage 2 と同じ中身を Report-Only で、報告先は `report-to` だけ |
+
+サーバのログ（手元の実行結果）です。
+
+```
+PWNED how=inline  from=http://127.0.0.1:18192/page?stage=0
+PWNED how=jsonp   from=http://127.0.0.1:18192/page?stage=0
+PWNED how=onerror from=http://127.0.0.1:18192/page?stage=0
+PWNED how=dom     from=http://127.0.0.1:18192/page?stage=0
+PWNED how=jsonp   from=http://127.0.0.1:18192/page?stage=1
+PWNED how=inline  from=http://127.0.0.1:18192/page?stage=3
+PWNED how=jsonp   from=http://127.0.0.1:18192/page?stage=3
+PWNED how=onerror from=http://127.0.0.1:18192/page?stage=3
+PWNED how=dom     from=http://127.0.0.1:18192/page?stage=3
+```
+
+| stage | inline | jsonp | onerror | dom | 正規のウィジェット |
+| --- | --- | --- | --- | --- | --- |
+| 0 なし | 実行 | 実行 | 実行 | 実行 | 動く |
+| 1 `'self'` | 止まる | **実行** | 止まる | 止まる | **動かない** |
+| 2 nonce ＋ strict-dynamic | 止まる | 止まる | 止まる | 止まる | 動く |
+| 3 Report-Only | 実行 | 実行 | 実行 | 実行 | 動く |
+
+stage 1 が、許可リスト型の弱さをそのまま見せています。
+
+- **JSONP を経由した注入は通った**。`/jsonp` は `'self'`、つまり許可したオリジンにあるからです。ブラウザの報告にも違反は出ません
+- 一方で、**正規のインラインのスクリプトまで止まり**、ウィジェットが読み込まれなかった。コンソールには `Executing inline script violates the following Content Security Policy directive 'script-src 'self''` が出ている。これを直そうとして `'unsafe-inline'` を足すと、注入も全部通るようになる
+
+stage 2 では 4 つとも止まり、正規のスクリプトは nonce で動き、そこから `createElement` で足した `/widget.js` も `'strict-dynamic'` で読み込まれました。JSONP の読み込みには、次の違反が出ています。
+
+```
+Loading the script 'http://127.0.0.1:18192/jsonp?callback=fetch(%27/pwned?how=jsonp%27);void'
+violates the following Content Security Policy directive: "script-src 'nonce-je0TdactCb5kgkb2BW9EHA==' 'strict-dynamic'".
+```
+
+### 違反報告の中身
+
+stage 3 の Report-Only では、注入はすべて実行され、違反は報告されるだけでした。stage 3 には報告先を 2 通りとも書いたので、stage 6 と 7 で 1 つずつ試しました。
+
+`report-uri /csp-report` だけの stage 6 では、違反の直後に、`application/csp-report` で次の JSON が届きました（抜粋）。
+
+```json
+{"csp-report":{"document-uri":"http://127.0.0.1:18192/page?stage=6&name=...",
+  "violated-directive":"script-src-elem","effective-directive":"script-src-elem",
+  "disposition":"report","blocked-uri":"inline","line-number":3,
+  "source-file":"http://127.0.0.1:18192/page","status-code":200,"script-sample":""}}
+```
+
+`report-to` のほうは、平文の `http://127.0.0.1` では届きませんでした（stage 3 で 70 秒、stage 7 で報告の送信を早める起動オプション `--short-reporting-delay` を付けて 15 秒待った）。サーバを自己署名の証明書で HTTPS にし、`Reporting-Endpoints` を `https://` にすると、stage 7 で `application/reports+json` の配列が届きました。
+
+```json
+[{"age":2,"type":"csp-violation","url":"https://127.0.0.1:18192/page?stage=7&name=...",
+  "body":{"blockedURL":"inline","disposition":"report","effectiveDirective":"script-src-elem",
+          "lineNumber":3,"sourceFile":"https://127.0.0.1:18192/page","statusCode":200,...}}]
+```
+
+さらに `report-uri` と `report-to` を両方書いた stage 3 を HTTPS で開くと、起動オプションなしでも約 2 秒で報告が来ました。届いたのは `report-to` の報告だけで、`/csp-report` には何も来ませんでした。仕様の「`report-to` があれば `report-uri` は無視する」のとおりです。**開発環境の平文の http で `report-to` の報告が来ないのを見て、報告の仕組みが壊れていると判断しない**ように注意してください（平文で届かなかった理由の仕様上の根拠までは、この回では確かめていません）。
+
+## Trusted Types: DOM の入口で文字列を止める
+
+stage 2 の結果表で、`dom`（`innerHTML` に入れた `<img onerror>`）が止まったのは、`onerror` 属性がインラインのスクリプトとして CSP に禁じられたからです。しかし `innerHTML` に HTML が入ったこと自体は止まっていません。実際、stage 2 のページの `#out` の中身を読むと、`<img src="x" onerror="...">` がそのまま入っていました。
+
+**DOM を経由した XSS**は、サーバが返す HTML ではなく、ページの JavaScript が `innerHTML`、`document.write`、`eval`、`script.src` のような危険な API（シンクと呼ぶ）に、利用者の入力をそのまま渡すことで起きます。Trusted Types は、この**シンクにただの文字列を渡すこと自体を禁じ**、「ポリシーを通して作った型付きの値」だけを受け付けるようにします（[MDN: Trusted Types API](https://developer.mozilla.org/en-US/docs/Web/API/Trusted_Types_API)）。
+
+```
+Content-Security-Policy: require-trusted-types-for 'script'; trusted-types app
+
+const p = trustedTypes.createPolicy('app', {
+  createHTML: s => エスケープや無害化をした文字列,
+  createScriptURL: u => 許した URL だけ返し、他は例外,
+});
+el.innerHTML = p.createHTML(input);   // 通る
+el.innerHTML = input;                 // TypeError
+```
+
+`trusted-types` にはポリシーの名前を並べ、それ以外の名前でポリシーを作ろうとすると例外になります。すると、**危険な値が作られる場所がポリシーの数か所に集まり**、レビューの対象がそこだけになります。
+
+実験の stage 4（強制だけでポリシーなし）では、注入の `innerHTML` だけでなく、**正規のコードの `script.src = '/widget.js'` も止まり**、ウィジェットは読み込まれませんでした。
+
+```
+script.src: TypeError: Failed to set the 'src' property on 'HTMLScriptElement': This document requires 'TrustedScriptURL' assignment.
+innerHTML: TypeError: Failed to set the 'innerHTML' property on 'Element': This document requires 'TrustedHTML' assignment.
+```
+
+stage 5 でポリシー `app` を作り、`/widget.js` だけを許し、HTML はエスケープする形にすると、ウィジェットは動き、`#out` には `&lt;img src=x onerror=...&gt;` という**文字としての**タグが入りました。導入には既存のコードをポリシー経由に直す手間がかかるので、web.dev は `Content-Security-Policy-Report-Only: require-trusted-types-for 'script'` で違反を集めてから直すことを勧めています（[web.dev: Trusted Types](https://web.dev/articles/trusted-types)）。
+
+| ブラウザ | Trusted Types の対応（執筆時点、2026 年 9 月） |
+| --- | --- |
+| Chrome / Edge | 83（2020 年）から（[web.dev](https://web.dev/articles/trusted-types)） |
+| Safari | 26.0（2025 年 9 月）から（[WebKit Features in Safari 26.0](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/)） |
+| Firefox | 148（2026 年 2 月 24 日）から（[Firefox 148 リリースノート](https://www.firefox.com/en-US/firefox/148.0/releasenotes/)） |
+
+MDN は、2026 年 2 月から主要ブラウザで使える（Baseline 2026）としています。
+
+<Callout type="warn" title="よくある誤解: 「CSP を入れれば XSS は防げる」">
+  CSP の仕様自身が、CSP は注入への**第一の防御ではなく、多層防御の一段**であり、入力の検証と出力のエスケープの代わりにはならないと書いています（[CSP3 1. Introduction](https://w3c.github.io/webappsec-csp/#intro)）。
+  実験の stage 2 でも、注入された `<img>` は DOM に入りました。止まったのは**スクリプトの実行**だけです。
+  HTML の注入が残っていれば、偽のログインフォームを置く、閉じていない属性で後ろの HTML ごと外へ送らせる（dangling markup、[CSP3 7.2.1](https://w3c.github.io/webappsec-csp/#dangling-markup-attacks)）といった、スクリプトを使わない攻撃ができます。
+  さらに、許可リスト型なら JSONP で迂回され、`'unsafe-inline'` を足せば無力になり、nonce を応答ごとに変えなければ（キャッシュされた HTML で同じ nonce が配られるなど）意味を失います。
+</Callout>
+
+## クリックジャッキングと frame-ancestors
+
+**クリックジャッキング**は、攻撃者のページが被害者のサイトを**透明な iframe で上に重ね**、利用者に別のものを押させたつもりで、実際には iframe の中の「アカウントを削除」を押させる攻撃です。利用者は本物のサイトにログインしたまま、本物のボタンを押しています。CSRF の対策（第 110 回）は効きません。**要求は本物のページから、本物のトークン付きで出る**からです。
+
+対策は、そもそも**他人の iframe に入れさせない**ことです。
+
+```
+Content-Security-Policy: frame-ancestors 'none'      どこにも埋め込ませない
+Content-Security-Policy: frame-ancestors 'self'      同じオリジンの親にだけ
+X-Frame-Options: DENY / SAMEORIGIN                   古いヘッダでの同じ指定
+```
+
+仕様では、`frame-ancestors 'none'` がおおむね `X-Frame-Options: DENY` に、`'self'` が `SAMEORIGIN` に当たり、**強制の CSP に `frame-ancestors` があれば `X-Frame-Options` は無視される**と定めています（[CSP3 6.4.2.2](https://w3c.github.io/webappsec-csp/#frame-ancestors-and-frame-options)）。`X-Frame-Options` の `ALLOW-FROM` は古い指定で、いまのブラウザはこれを含むヘッダを丸ごと無視し、`<meta>` で書いても効きません（[MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Frame-Options)）。特定の相手にだけ許したいなら、`frame-ancestors https://partner.example` と書きます。
+
+実験では、`http://localhost:18192/parent` という**別のサイト**のページから、`http://127.0.0.1:18192/framed` を iframe で開きました（手元のヘッドレス Chrome）。
+
+| `/framed` のヘッダ | iframe の中身 |
+| --- | --- |
+| なし | `account settings` と `delete account` のボタンが見える |
+| `X-Frame-Options: DENY` | 「127.0.0.1 で接続が拒否されました。」 |
+| `frame-ancestors 'none'` | 同上 |
+| `X-Frame-Options: SAMEORIGIN` | 同上（親は別オリジン） |
+| `X-Frame-Options: DENY` ＋ `frame-ancestors *` | **見える**（CSP が優先された） |
+
+最後の行は、両方のヘッダを出していて値が食い違うとき、`frame-ancestors` が勝つことを示しています。CDN やフレームワークがどちらか一方を自動で付けている場合に、意図と違う結果になりうる点です。
+
+## nosniff: 中身から種類を推測させない
+
+ブラウザは昔から、`Content-Type` が間違っていても、中身を見て種類を推測してきました（MIME スニッフィング）。これを悪用すると、利用者が上げた**テキストファイルや画像**を、別のページから `<script src>` で読み込ませて JavaScript として実行させられます。許可リスト型の CSP で `'self'` を許していれば、自分のオリジンに上げられたファイルがそのまま通ります。
+
+`X-Content-Type-Options: nosniff` は、この推測をやめさせます。Fetch Standard では、nosniff の付いた応答について、**スクリプトとして読む要求で MIME の種類が JavaScript でなければ遮る、スタイルとして読む要求で `text/css` でなければ遮る**と定めています（[Fetch Standard 3.6.1](https://fetch.spec.whatwg.org/#should-response-to-request-be-blocked-due-to-nosniff?)）。
+
+実験では、`fetch('/pwned?how=sniffed-text')` という中身を `Content-Type: text/plain` で返し、`<script src>` で読み込みました。
+
+```
+nosniff なし  → PWNED how=sniffed-text   （text/plain でも実行された）
+nosniff あり  → Refused to execute script from 'http://127.0.0.1:18192/data.txt?nosniff=1'
+                because its MIME type ('text/plain') is not executable, and strict MIME type checking is enabled.
+```
+
+nosniff なしでも、`image/*` や `text/csv` などは Fetch Standard の別の規則でスクリプトとしての実行を遮られますが、`text/plain` はそこに入らないので実行されました。**利用者が上げたファイルを配るサーバには、nosniff を必ず付ける**のが定石です。
+
+<Callout type="warn" title="よくある誤解: 「X-XSS-Protection を有効にすべき」">
+  `X-XSS-Protection` は、ブラウザが「要求に含まれていた文字列が応答にそのまま出たら、反射型の XSS とみなして止める」機能（XSS Auditor / XSS Filter）を操作するヘッダでした。
+  Chrome は、この機能が**サイトをまたいだ情報の漏れを生み**、迂回の方法も広く知られているとして、78（2019 年）で取り除きました（[Chrome 78 の廃止と削除](https://developer.chrome.com/blog/chrome-78-deps-rems)）。Edge も 2018 年 10 月の Windows 10 の更新で取り除き、Firefox は最初から実装していません（[Eric Lawrence](https://textslashplain.com/2018/11/06/an-update-on-the-edge-xss-filter/)）。
+  止めるかどうかの判定そのものが、正常なページの中身を外から探る手がかりになってしまったのが理由です。MDN は、このヘッダが**安全なサイトに XSS の弱点を生むことがある**とし、代わりに CSP を使うよう勧めています（[MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-XSS-Protection)）。
+  いまから付けるなら `X-XSS-Protection: 0`（無効）にするか、付けないのが妥当です。
+</Callout>
+
+## Permissions-Policy: 強い機能を誰に許すか
+
+カメラ、マイク、位置情報、決済のような強い機能は、ページ自身だけでなく、埋め込んだ iframe からも呼べます。`Permissions-Policy` は、これらの機能をこのページと、その中の iframe に許すかを宣言します（[MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Permissions-Policy)）。
+
+```
+Permissions-Policy: camera=(), microphone=(), geolocation=(self "https://maps.example")
+<iframe src="https://maps.example/..." allow="geolocation">
+```
+
+`()` はどこにも許さない、`self` は同じオリジンだけ。iframe で使うには、ヘッダの許可と iframe の `allow` 属性の両方が要ります。前身は `Feature-Policy` です。広告やウィジェットのように、**自分が中身を管理していない iframe に機能を渡さない**ためのもので、XSS そのものは防ぎません。MDN は執筆時点で、このヘッダを「実験的で、広く使われているブラウザの一部では動かない」としているので、ブラウザごとの対応を確かめてから頼ってください。
+
+## ほかの回で扱うもの: HSTS とキャッシュ
+
+**HSTS**（`Strict-Transport-Security`）は第 105 回で扱います。この回のヘッダはどれも、応答が**途中で書き換えられていない**ことを前提にしています。平文の http で届いた応答なら、攻撃者は CSP のヘッダごと消せます。HSTS は TLS を必ず始めさせることで、その前提を支えます。
+
+**キャッシュ**は第 77 回で見ました。個人情報の載った応答が、CDN やプロキシのような**共有のキャッシュ**に保存されると、別の利用者に返ってしまいます。
+
+```
+Cache-Control: private     共有のキャッシュには保存するな（ブラウザの中だけ）
+Cache-Control: no-store    どこにも保存するな
+```
+
+`private` は共有のキャッシュに保存させない指定、`no-store` はどこにも保存させない指定です（[RFC 9111 5.2.2.7](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.7)、[5.2.2.5](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.5)）。nonce 付きの CSP とも関係します。**nonce を埋め込んだ HTML を共有のキャッシュが保存すると、同じ nonce が全員に配られ**、攻撃者は自分で取得した応答から nonce を知ることができます。nonce を使うページは、ページごとに生成し、共有のキャッシュに載せない設計にします。
+
+## Clear-Site-Data: ログアウトで端末を片付ける
+
+ログアウトの本体は、サーバ側でセッションを無効にすることです（第 110 回）。それでも端末には、キャッシュされた個人情報のページ、`localStorage` に置いたデータ、Service Worker が残ります。共用の端末では、次の人に見えます。
+
+`Clear-Site-Data` は、応答を受けたブラウザに、**このサイトのデータを消させる**ヘッダです（[MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Clear-Site-Data)）。
+
+```
+Clear-Site-Data: "cache", "cookies", "storage"
+```
+
+| 値 | 消すもの |
+| --- | --- |
+| `"cache"` | HTTP キャッシュ、戻る・進むのためのキャッシュなど |
+| `"cookies"` | Cookie（登録可能なドメイン全体、サブドメインも含む） |
+| `"storage"` | `localStorage`、`sessionStorage`、IndexedDB、Service Worker など |
+| `"executionContexts"` | そのサイトを開いているタブを再読み込みさせる |
+| `"*"` | すべて |
+
+値は二重引用符で囲み、**安全な文脈（HTTPS）でしか効きません**。`"cookies"` がサブドメインにまで及ぶ点は、同じサイトの別のアプリのログインまで切ることになるので、範囲を意識して選びます。これも**ブラウザへの頼みごと**で、盗まれたセッションをサーバ側で無効にする代わりにはなりません。
+
+## ヘッダの一覧
+
+| ヘッダ | 防ぐもの | 防がないもの | 対応（執筆時点、2026 年 9 月） |
+| --- | --- | --- | --- |
+| CSP（nonce ＋ strict-dynamic） | 注入されたスクリプトの実行 | HTML の注入、スクリプトを使わない情報の持ち出し | 広く対応。`report-to` は Baseline 2026 |
+| CSP（許可リスト型） | 知らないドメインからの読み込み | 許可したドメイン上の JSONP やアップロード | 同上 |
+| Trusted Types | DOM のシンクへの文字列の代入 | サーバ側で出した HTML の注入 | Chrome 83、Safari 26.0、Firefox 148 |
+| `frame-ancestors` / `X-Frame-Options` | クリックジャッキング | 埋め込まれない攻撃全般 | `ALLOW-FROM` は無視される |
+| `nosniff` | テキストなどをスクリプトやスタイルとして読ませること | 正しい種類で返した悪意のあるファイル | 手元の Chrome 153 で確認 |
+| `Permissions-Policy` | iframe や自分のページによる強い機能の利用 | XSS | MDN は実験的としている |
+| `Cache-Control: private` / `no-store` | 共有のキャッシュからの漏れ | 端末に残ったデータ（`private` の場合） | HTTP の標準 |
+| `Clear-Site-Data` | ログアウト後に端末に残るデータ | 盗まれたセッションの悪用 | MDN は Baseline としている。HTTPS 限定 |
+| `X-XSS-Protection` | なし（付けるなら `0`） | ― | Chrome 78 と Edge が削除、Firefox は未実装 |
+
+## どの部品と組み合わさっているか
+
+| 守りたいこと | 組み合わせ |
+| --- | --- |
+| XSS が 1 つ残っても実行させない | 出力のエスケープ ＋ nonce の CSP ＋ Trusted Types ＋ 共有のキャッシュに載せない（nonce の再利用を防ぐ） |
+| XSS が起きても Cookie を持ち出させない | CSP ＋ HttpOnly（第 110 回）。その場での悪用は CSP の側でしか減らせない |
+| 他人のページから操作させない | CSRF の対策と SameSite（第 110 回）＋ `frame-ancestors`（押させる経路）＋ Fetch Metadata（第 90 回） |
+| 利用者が上げたファイルで攻撃させない | `nosniff` ＋ 別のドメインから配る（第 93 回） |
+| ヘッダ自体を書き換えさせない | HSTS と証明書の検証（第 105 回、第 102 回） |
+| ログアウトを端末まで効かせる | サーバ側でのセッションの無効化（第 110 回）＋ `Clear-Site-Data` |
+
+どのヘッダも、**ブラウザが同一オリジンポリシー（第 85 回）の上で協力してくれる**ことを前提にしています。そしてブラウザの協力は、利用者のブラウザにしか及びません。
+
+## まとめ
+
+- この回のヘッダはどれもブラウザへの指示で、守られるのはブラウザの中の利用者。攻撃者の curl には効かない
+- CSP は既定でインラインのスクリプトを禁じる。構文解析器には正規のものと注入されたものの区別がつかないからで、`'unsafe-inline'` はその守りを打ち消す
+- ドメインを並べる許可リスト型は、許可したドメイン上の JSONP などで迂回される。手元でも `'self'` の CSP を JSONP が通り抜けた
+- nonce（応答ごとの乱数）かハッシュで個々のスクリプトを許し、`'strict-dynamic'` で依存の読み込みを通すのが、いまの推奨の形
+- 導入は Report-Only で違反を集めてから。`report-to` があると `report-uri` は無視される。手元の Chrome では、`report-to` の報告は HTTPS でだけ届いた
+- Trusted Types は DOM のシンクへの文字列の代入を型で止める。執筆時点で Chrome、Safari、Firefox がそろった
+- CSP はスクリプトの実行を止めるが、HTML の注入は止めない。エスケープの代わりにはならない
+- クリックジャッキングは `frame-ancestors` で止める。`X-Frame-Options` と食い違えば CSP が勝つ
+- `nosniff` がなければ、`text/plain` のファイルもスクリプトとして実行された
+- `X-XSS-Protection` は情報の漏れを生むために各ブラウザから消えた。付けるなら `0`
+- 個人情報の応答は共有のキャッシュに載せず、ログアウトでは `Clear-Site-Data` で端末も片付ける
+
+この回のヘッダは、「読めない」「実行しない」をブラウザに守らせるものでした。次の回では、第 78 回の Spectre に戻り、**読めないはずのデータでも、同じプロセスのメモリに載っているだけで漏れる**問題と、それに対するヘッダ（CORP、COOP、COEP）を見ます。

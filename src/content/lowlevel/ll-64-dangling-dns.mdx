@@ -1,0 +1,305 @@
+---
+title: 消し忘れた名前
+description: 使い終わったサービスを指したまま残った CNAME や、消したゾーンへの NS 委任は、エラーを 1 つも出さずに、その名前を他人に明け渡す。宙に浮いた委任と参照が、なぜ乗っ取りになるのか
+chapter: dns
+order: 9
+status: published
+topics:
+  - ダングリング DNS
+  - サブドメイン乗っ取り
+  - lame delegation
+  - Sitting Ducks
+  - CNAME の消し忘れ
+  - NS 委任の消し忘れ
+  - ネームサーバの再割り当て
+  - 所有確認
+  - Certificate Transparency
+  - 資源の棚卸し
+requires:
+  - ll-63-dns-failure
+  - ll-58-dns-records
+  - ll-56-dns-zone
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 引けてしまうことが問題になる
+
+前回まで、DNS の障害は「引けない」「遅い」という形で表に出ました。この回で見るのは逆で、**きちんと引けてしまう**ことが問題になる場合です。
+
+第 58 回で見たとおり、DNS のレコードの多くは**指さし**です。CNAME は「この名前は、あの名前の別名だ」と別の名前を指し、NS は「この範囲は、あのサーバに任せる」と委任先を指します（第 56 回）。指さした先の資源を、あとで消したり解約したりしても、**自分のゾーンに残った指さしは、その事実を知りません**。
+
+そこへ**第三者が、同じ資源を取り直す**と、自分の名前の中身を他人が決められるようになります。これを **ダングリング（宙に浮いた）DNS** と呼びます。指す先を失ったレコードが、根を切られたまま宙に浮いている、という意味です。
+
+```
+作った直後            解約・削除の後            第三者が取り直した後
+shop → [自分の資源]   shop → [空きになった枠]   shop → [他人の資源]
+        ↑ 正しい               ↑ ここで消すべき          ↑ でも DNS は同じ答えを返す
+```
+
+厄介なのは、**エラーが 1 つも出ない**ことです。名前は今までどおり引け、TLS も張れ、ページも開きます。前回の障害のように監視のアラートが鳴るわけではないので、乗っ取られていることに気づく手がかりがありません。
+
+構図は 2 つあります。**CNAME の消し忘れ**と、**NS 委任の消し忘れ**です。前者は名前 1 本を、後者はサブドメイン以下をまるごと明け渡します。どちらも第 56 回・第 58 回で見た「指さし」の性質そのものが裏目に出たもので、DNS の欠陥ではなく**運用の消し忘れ**が原因です。順に見ます。
+
+## CNAME の消し忘れ: サブドメインの乗っ取り
+
+よくある流れは次のとおりです。`shop.example.com` を、どこかの事業者のホスティングに載せます。第 58 回で見たように、相手の IP は相手の都合で変わるので、CNAME で相手のホスト名を指します。
+
+```
+shop.example.com.   CNAME   example-shop.herokuapp.com.
+```
+
+やがてこのサービスをやめ、事業者側の資源を解約します。**このとき `shop.example.com` の CNAME も消すべき**ですが、消し忘れます。Microsoft はこの状態をそのまま「dangling DNS」と呼び、`app-contogreat-dev-001.azurewebsites.net` を指したままにした `greatapp.contoso.com` を例に、CREATION・DEPROVISIONING・TAKEOVER の 3 段で説明しています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。
+
+> The dangling subdomain, `greatapp.contoso.com`, is now vulnerable and can be taken over by being assigned to another Azure subscription's resource.
+
+攻撃者は、空いた `example-shop.herokuapp.com` を**自分のアカウントで取り直します**。すると、`shop.example.com` を引いた利用者は攻撃者の資源に案内されます。これが成り立つのは、事業者側に 2 つの性質があるからです。
+
+- **「そのホスト名はまだ誰にも使われていない」と判定して、先着順で払い出す。** 解約された名前が空きに戻る
+- **ホスト名で顧客を振り分ける。** 事業者の 1 つの入口に届いたリクエストを、`Host` ヘッダや TLS の SNI に書かれた名前で「どの顧客のものか」判断する（SNI は第 104 回、SNI での振り分けは第 105 回で詳しく見ます）
+
+この 2 つがそろうと、攻撃者は「同じ名前で枠を取る」だけで、その名前宛ての通信を受け取れます。事業者ごとに `*.azurewebsites.net`、`*.cloudapp.azure.com`、Traffic Manager、Front Door、CloudFront、S3 の静的サイト、GitHub Pages など、対象は広く知られています。Microsoft は自社のどの資源型が対象になるかを表にまとめ、Front Door・Blob Storage・CDN・パブリック IP・Traffic Manager・Container Instance・API Management・App Service などを挙げています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。
+
+```
+利用者 → shop.example.com → (CNAME) → example-shop.herokuapp.com
+                                          └─ 事業者の 1 つの入口
+                                             Host: shop.example.com で顧客を選ぶ
+                                             → 枠を取った者の内容を返す
+```
+
+<Callout type="note" title="ランダムな名前しか払い出さない事業者では起きにくい">
+  乗っ取りの鍵は「解約された名前を、別人が同じ名前で取り直せる」ことです。
+  だから、**払い出す名前が予測でき、かつ再取得できる**事業者ほど危険です。
+  たとえば Heroku は、カスタムドメインの向け先として推測しにくい `whispering-willow-5678.herokudns.com` の形を渡すようになっており、
+  古い `アプリ名.herokuapp.com` を指すのは推奨していません（[Heroku Dev Center](https://devcenter.heroku.com/articles/custom-domains)）。
+  CloudFront は別の枠で守っていて、代替ドメイン名（CNAME で指す先）を追加するには、
+  **その名前を含む信頼できる証明書を付けなければならず**、「ドメインの証明書を持つ者だけが、その名前を CloudFront に結びつけられる」形にしています（[AWS](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/CNAMEs.html)）。
+  事業者ごとに「取り直せる名前か」が違うので、乗っ取りの可否も事業者ごとに違います。
+</Callout>
+
+どの事業者のどのホスト名が乗っ取れるかは、有志が集めた一覧 **can-i-take-over-xyz** にまとまっています（[GitHub](https://github.com/EdOverflow/can-i-take-over-xyz)）。これはコミュニティが維持する参考資料で、各事業者を `Vulnerable`（脆弱）、`Not vulnerable`（脆弱でない）、`Edge case`（条件つき）に分け、解約後にそのホストが返す特徴的な文言（`"The specified bucket does not exist"`、`"No such app"` など）も載せています。事業者の仕様変更で状態は変わるので、執筆時点（2026 年 9 月）の値をうのみにせず、都度確かめる前提の一覧です。
+
+とりわけ **S3** は分かりやすい例です。バケット名は AWS 全体で 1 つしかない共有の名前空間にあり、消すと別のアカウントが同じ名前で作り直せます。
+
+> After you delete a bucket in the shared global namespace, be aware that another AWS account in the same partition can use the same bucket name for a new bucket and can therefore potentially receive requests intended for the deleted bucket.（[AWS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html)）
+
+静的サイトのホスティングでは**バケット名をドメイン名にぴったり合わせる**決まりなので（[AWS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/website-hosting-custom-domain-walkthrough.html)）、`shop.example.com` を載せていたなら、乗っ取るのに必要なバケット名も `shop.example.com` だと分かってしまいます。
+
+対して **GitHub Pages** は、`Edge case`（条件つき）に分類されています。カスタムドメインを**あらかじめ検証**しておけば、他人が同じ名前で Pages を立てられなくなるからです。検証は第 58 回・第 117 回の所有確認と同じで、`_github-pages-challenge-<ユーザ名>` という TXT レコードを置きます。検証済みのドメインは**その直下のサブドメインもまとめて守られ**、`example.com` を検証すれば `docs.example.com` なども保護されます（[GitHub Docs](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)）。ただし GitHub は**ワイルドカードの DNS レコードを使わないよう強く勧めて**います。`*.example.com` を置くと、検証した名前の**さらに下**（`b.a.example.com` など）が守りの外に残るためです。乗っ取りは、リポジトリを消したりプランを下げたりして Pages の割り当てが外れたのに、DNS がそこを指したまま、という第 58 回と同じ「消し忘れ」から起こります。
+
+## NS 委任の消し忘れ: 委任の乗っ取り
+
+CNAME はレコード 1 本の乗っ取りですが、**NS 委任の乗っ取り**はもっと広く効きます。第 56 回で見たとおり、委任は「親のゾーンに、子の名前の NS レコードを書く」ことでした。
+
+```
+親（レジストラ側 / 自社の親ゾーン）
+  sub.example.com.   NS   ns-1234.awsdns-56.com.   ← 委任先を指している
+```
+
+委任先の DNS 事業者側で、`sub.example.com` のゾーン（hosted zone）を消したのに、親の NS を残す。これがダングリングな委任です。攻撃者が同じ事業者で同じ名前のゾーンを作り、**たまたま同じネームサーバに割り当てられれば**、親の委任はそのまま生きているので、`sub.example.com` 以下の**すべてのレコード**を攻撃者が決められます。CNAME 1 本ではなく、A も MX も TXT も、サブドメイン全体です。
+
+```
+親の委任は最後まで動かない
+  sub.example.com. NS ns-1234.awsdns-56.com.   ← ずっとこのまま
+
+委任先の事業者:
+  ① [自分のゾーン]        親の NS が指す → 自分のレコードが引ける
+  ② （ゾーンを削除）       委任先が答えられない = lame（SERVFAIL / REFUSED）
+  ③ [攻撃者が同名で作成]   同じ ns-1234 に当たれば、親の委任がそのまま生きる
+                          → sub 以下の A・MX・TXT すべてを攻撃者が決める
+```
+
+この「たまたま同じネームサーバに」が成り立つかは事業者しだいです。2016 年に Matthew Bryant が報告した攻撃では、Route 53 が新しいゾーンにネームサーバを 4 つ割り当てることを逆手に取り、**目当ての 1 つが当たるまでゾーンを作っては消す**のを繰り返し、複数のゾーンにレコードを複製することで委任先を乗っ取れました。同じ手法が AWS・Google Cloud・Rackspace・DigitalOcean に効き、あわせて 12 万件あまりのドメインが対象だったとされます（[The Hacker Blog, 2016](https://thehackerblog.com/the-orphaned-internet-taking-over-120k-domains-via-a-dns-vulnerability-in-aws-google-cloud-rackspace-and-digital-ocean/index.html)）。ダングリングな委任は、委任先に**非再帰で NS を聞くと SERVFAIL か REFUSED が返る**（第 63 回で見た応答コード）ことで外から見つけられる、とも報告されています。
+
+Route 53 は、この報告のあと対策を入れました。ゾーンを消した後、同じ名前で新しいゾーンを作ろうとすると、**親にまだ残っている委任先のネームサーバと重ならないように割り当てる**ようになっています。ただし公式ドキュメントは、守れるのはこの 1 つの筋（シナリオ 1）だけで、**委任だけ先に書いてゾーンを作っていない場合など、ほかの筋は守れない**と明記しています。対策として、親の NS がゾーンの割り当て（delegation set）と一致していること、DNSSEC で署名すること（第 61 回）を挙げています（[AWS](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/protection-from-dangling-dns.html)）。
+
+### Sitting Ducks: 検証しない事業者を突く
+
+2024 年、Infoblox と Eclypsium が **"Sitting Ducks"** と名づけた攻撃を報告しました。レジストラでの NS 委任が、**アカウントの所有を検証しない DNS 事業者**を指したまま lame（委任先が答えられない状態）になっているドメインを乗っ取るものです。成立条件は 3 つとされています（[Eclypsium, 2024](https://eclypsium.com/blog/ducks-now-sitting-dns-internet-infrastructure-insecurity/)）。
+
+1. ドメイン（またはサブドメイン）が、**レジストラとは別の事業者**の権威 DNS を使っている
+2. その委任が **lame** である（委任先の権威サーバがそのドメインの情報を持っていない）
+3. その DNS 事業者が **exploitable** である（攻撃者が、委任先の事業者でそのドメインの所有を主張できてしまう）
+
+3 つ目が肝心です。委任先の事業者が「このドメインを管理してよいのはあなたか」を確かめずにゾーンを作らせるなら、攻撃者はレジストラのアカウントにも本来の持ち主のアカウントにも触れずに、そのドメインを支配できます。Eclypsium は執筆時点で乗っ取り可能なドメインを約 100 万件、2019 年以降に乗っ取られたものを 3 万件超と見積もり（[同](https://eclypsium.com/blog/ducks-now-sitting-dns-internet-infrastructure-insecurity/)）、Infoblox は 80 万件が脆弱で 7 万件がすでに乗っ取られていたとしています（[Infoblox, 2024](https://www.infoblox.com/blog/threat-intelligence/who-knew-domain-hijacking-is-so-easy/)）。この手法は Matt Bryant が 2016 年に記述しており、Infoblox は**ダングリング CNAME よりも成功しやすく、検出しにくい**と述べています。乗っ取られたドメインは、フィッシングや詐欺、大量のスパム、マルウェアの指令サーバ（C2）に使われ、正規のブランドを装った標的型攻撃にも転用されたと報告されています。
+
+なぜ検出しにくいのか。CNAME の消し忘れは、指さす先が 1 つの事業者のホスト名として自分のゾーンに書いてあるので、自分の DNS を洗えば見つかります。対して Sitting Ducks は、**親のレジストラ側の委任と、委任先の事業者側のゾーンの状態**という、離れた 2 か所の食い違いから生まれます。片方だけを見ても「委任は書いてある」「ゾーンは無い」としか分からず、乗っ取り済みになると（後述のとおり）ふつうに引けてしまいます。
+
+### ネームサーバのドメイン自体が失効する型
+
+もう 1 つ、委任にまつわる型があります。NS レコードに書くのは IP アドレスではなく**ネームサーバのホスト名**です（`ns1.old-dns-provider.net` など）。その**ホスト名のドメイン自体が期限切れになる**と、誰かがそのドメインを取り直し、正当なネームサーバを名乗れてしまいます。Bryant は、国際機関のドメインの権威ネームサーバが期限切れドメイン上にあった例を挙げ、その期限切れドメインを**買うだけ**でそのゾーンを支配できたと報告しています（[The Hacker Blog, 2017](https://thehackerblog.com/respect-my-authority-hijacking-broken-nameservers-to-compromise-your-target/)）。
+
+これは第 56 回のグルーの話とつながります。委任先のネームサーバが委任の内側にあれば、親がグルーでアドレスを預かります。しかし外側のドメインにあるネームサーバは、そのドメインの持ち主が変わればまるごと別人のものになります。**委任は「誰に聞くか」を名前で指しているだけで、その名前の持ち主が変わったことを親は知りません。**
+
+## 同じ構図の仲間
+
+指さした先の持ち主が変わる、という同じ構図は、ほかのレコードにもあります。
+
+| 型 | 指す先 | 持ち主が変わる形 |
+| --- | --- | --- |
+| A / AAAA | クラウドのグローバル IP | 解放した Elastic IP などが別の利用者に再割り当てされる |
+| MX | メールの届け先ホスト | そのホストを他人が取ると、メールを他人が受け取れる（第 125 回） |
+| TXT（SPF） | `include:` の先のドメイン | 先のドメインが失効し、他人に渡る（第 128 回） |
+| ドメインそのもの | 独自ドメインの登録 | 期限切れの独自ドメインを他人が取り直す（第 117 回） |
+
+A の例では、AWS の Elastic IP を解放すると**アドレスのプールに戻り、別の AWS アカウントに割り当てられうる**と明記されています（[AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing-eips-releasing.html)）。DNS に古い IP を書いたまま解放すると、その IP を引き当てた別の利用者に通信が届きます。CNAME のように名前で指していなくても、**共有のプールから借りている資源はいつか他人に回る**という点は同じです。
+
+MX の例は、乗っ取りの向きが「送る」ではなく「受ける」になります。第 125 回で見るように、メールの送信側は宛先ドメインの MX を引いてそこへ配送します。MX が指す届け先ホストを他人が取れば、そのドメイン宛てのメールを他人が受け取れます。SPF の `include:` は逆に、指す先が**消えると壊れる**型です。第 128 回で見るとおり、`include:` の先の SPF が無くなると自分のドメインの評価全体が permerror になり、契約をやめた配信サービスの SPF を誰かが取り直せば、その事業者を名乗るメールを通してしまいます。ドメインそのものの再取得は第 117 回で、廃業した会社のドメインを買い直して、そのドメインのメールアドレスで外部サービスに入れてしまう事故として見ます。
+
+## 乗っ取られると何が起きるか
+
+サブドメインを 1 つ握られただけ、と侮れないのは、その名前が**ほかの仕組みの信頼の土台**になっているからです。
+
+- **正規の TLS 証明書を取れる。** ACME の HTTP-01 は `http://<名前>/.well-known/acme-challenge/<トークン>` に置いたトークンを、DNS-01 は `_acme-challenge.<名前>` の TXT を確かめるだけです（[RFC 8555](https://www.rfc-editor.org/rfc/rfc8555.html)）。どちらも「その名前を**今**動かしている者」を確かめるだけなので、乗っ取った側が有効な証明書を取れます（第 103 回）。Microsoft も「SSL 証明書があれば守られる」は誤解だと明記しています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。手元の実験でも、攻撃者役のゾーンが `_acme-challenge.sub.example.test` の TXT を自由に返せたことを見ました。ACME から見れば、これは検証が通る、ということです
+- **親ドメインの Cookie が届く。** `Domain=example.com` で置かれた Cookie は、`shop.example.com` にも送られ、上書きもできます（[RFC 6265 8.6](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.6)、第 85・88・110 回）。乗っ取ったサブドメインで、本体のセッション Cookie を集められます
+- **許可リストに載っていた信頼が渡る。** `*.example.com` を CORS や CSP、OAuth の `redirect_uri` の許可に入れていると、その許可が攻撃者のサブドメインにも及びます（第 87・91 回、第 112 回）
+- **本物のドメインでフィッシングが立つ。** 見た目も証明書も本物なので、利用者にもブラウザにも見破れません。ドメインが積み上げてきた検索やメールの評判も、そのまま使われます
+
+第 85 回で「サブドメインが違えば別のサイト」という誤解を扱いました。放置されて乗っ取られた古いサブドメインは、本体と**同じサイトの内側**にいます。そこが握られると、上の 4 つがまとめて崩れます。
+
+```
+乗っ取った sub.example.com で攻撃者ができること
+  ├─ ACME で <名前> の証明書を取得        → 鍵マーク付きの偽サイト
+  ├─ Domain=example.com の Cookie を受信  → 本体のセッションを収集
+  ├─ *.example.com の許可を悪用           → CORS / CSP / OAuth の信頼を横取り
+  └─ 本物のドメインでフィッシング          → 利用者もブラウザも見破れない
+```
+
+1 つの名前の乗っ取りが、証明書・Cookie・許可リストという**別々の仕組みの前提**を同時に崩すのが、この攻撃の怖さです。どれも「同じドメイン（サイト）の中は信頼してよい」という前提に乗っており、その前提の内側に攻撃者が 1 つ足場を作れれば成り立ちます。
+
+## 防ぎ方
+
+**消す順番を守る。** 資源を消すときは、**先に DNS の指さしを消し、TTL が切れるのを待ってから資源を消す**。作るときは逆に、資源を用意してから指さす。Route 53 も、子のゾーンを消す前に親の NS を消し、その TTL の失効を待つよう勧めています（[AWS](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/protection-from-dangling-dns.html)）。
+
+```
+作るとき（安全側）        消すとき（安全側）
+1. 資源を用意する          1. DNS の指さしを消す
+2. 所有確認を済ませる      2. TTL が切れるのを待つ
+3. DNS で指す             3. 資源を消す
+   ↑ 指す先が常に自分         ↑ 空いた枠を指さない一瞬を作らない
+```
+
+危ないのは、この順番が逆になったときと、途中で止まったときです。「資源だけ消して DNS を消し忘れる」のがダングリング、「DNS で指したが資源をまだ作っていない」のも（Sitting Ducks のシナリオのように）宙に浮いた状態です。**指さしと資源は、どちらか一方だけが存在する時間を作らない**のが原則です。
+
+**台帳と突き合わせる。** DNS のレコードと、実際に持っている資源の一覧を定期的に照合します。Infrastructure as Code で「レコードと資源を同じ単位で」管理すると、片方だけ残る状態が生まれにくくなります。Microsoft は、消す前提の資源に削除ロックを掛け、「先に DNS を消す」印にする方法も挙げています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。
+
+**所有を証明させる事業者を選ぶ。** 第 58 回・第 117 回で見た TXT の所有確認は、ここでも効きます。Azure App Service は `asuid.<サブドメイン>` の TXT を、GitHub Pages は `_github-pages-challenge-<ユーザ名>` の TXT を置かせ、確認済みの名前を他人が取れないようにします（[GitHub Docs](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)）。
+
+**見知らぬ証明書に気づく。** CAA（第 58 回）で証明書を出してよい CA を絞っても、**乗っ取られた名前の証明書は防げません**。乗っ取った側は、あなたが許した CA を使えば普通に発行を受けられるからです。代わりに、Certificate Transparency（第 103 回）のログを監視し、自分のドメインに対する見知らぬ証明書の発行に気づく方が現実的です。
+
+<Callout type="warn" title="よくある誤解">
+  - **「使っていないサブドメインだから、放っておいても害はない」** — 使っていないからこそ、指す先が空いていれば他人に取られます。害は「使うこと」ではなく「指したまま残すこと」から来ます。
+  - **「CNAME の先が 404 やエラーを返しているなら安全」** — それは今そのホストに誰もいない、という意味でしかありません。攻撃者が同じ名前で枠を取れば、404 は本物のページに変わります。
+  - **「NS を事業者の名前にしてあれば、その事業者が守ってくれる」** — 事業者が守るのは事業者の枠だけです。委任先のゾーンを消して親の NS を残せば、その事業者が所有を検証しない限り乗っ取られます（Sitting Ducks）。
+  - **「CAA を設定していれば、勝手に証明書は出ない」** — CAA は CA を絞るだけで、その CA を使えば乗っ取った側も発行を受けられます。CAA は「他人の CA」を防ぎますが「他人の発行」は防ぎません。
+  - **「ワイルドカードの CNAME を置いておけば楽」** — `*.example.com` の CNAME は、無数のサブドメインをまとめて 1 つの事業者に向けます。その事業者が乗っ取り可能なら、まだ作っていない名前まで含めて危険が広がります。
+</Callout>
+
+## 手元で確かめる
+
+実在の第三者のドメインや事業者で乗っ取りを試すのは、検出の確認であってもいけません。代わりに、`.test`（実在しない予約 TLD）で仮想の構成を作り、手元だけで再現します。CoreDNS の権威サーバを 2 つ（親役と委任先の事業者役）、Unbound のフルリゾルバを 1 つ立て、コンテナ名は `ll64` で始め、ホスト側のポートは 18264〜18266 に割り当てました。
+
+```
+                     ┌─ ll64-parent (18264)  親ゾーン example.test
+dig → ll64-resolver ─┤   sub → NS ns1.dnshost.test / shop → CNAME ...
+      (18266)         └─ ll64-dnshost (18265)  委任先の事業者役
+                          + ll64-apphost        Host ヘッダで顧客を振り分ける HTTP サーバ
+```
+
+`dig` の宛先を `-p` でこれらのポートに向けると、フルリゾルバ経由でも、各権威サーバに直接でも引けます。第 56 回・第 63 回で使った `dig +norec`（RD ビットを落として権威の生の応答を見る）が、ここでも委任の状態を切り分けるのに効きます。
+
+### (a) NS 委任の乗っ取り
+
+親ゾーン `example.test` から `sub.example.test` を、事業者役のネームサーバ `ns1.dnshost.test` に委任します。健全なうちは、フルリゾルバ経由でレコードが引けます。
+
+```bash
+$ dig @127.0.0.1 -p 18266 sub.example.test MX +noall +answer
+sub.example.test.  5  IN  MX  10 mail.example.test.
+```
+
+事業者側で `sub.example.test` のゾーンを消すと、委任先はそのゾーンを知らなくなります。親の NS はそのままです。
+
+```bash
+$ dig @127.0.0.1 -p 18265 www.sub.example.test A +norec | grep status
+;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL     ← 委任先が答えられない（lame）
+$ dig @127.0.0.1 -p 18266 www.sub.example.test A | grep status
+;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL     ← フルリゾルバから見ても引けない
+```
+
+ここで「攻撃者」役が、同じ名前・同じネームサーバでゾーンを作り直します。親の委任は生きたままなので、攻撃者が書いた任意のレコードが引けるようになります。
+
+```bash
+$ for q in "www A" "sub.example.test MX" "sub.example.test TXT" "_acme-challenge.sub.example.test TXT"; do \
+    dig @127.0.0.1 -p 18266 +noall +answer ${q/#www/www.sub.example.test}; done
+www.sub.example.test.             5  IN  A    198.51.100.66
+sub.example.test.                 5  IN  MX   10 mx.evil.test.
+sub.example.test.                 5  IN  TXT  "v=spf1 ip4:198.51.100.0/24 -all"
+_acme-challenge.sub.example.test. 5  IN  TXT  "token-chosen-by-attacker"
+```
+
+A も MX も、SPF の TXT も、ACME の検証用 TXT まで、サブドメイン以下がまるごと攻撃者のものになりました。親のゾーンは 1 文字も変えていません。
+
+### (b) CNAME の乗っ取り
+
+`shop.example.test` を、事業者役の HTTP サーバが動く `shop-example.apphost.test` に CNAME で向けます。事業者役は `Host` ヘッダで顧客を振り分け、登録した顧客の内容を返します。
+
+```bash
+# 正規の顧客が登録している間
+$ curl -s http://shop.example.test/       # フルリゾルバ経由で名前解決
+[example-inc] Example Shop official
+
+# 顧客が解約する（事業者側の枠が空く）と
+$ curl -s http://shop.example.test/
+No such app                               # 404。ここで「安全」と思うのが誤解
+
+# 攻撃者が同じホスト名で枠を取り直すと
+$ curl -s http://shop.example.test/
+[mallory] Please log in again: enter your password
+```
+
+CNAME は同じ、名前解決の結果も同じ。変わったのは、事業者の入口の先にいる顧客だけです。
+
+### (c) 宙に浮いたレコードを見つける
+
+自分の管理するドメインの一覧に対して、**CNAME の先が NXDOMAIN のもの**と、**NS 委任先が lame なもの**を洗い出す小さなスクリプトを、`dnspython` を作業ディレクトリの venv に入れて書きました。委任先には非再帰で SOA を聞き、`AA` が立った `NOERROR` が返るかで健全さを判定します。手元の仮想ゾーンに対して、乗っ取り後と lame の 2 つの状態で走らせた出力です。
+
+```
+== lame state（委任先のゾーンを消した後）
+www.example.test.    -                                 ok
+shop.example.test.   CNAME shop-example.apphost.test.  ok
+blog.example.test.   CNAME example-blog.bucket.test.   DANGLING NXDOMAIN
+sub.example.test.    NS    ns1.dnshost.test.           LAME SERVFAIL
+```
+
+`blog` は指す先の CNAME が引けず（NXDOMAIN）、`sub` は委任先が答えられない（SERVFAIL）と分かります。実運用では、これに Certificate Transparency の監視と資源台帳の突き合わせを足します。
+
+<Callout type="tip" title="lame と乗っ取り済みは、外からは見分けにくい">
+  上の判定で `ok` と出た `shop` は、実は攻撃者に乗っ取られた後の状態でした。
+  **乗っ取られた名前は、正しく引けてしまう**ので、NXDOMAIN や SERVFAIL では捕まりません。
+  「引けないもの（lame・NXDOMAIN）」は乗っ取りの**手前**の状態にすぎず、そこを塞ぐのは予防です。
+  すでに乗っ取られたものを見つけるには、引けるかどうかではなく、
+  **指す先が本当に自分の資源か**（台帳との照合）と、**身に覚えのない証明書が出ていないか**（CT）を見る必要があります。
+</Callout>
+
+## 部品の組み合わせ
+
+乗っ取りが成り立つのも、そこから被害が広がるのも、この章とほかの章で見た部品が噛み合った結果です。
+
+| 部品 | 見た回 | 乗っ取りでの役割 |
+| --- | --- | --- |
+| NS 委任 / CNAME の指さし | 第 56・58 回 | 消し忘れると、指す先を他人に取られる入口になる |
+| 事業者のホスト名での振り分け | 第 90・104 回 | 同じ名前で枠を取れば、その名前宛ての通信が届く |
+| ACME の検証 | 第 103 回 | 「今その名前を動かす者」に証明書を出す |
+| Cookie の Domain 属性 | 第 88・110 回 | 親ドメインの Cookie がサブドメインに届く |
+| CORS / CSP / redirect_uri の許可 | 第 87・91・112 回 | `*.example.com` の許可が攻撃者に渡る |
+
+## まとめ
+
+- ダングリング DNS は、指す先の資源を消したのに指さし（CNAME・NS）を残した状態。第三者が同じ資源を取り直すと、その名前の中身を他人が決められる。エラーが出ないので気づきにくい
+- CNAME の消し忘れは、事業者が「空いた名前を先着で払い出す」ことと「ホスト名で顧客を振り分ける」ことで成り立つ。ランダムな名前しか出さない事業者や、証明書で所有を確かめる事業者では起きにくい
+- NS 委任の消し忘れは被害が広い。委任先のゾーンを消して親の NS を残すと、同じネームサーバを引ける攻撃者にサブドメイン以下がまるごと渡る。Sitting Ducks は、所有を検証しない事業者を突く型
+- ネームサーバのホスト名のドメイン自体が失効する型もある。委任は名前を指しているだけで、その名前の持ち主が変わったことを親は知らない（第 56 回のグルー）
+- 乗っ取られると、正規の TLS 証明書が取れ、親ドメインの Cookie が届き、許可リストの信頼が渡り、本物のドメインでフィッシングが立つ
+- 防ぐには、消す順番（先に DNS、後に資源）、台帳との突き合わせ、所有確認、CT の監視。CAA は他人の CA を防ぐが他人の発行は防げない
+
+名前を引き、TCP でつながったところで、ようやくアプリケーション同士が話し始めます。次の第 11 章では、その上に積まれている層として、**サービス同士の通信**を見ます。まずは、1 本の TCP 接続に多数のリクエストを流す HTTP/2 のフレームからです。

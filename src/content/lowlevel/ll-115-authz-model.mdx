@@ -1,0 +1,436 @@
+---
+title: 認可を設計する
+description: 誰なのかは分かった。では、その人にこの文書を読ませてよいのか。スコープと権限を分け、RBAC・ABAC・ReBAC の 3 つの表し方、判定と実行を分ける構成、判定を置く場所、BOLA を防ぐ原則、監査ログまでを、OPA と OpenFGA と PostgreSQL を手元で動かしながら見ます
+chapter: identity
+order: 8
+status: published
+topics:
+  - スコープと権限
+  - RBAC
+  - ABAC
+  - ReBAC / Zanzibar
+  - OPA / Rego
+  - OpenFGA
+  - PDP / PEP
+  - 行単位のセキュリティ
+  - マルチテナント
+  - 監査ログ
+requires:
+  - ll-114-token-verify
+  - ll-112-oauth
+  - ll-108-authn-authz
+  - ll-43-permission
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 残った最後の問い
+
+第 109〜114 回で、「このリクエストを送ってきたのは誰か」には答えられるようになりました。パスワードやパスキーで本人を確かめ、その結果をセッションや JWT で持ち越し、OAuth と OIDC で他のアプリに委ね、受け取った側でトークンを検証しました。
+
+残ったのは、第 108 回の 4 段階のうちの 3 つ目、**認可**です。第 108 回の実験では、BOLA を `if doc.owner != user` の 1 行で塞ぎました。しかしその直後の Callout で見たとおり、「読んでよい人」は所有者だけではありません。共有された人、同じチームの人、管理者、監査担当。規則が増えるたびに `if` が各処理に散らばり、**1 か所の書き忘れがそのまま他人のデータの漏洩**になります。
+
+この回では、その規則を**どう表し**（RBAC、ABAC、ReBAC）、**どこで判定し**（ゲートウェイ、サービス、データ層）、**どう記録するか**（監査ログ）を見ます。
+
+## スコープと権限は別の軸
+
+最初に、第 112 回で予告した区別を片付けます。アクセストークンの `scope` と、利用者の権限は、**別々の主体が別々の理由で決めたもの**です。
+
+| | スコープ | 権限 |
+| --- | --- | --- |
+| 何を表すか | 利用者が**クライアントに**許した範囲 | **利用者本人が**システムの中でしてよいこと |
+| 誰が決めるか | 同意画面で利用者が（認可サーバが記録） | システムの管理者や資源の所有者 |
+| どこにあるか | アクセストークン（第 111 回の `scope` クレーム） | アプリの DB、ポリシー、関係の表 |
+| 粒度 | 粗い（`docs.read` のような機能の単位） | 細かい（この文書、この行） |
+| 規定 | 意味は認可サーバとリソースサーバが決める（[RFC 6749 3.3](https://www.rfc-editor.org/rfc/rfc6749.html#section-3.3)） | OAuth は何も決めない |
+
+実際に許される操作は、**2 つの共通部分**です。
+
+```
+  利用者 alice の権限          クライアント（写真アプリ）のスコープ
+  ┌───────────────────┐       ┌───────────────────┐
+  │ 自分の文書を読む    │       │ docs.read          │
+  │ 自分の文書を消す    │       │                    │
+  │ チームの文書を読む  │       │                    │
+  └───────────────────┘       └───────────────────┘
+            └──────────── 共通部分 ────────────┘
+        このクライアント経由で alice ができるのは
+        「自分とチームの文書を読む」だけ。消すことはできない
+```
+
+スコープは「クライアントを通してできることの上限」を下げるだけで、権限を**足す**ことはありません。`docs.read` を持つトークンでも、alice が読めない文書は読めません。
+
+<Callout type="warn" title="よくある誤解: ロールをスコープに入れれば認可が済む">
+  利用者のロールを `scope=admin` のようにトークンへ入れ、リソースサーバがそれだけを見る設計があります。
+  これには 2 つの問題があります。1 つは、**スコープの意味が「クライアントに許した範囲」から「利用者の身分」にすり替わる**ことです。
+  どのクライアントが admin を名乗れるのかが同意の仕組みから外れます。
+  もう 1 つは、**トークンに書けるのは粗い情報だけ**だということです。「alice は文書 42 を読める」を
+  すべての文書についてトークンに書くことはできません。オブジェクト単位の判定は、リクエストのたびに
+  サーバ側の情報を見て行うしかありません。第 111 回で見たとおり、トークンの中身は発行した時点の写しなので、
+  権限を取り上げても期限まで残るという問題も加わります。
+</Callout>
+
+## RBAC: 人とできることの間にロールを挟む
+
+**RBAC（Role-Based Access Control）**は、利用者に直接権限を付けず、間に**ロール**を挟む方式です。NIST のモデルは 2004 年に ANSI/INCITS 359-2004 として標準になり、2012 年に改訂されました。モデルは Core RBAC（利用者とロール、ロールと権限の 2 つの割り当て）、ロールの階層、静的・動的な職務分掌の 4 つの部品でできています（[NIST RBAC FAQ](https://csrc.nist.gov/projects/role-based-access-control/faqs)）。
+
+```
+  利用者 ──割り当て──▶ ロール ──割り当て──▶ 権限（操作 × 対象の種類）
+  alice                 editor               docs:read, docs:update
+  bob                   admin                docs:read, docs:update, docs:delete
+```
+
+第 43 回で見た Unix のグループも、この形に近いものです。人が入れ替わってもロールと権限の対応はそのままなので、**「新人に何を許すか」を 1 回の割り当てで済ませられる**のが RBAC の強みです。「誰が admin か」を一覧できるので、棚卸しもしやすくなります。
+
+弱点は、**「どの対象に」を表せない**ことです。「自分が作った文書だけ消せる」「acme 社の文書だけ読める」を RBAC だけで書こうとすると、`acme-editor`、`globex-editor`、`project-x-viewer` のように、対象ごとにロールを作ることになります。OWASP の認可チートシートは、これを**ロールの爆発（role explosion）**と呼び、多数のロールがあるとロールの確認を見落としやすいこと、別々の組織や顧客がアクセスするマルチテナントの用途に RBAC が向かないことを理由に、**ABAC や ReBAC を RBAC より優先する**よう勧めています（[OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)）。
+
+## ABAC: 属性の組み合わせで判定する
+
+**ABAC（Attribute-Based Access Control）**は、NIST SP 800-162 の定義では「主体、対象、要求された操作、場合によっては環境条件の**属性**を、ポリシーや規則と照らし合わせて評価し、操作の可否を決める方法」です（[NIST SP 800-162](https://csrc.nist.gov/pubs/sp/800/162/upd2/final)）。
+
+```
+  主体の属性      id=alice, tenant=acme, roles=[editor], department=sales
+  対象の属性      id=doc-2, tenant=acme, owner=bob, label=confidential, department=hr
+  操作            read
+  環境の属性      時刻、接続元のネットワーク、端末の状態、認証の強さ（第 114 回の acr）
+        │
+        ▼  ポリシー: 「同じテナントで、ロールか所有者で許され、機密なら部署が一致すること」
+      拒否
+```
+
+ロールは属性の 1 つとして扱えるので、ABAC は RBAC を含みます。「テナントが一致すること」「機密文書は同じ部署だけ」「管理操作は MFA 済みのセッションだけ」を、ロールを増やさずに書けます。
+
+代わりに、2 つの難しさが生まれます。1 つは、**判定が属性の正しさに全面的に依存する**ことです。`department` を誰がどこから持ってくるのか、それがリクエストの本文のような利用者が書き換えられる場所なら、規則は無意味になります。もう 1 つは、**逆引きが難しい**ことです。「doc-2 を読めるのは誰か」「alice が読める文書はどれか」は、全員・全文書について規則を評価しないと答えられません。
+
+## ReBAC: 関係をたどって判定する
+
+Google Drive の共有を考えます。「フォルダを共有された人は、その中の文書も読める」「グループに共有すれば、グループの全員が読める」。ここで効いているのは属性ではなく、**対象と人、対象と対象の間の関係**です。これを正面から扱うのが **ReBAC（Relationship-Based Access Control）**です。
+
+その代表が、Google の **Zanzibar** です。2019 年の USENIX ATC の論文で、Calendar、Drive、Maps、Photos、YouTube などの認可を 1 つのデータモデルで扱い、**数兆の ACL、毎秒数百万の判定、95 パーセンタイルで 10 ミリ秒未満、3 年間で 99.999% を超える可用性**と報告されています（[Pang ほか, USENIX ATC 2019](https://www.usenix.org/conference/atc19/presentation/pang)）。
+
+Zanzibar は、権限を**関係タプル**の集まりで表します（論文 2.1 節）。
+
+```
+  ⟨tuple⟩   ::= ⟨object⟩ '#' ⟨relation⟩ '@' ⟨user⟩
+  ⟨user⟩    ::= ⟨user id⟩ | ⟨userset⟩
+  ⟨userset⟩ ::= ⟨object⟩ '#' ⟨relation⟩
+
+  doc:readme#owner@10                  利用者 10 は doc:readme の owner
+  group:eng#member@11                  利用者 11 は group:eng の member
+  doc:readme#viewer@group:eng#member   group:eng の member は doc:readme の viewer
+  doc:readme#parent@folder:A#...       doc:readme は folder:A の中にある
+```
+
+これに、**「editor は viewer でもある」「親フォルダの viewer は文書の viewer でもある」**という書き換え規則（userset rewrite）を名前空間ごとに与えます（論文 2.3 節）。判定は「alice から doc:readme#viewer まで、タプルと規則をたどってつながるか」というグラフの探索になります。ACL とグループを同じタプルで表すので、入れ子のグループも自然に扱えます。
+
+論文が強調しているのは、速さよりも**一貫性**です。論文は「新しい敵（new enemy）」問題を 2 つの例で説明しています（2.2 節）。
+
+- Alice がフォルダの ACL から Bob を外し、その後 Charlie に新しい文書をそのフォルダへ移してもらう。2 つの変更の順序を無視して判定すると、Bob が新しい文書を見られてしまう
+- Alice が文書の ACL から Bob を外し、その後 Charlie が文書に新しい内容を足す。Bob を外す前の古い ACL で判定すると、Bob が新しい内容を見られてしまう
+
+これを防ぐために Zanzibar は、ACL の書き込みや内容の版に対応するタイムスタンプを符号化した不透明なトークン **zookie** を返し、後の判定で「少なくともこの時点より新しい ACL で判定せよ」と指定させます。第 110 回と第 114 回で繰り返し見た**キャッシュと失効の trade-off** が、ここでも「どの時点の権限で判定するか」という形で現れます。
+
+Zanzibar そのものは公開されていませんが、論文に倣った実装があります。**OpenFGA** は Auth0/Okta が 2022 年に公開し、2025 年 10 月に CNCF の Incubating に進みました（[CNCF](https://www.cncf.io/blog/2025/11/11/openfga-becomes-a-cncf-incubating-project/)）。**SpiceDB** は AuthZed の実装で、zookie に当たるものを ZedToken と呼び、`minimize_latency` から `fully_consistent` までの一貫性を要求ごとに選ばせます（[SpiceDB](https://authzed.com/docs/spicedb/concepts/consistency)）。OpenFGA にも、キャッシュを使う `MINIMIZE_LATENCY`（既定）と、キャッシュを飛ばす `HIGHER_CONSISTENCY` があります（[OpenFGA](https://openfga.dev/docs/interacting/consistency)）。
+
+3 つの方式を並べます。
+
+| | RBAC | ABAC | ReBAC |
+| --- | --- | --- | --- |
+| 判定の材料 | 利用者のロール | 主体・対象・環境の属性 | 対象と人・対象同士の関係 |
+| 得意なこと | 機能単位の許可、棚卸し | テナント、部署、時刻、端末などの条件 | 共有、フォルダの継承、グループの入れ子 |
+| 苦手なこと | 対象ごとの区別（ロールの爆発） | 逆引き、属性の出どころの管理 | 関係で表せない条件（時刻、IP） |
+| 「X を読めるのは誰か」 | ロールから分かる | 全件の評価が要る | グラフを逆にたどれる |
+| 代表的な実装 | 多くのフレームワークの組み込み | OPA、Cedar | OpenFGA、SpiceDB |
+
+実際のシステムは 1 つに決めません。**機能は RBAC、テナントの境界は ABAC、共有は ReBAC**のように組み合わせるのが普通です。
+
+## 判定と実行を分ける: PEP と PDP
+
+どの方式で書くにしても、規則を各処理の `if` に埋め込むと、規則を変えるたびに全部の処理を直し、全部をテストし直すことになります。そこで、**判定する部品**と、**判定に従う部品**を分けます。XACML 3.0（OASIS、2013）の用語が今も広く使われています（[XACML 3.0 1.1.1](https://docs.oasis-open.org/xacml/3.0/xacml-3.0-core-spec-os-en.html)）。
+
+```
+     リクエスト
+         │
+         ▼
+  ┌──────────────┐  ① 判定の依頼（誰が、何を、どれに）   ┌──────────────┐
+  │     PEP      │ ──────────────────────────────────▶ │     PDP      │
+  │ 実行する場所  │ ◀────────────────────────────────── │ 判定する場所  │
+  │ (API の処理)  │  ② 許可 / 拒否（と理由）             │ (OPA, FGA)   │
+  └──────┬───────┘                                      └──────┬───────┘
+         │ ③ 許可なら処理、拒否なら 403/404                     │ 属性や関係を引く
+         ▼                                                      ▼
+      データ                                             PIP（属性の出どころ）
+                                                         PAP（ポリシーを書き、配る）
+```
+
+- **PEP（Policy Enforcement Point）**: 判定を依頼し、その結果に従ってアクセスを止める場所
+- **PDP（Policy Decision Point）**: ポリシーを評価して判定を返す場所
+- **PIP（Policy Information Point）**: 属性の出どころ。利用者の部署、文書の所有者
+- **PAP（Policy Administration Point）**: ポリシーを作る場所
+
+こう分けると、ポリシーをアプリのコードとは別にレビューし、テストし、配れます。ただし、**PEP を置き忘れた処理は PDP があっても素通り**です。分けたことで守られるのは「判定の一貫性」であって、「すべての入口で判定を呼んだか」は別に確かめる必要があります。
+
+ポリシーエンジンの代表は 2 つです。**OPA（Open Policy Agent）**は汎用のポリシーエンジンで、Rego という言語で規則を書き、任意の JSON を入力に判定します。2021 年に CNCF の Graduated になりました（[CNCF](https://www.cncf.io/projects/open-policy-agent-opa/)）。Kubernetes のアドミッション制御や Terraform の検査のように、アプリの認可以外にも使われます。**Cedar** は AWS が作った認可専用の言語で、Amazon Verified Permissions で使われ、2025 年 10 月に CNCF の Sandbox に入りました（[CNCF](https://www.cncf.io/projects/cedar/)）。Cedar は `permit` と `forbid` で規則を書き、**何も当てはまらなければ拒否、`forbid` が 1 つでも当てはまれば拒否**と決まっています（[Cedar](https://docs.cedarpolicy.com/policies/syntax-policy.html)）。
+
+```
+forbid (principal, action, resource) when { resource.private } unless { principal == resource.owner };
+```
+
+## 手元で確かめる 1: OPA でテナントと属性を判定する
+
+OPA 1.21 を Docker で起動し（ホスト側は 18105 番）、文書サービスの規則を Rego で書きます。規則は「同じテナントであること」「所有者か、ロールで操作が許されること」「機密文書は同じ部署であること」の 3 つです。
+
+```rego
+package docs.authz
+
+default allow := false
+
+allow if {
+	same_tenant
+	action_permitted
+	not blocked_by_label
+}
+
+same_tenant if input.subject.tenant == input.resource.tenant
+
+role_actions := {
+	"viewer": {"read"},
+	"editor": {"read", "update"},
+	"admin": {"read", "update", "delete"},
+}
+
+action_permitted if input.subject.id == input.resource.owner
+
+action_permitted if {
+	some role in input.subject.roles
+	input.action in role_actions[role]
+}
+
+blocked_by_label if {
+	input.resource.label == "confidential"
+	input.subject.department != input.resource.department
+}
+
+reasons contains "tenant mismatch" if not same_tenant
+reasons contains "action not permitted" if not action_permitted
+reasons contains "confidential: department mismatch" if blocked_by_label
+```
+
+`default allow := false` が **既定で拒否**を表します。どの `allow` の本体も満たされなければ false です。
+
+```
+$ docker run -d --name ll105-opa -p 18105:8181 -v $PWD/policy:/policy:ro \
+    openpolicyagent/opa:latest run --server --addr=0.0.0.0:8181 /policy
+$ curl -s -X POST localhost:18105/v1/data/docs/authz/allow -d '{"input": ...}'
+```
+
+入力を変えて 5 回問い合わせた結果です（`allow` と `reasons` だけを抜き出しています）。
+
+```
+alice (viewer, acme) が acme の doc-1 を read          {'allow': True,  'reasons': []}
+alice (viewer, acme) が acme の doc-1 を delete        {'allow': False, 'reasons': ['action not permitted']}
+alice (admin,  acme) が globex の doc-9 を read        {'allow': False, 'reasons': ['tenant mismatch']}
+alice (editor, sales) が hr の機密 doc-2 を read       {'allow': False, 'reasons': ['confidential: department mismatch']}
+bob (ロールなし, hr) が自分の機密 doc-2 を update       {'allow': True,  'reasons': []}
+```
+
+3 行目が大事です。alice は admin のロールを持っていますが、**別のテナントの文書には何もできません**。RBAC だけで「admin は delete できる」と書いていたら、この行は許可になっていたはずです。
+
+ポリシーがコードから独立しているので、単体テストも書けます。
+
+```
+$ docker run --rm -v $PWD/policy:/policy:ro openpolicyagent/opa:latest test /policy -v
+data.docs.authz_test.test_admin_of_other_tenant_denied: PASS (2.7905ms)
+data.docs.authz_test.test_viewer_can_read: PASS (5.449292ms)
+data.docs.authz_test.test_viewer_cannot_delete: PASS (5.934ms)
+--------------------------------------------------------------------------------
+PASS: 3/3
+```
+
+この実験で **PEP が組み立てている `input` を信じている**ことに注意してください。`subject.tenant` は検証済みのトークン（第 114 回）から、`resource.tenant` と `owner` は DB から取らなければなりません。どちらかをリクエストの本文から取れば、利用者は好きな判定を引き出せます。PDP は、渡された属性が正しいかどうかを知りません。
+
+## 手元で確かめる 2: OpenFGA で共有をたどる
+
+次に OpenFGA 1.21 を起動し（ホスト側 18106 番、保存先はメモリ）、フォルダとチームの共有をモデルにします。
+
+```
+$ docker run -d --name ll105-openfga -p 18106:8080 openfga/openfga:latest run
+```
+
+```
+model
+  schema 1.1
+
+type user
+
+type team
+  relations
+    define member: [user]
+
+type folder
+  relations
+    define owner: [user]
+    define viewer: [user, team#member] or owner
+
+type document
+  relations
+    define parent: [folder]
+    define owner: [user]
+    define editor: [user, team#member] or owner
+    define viewer: [user, team#member] or editor or viewer from parent
+```
+
+最後の行が Zanzibar の書き換え規則に当たります。文書の viewer は、直接の viewer、editor、**親フォルダの viewer** のいずれかです。この DSL を `fga model transform` で JSON にしてストアに書き込み、関係タプルを 5 つ入れます。
+
+```
+user:bob         owner   folder:payroll
+folder:payroll   parent  document:salary-2026
+team:hr#member   viewer  folder:payroll
+user:carol       member  team:hr
+user:alice       owner   document:draft
+```
+
+`/check` で判定します。
+
+```
+{"allowed":true}   <- user:carol viewer document:salary-2026   carol → hr の member → フォルダの viewer → 文書の viewer
+{"allowed":false}  <- user:alice viewer document:salary-2026   どの経路もない
+{"allowed":true}   <- user:bob viewer document:salary-2026     フォルダの owner → フォルダの viewer → 文書の viewer
+{"allowed":false}  <- user:bob editor document:salary-2026     フォルダの owner は文書の editor にはならない
+{"allowed":true}   <- user:alice editor document:draft         文書の owner は editor
+```
+
+4 行目は、モデルに書いたとおりの結果です。フォルダの所有者に中の文書を編集させたいなら、`editor` の定義に `or owner from parent` を足します。**許可の範囲はモデルの 1 行で決まり、その 1 行をレビューすればよい**ことが、ReBAC の読みやすさです。
+
+逆引きもできます。ABAC では難しかった「carol が読める文書はどれか」です。
+
+```
+$ curl -s -X POST localhost:18106/stores/$S/list-objects \
+    -d '{"type":"document","relation":"viewer","user":"user:carol", ...}'
+{"objects":["document:salary-2026"]}
+```
+
+最後に、carol を hr から外して、もう一度判定します。
+
+```
+$ curl -s -X POST localhost:18106/stores/$S/write \
+    -d '{"deletes":{"tuple_keys":[{"user":"user:carol","relation":"member","object":"team:hr"}]}}'
+{"allowed":false}  <- user:carol viewer document:salary-2026
+```
+
+**タプルを 1 つ消すだけで、そのチーム経由で届いていたすべての権限が消えます**。文書ごとの ACL を直して回る必要はありません。ただし、この実験はキャッシュを使わない既定の設定です。キャッシュを有効にした本番では、書き込みの直後の `MINIMIZE_LATENCY` の判定が古い結果を返しうると OpenFGA の文書は注意しています。前の節の「新しい敵」問題です。
+
+## どこで判定するか
+
+判定を呼ぶ場所（PEP）の候補は、リクエストの経路に沿って 3 つあります。
+
+```
+  利用者 ─▶ ゲートウェイ ─▶ サービス ─▶ データ層
+            │               │            │
+            │ トークンは有効か │ この文書を   │ この行を返してよいか
+            │ スコープはあるか │ 読んでよいか │ （行単位のセキュリティ）
+            │ この API を     │              │
+            │ 呼んでよいか    │              │
+```
+
+| 場所 | 判定できること | 判定できないこと |
+| --- | --- | --- |
+| ゲートウェイ | トークンの検証、スコープ、機能単位のロール、レート制限 | 対象のオブジェクトの持ち主（DB を見ていない） |
+| サービス | オブジェクト単位の判定、業務の規則 | 書き忘れた処理（PEP がなければ素通り） |
+| データ層 | テナントや所有者による行の絞り込み | 業務の文脈（なぜ読むのか） |
+
+<Callout type="warn" title="よくある誤解: ゲートウェイで認可したから、後ろのサービスは確かめなくてよい">
+  ゲートウェイが見ているのは、URL とヘッダとトークンだけです。`GET /docs/2` の 2 が誰の文書かは、
+  DB を引いたサービスにしか分かりません。ゲートウェイで判定できるのは「この利用者は文書の API を呼んでよいか」までで、
+  BOLA を防ぐ「この文書を読んでよいか」はサービスの中でしか判定できません。
+  さらに第 114 回で見たとおり、ゲートウェイがヘッダで ID を渡す型は、**後ろのサービスにゲートウェイを経由せずに届かないこと**が前提です。
+  OWASP のチートシートも、認可の確認は**正しい場所で**、すなわちサーバ側で、リクエストのたびに行うよう求めています。
+</Callout>
+
+## データ層で縛る: 行単位のセキュリティ
+
+サービスの PEP を書き忘れても漏れないように、**データ層にもう 1 枚**置けます。PostgreSQL の行単位のセキュリティ（RLS）は、テーブルにポリシーを付け、条件に合う行だけを見せます。手元の PostgreSQL 17 で、テナントの境界を作ります。
+
+```sql
+CREATE TABLE docs (id int PRIMARY KEY, tenant text NOT NULL, title text);
+INSERT INTO docs VALUES (1,'acme','acme の見積'),(2,'acme','acme の議事録'),(3,'globex','globex の契約書');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON docs USING (tenant = current_setting('app.tenant', true));
+GRANT SELECT, INSERT ON docs TO app;
+```
+
+アプリ用のロール `app` で接続し、テナントを設定してから読みます。
+
+```
+SET ROLE app;
+SELECT id, tenant, title FROM docs;              → (0 rows)        テナント未設定なら何も見えない
+SET app.tenant = 'acme';
+SELECT id, tenant, title FROM docs;              → 1, 2 の 2 行
+SELECT id, tenant, title FROM docs WHERE id = 3; → (0 rows)        globex の行は ID を指定しても見えない
+INSERT INTO docs VALUES (4,'globex','紛れ込み');
+ERROR:  new row violates row-level security policy for table "docs"
+```
+
+`WHERE id = 3` が 0 行になるのが要点です。**アプリが `WHERE tenant = ...` を書き忘れても、DB が行を絞ります**。書き込みも、ポリシーに合わない行は拒まれます。
+
+<Callout type="warn" title="よくある誤解: RLS を有効にすれば、誰から見ても行が絞られる">
+  PostgreSQL の文書は、**スーパーユーザと BYPASSRLS 属性を持つロールは常に RLS を迂回し、テーブルの所有者も通常は迂回する**と書いています（[PostgreSQL 5.9](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)）。
+  手元でも、テーブルの所有者 `migrator` で同じ `SELECT count(*)` を実行すると、テナントを acme にしていても **3 行全部**が数えられました。
+  `ALTER TABLE docs FORCE ROW LEVEL SECURITY` の後は 2 行です。
+  マイグレーションで作ったロールのままアプリを動かしていると、ポリシーは 1 行も効いていません。
+  また、`SET` は接続が続く限り残るので、接続プールで次のリクエストに前のテナントが残らないよう、トランザクションの中だけ効く `SET LOCAL` を使うなどの配慮が要ります。
+</Callout>
+
+データ層の判定は、あくまで**最後の網**です。「このテナントの行だけ」は得意ですが、「共有された人も読める」のような規則を SQL のポリシーに全部書くと、今度はそちらが読めなくなります。
+
+## BOLA を防ぐ原則
+
+ここまでの部品を、第 108 回の BOLA に戻して原則にまとめます。
+
+1. **既定で拒否する**。規則に当てはまらなければ拒否（Rego の `default allow := false`、Cedar の既定、RLS のポリシーなしは全拒否）
+2. **オブジェクトに触れるすべての処理で確かめる**。読み、更新、削除だけでなく、**一覧**も。一覧は「読める ID の集合」で絞る（OpenFGA の `list-objects` や RLS）。1 件ずつ取ってから捨てると、件数やページ送りで存在が漏れる
+3. **判定の材料を利用者から受け取らない**。利用者 ID とテナントは検証済みのトークンから、所有者は DB から取る。`?tenant=globex` や本文の `owner` を信じない
+4. **プロパティも確かめる**。OWASP API Security Top 10（2023）は、オブジェクト単位（API1: BOLA）の他に、**プロパティ単位**（[API3: BOPLA](https://api-security.owasp.org/editions/2023/en/0xa3-broken-object-property-level-authorization)。読めてはいけない項目を返す、書けてはいけない項目を書かせる）と**機能単位**（[API5: BFLA](https://api-security.owasp.org/editions/2023/en/0xa5-broken-function-level-authorization)。一般の利用者が管理用の API を呼べる）を別に挙げている
+5. **失敗は安全な側に倒す**。PDP に届かない、タイムアウトしたときは拒否する。「判定できなかったので通す」は、PDP を止めれば全部通るということ
+6. **テストする**。OPA の `opa test` のように、許可だけでなく「拒否されるべきもの」をテストに書く
+
+**マルチテナント**では、2 と 3 が特に重くなります。テナント ID は他の属性と違い、**一度越えると別の会社のデータ**です。テナントの境界は、アプリの規則、DB の RLS、場合によってはテナントごとの DB や暗号鍵（第 100 回のエンベロープ暗号化で鍵をテナントごとに分ける）と、何枚も重ねるのが普通です。
+
+## 監査ログ: 許可も拒否も残す
+
+第 108 回の 4 段階の最後が監査です。認可の判定は、**あとで「なぜ見えたのか」「なぜ見えなかったのか」に答えられる形**で残します。
+
+| 残すもの | 例 | 理由 |
+| --- | --- | --- |
+| 誰が | `iss` + `sub`（第 113 回）、クライアント ID | email は変わる。委任なら「誰の代わりに、どのクライアントが」 |
+| 何を | 操作と対象のオブジェクト ID、テナント | 「読んだ文書の一覧」を後から出すため |
+| 結果 | 許可 / 拒否と、その理由 | 拒否の急増は攻撃の兆候（ID の総当たり） |
+| 根拠 | ポリシーの版、モデルの ID、判定の ID | 規則を変えた後でも、当時の判定を再現する |
+| いつ | 時刻（第 140 回の時計） | 他のログと突き合わせる |
+
+OPA の決定ログは、判定ごとの `decision_id`、入力、結果、使ったポリシーの束の版を記録し、送る前に入力の一部を消したり置き換えたりできます（[OPA Decision Logs](https://www.openpolicyagent.org/docs/management-decision-logs)）。**入力にはトークンや個人情報が入りがち**なので、第 100 回で見たログからの漏洩の経路にしないよう、残す項目を決めておきます。監査ログそのものも、書き換えられないところへ送ります。
+
+## 組み合わせで見る
+
+この回の部品は、単体では何も守りません。
+
+| 部品 | 何を保証するか | 何と組み合わさって意味を持つか |
+| --- | --- | --- |
+| 認証とトークンの検証（第 109〜114 回） | 利用者が誰か、どのクライアントか | これがないと、PDP に渡す `subject` が嘘になる |
+| スコープ（第 112 回） | クライアントに許した上限 | 利用者の権限との共通部分として |
+| PDP（OPA、Cedar、OpenFGA） | 規則どおりの判定 | すべての入口の PEP と、正しい属性（PIP） |
+| RLS | 書き忘れても行が漏れない | 所有者でも迂回しないロール設定、正しいテナントの設定 |
+| 監査ログ | 後から説明できる | 時計、判定の ID、ポリシーの版 |
+
+## まとめ
+
+- スコープは利用者がクライアントに許した上限、権限は利用者本人ができること。実際に許されるのは共通部分で、スコープは権限を足さない
+- RBAC は人と権限の間にロールを挟む。棚卸しに強いが「どの対象に」を表せず、ロールが爆発する
+- ABAC は主体・対象・操作・環境の属性で判定する。条件を柔軟に書けるが、属性の出どころが信頼の要で、逆引きが難しい
+- ReBAC は関係タプルと書き換え規則のグラフで判定する。Zanzibar が原型で、OpenFGA と SpiceDB が実装。「新しい敵」問題を zookie などで防ぐ
+- 判定（PDP）と実行（PEP）を分けると規則をレビュー・テストできるが、PEP を置き忘れた入口は素通りになる
+- ゲートウェイはオブジェクトの持ち主を知らない。BOLA はサービスの中で防ぎ、データ層の RLS を最後の網にする。RLS は所有者とスーパーユーザを通常は通す
+- 既定で拒否、すべての処理（一覧を含む）で確かめる、判定の材料を利用者から受け取らない、判定できなければ拒否する
+- 監査ログには誰が・何を・結果・根拠（ポリシーの版）・いつを残し、許可も拒否も記録する
+
+第17章はここで終わりです。1 つのサービスの中なら、ここまでの部品で「誰が」「何をしてよいか」に答えられます。では、会社の中の 100 のサービスに、1 回のログインで入るにはどうするのか。第18章では、ログインをまとめる SSO を見ます。

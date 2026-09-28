@@ -1,0 +1,343 @@
+---
+title: オリジンとサイト
+description: a.example.com と b.example.com は「同じ」なのか「別」なのか。ブラウザの境界には、スキーム・ホスト・ポートで決まるオリジンと、登録可能なドメインで決まるサイトの 2 つの物差しがあります。どの仕組みがどちらを使うのかを、Public Suffix List とヘッドレスの Chrome で確かめます
+chapter: websec
+order: 1
+status: published
+topics:
+  - オリジン
+  - サイト
+  - 同一オリジンポリシー
+  - 登録可能なドメイン（eTLD+1）
+  - Public Suffix List
+  - schemeful same-site
+  - 不透明なオリジン（null）
+  - document.domain
+requires:
+  - ll-78-browser-process
+  - ll-77-navigation
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 「同じ相手」をどう決めるか
+
+第 78 回で見たとおり、ブラウザは**互いに信用しない多数のサイトのコード**を 1 つのプログラムの中で同時に動かしています。銀行のタブと、広告の iframe と、昨日たまたま開いたブログが、同じブラウザの中にいます。
+
+そうなると、ブラウザは絶えず「このコードに、あのデータを見せてよいか」を判断しなければなりません。判断するには、まず**誰と誰が同じ相手なのか**を決める物差しが要ります。
+
+ブラウザには、この物差しが 2 本あります。
+
+- **オリジン**: スキーム・ホスト・ポートの組。細かい物差し
+- **サイト**: スキームと「登録可能なドメイン」の組。粗い物差し
+
+`https://a.example.com` と `https://b.example.com` は、**オリジンで測ると別、サイトで測ると同じ**です。この回では、この 2 本の物差しの定義と、どの仕組みがどちらを使っているかを整理します。この章の残りの回は、すべてこの区別の上に立っています。
+
+## この章で見るもの
+
+| 回 | 題 | 中心の問い |
+| --- | --- | --- |
+| 第 85 回 | オリジンとサイト（この回） | 何を「同じ相手」とみなすか |
+| 第 86 回 | クロスオリジンで何ができて、何ができないか | 送れるが読めない、という非対称はどこから来たか |
+| 第 87 回 | CORS | サーバはどうやって「読ませてよい」と伝えるか |
+| 第 88 回 | ファーストパーティ Cookie とサードパーティ Cookie | 同じ Cookie が文脈で第三者になるのはなぜか |
+| 第 89 回 | ブラウザごとの Cookie の扱い | Safari、Firefox、Chrome は何をどこまで制限しているか |
+| 第 90 回 | ブラウザが送る文脈のヘッダ | 要求が「どこから来たか」をサーバはどう知るか |
+| 第 91 回 | 守るためのレスポンスヘッダ | CSP などは何を防ぎ、何を防がないか |
+| 第 92 回 | プロセスとメモリを分けるヘッダ | 「読めない」だけでは足りないのはなぜか |
+| 第 93 回 | フロントと API をどこに置くか | 構成の型ごとに、ここまでの部品がどう効くか |
+
+## オリジン: スキーム・ホスト・ポートの組
+
+HTML Standard は、オリジンを**ウェブのセキュリティモデルの基本単位**（原文では "fundamental currency"）と呼び、同じオリジンを共有する者は互いを信頼し同じ権限を持つ、とみなしています（[HTML Standard 7.1.1 Origins](https://html.spec.whatwg.org/multipage/browsers.html#origin)）。
+
+オリジンには 2 種類あります（同じ節）。
+
+- **タプルのオリジン**: スキーム、ホスト、ポート（null か 16 ビットの整数）、ドメイン（`document.domain` 用。普段は null）の組
+- **不透明なオリジン**: 中身を持たない内部の値。文字列にすると `null` になり、できる操作は「同じ値か」の比較だけ
+
+2 つのタプルのオリジンが**同一オリジン**なのは、**スキーム、ホスト、ポートの 3 つがすべて一致するとき**です。パスもクエリも関係しません。
+
+URL からオリジンを取り出すのは `new URL(...).origin` です。Node 20 で試しました（手元の実行結果）。
+
+```
+https://example.com/a/b?q=1#x      -> https://example.com
+https://example.com:443/           -> https://example.com
+http://example.com:80/             -> http://example.com
+https://example.com:8443/          -> https://example.com:8443
+HTTPS://EXAMPLE.com/               -> https://example.com
+https://user:pw@example.com/       -> https://example.com
+https://例え.jp/                     -> https://xn--r8jz45g.jp
+file:///etc/hosts                  -> null
+data:text/html,hi                  -> null
+blob:https://example.com/1234      -> https://example.com
+about:blank                        -> null
+```
+
+読み取れることを並べます。
+
+- **既定のポートは消える**。`https` の 443 と `http` の 80 は、URL の解析の時点でポートが null になるので、`:443` を書いても書かなくても同じオリジンです
+- スキームとホストは小文字に、国際化ドメイン名は Punycode（`xn--`）にそろえられてから比べられる
+- `data:` や `about:blank` の URL 自体は不透明なオリジンになる。`blob:` は中に書かれた URL のオリジンを引き継ぐ（[URL Standard: origin](https://url.spec.whatwg.org/#concept-url-origin)）
+
+## サイト: 登録可能なドメインで束ねる
+
+**サイト**は、スキームと、ホストの**登録可能なドメイン**の組です（[HTML Standard 7.1.1.1 Sites](https://html.spec.whatwg.org/multipage/browsers.html#sites)）。ポートとドメインの成分は無視されます。
+
+登録可能なドメインとは、ホストの**公開接尾辞**（public suffix）と、その 1 つ左のラベルを合わせたものです（[URL Standard: Host miscellaneous](https://url.spec.whatwg.org/#host-miscellaneous)）。**eTLD+1**（実質的なトップレベルドメインに 1 ラベル足したもの）とも呼ばれます。
+
+- 公開接尾辞: その下を**誰でも登録できる**部分。`com`、`co.jp`、`github.io` など
+- 登録可能なドメイン: その下で**1 つの組織が管理している**単位。`example.com`、`example.co.jp`
+
+公開接尾辞は DNS の構造からは分かりません。`co.jp` も `example.jp` も、DNS の上では同じ 2 ラベルのドメインです。第 58 回で見た DNS のレコードのどこにも「ここから下は別の持ち主」とは書かれていません。そこで、ブラウザは **Public Suffix List**（PSL）という、有志が管理する一覧表に頼っています（[publicsuffix.org](https://publicsuffix.org/)）。
+
+PSL には 2 つの区画があります。
+
+- **ICANN の区画**: `com`、`jp`、`co.jp` のように、レジストリが管理するもの
+- **私的な区画**: `github.io`、`vercel.app`、`herokuapp.com` のように、**企業が「利用者ごとのサブドメインを別の持ち主として扱ってほしい」と申請したもの**
+
+`github.io` が公開接尾辞なので、`a.github.io` と `b.github.io` の登録可能なドメインはそれぞれ `a.github.io` と `b.github.io` になり、**別のサイト**になります。GitHub Pages で他人のページに Cookie を仕込まれないのは、この登録のおかげです（自社のドメインを PSL に載せる意味は第 93 回で扱います）。
+
+### 同一オリジン、同一サイト、クロスサイト
+
+| A | B | 同一オリジン | 同一サイト |
+| --- | --- | --- | --- |
+| `https://example.com` | `https://example.com/other` | 同じ | 同じ |
+| `https://a.example.com` | `https://b.example.com` | **別** | **同じ** |
+| `https://example.com` | `https://example.com:8443` | **別**（ポート） | **同じ**（ポートは無視） |
+| `https://example.com` | `http://example.com` | 別 | **別**（スキームが違う） |
+| `https://a.github.io` | `https://b.github.io` | 別 | **別**（`github.io` は公開接尾辞） |
+| `https://example.co.jp` | `https://example.jp` | 別 | 別 |
+| `http://127.0.0.1` | `http://localhost` | 別 | 別（ホスト名が違い、どちらも登録可能なドメインを持たない） |
+
+IP アドレスや `localhost` のように登録可能なドメインを持たないホストは、ホストそのものがサイトの成分になります（HTML Standard の「obtain a site」の手順）。
+
+<Callout type="warn" title="よくある誤解: 「サブドメインが違えば別のサイト」">
+  `a.example.com` と `b.example.com` は**別のオリジンですが、同じサイト**です。
+  SameSite の Cookie（第 110 回）も、サイト分離のプロセス（第 78 回）も、この 2 つを区別しません。
+  利用者が自由にページを置けるサブドメインや、放置されて乗っ取られた古いサブドメインがあれば、そこは本体と「同じサイト」の内側にいます。
+  逆に、`a.github.io` と `b.github.io` は、見た目はサブドメインの違いでも**別のサイト**です。
+  サイトかどうかは見た目のドットの数ではなく、**PSL で決まります**。
+</Callout>
+
+### schemeful same-site
+
+以前は「サイト」にスキームが含まれず、`http://example.com` と `https://example.com` は同じサイトとして扱われていました。いまの HTML Standard は、スキームを無視する比較を「schemelessly same site」、スキームも比べるものを「same site」として分けています（[7.1.1.1](https://html.spec.whatwg.org/multipage/browsers.html#sites)）。
+
+Chrome は、Cookie の SameSite の判定でスキームも比べる **schemeful same-site** を Chrome 89 で既定にしました（[Chrome Platform Status](https://chromestatus.com/feature/5096179480133632)）。これで、平文の `http://example.com` のページ（通信路で書き換えられうる）から、`https://example.com` への要求は**クロスサイト**として扱われます。Firefox は同じ Platform Status の記録で支持（Positive）、Safari は意見表明なし（No signal）となっており、両者の既定の挙動までは、執筆時点（2026 年 9 月）で一次ソースから確かめられませんでした。
+
+## 手元で確かめる（1）: PSL から eTLD+1 を計算する
+
+PSL の生ファイルを取り、自分で判定してみます。作業ディレクトリで取得した版は次のものでした。
+
+```
+$ curl -s https://publicsuffix.org/list/public_suffix_list.dat -o psl.dat
+$ grep -E '^// (VERSION|COMMIT)' psl.dat
+// VERSION: 2026-09-24_13-26-36_UTC
+// COMMIT: a179a48c465e818cfd8d626691cb317985da87fb
+$ grep -c -v -E '^(//|$)' psl.dat
+10334
+$ grep -n -E '^(github\.io|co\.jp|\*\.kawasaki\.jp|!city\.kawasaki\.jp)$' psl.dat
+2013:co.jp
+2120:*.kawasaki.jp
+2121:!city.kawasaki.jp
+13779:github.io
+```
+
+規則は 10334 行あり、そのうち 3384 行が私的な区画です。規則には 3 種類あります。
+
+- 普通の規則（`co.jp`）: そのラベル列が公開接尾辞
+- ワイルドカード（`*.kawasaki.jp`）: その下の 1 ラベルまで含めて公開接尾辞
+- 例外（`!city.kawasaki.jp`）: ワイルドカードに当てはまるが、公開接尾辞ではない
+
+判定は「最も長く一致する規則を探し、例外なら 1 ラベル短くする。どれにも一致しなければ最後のラベルを公開接尾辞とみなす」だけです。30 行ほどの Python で書き、venv に入れた `publicsuffixlist`（1.0.2.20260925）の結果と突き合わせました。
+
+```python
+def public_suffix(host):
+    labels = host.split(".")
+    for i in range(len(labels)):
+        cand = ".".join(labels[i:])
+        if cand in exceptions:
+            return ".".join(labels[i + 1:])
+        if cand in rules or ".".join(["*"] + labels[i + 1:]) in rules:
+            return cand
+    return labels[-1]
+```
+
+```
+www.example.com        public suffix=com                  eTLD+1=example.com
+a.example.com          public suffix=com                  eTLD+1=example.com
+shop.example.co.jp     public suffix=co.jp                eTLD+1=example.co.jp
+a.github.io            public suffix=github.io            eTLD+1=a.github.io
+b.github.io            public suffix=github.io            eTLD+1=b.github.io
+github.io              public suffix=github.io            eTLD+1=None
+foo.city.kawasaki.jp   public suffix=kawasaki.jp          eTLD+1=city.kawasaki.jp
+foo.bar.kawasaki.jp    public suffix=bar.kawasaki.jp      eTLD+1=foo.bar.kawasaki.jp
+my-app.vercel.app      public suffix=vercel.app           eTLD+1=my-app.vercel.app
+localhost              public suffix=localhost            eTLD+1=None
+```
+
+2 つの実装で、全部の行が一致しました。`github.io` 自身は公開接尾辞そのものなので、登録可能なドメインを持ちません。川崎市の例は、ワイルドカードと例外の組み合わせで「`city.kawasaki.jp` だけは 1 つの組織」と表しています。
+
+<Callout type="note" title="ブラウザの PSL は、ブラウザと一緒に届く">
+  ブラウザは PSL を毎回取りに行くのではなく、ビルドの時点の版を**本体に組み込んで**います。
+  PSL に新しく登録しても、利用者のブラウザが更新されるまでは効きません。
+  同じ URL でも、ブラウザの版によってサイトの判定が変わりうるということです。
+</Callout>
+
+## 同一オリジンポリシーは何を止めるのか
+
+**同一オリジンポリシー**は、あるオリジンの文書やスクリプトが、別のオリジンの資源とどう関われるかを制限する仕組みです。MDN は、別のオリジンとのやり取りを 3 つに分けて整理しています（[MDN: Same-origin policy](https://developer.mozilla.org/en-US/docs/Web/Security/Same-origin_policy)）。
+
+| 種類 | 例 | 既定 |
+| --- | --- | --- |
+| 書き込み（送る） | リンク、リダイレクト、フォームの送信 | **許す** |
+| 埋め込み | `<script src>`、`<link rel=stylesheet>`、`<img>`、`<video>`、`<iframe>`、`@font-face` | **許す** |
+| 読み出し | 別のオリジンの応答の中身、別のオリジンの iframe の DOM | **止める** |
+
+つまり、同一オリジンポリシーは主に**読むこと**を止める仕組みで、**送ること**は止めません。別のサイトのページからフォームで POST を送れるのはこのためで、それが CSRF の根になります（第 110 回）。埋め込みを許しているのは、画像や広告やスクリプトの配信所を他のオリジンに置くことが、ウェブの成り立ちそのものだったからです。この非対称の由来と、埋め込みから情報が漏れる経路は第 86 回で見ます。
+
+<Callout type="warn" title="よくある誤解: 「同一オリジンポリシーがあるので、別のサイトから自分のサーバへは要求が来ない」">
+  要求は来ます。ブラウザが止めるのは、多くの場合**応答をページに読ませること**であって、要求を送ることではありません。
+  フォームの POST も、`<img>` の GET も、読めない `fetch` も、サーバには届いて処理されます。
+  サーバの状態を変える操作は、同一オリジンポリシーとは別の手段（CSRF の対策、第 110 回と第 90 回）で守る必要があります。
+  CORS のエラーが出ても要求はサーバに届いていることがある、という話は第 87 回で確かめます。
+</Callout>
+
+### オリジンは誰が決めるのか
+
+ページのオリジンを決めるのは**ブラウザ**です。ブラウザは、文書をどの URL から読み込んだかを見てオリジンを割り当て、ページの JavaScript はそれを書き換えられません。第 78 回で見たように、別のオリジンのデータを渡してよいかを判断するのは、乗っ取られうるレンダラではなくブラウザ側のプロセスです。WebAuthn でブラウザがページのオリジンを署名の対象に書き込む（第 109 回）のも、オリジンが**ページには偽れない値**だからです。
+
+## 手元で確かめる（2）: ヘッドレスの Chrome で境界を見る
+
+Python の `http.server` で同じ内容のサーバを 127.0.0.1 の 18182 と 18183 で立て、Playwright からヘッドレスの Chrome 153 を**独立したプロファイル**（毎回まっさらな一時プロファイル）で動かしました。`--host-resolver-rules` で `a.example.test`、`b.example.test`、`other.test`、`a.github.io`、`b.github.io` を 127.0.0.1 に向けています。`.test` は PSL に無いので、最後のラベル `test` が公開接尾辞とみなされ、`a.example.test` の登録可能なドメインは `example.test` になります。
+
+まず、A のページに B の iframe を入れ、親から `iframe.contentWindow.document` を読みます。同時に、B にあらかじめ `SameSite=Strict` の Cookie を置いておき、iframe の要求にそれが付くかをサーバのログで見ます。**Strict の Cookie が付けば、Chrome はそれを同一サイトの要求と判定した**ということです。
+
+```
+A                              B                              親から DOM を読む   Strict の Cookie
+http://a.example.test:18182    http://a.example.test:18182    read ok            付いた
+http://a.example.test:18182    http://b.example.test:18182    SecurityError      付いた
+http://a.example.test:18182    http://a.example.test:18183    SecurityError      付いた
+http://a.github.io:18182       http://b.github.io:18182       SecurityError      付かない
+http://a.example.test:18182    http://other.test:18182        SecurityError      付かない
+http://127.0.0.1:18182         http://localhost:18182         SecurityError      付かない
+```
+
+2 本の物差しがそのまま見えます。**DOM を読めるかはオリジンで決まり**、ポートだけが違っても読めません。**Strict の Cookie が付くかはサイトで決まり**、サブドメインやポートが違っても付きますが、`github.io` の兄弟には付きません。Chrome が本体に組み込んだ PSL で判定していることも分かります。
+
+Chrome 153 には、HTML Standard に新しく入った `Origin` インタフェース（[7.1.1.3](https://html.spec.whatwg.org/multipage/browsers.html#the-origin-interface)）も実装されていました。オリジンとサイトの比較を、文字列の操作ではなくブラウザ自身の判定で行えます。
+
+```
+> const o = Origin.from('https://a.example.com')
+> o.isSameOrigin(Origin.from('https://b.example.com'))       // false
+> o.isSameSite(Origin.from('https://b.example.com'))         // true
+> Origin.from('https://a.github.io').isSameSite(Origin.from('https://b.github.io'))  // false
+> o.isSameSite(Origin.from('http://a.example.com'))          // false（schemeful）
+> o.isSameSite(Origin.from('https://a.example.com:8443'))    // true（ポートは無視）
+```
+
+`Origin` を他のブラウザが実装しているかは、執筆時点で確かめていません。使う前に対応状況を確認してください。
+
+## null のオリジンと file://
+
+不透明なオリジンは、次のような「どこの誰とも言えない」文書に割り当てられます。
+
+- `sandbox` 属性の付いた iframe（`allow-same-origin` を付けない場合）
+- `data:` の URL で開いた文書
+
+手元の Chrome で、`sandbox="allow-scripts"` の iframe から親に `self.origin` を送ると、中身も、受け取った `message` イベントの `origin` も、どちらも文字列の `null` でした。一方、スクリプトで作った `about:blank` の iframe は、URL が `about:blank` のままでも**作った親のオリジン**（`http://127.0.0.1:18183`）を受け継いでいました。URL のオリジンと文書のオリジンは、いつも同じとは限りません。
+
+<Callout type="warn" title="よくある誤解: 「Origin: null なら、どこからでもないので許してよい」">
+  `null` は「オリジンが無い」ではなく、**誰でも作れる**オリジンです。
+  攻撃者のページが `sandbox` の iframe を 1 つ作れば、その中から送る要求は `null` を名乗ります。
+  しかも不透明なオリジンは、文字列にすると区別がつかないので、許可の一覧に `null` を入れると、無関係なすべての不透明なオリジンを許すことになります。
+  CORS で `null` を許す危険は第 87 回で見ます。
+</Callout>
+
+`file://` はさらに曖昧です。URL Standard は、`file:` のオリジンについて「残念ながら、これは読者への課題として残す。迷ったら新しい不透明なオリジンを返すこと」と書いています（[URL Standard](https://url.spec.whatwg.org/#concept-url-origin)）。MDN も、現在のブラウザはローカルのファイルを通常は不透明なオリジンとして扱い、同じフォルダのファイルどうしも同一オリジンにならない、としています（[MDN](https://developer.mozilla.org/en-US/docs/Web/Security/Same-origin_policy)）。
+
+手元の Chrome 153 で `file://` のページを開くと、`self.origin` は `null` でしたが、`location.origin` は `file://` でした。**同じページに 2 つの答え**があり、仕様が決めきれていない部分がブラウザの実装に残っています。ローカルの HTML から `fetch` で隣のファイルを読めない、というよくある困りごとはここから来ます。開発では、`file://` で開かずに小さな HTTP サーバで配るのが確実です。
+
+## document.domain: オリジンを緩める古い抜け道
+
+オリジンの 4 つ目の成分の「ドメイン」は、`document.domain` のためだけにあります。`a.example.com` と `b.example.com` の両方のページが `document.domain = "example.com"` と書くと、2 つは「same origin-domain」になり、互いの DOM を同期的に触れるようになります（[HTML Standard 7.1.1.2](https://html.spec.whatwg.org/multipage/browsers.html#relaxing-the-same-origin-restriction)）。
+
+HTML Standard はこの setter を使わないように求めています。理由は 2 つです。
+
+- **ポートが無視される**。同じホストの別のポートで動く第三者のサーバも、同じ値を設定すれば入り込める
+- 第 78 回で見た、**オリジンごとにプロセスを分ける**方向の変更の障害になる。同期的に DOM を触れる 2 つの文書は、同じプロセスに置くしかない
+
+仕様は「この機能はウェブから取り除く途中にある（何年もかかる長い過程）」と書き、代わりに `postMessage()` を使うよう勧めています。`Origin-Agent-Cluster: ?1` の応答ヘッダを返すと、そのオリジンの文書は「オリジン単位のエージェントクラスタ」に入り、setter は何もしなくなります（Chrome は 88 からこのヘッダに対応、[Chrome Platform Status](https://chromestatus.com/feature/5683766104162304)）。
+
+では既定はどうか。Chrome の開発者向けブログは、2023 年に「Chrome 115 から既定で `document.domain` を設定できなくする」と告知しました（[Chrome for Developers](https://developer.chrome.com/blog/document-domain-setter-deprecation)）。ところが Chrome Platform Status では、執筆時点（2026 年 9 月）でもこの項目は「In developer trial (Behind a flag)」のままです（[Chrome Platform Status](https://chromestatus.com/feature/5428079583297536)）。手元でも確かめました。
+
+```
+                                          originAgentCluster   setter の結果              iframe の DOM
+Chrome 153 の既定（ヘッダなし）              false                a.example.test → example.test   両方が設定すると read ok
+親だけが設定                                -                    -                               SecurityError
+document.domain = "test"（公開接尾辞）       -                    SecurityError                   -
+```
+
+手元の Chrome 153 では、**既定のままでも setter は効き**、親子の両方が `example.test` を設定すると別オリジンの DOM が読めました。公開接尾辞そのもの（`test`）への設定は拒否されます。告知と実際の既定がずれているので、「もう `document.domain` は効かない」と思い込まず、**使っていないなら `Origin-Agent-Cluster: ?1` を返して自分で閉じる**のが確実です。
+
+## どの仕組みがどちらの物差しを使うか
+
+ここまでの区別を、この先の回で出てくる仕組みにあてはめます。
+
+| 仕組み | 境界の単位 | 補足 |
+| --- | --- | --- |
+| DOM へのアクセス、`fetch` の応答の読み出し | オリジン | 同一オリジンポリシー。緩めるのは CORS（第 87 回） |
+| `localStorage`、IndexedDB | オリジン | 別のオリジンの保存領域は読み書きできない。さらにトップレベルのサイトでも分ける流れがある（第 88 回） |
+| Cookie の送り先 | **ドメイン ＋ パス** | ポートを区別しない。スキームは `Secure` 属性でしか区別しない。`Domain` 属性で登録可能なドメインまで広げられる（第 110 回） |
+| SameSite 属性 | サイト | 要求を始めた文脈と宛先が同一サイトか（第 110 回） |
+| 第三者 Cookie の制限 | サイト | トップレベルのサイトと Cookie のサイトが違うか（第 88 回、第 89 回） |
+| `Sec-Fetch-Site` | オリジンとサイトの両方 | `same-origin` / `same-site` / `cross-site` / `none` を区別する（第 90 回） |
+| サイト分離のプロセス | サイト | スキームと登録可能なドメイン。サブドメインとポートは無視する（[Chromium: Site Isolation](https://www.chromium.org/Home/chromium-security/site-isolation/)） |
+| WebAuthn の RP ID | 登録可能なドメインの範囲 | 既定はオリジンのホスト。そのホストか、登録可能なドメインまでの上位のドメインだけを名乗れる（[WebAuthn Level 3](https://www.w3.org/TR/webauthn-3/#rp-id)、第 109 回） |
+| `postMessage` | オリジン | 受け手が `event.origin` を確かめる（第 86 回） |
+
+Cookie だけが、オリジンともサイトとも違う**独自の物差し**を持っている点に注意してください。RFC 6265 は、Cookie は**ポートで分離されない**と明記しています（[RFC 6265 8.5](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.5)）。Cookie が同一オリジンポリシーより古く、別々に育ってきたためです。
+
+## 手元で確かめる（3）: Cookie と localStorage の物差しの違い
+
+同じヘッドレスの Chrome で、`http://127.0.0.1:18182` のページに `localStorage` と Cookie を 1 つずつ書き、ポートだけが違う `http://127.0.0.1:18183` のページで読みました。
+
+```
+on 18183 {"localStorage":null,"cookie":"c=set-on-18182"}
+```
+
+`localStorage` はオリジンで分かれるので見えず、**Cookie はポートで分かれないので見えました**。同じホストの別のポートで別のアプリを動かしている開発環境では、Cookie の名前の衝突が起きます。
+
+次に、`Domain` 属性で Cookie を上位のドメインへ広げます。
+
+```
+set on a.example.test with Domain=example.test: here="wide=1"  on b.example.test="wide=1"
+set on a.github.io   with Domain=github.io:     here=""        on b.github.io=""
+```
+
+`example.test` への拡大は受け付けられ、兄弟の `b.example.test` にも届きました。`github.io` は公開接尾辞なので、ブラウザは**Cookie ごと捨てました**（書いた本人のページにも残っていません）。RFC 6265 の受け取りの手順は、公開接尾辞を拒むように設定されたブラウザでは、`Domain` 属性が公開接尾辞（かつ要求先のホストそのものではない）なら Cookie を丸ごと無視する、と定めています（[RFC 6265 5.3](https://www.rfc-editor.org/rfc/rfc6265.html#section-5.3)）。もし PSL がなければ、`a.github.io` の持ち主は、すべての GitHub Pages の利用者に Cookie を配れてしまいます。
+
+## 組み合わせで見る
+
+オリジンとサイトは、それだけでは何も守りません。**何かの仕組みが境界の単位として使ったとき**に初めて意味を持ちます。
+
+| 守りたいこと | 使う物差し | 組み合わせる部品 |
+| --- | --- | --- |
+| 他のサイトのページに自分の DOM や応答を読ませない | オリジン | 同一オリジンポリシー（この回）、CORS（第 87 回） |
+| 他のサイトから始まった要求にログイン状態を付けない | サイト | SameSite（第 110 回）、Fetch Metadata（第 90 回） |
+| 埋め込み先ごとの追跡を防ぐ | サイト | 第三者 Cookie の制限と保存領域の分割（第 88 回、第 89 回） |
+| 投機実行で別のサイトのメモリを読ませない | サイト | サイト分離（第 78 回）、COOP / COEP（第 92 回） |
+| 利用者ごとのサブドメインを互いに隔てる | サイト | PSL への登録（第 93 回） |
+
+## まとめ
+
+- ブラウザには 2 本の物差しがある。**オリジン**はスキーム・ホスト・ポートの組、**サイト**はスキームと登録可能なドメイン（eTLD+1）の組
+- 登録可能なドメインは DNS からは分からず、**Public Suffix List** で決まる。`github.io` のように、企業が申請した私的な区画もある
+- `a.example.com` と `b.example.com` は別オリジンで同じサイト。`a.github.io` と `b.github.io` は別サイト。Chrome は 89 から、スキームが違えば別サイトとして扱う
+- 同一オリジンポリシーは主に**読み出し**を止め、送ることと埋め込むことは許す。要求そのものはサーバに届く
+- オリジンを決めるのはブラウザで、ページは偽れない。`null` は「誰でもない」ではなく「誰でも名乗れる」オリジン。`file://` は仕様でも決めきれていない
+- `document.domain` はポートを無視してオリジンを緩める古い抜け道で、廃止の途中にある。手元の Chrome 153 では既定のままでまだ効いた
+- DOM と `localStorage` はオリジン、SameSite と第三者 Cookie とサイト分離はサイト、Cookie の送り先は**ドメインとパス**（ポートを区別しない）という、3 つ目の物差しを持つ
+
+次の回では、別のオリジンに対して「何ができて、何ができないか」を細かく見ます。埋め込みは許し、読み出しは止める、という非対称がどこから来たのか、そしてその隙間から何が漏れるのかを、2 つのオリジンを立てて確かめます。
