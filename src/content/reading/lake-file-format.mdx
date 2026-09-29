@@ -93,7 +93,7 @@ duckdb  : [BIGINT, VARCHAR, VARCHAR, DOUBLE] ['0070012', '1500001', '0600000']
 
 ## Avro：スキーマを持ち歩く行指向
 
-**Avro** は Apache のデータの直列化の仕組み（プログラム上のデータをバイト列にする方式）で、執筆時点で公開されている仕様は 1.12.0 です（[Avro Documentation](https://avro.apache.org/docs/)）。スキーマは JSON で書き、値はスキーマに従って詰めたバイナリにします。**バイナリの中には型の情報もフィールドの名前も入りません。** 整数は Protocol Buffers と同じくジグザグ符号化した可変長整数です（<a href={`${import.meta.env.BASE_URL}lowlevel/ll-66-protobuf-wire/`}>Protocol Buffers のワイヤ形式</a>の回で見た varint と zigzag）。
+**Avro** は Apache のデータの直列化の仕組み（プログラム上のデータをバイト列にする方式）で、執筆時点で公開されている仕様は 1.12.0 です（[Avro Documentation](https://avro.apache.org/docs/)）。スキーマは JSON で書き、値はスキーマに従って詰めたバイナリにします。**バイナリの中には型の情報もフィールドの名前も入りません。** 整数は Protocol Buffers と同じくジグザグ符号化した可変長整数です（<a href={`${import.meta.env.BASE_URL}lowlevel/ll-67-protobuf-wire/`}>Protocol Buffers のワイヤ形式</a>の回で見た varint と zigzag）。
 
 名前も型も無いバイト列を読むには書き手のスキーマが要るので、ファイルに保存するときは**オブジェクトコンテナファイル**という形にして、ヘッダにスキーマを書きます（[Avro Specification: Object Container Files](https://avro.apache.org/docs/1.12.0/specification/)）。
 
@@ -133,7 +133,7 @@ Avro では、**書いたときのスキーマ（書き手のスキーマ）と�
 SchemaResolutionError No default value for field channel in Order
 ```
 
-このように、スキーマを変えても古いデータを読めるようにすることを**スキーマ進化**と呼びます。Protocol Buffers は同じことを**フィールド番号**で行い、名前はバイナリに載りませんでした（<a href={`${import.meta.env.BASE_URL}lowlevel/ll-67-protobuf-types/`}>Protobuf の型</a>の回）。Avro は**名前**で対応づけるので、名前を変えるときは別名を残す必要があり、代わりに番号を管理する必要がありません。どちらも「データだけでは読めず、書き手のスキーマが要る」点は同じです。
+このように、スキーマを変えても古いデータを読めるようにすることを**スキーマ進化**と呼びます。Protocol Buffers は同じことを**フィールド番号**で行い、名前はバイナリに載りませんでした（<a href={`${import.meta.env.BASE_URL}lowlevel/ll-68-protobuf-types/`}>Protobuf の型</a>の回）。Avro は**名前**で対応づけるので、名前を変えるときは別名を残す必要があり、代わりに番号を管理する必要がありません。どちらも「データだけでは読めず、書き手のスキーマが要る」点は同じです。
 
 ストリームで 1 件ずつ送るメッセージには、毎回スキーマ全体を付けられません。そのため仕様には、2 バイトの印 `C3 01` とスキーマの 8 バイトの指紋（CRC-64-AVRO）を値の前に付ける単一オブジェクト符号化も定められています。読み手は指紋からスキーマを引きます。データレイクでは、Avro は**書き込みの途中の層**でよく見かけます。Iceberg のマニフェスト（テーブルに属するデータファイルの一覧）は Avro ファイルです（[Iceberg Table Spec](https://iceberg.apache.org/spec/)）。Hudi の Merge-on-Read（MoR、更新を別のログに追記しておき、読むときに合わせる方式）では、ログファイルのデータブロックに行指向の Avro を使え、Hudi のドキュメントはその目的を高速で軽い書き込みとしています（[Hudi: Storage Layouts](https://hudi.apache.org/docs/storage_layouts)）。
 
