@@ -13,16 +13,16 @@ topics:
   - GOMAXPROCS
   - requests / limits
 requires:
-  - ll-142-virtualization
+  - ll-143-virtualization
   - ll-36-scheduler
-  - ll-144-runtime
+  - ll-145-runtime
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## オプションはファイルになる
 
-第 142 回で、コンテナは名前空間と cgroup の組み合わせだと書きました。第 144 回で見たとおり、runc はコンテナを起動するときに cgroup を 1 つ作り、そこにプロセスを入れます。
+第 143 回で、コンテナは名前空間と cgroup の組み合わせだと書きました。第 145 回で見たとおり、runc はコンテナを起動するときに cgroup を 1 つ作り、そこにプロセスを入れます。
 
 `docker run` の資源のオプションは、**その cgroup のファイルへの書き込み**に変換されます。コンテナの中から、そのファイルを読めます。
 

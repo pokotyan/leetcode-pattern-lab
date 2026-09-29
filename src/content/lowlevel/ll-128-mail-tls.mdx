@@ -2,7 +2,7 @@
 title: メールの経路を暗号化する
 description: 送信ボタンを押したメールは、サーバからサーバへ暗号化されて運ばれているのでしょうか。提出と中継でまったく違う事情、証明書を確かめない STARTTLS、それを消す攻撃、そして MTA-STS と DANE がどこに信頼の根を置いて穴をふさぐのかを見ます
 chapter: mail
-order: 5
+order: 6
 status: published
 topics:
   - STARTTLS
@@ -14,7 +14,7 @@ topics:
   - TLS-RPT
   - REQUIRETLS
 requires:
-  - ll-126-message-format
+  - ll-127-message-format
   - ll-104-tls13-handshake
   - ll-102-pki-chain
   - ll-61-dnssec
@@ -139,7 +139,7 @@ S: 220 Ready to start TLS
    （サーバが「RSET」を TLS の中で届いたコマンドとして処理してしまう）
 ```
 
-サーバが平文の段階で読み込んだ受信バッファを、TLS に切り替えるときに**捨てずに持ち越す**と、平文で送り込まれた残りの行が、暗号化された会話の一部として扱われます。第 124 回で見たパイプライン（PIPELINING）で、複数の行をまとめて受け取れるのが普通であるため、この境目の処理を誤りやすいのです。RFC 3207 の「TLS の後は状態を捨てよ」という規則は、実装では守り切れていませんでした。
+サーバが平文の段階で読み込んだ受信バッファを、TLS に切り替えるときに**捨てずに持ち越す**と、平文で送り込まれた残りの行が、暗号化された会話の一部として扱われます。第 125 回で見たパイプライン（PIPELINING）で、複数の行をまとめて受け取れるのが普通であるため、この境目の処理を誤りやすいのです。RFC 3207 の「TLS の後は状態を捨てよ」という規則は、実装では守り切れていませんでした。
 
 この研究の結論が表題のとおり、**提出と受信（IMAP、POP3）では STARTTLS をやめて暗黙の TLS を使うべき**、というものです。RFC 8314 の推奨と同じ向きです。一方、MTA 同士の 25 番には暗黙の TLS のポートがないので、中継は STARTTLS を使い続けるしかありません。そこで、STARTTLS を「消されたら気づける」「偽のサーバなら気づける」ようにする仕組みが必要になります。
 
@@ -246,7 +246,7 @@ _smtp._tls.example.com.  IN  TXT  "v=TLSRPTv1; rua=mailto:tlsrpt@example.com"
 
 送る側は、1 日（UTC の 0 時から 24 時）分を JSON にまとめ、`rua` の宛先へメールか HTTPS で送ります。報告の結果の種類には、`starttls-not-supported`、`certificate-host-mismatch`、`certificate-expired`、`validation-failure`（ここまでが TLS の交渉の失敗）、`sts-policy-fetch-error`、`dane-required`（方針に関わる失敗）などがあります。
 
-導入の順番は、DMARC（第 130 回）と同じく段階的です。まず TLS-RPT を置き、MTA-STS を `testing` で公開して報告を読み、失敗がないことを確かめてから `enforce` に上げます。
+導入の順番は、DMARC（第 131 回）と同じく段階的です。まず TLS-RPT を置き、MTA-STS を `testing` で公開して報告を読み、失敗がないことを確かめてから `enforce` に上げます。
 
 ## 経路の TLS はエンドツーエンドではない
 
@@ -262,24 +262,24 @@ _smtp._tls.example.com.  IN  TXT  "v=TLSRPTv1; rua=mailto:tlsrpt@example.com"
 | --- | --- |
 | 回線上の盗聴 | 中継するサーバの管理者（や、そこへ侵入した者）が読むこと |
 | （MTA-STS / DANE なら）偽のサーバへの誘導 | メールボックスに保存された中身 |
-| （MTA-STS / DANE なら）STARTTLS の除去 | 中継の途中で中身を書き換えること（それは DKIM の仕事。第 129 回） |
-| | 送信者が本物かどうか（SPF、DKIM、DMARC の仕事。第 128〜130 回） |
+| （MTA-STS / DANE なら）STARTTLS の除去 | 中継の途中で中身を書き換えること（それは DKIM の仕事。第 130 回） |
+| | 送信者が本物かどうか（SPF、DKIM、DMARC の仕事。第 129〜131 回） |
 
 さらに、TLS を使うかどうかは**区間ごと**に決まります。自分の事業者と相手の事業者の間が TLS でも、相手が社内の別のサーバへ転送する区間が平文なら、そこで読めます。送る側が「全区間で TLS を使え」と指示する **REQUIRETLS**（[RFC 8689](https://www.rfc-editor.org/rfc/rfc8689.html)、2019 年）という拡張もありますが、MAIL FROM に付けるこの指示を、途中のすべての MTA が理解していなければ意味がありません。
 
 <Callout type="warn" title="「TLS で送ったから、機密のメールも安全」ではない">
   経路の TLS は、封筒を運ぶトラックに鍵をかけるようなものです。
   集配所（各 MTA）では封筒は開いた状態で棚に並びます。
-  中継するサーバにも読ませたくない中身は、メッセージ自体を暗号化する S/MIME や OpenPGP で守る必要があります。第 131 回で扱います。
+  中継するサーバにも読ませたくない中身は、メッセージ自体を暗号化する S/MIME や OpenPGP で守る必要があります。第 132 回で扱います。
 </Callout>
 
 ## 手元で確かめる
 
-作業は `scratchpad/work/ll-127-mail-tls/` で行いました。
+作業は `scratchpad/work/ll-128-mail-tls/` で行いました。
 
 ### 25 番は届かない
 
-執筆に使った回線では、外部の 25 番への接続が通りませんでした（`nc -vz gmail-smtp-in.l.google.com 25` がタイムアウトし、587 番と 465 番にはつながる）。家庭用やクラウドの回線の多くが外向きの 25 番を塞いでいるためです（第 125 回）。そこで、MX の代わりに**提出のサーバ**で STARTTLS と証明書を見ます。認証もメールの送信もせず、EHLO と STARTTLS だけで切り上げます。
+執筆に使った回線では、外部の 25 番への接続が通りませんでした（`nc -vz gmail-smtp-in.l.google.com 25` がタイムアウトし、587 番と 465 番にはつながる）。家庭用やクラウドの回線の多くが外向きの 25 番を塞いでいるためです（第 126 回）。そこで、MX の代わりに**提出のサーバ**で STARTTLS と証明書を見ます。認証もメールの送信もせず、EHLO と STARTTLS だけで切り上げます。
 
 ### 平文の EHLO と、TLS の後の EHLO
 
@@ -307,7 +307,7 @@ auth:  LOGIN PLAIN XOAUTH2 PLAIN-CLIENTTOKEN OAUTHBEARER XOAUTH
 TLSv1.3 TLS_AES_256_GCM_SHA384
 ```
 
-TLS の後は `starttls` が消え、`auth` が現れました。平文の間はパスワードを受け付けない、という先ほどの Callout の実例です。`XOAUTH2` と `OAUTHBEARER` は第 132 回で扱う OAuth での認証です。
+TLS の後は `starttls` が消え、`auth` が現れました。平文の間はパスワードを受け付けない、という先ほどの Callout の実例です。`XOAUTH2` と `OAUTHBEARER` は第 133 回で扱う OAuth での認証です。
 
 ### 証明書を名前で確かめる
 
@@ -413,7 +413,7 @@ SHA2-256(stdin)= 8593bdfc8ccc7941183b7bed927622cff57935f774b0faa1e009c0c5e1da798
 | TLS 1.3 | STARTTLS の後に張る暗号化の本体 | 第 104 回 |
 | X.509 と信頼の連鎖 | 提出のサーバと MTA-STS の方針の配信元の検証 | 第 101 回、第 102 回 |
 | 公開鍵の形式（SPKI） | TLSA `3 1 1` が照合する対象 | 第 99 回 |
-| DNS の MX | 中継の接続先を決める。守られていないと名前の照合が無意味になる | 第 58 回、第 125 回 |
+| DNS の MX | 中継の接続先を決める。守られていないと名前の照合が無意味になる | 第 58 回、第 126 回 |
 | DNSSEC | DANE の信頼の根。MX と TLSA の答えを守る | 第 61 回 |
 | HTTPS（Web PKI） | MTA-STS の信頼の根。方針を守る | 第 102 回、第 105 回 |
 | 鍵のローテーション | TLSA を新旧並べる、MTA-STS の `id` と `max_age` | 第 100 回 |
@@ -433,4 +433,4 @@ SHA2-256(stdin)= 8593bdfc8ccc7941183b7bed927622cff57935f774b0faa1e009c0c5e1da798
 - **TLS-RPT** で失敗を報告してもらい、`testing` から `enforce` へ段階的に上げる
 - どれも守るのは回線だけで、**経路の TLS はエンドツーエンドではない**。各 MTA の中ではメールは平文
 
-ここまでで、メールを「盗み見られずに運ぶ」ことは見ました。しかし、運ばれてきたメールの差出人が本物かどうかは、まだ何も確かめていません。次の第 128 回では、その最初の手がかりである SPF が、実は利用者の見る From: ではなく、エンベロープの MAIL FROM しか見ていないことから始めます。
+ここまでで、メールを「盗み見られずに運ぶ」ことは見ました。しかし、運ばれてきたメールの差出人が本物かどうかは、まだ何も確かめていません。次の第 129 回では、その最初の手がかりである SPF が、実は利用者の見る From: ではなく、エンベロープの MAIL FROM しか見ていないことから始めます。

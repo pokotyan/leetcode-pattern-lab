@@ -2,7 +2,7 @@
 title: SPF が確かめているもの
 description: '「SPF を設定したので、うちのドメインはなりすまされない」は本当でしょうか。SPF が見ているのは利用者の目に入る From: ではなく、SMTP の MAIL FROM です。書式と評価の順番、DNS の問い合わせ 10 回の上限、転送で壊れる理由までを、小さな評価器を書いて確かめます'
 chapter: mail
-order: 6
+order: 7
 status: published
 topics:
   - SPF
@@ -15,7 +15,7 @@ topics:
   - SPF のフラット化
   - 転送と SRS
 requires:
-  - ll-127-mail-tls
+  - ll-128-mail-tls
   - ll-123-mail-map
   - ll-58-dns-records
 ---
@@ -35,7 +35,7 @@ SMTP の会話（エンベロープ）      MAIL FROM:<bounce-42@mailer.example.
 
 利用者のメールソフトが表示するのは下の `From:` です。**SPF が確かめるのは上の MAIL FROM（と HELO）のドメイン**で、`From:` には一切触れません（[RFC 7208 2.2〜2.4](https://www.rfc-editor.org/rfc/rfc7208.html#section-2.2)）。これが SPF についての最大の誤解の出発点です。
 
-なぜ `From:` を見ないのか。理由は設計の順番にあります。RFC 7208 は、SPF の検査を **MAIL コマンドを受け取った時点**で行うことを想定しています（[2.5](https://www.rfc-editor.org/rfc/rfc7208.html#section-2.5)）。第 124 回の会話で言えば、`MAIL FROM` の直後、`DATA` より前です。この時点では、受信側はまだ本文もヘッダも受け取っていません。**見ようにも `From:` がまだ届いていない**のです。
+なぜ `From:` を見ないのか。理由は設計の順番にあります。RFC 7208 は、SPF の検査を **MAIL コマンドを受け取った時点**で行うことを想定しています（[2.5](https://www.rfc-editor.org/rfc/rfc7208.html#section-2.5)）。第 125 回の会話で言えば、`MAIL FROM` の直後、`DATA` より前です。この時点では、受信側はまだ本文もヘッダも受け取っていません。**見ようにも `From:` がまだ届いていない**のです。
 
 その代わり、SPF には「受け取る前に断れる」という利点があります。`MAIL FROM` の段階で `550` を返せば、本文を 1 バイトも受け取らずに済みます。
 
@@ -60,7 +60,7 @@ MAIL FROM: <x@example.com>   ×   接続元 IP 198.51.100.7
         └── example.com の TXT を引く ──→ この IP は一覧にあるか？
 ```
 
-HELO についても、RFC 7208 は検査することを推奨しています（[2.3](https://www.rfc-editor.org/rfc/rfc7208.html#section-2.3)）。特に、第 124 回で見たバウンスの `MAIL FROM:<>` のように送信者が空のときは、`postmaster@<HELO の名前>` を MAIL FROM とみなして評価します（[2.4](https://www.rfc-editor.org/rfc/rfc7208.html#section-2.4)）。
+HELO についても、RFC 7208 は検査することを推奨しています（[2.3](https://www.rfc-editor.org/rfc/rfc7208.html#section-2.3)）。特に、第 125 回で見たバウンスの `MAIL FROM:<>` のように送信者が空のときは、`postmaster@<HELO の名前>` を MAIL FROM とみなして評価します（[2.4](https://www.rfc-editor.org/rfc/rfc7208.html#section-2.4)）。
 
 ## 書式: 項目を左から順に読む
 
@@ -153,7 +153,7 @@ RFC 自身が「振り返れば include という名前はまずい選び方だ�
   攻撃者が自分で `attacker.example` を取り、自分のサーバを SPF に書き、`MAIL FROM:<x@attacker.example>` で送れば、SPF は **pass** になります。
   そのうえで本文のヘッダに `From: support@example.com` と書いても、SPF はそれを見ません。
   RFC 7208 もこの点を明記し、「利用者やメールソフトが、認証された名前と `From:` が違うことに気づかなければ、誤った安心感を与えうる」としています（[11.2](https://www.rfc-editor.org/rfc/rfc7208.html#section-11.2)）。
-  2 つを結びつけるのは SPF ではなく、第 130 回の DMARC です。
+  2 つを結びつけるのは SPF ではなく、第 131 回の DMARC です。
 </Callout>
 
 ## DNS の問い合わせ 10 回の上限
@@ -362,7 +362,7 @@ github.com. 300 IN TXT "v=spf1 ip4:192.30.252.0/22 include:spf.protection.outloo
 フラット化した写しを定期的に自動で作り直す仕組みを持てるなら、選択肢になります。持てないなら、先に次の手を考えるほうが安全です。
 
 - **使っていない include を消す。** 契約が終わったサービスの include は、上限を食うだけでなく、そのサービスの利用者全員に自分のドメインを名乗らせる穴になります
-- **送信の用途ごとにサブドメインを分ける。** 配信サービスが MAIL FROM に `bounce.example.com` のような専用のドメインを使えるなら、SPF はそのドメインごとに別々に数えられます（第 133 回で扱います）
+- **送信の用途ごとにサブドメインを分ける。** 配信サービスが MAIL FROM に `bounce.example.com` のような専用のドメインを使えるなら、SPF はそのドメインごとに別々に数えられます（第 134 回で扱います）
 - **`a` と `mx` を `ip4` と `ip6` に置き換える。** M3AAWG は、`a` と `mx` を必要がない限り使わないよう勧めています（[2017](https://www.m3aawg.org/documents/en/m3aawg-best-practices-for-managing-spf-records) 4.1）
 
 最後に、1 行目の穴の話を補っておきます。M3AAWG は、大きな共有の基盤を include するときには「その基盤の利用者全員に、自分のドメインを名乗る許可を与えてしまいうる」と注意しています（同 4.1）。SPF の pass は「その IP から来た」ことしか言わないので、同じ IP を他の顧客と共有していれば、区別はできません。
@@ -392,7 +392,7 @@ Microsoft 365 は外部への自動転送で SRS を使っており、書き換�
 | MAIL FROM | `bob@fabrikam.com` | `john.work+SRS=44ldt=IX=fabrikam.com=bob@contoso.com` |
 | From: | `bob@fabrikam.com` | `bob@fabrikam.com` |
 
-`44ldt` はハッシュ、`IX` は時刻で、第三者が勝手に SRS のアドレスを作って転送する側を踏み台にできないようにしています。同じページは、**SRS で SPF は pass しても、DMARC は pass しない**と注意しています。`From:` は `fabrikam.com` のままで、SPF で認証されたのは `contoso.com` だからです。転送で DMARC を通すには、`From:` のドメインの DKIM 署名が壊れずに届く必要があります（第 129 回、第 130 回）。
+`44ldt` はハッシュ、`IX` は時刻で、第三者が勝手に SRS のアドレスを作って転送する側を踏み台にできないようにしています。同じページは、**SRS で SPF は pass しても、DMARC は pass しない**と注意しています。`From:` は `fabrikam.com` のままで、SPF で認証されたのは `contoso.com` だからです。転送で DMARC を通すには、`From:` のドメインの DKIM 署名が壊れずに届く必要があります（第 130 回、第 131 回）。
 
 ## -all と ~all は結局どちらがよいのか
 
@@ -415,19 +415,19 @@ M3AAWG は「ほとんどの受信側は `~all` と `-all` を同じように扱
 
 メールを一切送らないドメインには、`v=spf1 -all` だけを置くのが定石です（[RFC 7208 10.1.2](https://www.rfc-editor.org/rfc/rfc7208.html#section-10.1.2)）。送信に使われない `www.example.com` やキャンペーン用のドメインを、MAIL FROM に使われにくくできます。
 
-受信側は SPF の結果を `Received-SPF` や `Authentication-Results` のヘッダに書き残します（[RFC 7208 9](https://www.rfc-editor.org/rfc/rfc7208.html#section-9)）。そこには `envelope-from=` や `smtp.mailfrom=` と書かれ、**ヘッダ自身が、検査したのは `From:` ではないと言っています**。読み方は第 133 回でまとめて扱います。
+受信側は SPF の結果を `Received-SPF` や `Authentication-Results` のヘッダに書き残します（[RFC 7208 9](https://www.rfc-editor.org/rfc/rfc7208.html#section-9)）。そこには `envelope-from=` や `smtp.mailfrom=` と書かれ、**ヘッダ自身が、検査したのは `From:` ではないと言っています**。読み方は第 134 回でまとめて扱います。
 
 ## SPF は何と組み合わさって意味を持つか
 
 | 部品 | 役目 | 見た回 |
 | --- | --- | --- |
 | TCP の接続 | 接続元 IP が偽りにくいこと | 第 53 回 |
-| SMTP のエンベロープ | MAIL FROM と HELO という、検査される名前 | 第 123 回、第 124 回 |
+| SMTP のエンベロープ | MAIL FROM と HELO という、検査される名前 | 第 123 回、第 125 回 |
 | DNS の TXT | 許可の一覧を置く場所 | 第 58 回 |
 | DNS のキャッシュと TTL | include 先の変更がいつ効くか | 第 60 回 |
 | DNSSEC | 一覧そのものが偽られていないこと。無ければ偽の答えで pass を作れる（[RFC 7208 11.3](https://www.rfc-editor.org/rfc/rfc7208.html#section-11.3)） | 第 61 回 |
-| DKIM | 転送で壊れにくい、もう 1 つの認証 | 第 129 回 |
-| DMARC | 認証されたドメインと `From:` を結びつける | 第 130 回 |
+| DKIM | 転送で壊れにくい、もう 1 つの認証 | 第 130 回 |
+| DMARC | 認証されたドメインと `From:` を結びつける | 第 131 回 |
 
 SPF 単体は、「このドメインの管理者は、この IP を知っている」としか言いません。利用者が見る差出人を守る話になるのは、DMARC と組み合わさったときです。
 
@@ -442,4 +442,4 @@ SPF 単体は、「このドメインの管理者は、この IP を知ってい
 - 転送では MAIL FROM が元のままなので SPF は fail する。SRS で書き換えれば SPF は pass するが、DMARC は `From:` と揃わないので pass しない
 - `-all` と `~all` の実際の差は小さく、`-all` は DMARC より前に正規の転送メールを落とすことがある
 
-SPF は「どこから来たか」を確かめる仕組みで、転送のように経路が変わると壊れます。次の第 129 回では、経路ではなく**メッセージそのものに署名を付ける** DKIM を見ます。署名が保証するのは何で、`From:` とはどう関係するのでしょうか。
+SPF は「どこから来たか」を確かめる仕組みで、転送のように経路が変わると壊れます。次の第 130 回では、経路ではなく**メッセージそのものに署名を付ける** DKIM を見ます。署名が保証するのは何で、`From:` とはどう関係するのでしょうか。

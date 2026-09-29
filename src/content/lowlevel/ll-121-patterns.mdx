@@ -158,7 +158,7 @@ import Callout from '../../components/Callout.astro'
 | --- | --- | --- |
 | ゲートウェイでの JWT 検証（アルゴリズム固定、iss、aud、exp） | 入ってきたトークンが、信頼する IdP がこの API 宛てに発行した有効なものであること | 第 111 回、第 114 回 |
 | 受信ヘッダの削除と作り直し | 後ろへ渡る ID が、クライアントの書いたものではないこと | 第 105 回 |
-| ネットワークの制限、mTLS、ゲートウェイの署名 | 後ろのサービスに届いたリクエストが、ゲートウェイを通ったものであること | 第 105 回、第 156 回 |
+| ネットワークの制限、mTLS、ゲートウェイの署名 | 後ろのサービスに届いたリクエストが、ゲートウェイを通ったものであること | 第 105 回、第 157 回 |
 | サービスごとの認可 | その利用者に、そのオブジェクトを触らせてよいこと | 第 115 回 |
 
 **弱点**は 2 つあります。1 つは上の迂回です。もう 1 つは、ゲートウェイが確かめるのが「有効なトークンか」までだということです。BOLA（第 108 回）のような**オブジェクトごとの認可**は、データを知っている後ろのサービスにしかできません。
@@ -269,7 +269,7 @@ $ curl -s -b jar.txt -H 'X-Requested-With: fetch' http://127.0.0.1:18110/api/ord
                 利用者の ID: JWT
 ```
 
-サービスメッシュ（第 156 回）では、各サービスのプロキシが短命な証明書で mTLS を張ります。SPIFFE の X.509-SVID は、ワークロードの ID を `spiffe://` で始まる URI として証明書の SAN に 1 つだけ入れます（[SPIFFE X.509-SVID](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md)）。これで「**どのサービスが**呼んでいるか」が分かります。
+サービスメッシュ（第 157 回）では、各サービスのプロキシが短命な証明書で mTLS を張ります。SPIFFE の X.509-SVID は、ワークロードの ID を `spiffe://` で始まる URI として証明書の SAN に 1 つだけ入れます（[SPIFFE X.509-SVID](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md)）。これで「**どのサービスが**呼んでいるか」が分かります。
 
 しかし mTLS は、「**誰のために**」呼んでいるかを知りません。そこで利用者の ID は、リクエストのヘッダに乗せた JWT で別に運びます。Istio の認可ポリシーはこの 2 つを別の欄で扱っていて、`principals` はピアの証明書から得た ID（例 `cluster.local/ns/default/sa/productpage`）で mTLS が要り、`requestPrincipals` は JWT から得た `iss/sub` で RequestAuthentication が要る、と書かれています（[Istio: Authorization Policy](https://istio.io/latest/docs/reference/config/security/authorization-policy/)）。
 
@@ -277,7 +277,7 @@ $ curl -s -b jar.txt -H 'X-Requested-With: fetch' http://127.0.0.1:18110/api/ord
 
 | 部品 | 何を保証しているか | 回 |
 | --- | --- | --- |
-| mTLS + 短命な証明書（SPIFFE ID） | 通信の相手がどのワークロードか。区間の盗聴と改ざんの防止 | 第 105 回、第 120 回、第 156 回 |
+| mTLS + 短命な証明書（SPIFFE ID） | 通信の相手がどのワークロードか。区間の盗聴と改ざんの防止 | 第 105 回、第 120 回、第 157 回 |
 | 利用者の JWT（iss、sub、aud） | このリクエストが誰のためのものか | 第 111 回、第 114 回 |
 | トークン交換（aud の付け替え、`act`） | 下流へ渡すトークンが、その宛先でしか使えないこと。誰が代理しているか | 第 114 回 |
 | 認可ポリシー（`principals` と `requestPrincipals` の両方） | 「このサービスから、この利用者のために」の組み合わせを許すか | 第 115 回 |

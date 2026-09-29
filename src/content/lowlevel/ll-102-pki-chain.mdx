@@ -105,7 +105,7 @@ Node.js の `--use-system-ca` は v23.8.0 と v22.15.0 で入りました（[Nod
 | 確かめること | 見る場所 | 呼び戻す回 |
 | --- | --- | --- |
 | **署名**: 各証明書が、1 つ上の公開鍵で検証できる | signatureValue | 第 98 回 |
-| **期限**: すべての証明書が、今の時刻で有効期間内 | notBefore / notAfter | 第 101 回、第 140 回（時計） |
+| **期限**: すべての証明書が、今の時刻で有効期間内 | notBefore / notAfter | 第 101 回、第 141 回（時計） |
 | **CA であること**: 上の段がすべて `CA:TRUE`、段数が pathLenConstraint 以内 | Basic Constraints | 第 101 回 |
 | **用途**: サーバ証明書の EKU に serverAuth、CA の KU に keyCertSign | Key Usage / EKU | 第 101 回 |
 | **名前の範囲**: 上の段の Name Constraints に収まっている | Name Constraints | この回 |
@@ -174,7 +174,7 @@ Entrust の措置が「ルートを丸ごと消す」ではなく「ある日付
 
 ## 自分で CA を持つ: プライベート PKI
 
-社内のサービス間通信や、第 156 回のサービスメッシュの mTLS では、公開の CA ではなく**自前の CA** を使うのが普通です。公開の CA は、`db.internal.test` のような社内だけの名前には発行しませんし、有効期間の短い証明書を大量に発行し続ける用途にも向きません。
+社内のサービス間通信や、第 157 回のサービスメッシュの mTLS では、公開の CA ではなく**自前の CA** を使うのが普通です。公開の CA は、`db.internal.test` のような社内だけの名前には発行しませんし、有効期間の短い証明書を大量に発行し続ける用途にも向きません。
 
 選択肢は、`openssl` で手作りするところから、[step-ca](https://smallstep.com/docs/step-ca/) のような ACME 対応の CA サーバ、[AWS Private CA](https://docs.aws.amazon.com/privateca/latest/userguide/PcaWelcome.html) のようなマネージドなものまであります。仕組みはこの回の 3 段と同じで、**そのルートを、使う側のトラストストアにどう配るか**が運用の中心になります。前の節の表のとおり、配り先は OS だけでは足りません。
 
@@ -272,7 +272,7 @@ $ openssl verify -CAfile root.crt -untrusted int.crt -attime $(date -v+200d +%s)
 error 10 at 0 depth lookup: certificate has expired
 ```
 
-EKU が serverAuth だけなので、クライアント証明書としては使えません。`-attime` は時計を 200 日進めたふりをします。時計がずれた端末（第 140 回）では、これが本当に起きます。
+EKU が serverAuth だけなので、クライアント証明書としては使えません。`-attime` は時計を 200 日進めたふりをします。時計がずれた端末（第 141 回）では、これが本当に起きます。
 
 ### サーバが中間を送らないと
 
@@ -367,7 +367,7 @@ Node.js 20.19 の埋め込み（tls.rootCertificates）            149
 Python の certifi 2026.04.22                                120
 ```
 
-同じマシンの上で、**4 つの一覧が 4 つとも違う**ことが分かります。Docker の `debian:bookworm-slim` では、`ca-certificates` を入れるまで `/etc/ssl/certs` 自体が存在しませんでした（`ls: cannot access '/etc/ssl/certs'`）。後の第 145 回で、distroless などのイメージに CA 証明書を入れる話が出てくるのはこのためです。
+同じマシンの上で、**4 つの一覧が 4 つとも違う**ことが分かります。Docker の `debian:bookworm-slim` では、`ca-certificates` を入れるまで `/etc/ssl/certs` 自体が存在しませんでした（`ls: cannot access '/etc/ssl/certs'`）。後の第 146 回で、distroless などのイメージに CA 証明書を入れる話が出てくるのはこのためです。
 
 ## まとめ
 
@@ -379,6 +379,6 @@ Python の certifi 2026.04.22                                120
 - クロス署名でチェーンは複数通り組める。2021 年の DST Root CA X3 の期限切れでは、ストアの中身とチェーン組み立ての実装の差（OpenSSL 1.0.2、古い Android）で結果が分かれた
 - CA は外されることがある（Symantec、Entrust）。Name Constraints は CA が発行できる名前の範囲を縛る
 - ルートを 1 枚足すことは、その持ち主にあらゆる名前の証明書を作る力を渡すこと。社内 CA も TLS 検査プロキシもこの上に成り立つ
-- 検証は、署名（第 98 回）・証明書の中身（第 101 回）・時計（第 140 回）・失効（第 103 回）・トラストストアの組み合わせで、初めて意味を持つ
+- 検証は、署名（第 98 回）・証明書の中身（第 101 回）・時計（第 141 回）・失効（第 103 回）・トラストストアの組み合わせで、初めて意味を持つ
 
 検証の手順の表で、失効だけは「第 103 回」に送ったままでした。次の回では、証明書がどう発行され、どう取り消され、誤った発行がどう見つかるのかを見ます。

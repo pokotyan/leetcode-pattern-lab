@@ -14,8 +14,8 @@ topics:
   - override / include / profiles
   - develop.watch
 requires:
-  - ll-147-network-storage
-  - ll-145-dockerfile
+  - ll-148-network-storage
+  - ll-146-dockerfile
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -264,7 +264,7 @@ services:
 
 バインドマウントとの違いは、**ファイルを共有していない** ことです。変更があったファイルだけを、その都度コンテナの中にコピーします。コンテナは自分のファイルシステムの中のファイルを読むので、ファイル共有の遅さの影響を受けません。
 
-`build:` の設定は、第 145 回で見た BuildKit にそのまま渡されます。Compose v5 では Compose 内部のビルド処理がなくなり、`docker build` と同じ経路（Bake）に一本化されました（[Compose v5.0.0 リリースノート](https://github.com/docker/compose/releases/tag/v5.0.0)）。
+`build:` の設定は、第 146 回で見た BuildKit にそのまま渡されます。Compose v5 では Compose 内部のビルド処理がなくなり、`docker build` と同じ経路（Bake）に一本化されました（[Compose v5.0.0 リリースノート](https://github.com/docker/compose/releases/tag/v5.0.0)）。
 
 ## Compose がやらないこと
 

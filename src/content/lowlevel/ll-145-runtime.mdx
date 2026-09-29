@@ -14,7 +14,7 @@ topics:
   - tini / --init
   - gVisor / Kata / runwasi
 requires:
-  - ll-143-image
+  - ll-144-image
   - ll-46-signal
   - ll-33-process
 ---
@@ -74,7 +74,7 @@ bundle/
 └── rootfs/         overlayfs で重ねた / （イメージの層 + 書き込み層）
 ```
 
-`config.json` の中身は、第 142 回で見た仕組みをそのまま JSON にしたものです。
+`config.json` の中身は、第 143 回で見た仕組みをそのまま JSON にしたものです。
 
 ```json
 {
@@ -101,10 +101,10 @@ bundle/
 
 runc がすることは、順番に並べるとこうなります。
 
-1. `clone` で子プロセスを作る。このとき名前空間のフラグを渡す（第 34 回・第 142 回）
+1. `clone` で子プロセスを作る。このとき名前空間のフラグを渡す（第 34 回・第 143 回）
 2. 子を cgroup に入れ、メモリや CPU の上限を書き込む
 3. 子の中で、rootfs を `/` に据える（`pivot_root`）。`/proc` や `/dev` をマウントする
-4. capability を削り、seccomp のフィルタを設定する（第 151 回）
+4. capability を削り、seccomp のフィルタを設定する（第 152 回）
 5. `execve` で `echo` に置き換わる
 
 最後の `execve` で、runc の子プロセスは `echo` そのものになります。第 33 回で見た **fork して exec する** 流れと同じです。違うのは、fork と exec の間に、見える範囲と使える量を制限する手順が挟まっていることだけです。
@@ -150,7 +150,7 @@ $ docker run --rm --pid=host alpine:3.20 ps -o pid,ppid,args
 
 ## PID 1 は特別扱いされる
 
-runc が `execve` した結果、アプリケーションはコンテナの中で **PID 1** になります。第 142 回の PID 名前空間のためです。
+runc が `execve` した結果、アプリケーションはコンテナの中で **PID 1** になります。第 143 回の PID 名前空間のためです。
 
 普通の Linux で PID 1 は init（systemd など）の席です。カーネルは PID 1 を特別に扱います。その扱いが、アプリケーションを PID 1 にしたとき、2 つの問題を起こします。
 
@@ -227,7 +227,7 @@ exec node server.js    # シェルが node に置き換わり、node が PID 1 �
 
 ## runc 以外のランタイム
 
-shim の名前を差し替えれば、runc 以外の実行方法を選べます。第 142 回で名前だけ出したものが、ここに入ります。
+shim の名前を差し替えれば、runc 以外の実行方法を選べます。第 143 回で名前だけ出したものが、ここに入ります。
 
 | ランタイム | 何をするか | 分離の強さ |
 | --- | --- | --- |
@@ -239,7 +239,7 @@ shim の名前を差し替えれば、runc 以外の実行方法を選べます�
 
 どれも containerd から見れば **同じ形の shim** です。イメージの取得、層の展開、ログの受け渡しは共通で、最後に「何で動かすか」だけが違います。
 
-**runwasi** は containerd のサブプロジェクトで、Wasm のワークロードを、containerd から直接、あるいは Kubernetes の kubelet 経由で動かすためのものです（[containerd/runwasi](https://github.com/containerd/runwasi)）。第 136 回の Wasm ランタイム（Wasmtime、WasmEdge など）を shim の中に組み込み、`io.containerd.wasmtime.v1` のようなランタイム名で呼び出します。イメージの層に入っているのが Linux の実行ファイルではなく `.wasm` ファイルで、runc の代わりに Wasm ランタイムがそれを実行する、という違いです。
+**runwasi** は containerd のサブプロジェクトで、Wasm のワークロードを、containerd から直接、あるいは Kubernetes の kubelet 経由で動かすためのものです（[containerd/runwasi](https://github.com/containerd/runwasi)）。第 137 回の Wasm ランタイム（Wasmtime、WasmEdge など）を shim の中に組み込み、`io.containerd.wasmtime.v1` のようなランタイム名で呼び出します。イメージの層に入っているのが Linux の実行ファイルではなく `.wasm` ファイルで、runc の代わりに Wasm ランタイムがそれを実行する、という違いです。
 
 <Callout type="note" title="Docker Desktop の Wasm 機能は非推奨">
   Docker Desktop は、こうした Wasm 用の shim を同梱して `docker run --runtime=io.containerd.wasmtime.v1`
@@ -269,7 +269,7 @@ Docker Desktop / 6.12.72-linuxkit
      └── containerd-shim ─ コンテナ
 ```
 
-**Mac で動かすコンテナは、仮想マシンの中のコンテナ**です。第 142 回の 2 つの分離が、両方とも使われています。ファイル共有が遅い、ポートの見え方が Linux と違う、といった Mac 特有の問題は、この VM の境界から来ています（第 147 回）。
+**Mac で動かすコンテナは、仮想マシンの中のコンテナ**です。第 143 回の 2 つの分離が、両方とも使われています。ファイル共有が遅い、ポートの見え方が Linux と違う、といった Mac 特有の問題は、この VM の境界から来ています（第 148 回）。
 
 ## まとめ
 

@@ -16,9 +16,9 @@ topics:
   - PodDisruptionBudget
   - 自発的な中断 / 非自発的な中断
 requires:
-  - ll-155-k8s-service
+  - ll-156-k8s-service
   - ll-46-signal
-  - ll-144-runtime
+  - ll-145-runtime
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -43,7 +43,7 @@ import Callout from '../../components/Callout.astro'
 
 ## Deployment は、2 つの ReplicaSet の数を調整する
 
-入れ替えを行うのは Deployment のコントローラです。仕組みは第 152 回の調整ループそのものです。
+入れ替えを行うのは Deployment のコントローラです。仕組みは第 153 回の調整ループそのものです。
 
 Deployment は、Pod を直接は作りません。**ReplicaSet**（「このテンプレートの Pod を n 個」という宣言）を作り、その数を調整します。テンプレートを書き換えると、新しいテンプレートの ReplicaSet がもう 1 つ作られ、コントローラは 2 つの数を少しずつ動かします。
 
@@ -60,7 +60,7 @@ Deployment api（あるべき数 4、テンプレート v2）
 | `maxUnavailable` | あるべき数から、同時に何個まで欠けてよいか | 1 個まで欠けてよい（最低 3 個） |
 | `maxSurge` | あるべき数を、同時に何個まで超えてよいか | 1 個まで多くてよい（最大 5 個） |
 
-`maxSurge` を大きくすれば、先に新しい Pod を立ててから古いものを消すので、欠けずに済みます。ただし一時的に余分な資源（第 154 回の requests の分）が要ります。`maxUnavailable` を大きくすれば資源は要りませんが、その間は処理できる量が減ります。
+`maxSurge` を大きくすれば、先に新しい Pod を立ててから古いものを消すので、欠けずに済みます。ただし一時的に余分な資源（第 155 回の requests の分）が要ります。`maxUnavailable` を大きくすれば資源は要りませんが、その間は処理できる量が減ります。
 
 古い ReplicaSet は、数を 0 にしたまま残ります。**戻すときは、古い ReplicaSet の数を増やし直すだけ**です。イメージを作り直す必要はありません。
 
@@ -68,7 +68,7 @@ Deployment api（あるべき数 4、テンプレート v2）
 
 ## 準備ができたことを、誰が判定するのか
 
-第 148 回で、Compose の `depends_on` は「プロセスを起動した」ことしか意味せず、「仕事を受けられる」ことは healthcheck で別に判定する必要がある、と見ました。Kubernetes でも同じ区別をします。判定の仕組みを **probe** と呼び、3 種類あります（[Kubernetes Docs](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)）。
+第 149 回で、Compose の `depends_on` は「プロセスを起動した」ことしか意味せず、「仕事を受けられる」ことは healthcheck で別に判定する必要がある、と見ました。Kubernetes でも同じ区別をします。判定の仕組みを **probe** と呼び、3 種類あります（[Kubernetes Docs](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)）。
 
 | probe | 問い | 失敗したら |
 | --- | --- | --- |
@@ -133,13 +133,13 @@ lifecycle:
       seconds: 5     # この間に、各ノードの規則が更新されるのを待つ
 ```
 
-`preStop` は TERM より前に実行されるので、この 5 秒の間、アプリは何も知らずに受け付け続けます。その間に振り分け先から外れ、5 秒後に TERM が届いたときには、新しい接続はもう来ません。`sleep` の動作は kubelet 自身が実行するので、第 145 回の distroless のようにシェルも `sleep` コマンドも入っていないイメージでも使えます（[Kubernetes Docs](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)）。
+`preStop` は TERM より前に実行されるので、この 5 秒の間、アプリは何も知らずに受け付け続けます。その間に振り分け先から外れ、5 秒後に TERM が届いたときには、新しい接続はもう来ません。`sleep` の動作は kubelet 自身が実行するので、第 146 回の distroless のようにシェルも `sleep` コマンドも入っていないイメージでも使えます（[Kubernetes Docs](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)）。
 
 `preStop` の時間も猶予期間に含まれることに注意します。`preStop` で 5 秒、処理中のリクエストを終えるのに 20 秒かかるなら、猶予期間はそれより長くなければなりません。
 
 <Callout type="warn" title="TERM が、そもそも届いていない">
   入れ替えのたびに Pod がきっかり 30 秒かかって消えるなら、TERM が無視されている疑いがあります。
-  第 144 回で見たとおり、PID 1 は既定の動作が効かない特別なプロセスで、
+  第 145 回で見たとおり、PID 1 は既定の動作が効かない特別なプロセスで、
   shell 形式の `CMD` ではシェルが PID 1 になり、TERM をアプリに渡さないことがあります。
   kubelet は猶予期間いっぱい待ち、最後に KILL を送ります。
   処理中のリクエストは、後始末の機会なく切られます。

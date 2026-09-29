@@ -317,7 +317,7 @@ at_hash = base64.urlsafe_b64encode(digest[:16]).rstrip(b"=").decode()
 print("user =", (claims["iss"], claims["sub"]))
 ```
 
-`algorithms` を固定し、`aud` と `iss` を必ず渡すのが第 111 回の教訓です。`leeway=30` は時計のずれ（第 140 回）の許容です。
+`algorithms` を固定し、`aud` と `iss` を必ず渡すのが第 111 回の教訓です。`leeway=30` は時計のずれ（第 141 回）の許容です。
 
 ```
 at_hash expected U6wOFA7h05XgCn74zGe0tQ got U6wOFA7h05XgCn74zGe0tQ True

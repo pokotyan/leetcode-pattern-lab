@@ -209,7 +209,7 @@ SP-A に届いた `SAMLResponse` を Base64 で戻すと、7,762 バイトの XM
 
 - 署名を検証する
 - `Recipient` が、応答を受け取った ACS の URL と一致する
-- `NotOnOrAfter` が過ぎていない（IdP との時計のずれは許容する。第 140 回）
+- `NotOnOrAfter` が過ぎていない（IdP との時計のずれは許容する。第 141 回）
 - `InResponseTo` が、自分の出した `AuthnRequest` の ID と一致する
 - さらに POST バインディングでは、**アサーションは署名されていなければならず**、SP は使い終わったアサーションの ID を有効期間のあいだ覚えておき、**2 回目を拒否しなければならない**（[Profiles 4.1.4.5](https://docs.oasis-open.org/security/saml/v2.0/saml-profiles-2.0-os.pdf)）
 

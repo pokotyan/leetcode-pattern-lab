@@ -17,7 +17,7 @@ topics:
 requires:
   - ll-69-grpc-wire
   - ll-70-grpc-error
-  - ll-155-k8s-service
+  - ll-156-k8s-service
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -40,7 +40,7 @@ import Callout from '../../components/Callout.astro'
 
 ## Pod を増やしても散らない
 
-第 155 回で、Kubernetes の Service は**接続の最初の 1 回だけ**振り分け先を決め、以後は conntrack が同じ Pod に書き換え続けると見ました。HTTP/2 では、1 本の接続に多数のリクエストをストリームとして流します（第 65 回）。組み合わせると、次のようになります。
+第 156 回で、Kubernetes の Service は**接続の最初の 1 回だけ**振り分け先を決め、以後は conntrack が同じ Pod に書き換え続けると見ました。HTTP/2 では、1 本の接続に多数のリクエストをストリームとして流します（第 65 回）。組み合わせると、次のようになります。
 
 ```
  クライアント ── 1 本の TCP 接続 ──→ ClusterIP ──DNAT──→ Pod A   ← 全部ここ
@@ -59,7 +59,7 @@ gRPC の設計文書は、振り分けを**呼び出し単位で行うもの**�
 | 方向 | やり方 | 代償 |
 | --- | --- | --- |
 | クライアントで振り分ける | 全サーバのアドレスを知り、全員と接続を張って呼び出しごとに選ぶ | クライアントが名前解決と振り分けを持つ |
-| L7 のプロキシを挟む | HTTP/2 を理解するプロキシがストリームごとに振り分ける | 1 段増える。メッシュなら Pod ごとにプロキシ（第 156 回） |
+| L7 のプロキシを挟む | HTTP/2 を理解するプロキシがストリームごとに振り分ける | 1 段増える。メッシュなら Pod ごとにプロキシ（第 157 回） |
 | 制御面から配る（xDS） | 振り分け先と規則を、別のサーバがクライアントに配り続ける | 制御面を運用する |
 | サーバが定期的に切る | 接続に寿命を設け、張り直しのたびに L4 の振り分けをやり直させる | 張り直しのコスト。偏りは残る |
 
@@ -138,7 +138,7 @@ SERVER ... Graceful shutdown: Ping received. Sending final GOAWAY with stream_id
 
 GOAWAY は 2 回送られています。1 回目は最後のストリーム ID を 2<sup>31</sup> − 1 にして「これから閉じる」とだけ伝え、PING の往復で相手が受け取ったことを確かめてから、2 回目で実際に処理した最後のストリーム ID（ここでは 5）を伝えます。**1 回目の GOAWAY とすれ違いに送られてきたストリームを取りこぼさない**ための手順で、A9 が 2<sup>31</sup> − 1 から始めることを勧めているのもこのためです。
 
-Pod を止めるときの手順（preStop で待ち、TERM で GOAWAY を送る）は第 157 回で見ました。gRPC のサーバ実装は、この「新しい呼び出しを断り、処理中のものは待ち、期限を過ぎたら打ち切る」を **graceful shutdown** として持っています（[gRPC Guides](https://grpc.io/docs/guides/server-graceful-stop/)）。Python なら `server.stop(grace)` の引数が、その待ち時間です。
+Pod を止めるときの手順（preStop で待ち、TERM で GOAWAY を送る）は第 158 回で見ました。gRPC のサーバ実装は、この「新しい呼び出しを断り、処理中のものは待ち、期限を過ぎたら打ち切る」を **graceful shutdown** として持っています（[gRPC Guides](https://grpc.io/docs/guides/server-graceful-stop/)）。Python なら `server.stop(grace)` の引数が、その待ち時間です。
 
 ## 死んだ接続を見つける: keepalive
 
@@ -227,7 +227,7 @@ retryPolicy なし: StatusCode.UNAVAILABLE attempt 1: not yet
 
 ### 再試行の嵐を止める
 
-第 63 回では、引けない名前への再試行がリゾルバを押し潰す例を、第 156 回では、段ごとの再試行が掛け算になるリトライストームを見ました。A6 は、クライアントごとに**再試行を止める仕組み**を用意しています（同上）。
+第 63 回では、引けない名前への再試行がリゾルバを押し潰す例を、第 157 回では、段ごとの再試行が掛け算になるリトライストームを見ました。A6 は、クライアントごとに**再試行を止める仕組み**を用意しています（同上）。
 
 ```json
 "retryThrottling": { "maxTokens": 10, "tokenRatio": 0.1 }
@@ -265,7 +265,7 @@ service Health {
 
 この同じサービスを、2 種類の相手が呼びます。
 
-- **Kubernetes の kubelet**。probe の種類として `grpc: { port: ... }` を書くと、この `Check` を呼んで判定します（[Kubernetes Docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)）。readiness と liveness の意味は第 157 回で見たとおりです
+- **Kubernetes の kubelet**。probe の種類として `grpc: { port: ... }` を書くと、この `Check` を呼んで判定します（[Kubernetes Docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)）。readiness と liveness の意味は第 158 回で見たとおりです
 - **gRPC のクライアント自身**。サービス設定に `"healthCheckConfig": {"serviceName": "..."}` を書くと、接続を張るたびに `Watch` を呼び、健全と返ってくるまでその接続には呼び出しを送らず、不健全に変わったら送るのをやめます（[gRPC Guides](https://grpc.io/docs/guides/health-checking/)）。`pick_first` のように意味を持たないポリシーでは使われません
 
 後者は、Kubernetes が EndpointSlice から Pod を外すのを待たずに、**クライアントが自分で外せる**という点で速く効きます。
@@ -287,7 +287,7 @@ C-core の受信側のメッセージの上限は、既定で **4 MiB**（4 × 1
 
 ここまでの問題は、ほとんどがログに「UNAVAILABLE」や「DEADLINE_EXCEEDED」としか出ません。だから、**呼び出しごとの結果を数える**ことが最初の手がかりになります。
 
-gRPC は OpenTelemetry のメトリクスを組み込みで出せます（[gRPC Guides](https://grpc.io/docs/guides/opentelemetry-metrics/)）。アプリから見た 1 回の呼び出しの時間 `grpc.client.call.duration`、再試行を含む試行 1 回ずつの時間 `grpc.client.attempt.duration`、サーバから見た時間 `grpc.server.call.duration` などがあり、属性には `grpc.method` と `grpc.status` が付きます。**`grpc.status` ごとに分けて見る**と、`UNAVAILABLE` が増えたのか（つながらない、切られた）、`DEADLINE_EXCEEDED` が増えたのか（遅い）、`RESOURCE_EXHAUSTED` なのか（上限や流量制限）が区別できます。HTTP のステータスはほぼ常に 200 なので（第 70 回）、HTTP の層のメトリクスでは見えません。call と attempt の数の差を見れば、再試行の実験で見た「アプリには見えない再試行」がどれだけ起きているかが分かります。トレースとの組み合わせ方は第 162 回で扱います。
+gRPC は OpenTelemetry のメトリクスを組み込みで出せます（[gRPC Guides](https://grpc.io/docs/guides/opentelemetry-metrics/)）。アプリから見た 1 回の呼び出しの時間 `grpc.client.call.duration`、再試行を含む試行 1 回ずつの時間 `grpc.client.attempt.duration`、サーバから見た時間 `grpc.server.call.duration` などがあり、属性には `grpc.method` と `grpc.status` が付きます。**`grpc.status` ごとに分けて見る**と、`UNAVAILABLE` が増えたのか（つながらない、切られた）、`DEADLINE_EXCEEDED` が増えたのか（遅い）、`RESOURCE_EXHAUSTED` なのか（上限や流量制限）が区別できます。HTTP のステータスはほぼ常に 200 なので（第 70 回）、HTTP の層のメトリクスでは見えません。call と attempt の数の差を見れば、再試行の実験で見た「アプリには見えない再試行」がどれだけ起きているかが分かります。トレースとの組み合わせ方は第 163 回で扱います。
 
 ## 使わない方がよい場面
 

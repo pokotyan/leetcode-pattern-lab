@@ -294,7 +294,7 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'mail',
     title: '第19章　メールが届くまで',
-    summary: 'メールは、ここまでの部品をすべて使う、最も古く最も継ぎ足された仕組み。エンベロープとヘッダの違い、SMTP の会話、MX と配送の経路、メッセージの形式、経路の暗号化（STARTTLS・MTA-STS・DANE）、差出人を確かめる SPF・DKIM・DMARC、中身の暗号化と署名、メールボックスを読む IMAP と OAuth、そしてアプリから確実に届かせる運用',
+    summary: 'メールは、ここまでの部品をすべて使う、最も古く最も継ぎ足された仕組み。エンベロープとヘッダの違い、@ の左側を決めるのは誰か（サブアドレスと正規化）、SMTP の会話、MX と配送の経路、メッセージの形式、経路の暗号化（STARTTLS・MTA-STS・DANE）、差出人を確かめる SPF・DKIM・DMARC、中身の暗号化と署名、メールボックスを読む IMAP と OAuth、そしてアプリから確実に届かせる運用',
   },
   {
     id: 'ffi',

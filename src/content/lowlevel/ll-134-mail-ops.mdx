@@ -2,7 +2,7 @@
 title: アプリからメールを送る・届かせる
 description: パスワード再設定のメールが「届かない」と言われたとき、どこから疑えばよいのか。配信サービスを使うときに自分のドメインで揃えるもの、評判、バウンスと苦情、配信停止、そして受信側が付けた判定の読み方まで、章の部品を運用の側から組み直します
 chapter: mail
-order: 11
+order: 12
 status: published
 topics:
   - トランザクションメール
@@ -15,10 +15,10 @@ topics:
   - ワンクリック配信停止（RFC 8058）
   - Authentication-Results（RFC 8601）
 requires:
-  - ll-132-mailbox-access
-  - ll-130-dmarc
-  - ll-129-dkim
-  - ll-128-spf
+  - ll-133-mailbox-access
+  - ll-131-dmarc
+  - ll-130-dkim
+  - ll-129-spf
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -29,7 +29,7 @@ import Callout from '../../components/Callout.astro'
 
 このとき疑うべき場所は、驚くほど多くあります。アプリが送信に失敗したのか。配信サービスが受け付けたあと、相手のサーバに断られたのか。受け取られたが迷惑メールのフォルダに入ったのか。そもそも宛先のアドレスが間違っているのか。
 
-この章では、メールを部品に分けて見てきました。SMTP の会話（第 124 回）、MX による経路（第 125 回）、メッセージの形式（第 126 回）、経路の TLS（第 127 回）、SPF（第 128 回）、DKIM（第 129 回）、DMARC（第 130 回）。最後の回では向きを変えて、**送る側の運用として、これらの部品をどう揃え、壊れたときにどこを見るか**を見ます。
+この章では、メールを部品に分けて見てきました。SMTP の会話（第 125 回）、MX による経路（第 126 回）、メッセージの形式（第 127 回）、経路の TLS（第 128 回）、SPF（第 129 回）、DKIM（第 130 回）、DMARC（第 131 回）。最後の回では向きを変えて、**送る側の運用として、これらの部品をどう揃え、壊れたときにどこを見るか**を見ます。
 
 先に結論を言うと、**届くかどうかは「正しく名乗れているか」と「信用されているか」の 2 段で決まります**。SPF・DKIM・DMARC が扱うのは前者だけです。
 
@@ -48,13 +48,13 @@ import Callout from '../../components/Callout.astro'
 
 Amazon SES も、本番利用の申請で「Marketing」か「Transactional」かを選ばせ、後者を「1 人ごとに、利用者の操作をきっかけに送るもの」と説明しています（[SES のドキュメント](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)）。Gmail も、ワンクリック配信停止を求めるのはマーケティングと販促のメッセージだけで、**トランザクションメールは対象外**だと明記しています（[Gmail の FAQ](https://support.google.com/a/answer/14229414?hl=en)）。
 
-分ける理由は、**評判を混ぜないため**です。キャンペーンのメールで苦情が増えると、同じ送信元から出ているパスワード再設定のメールまで巻き添えで迷惑メール扱いされます。パスワード再設定のメールが届かないことは、そのまま利用者がログインできないことを意味します（第 109 回、第 132 回で見たとおり、メールはアカウント回復の鍵です）。
+分ける理由は、**評判を混ぜないため**です。キャンペーンのメールで苦情が増えると、同じ送信元から出ているパスワード再設定のメールまで巻き添えで迷惑メール扱いされます。パスワード再設定のメールが届かないことは、そのまま利用者がログインできないことを意味します（第 109 回、第 133 回で見たとおり、メールはアカウント回復の鍵です）。
 
 Gmail の送信者ガイドラインも、**同じ種類のメッセージは同じ From: アドレスから送る**ように勧め、`alert@example.com`（アカウントの通知）、`deals@example.com`（販促）のような分け方を例に挙げています（[Gmail の送信者ガイドライン](https://support.google.com/a/answer/81126?hl=en)）。実務では、アドレスだけでなく、次の節で見るように**送信用のサブドメインと、配信サービスの中の送信の設定（IP の組）まで分ける**ことが多いです。
 
 ## 配信サービスを使うとき、自分のドメインで揃えるもの
 
-いまは、アプリから直接相手の MX へ SMTP でつなぐことはまずありません。第 125 回で見たとおり、クラウドの多くは 25 番ポートの外向き通信を既定で塞いでいますし、IP の評判を自分で育てるのは大変です。Amazon SES や SendGrid のような**配信サービス**に API か SMTP の提出（587 番）で渡し、あとの中継を任せます。
+いまは、アプリから直接相手の MX へ SMTP でつなぐことはまずありません。第 126 回で見たとおり、クラウドの多くは 25 番ポートの外向き通信を既定で塞いでいますし、IP の評判を自分で育てるのは大変です。Amazon SES や SendGrid のような**配信サービス**に API か SMTP の提出（587 番）で渡し、あとの中継を任せます。
 
 ここで起きる典型的な失敗は、**配信サービスの既定の設定のまま送る**ことです。
 
@@ -65,38 +65,38 @@ Gmail の送信者ガイドラインも、**同じ種類のメッセージは同
 自分のドメインで揃えた  …@mail.example.com     no-reply@example.com   example.com
 ```
 
-SES は、何も設定しなければ **`amazonses.com` のサブドメインを MAIL FROM に使います**。これで SPF は pass します。MAIL FROM のドメインが、実際に送った SES のものだからです（[SES のドキュメント](https://docs.aws.amazon.com/ses/latest/dg/mail-from.html)）。しかし、利用者が見る From: は `example.com` です。第 130 回で見たとおり、DMARC（現行は [RFC 9989](https://www.rfc-editor.org/rfc/rfc9989.html)）は **From: のドメインと、SPF の MAIL FROM か DKIM の d= が揃っていること**（アラインメント）を求めます。既定のままでは、SPF も DKIM も pass しているのに DMARC は fail します。
+SES は、何も設定しなければ **`amazonses.com` のサブドメインを MAIL FROM に使います**。これで SPF は pass します。MAIL FROM のドメインが、実際に送った SES のものだからです（[SES のドキュメント](https://docs.aws.amazon.com/ses/latest/dg/mail-from.html)）。しかし、利用者が見る From: は `example.com` です。第 131 回で見たとおり、DMARC（現行は [RFC 9989](https://www.rfc-editor.org/rfc/rfc9989.html)）は **From: のドメインと、SPF の MAIL FROM か DKIM の d= が揃っていること**（アラインメント）を求めます。既定のままでは、SPF も DKIM も pass しているのに DMARC は fail します。
 
 揃えるために、自分のドメインの DNS に置くものは次のとおりです。
 
 | 置くもの | 名前の例 | 値の例 | 何のため | 呼び戻す回 |
 | --- | --- | --- | --- | --- |
-| DKIM の公開鍵（CNAME で委任） | `tok1._domainkey.example.com` | `tok1.dkim.amazonses.com` への CNAME | d= を自分のドメインにする | 第 129 回、第 99 回 |
-| カスタム MAIL FROM の MX | `mail.example.com` | `10 feedback-smtp.<region>.amazonses.com` | バウンスと苦情を受ける | 第 124 回、第 125 回 |
-| カスタム MAIL FROM の SPF | `mail.example.com` | `v=spf1 include:amazonses.com ~all` | MAIL FROM を自分のドメインにする | 第 128 回 |
-| DMARC | `_dmarc.example.com` | `v=DMARC1; p=none; rua=…` | From: と揃っているかを受信側に確かめさせる | 第 130 回 |
+| DKIM の公開鍵（CNAME で委任） | `tok1._domainkey.example.com` | `tok1.dkim.amazonses.com` への CNAME | d= を自分のドメインにする | 第 130 回、第 99 回 |
+| カスタム MAIL FROM の MX | `mail.example.com` | `10 feedback-smtp.<region>.amazonses.com` | バウンスと苦情を受ける | 第 125 回、第 126 回 |
+| カスタム MAIL FROM の SPF | `mail.example.com` | `v=spf1 include:amazonses.com ~all` | MAIL FROM を自分のドメインにする | 第 129 回 |
+| DMARC | `_dmarc.example.com` | `v=DMARC1; p=none; rua=…` | From: と揃っているかを受信側に確かめさせる | 第 131 回 |
 
 MX と SPF の値は、SES のコンソールが示す形そのものです（[SES: カスタム MAIL FROM ドメイン](https://docs.aws.amazon.com/ses/latest/dg/mail-from.html)）。
 
 ### DKIM を CNAME で委任する理由
 
-第 129 回では、DKIM の公開鍵を `<セレクタ>._domainkey.<ドメイン>` の TXT に**自分で**置きました。配信サービスを使うときは、そこに TXT ではなく **CNAME** を置き、配信サービスの持つ名前へ向けるのが普通です。
+第 130 回では、DKIM の公開鍵を `<セレクタ>._domainkey.<ドメイン>` の TXT に**自分で**置きました。配信サービスを使うときは、そこに TXT ではなく **CNAME** を置き、配信サービスの持つ名前へ向けるのが普通です。
 
 SES の Easy DKIM では **3 つの CNAME** を置き、値は `<トークン>.dkim.<リージョン>.amazonses.com` の形になります。鍵の長さは既定で 2048 ビットです（[SES: ID の作成と検証](https://docs.aws.amazon.com/ses/latest/dg/creating-identities.html)、[Easy DKIM](https://docs.aws.amazon.com/ses/latest/dg/send-email-authentication-dkim-easy.html)）。SendGrid の「automated security」も、`s1._domainkey` と `s2._domainkey` の 2 つの CNAME と、MAIL FROM 用の `em1234` のような CNAME を置かせます（[SendGrid のドキュメント](https://www.twilio.com/docs/sendgrid/ui/account-and-settings/how-to-set-up-domain-authentication)）。
 
-CNAME にすると、**秘密鍵も公開鍵も配信サービスの側で管理され、鍵の入れ替えのたびに自分の DNS を触らずに済みます**。第 129 回で見た「セレクタを変えて並行運用する」ローテーションを、相手に任せられるわけです。その代わり、**そのセレクタの名前で example.com の署名を作る権限を、配信サービスに渡している**ことになります。使わなくなった配信サービスの CNAME を残しておくと、その権限も残り続けます。
+CNAME にすると、**秘密鍵も公開鍵も配信サービスの側で管理され、鍵の入れ替えのたびに自分の DNS を触らずに済みます**。第 130 回で見た「セレクタを変えて並行運用する」ローテーションを、相手に任せられるわけです。その代わり、**そのセレクタの名前で example.com の署名を作る権限を、配信サービスに渡している**ことになります。使わなくなった配信サービスの CNAME を残しておくと、その権限も残り続けます。
 
 ### カスタム MAIL FROM ドメインを別のサブドメインにする理由
 
-MAIL FROM はバウンス（第 124 回の DSN）の返送先です。SES は、カスタム MAIL FROM の名前に **MX をちょうど 1 つ**置くよう求め、さらに **そのサブドメインを送信にも受信にも使わない**ように求めています（[SES のドキュメント](https://docs.aws.amazon.com/ses/latest/dg/mail-from.html)）。`example.com` 自体の MX は社員のメールボックス（第 132 回）に向いているので、それとは別の名前が必要になるわけです。
+MAIL FROM はバウンス（第 125 回の DSN）の返送先です。SES は、カスタム MAIL FROM の名前に **MX をちょうど 1 つ**置くよう求め、さらに **そのサブドメインを送信にも受信にも使わない**ように求めています（[SES のドキュメント](https://docs.aws.amazon.com/ses/latest/dg/mail-from.html)）。`example.com` 自体の MX は社員のメールボックス（第 133 回）に向いているので、それとは別の名前が必要になるわけです。
 
-DMARC の既定は relaxed なアラインメントなので、`mail.example.com` と `example.com` は組織ドメインが同じで「揃っている」と判定されます（第 130 回）。**サブドメインに分けても DMARC は通る**、というのがこの設計の前提です。
+DMARC の既定は relaxed なアラインメントなので、`mail.example.com` と `example.com` は組織ドメインが同じで「揃っている」と判定されます（第 131 回）。**サブドメインに分けても DMARC は通る**、というのがこの設計の前提です。
 
 <Callout type="warn" title="「SPF に include を足したから大丈夫」ではない">
   配信サービスの案内に従って、`example.com` の SPF に `include:` を足す人は多いです。
-  しかし SPF が確かめるのは **MAIL FROM のドメイン**です（第 128 回）。
+  しかし SPF が確かめるのは **MAIL FROM のドメイン**です（第 129 回）。
   MAIL FROM が配信サービスの既定のドメインのままなら、`example.com` の SPF は**一度も引かれません**。
-  足した `include:` は、第 58 回と第 128 回で見た 10 回の上限を圧迫するだけです。
+  足した `include:` は、第 58 回と第 129 回で見た 10 回の上限を圧迫するだけです。
   SPF で DMARC を通したいなら、MAIL FROM を自分のドメインにするところまでが 1 組です。
 </Callout>
 
@@ -114,7 +114,7 @@ news.example.com       お知らせ・キャンペーン（配信サービス B�
 分ける理由は 3 つあります。
 
 1. **評判の分離。** 受信側は、IP だけでなくドメインにも評判を付けます。`news` の苦情が増えても、`auth` への影響を小さくできます
-2. **DMARC の方針を段階的に上げられる。** 第 130 回の `sp=` や、サブドメイン自身の `_dmarc` で、新しく始めた送信だけ `p=none` から様子を見られます
+2. **DMARC の方針を段階的に上げられる。** 第 131 回の `sp=` や、サブドメイン自身の `_dmarc` で、新しく始めた送信だけ `p=none` から様子を見られます
 3. **止めやすい。** 使わなくなった配信サービスの SPF、DKIM の CNAME、MX を、サブドメインごとまとめて消せます
 
 ただし、分ければ別人として扱われるわけではありません。Gmail は、一括送信者の基準である 1 日 5,000 通を数えるとき、**同じ組織ドメインから送られたメールを合算する**と書いています（`solarmora.com` と `promotions.solarmora.com` の例。[Gmail の FAQ](https://support.google.com/a/answer/14229414?hl=en)）。評判も、組織ドメインの単位で影響し合うと考えておくのが安全です。
@@ -127,7 +127,7 @@ SPF・DKIM・DMARC がすべて pass しても、それは「**このメール�
 
 | 単位 | 何で見分けるか | 移せるか |
 | --- | --- | --- |
-| IP アドレス | 接続してきた送信元の IP（第 125 回の逆引きも含む） | 配信サービスを変えれば変わる |
+| IP アドレス | 接続してきた送信元の IP（第 126 回の逆引きも含む） | 配信サービスを変えれば変わる |
 | ドメイン | DKIM の d=、From: のドメイン | **ついて回る** |
 
 DKIM と DMARC で「このドメインが送った」ことを確かめられる以上、受信側は評判を IP ではなくドメインに結びつけて覚えておけます。だから、**配信サービスを乗り換えて IP が変わっても、悪い評判のドメインは悪いまま**だと考えるべきです。
@@ -172,11 +172,11 @@ ZEN は複数のリストをまとめたゾーンで、返ってくるアドレ�
 
 | 信号 | 何か | どこから来るか |
 | --- | --- | --- |
-| ハードバウンス | 宛先が存在しない（`5.1.1` など、第 124 回） | 相手の MTA が 5xx を返す、または DSN が MAIL FROM に届く |
+| ハードバウンス | 宛先が存在しない（`5.1.1` など、第 125 回） | 相手の MTA が 5xx を返す、または DSN が MAIL FROM に届く |
 | ソフトバウンス | 一時的に受け取れない（容量超過、4xx） | 同上。配信サービスが再送する |
 | 苦情 | 利用者が「迷惑メール」のボタンを押した | メールボックス事業者のフィードバックループ |
 
-**フィードバックループ**は、メールボックス事業者が「あなたのメールを利用者が迷惑メールと報告した」と送信者に知らせる仕組みです。報告の形式は ARF（[RFC 5965](https://www.rfc-editor.org/rfc/rfc5965.html)）と呼ばれる、元のメッセージを添付した MIME のメッセージです（第 126 回）。報告の宛先は、カスタム MAIL FROM の MX を通じて配信サービスが受け取り、SNS の通知などで送信者のアプリへ渡します（[SES: 通知の設定](https://docs.aws.amazon.com/ses/latest/dg/monitor-sending-activity-using-notifications.html)）。
+**フィードバックループ**は、メールボックス事業者が「あなたのメールを利用者が迷惑メールと報告した」と送信者に知らせる仕組みです。報告の形式は ARF（[RFC 5965](https://www.rfc-editor.org/rfc/rfc5965.html)）と呼ばれる、元のメッセージを添付した MIME のメッセージです（第 127 回）。報告の宛先は、カスタム MAIL FROM の MX を通じて配信サービスが受け取り、SNS の通知などで送信者のアプリへ渡します（[SES: 通知の設定](https://docs.aws.amazon.com/ses/latest/dg/monitor-sending-activity-using-notifications.html)）。
 
 配信サービスは、この比率を厳しく見ています。SES の基準は次のとおりです（[SES: 評判の通知](https://docs.aws.amazon.com/ses/latest/dg/reputationdashboardmessages.html)、執筆時点の 2026 年 9 月）。
 
@@ -213,7 +213,7 @@ List-Unsubscribe-Post: List-Unsubscribe=One-Click
 
 **GET ではなく POST** なのは、迷惑メール対策のソフトがヘッダの中の URL を**勝手に取得する**ことがあるからです（RFC 8058 の冒頭）。GET で配信停止できると、利用者が何もしていないのに、中身を調べに来たソフトが停止させてしまいます。第 109 回で見た「メールのリンクを踏んだら即ログイン」の設計が、同じ理由で壊れることがあります。
 
-RFC 8058 はさらに、この 2 つのヘッダが **DKIM の署名に含まれていること**（`h=` に入っていること）を求め、署名がなければ受信側はワンクリック配信停止を提供すべきでないとしています。途中で差し替えられた配信停止の URL に POST させられるのを防ぐためです（第 129 回）。
+RFC 8058 はさらに、この 2 つのヘッダが **DKIM の署名に含まれていること**（`h=` に入っていること）を求め、署名がなければ受信側はワンクリック配信停止を提供すべきでないとしています。途中で差し替えられた配信停止の URL に POST させられるのを防ぐためです（第 130 回）。
 
 ## 受信側で何が判定されたかを読む
 
@@ -240,7 +240,7 @@ Authentication-Results: example.com; iprev=pass
 | `smtp.mailfrom=example.net` | **何を**確かめたか。SPF は MAIL FROM を見た |
 | `dkim=pass header.d=…` | DKIM は、どのドメインの署名が通ったか |
 | `dmarc=pass header.from=…` | DMARC は、From: のどのドメインについて判定したか |
-| `iprev=pass` | 第 125 回の逆引きと正引きの一致 |
+| `iprev=pass` | 第 126 回の逆引きと正引きの一致 |
 
 ここで大事なのは、各結果の後ろの **`smtp.mailfrom`、`header.d`、`header.from` が、それぞれ別のドメインでありうる**ことです。`spf=pass` を見て安心する前に、**何のドメインについての pass なのか**を読みます。第 123 回の「エンベロープとヘッダは別物」が、そのまま判定の読み方になります。
 
@@ -272,7 +272,7 @@ docker run -d --name ll123 -p 18122:1025 -p 18123:8025 axllent/mailpit
 python3 -m venv .venv && .venv/bin/pip install dkimpy cryptography
 ```
 
-模型の DNS は Python の辞書で持ちます。ここで決めているのは第 128〜130 回の内容そのものです。
+模型の DNS は Python の辞書で持ちます。ここで決めているのは第 129〜131 回の内容そのものです。
 
 ```python
 DNS = {
@@ -284,7 +284,7 @@ DNS = {
 }
 ```
 
-送る側は、`smtplib` で MAIL FROM と From: を別々に指定し（第 123 回）、`dkimpy` で d= を変えて署名します（第 129 回）。本物の受信側は TCP の接続元から IP を知りますが、ここではすべて手元から送るので、**送信元の IP だけはヘッダ `X-Lab-Client-IP` で模型に渡しています**。E の 1 通には、送信者が自分で書いた偽の `Authentication-Results: mx.example.jp; spf=pass; dkim=pass; dmarc=pass` を入れておきます。
+送る側は、`smtplib` で MAIL FROM と From: を別々に指定し（第 123 回）、`dkimpy` で d= を変えて署名します（第 130 回）。本物の受信側は TCP の接続元から IP を知りますが、ここではすべて手元から送るので、**送信元の IP だけはヘッダ `X-Lab-Client-IP` で模型に渡しています**。E の 1 通には、送信者が自分で書いた偽の `Authentication-Results: mx.example.jp; spf=pass; dkim=pass; dmarc=pass` を入れておきます。
 
 判定器の要点は数行です。
 
@@ -299,7 +299,7 @@ dkim_aligned = k == "pass" and org(d_domain) == org(from_domain)
 dmarc = "pass" if spf_aligned or dkim_aligned else "fail"
 ```
 
-`org()` は、第 130 回で見た組織ドメインの決め方を「右の 2 ラベル」に手抜きしたものです。本物は、旧版の RFC 7489 では Public Suffix List を、それを置き換えた [RFC 9989](https://www.rfc-editor.org/rfc/rfc9989.html)（2026 年 5 月）では DNS の木をたどる方式を使います。実行した結果の抜粋です。
+`org()` は、第 131 回で見た組織ドメインの決め方を「右の 2 ラベル」に手抜きしたものです。本物は、旧版の RFC 7489 では Public Suffix List を、それを置き換えた [RFC 9989](https://www.rfc-editor.org/rfc/rfc9989.html)（2026 年 5 月）では DNS の木をたどる方式を使います。実行した結果の抜粋です。
 
 ```
 == B 配信サービスの既定のまま
@@ -337,7 +337,7 @@ Authentication-Results: mx.example.jp;
 読みどころは 3 つです。
 
 - **B は、SPF も DKIM も pass なのに DMARC は fail** します。`p=reject` なら受信側は受け取りを拒否します。前の節の「既定のまま送る」失敗がこれです
-- **C と D は、片方が壊れても、もう片方が揃っていれば DMARC は pass** します。C はリンクの書き換えで DKIM が壊れた例、D は転送で送信元の IP が変わって SPF が壊れた例（第 128 回）です。両方を揃えておくのは、**どちらかが壊れる経路が必ずあるから**です
+- **C と D は、片方が壊れても、もう片方が揃っていれば DMARC は pass** します。C はリンクの書き換えで DKIM が壊れた例、D は転送で送信元の IP が変わって SPF が壊れた例（第 129 回）です。両方を揃えておくのは、**どちらかが壊れる経路が必ずあるから**です
 - **E は、SPF が pass しています**。攻撃者は自分のドメインの SPF を正しく書けば pass させられます。止めているのは DMARC のアラインメントだけで、送信者が書いた偽の判定は、判定器が最初に消しています
 
 ## 「全部 pass なのに迷惑メールに入る」
@@ -351,10 +351,10 @@ Authentication-Results: mx.example.jp;
   pass は迷惑メールの判定に進むための**入場券**で、判定そのものは評判と内容で決まります。
 </Callout>
 
-逆に、認証が欠けていると、評判の良し悪しを見る前に落とされるようになりました。Gmail は 2024 年 2 月から全送信者に SPF か DKIM、一括送信者に SPF・DKIM・DMARC とアラインメントを求め、**2025 年 11 月からは要件を満たさないメールに一時的・恒久的な拒否を増やしていく**としています（[Gmail の FAQ](https://support.google.com/a/answer/14229414?hl=en)）。Microsoft も 2025 年 5 月 5 日から、outlook.com・hotmail.com・live.com 宛てについて、1 日 5,000 通以上の送信者に同様の要件を課し、満たさないメールを `550 5.7.515` で拒否するとしています（[Microsoft Tech Community](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730)）。詳しくは第 130 回で見ました。
+逆に、認証が欠けていると、評判の良し悪しを見る前に落とされるようになりました。Gmail は 2024 年 2 月から全送信者に SPF か DKIM、一括送信者に SPF・DKIM・DMARC とアラインメントを求め、**2025 年 11 月からは要件を満たさないメールに一時的・恒久的な拒否を増やしていく**としています（[Gmail の FAQ](https://support.google.com/a/answer/14229414?hl=en)）。Microsoft も 2025 年 5 月 5 日から、outlook.com・hotmail.com・live.com 宛てについて、1 日 5,000 通以上の送信者に同様の要件を課し、満たさないメールを `550 5.7.515` で拒否するとしています（[Microsoft Tech Community](https://techcommunity.microsoft.com/blog/microsoftdefenderforoffice365blog/strengthening-email-ecosystem-outlook%E2%80%99s-new-requirements-for-high%E2%80%90volume-senders/4399730)）。詳しくは第 131 回で見ました。
 
 <Callout type="warn" title="「配信サービスが受け付けた」は「届いた」ではない">
-  配信サービスの API が 200 を返しても、それは第 124 回の 250 と同じく「**預かった**」という意味です。
+  配信サービスの API が 200 を返しても、それは第 125 回の 250 と同じく「**預かった**」という意味です。
   その先で相手の MTA に 5xx で断られることも、受け取られて迷惑メールに入ることもあります。
   アプリは送信の API の成功だけでなく、配信・バウンス・苦情のイベントを受け取って記録し、
   利用者のサポートの画面から「最後に送ったメールがどうなったか」を引けるようにしておくと、問い合わせに答えられます。
@@ -368,15 +368,15 @@ Authentication-Results: mx.example.jp;
 | --- | --- | --- | --- |
 | アプリ | 送信の API 自体が失敗、または呼ばれていない | アプリのログ、配信サービスの送信記録 | — |
 | 送信抑止 | 配信サービスが送らずに捨てた | 送信抑止リスト、過去のハードバウンス | この回 |
-| DNS | 宛先ドメインの MX が引けない、null MX | `dig MX`、TTL と古いキャッシュ | 第 58 回、第 60 回、第 125 回 |
-| 経路 | 接続できない、4xx で再送が続く | 配信サービスのイベントの応答コード | 第 124 回、第 125 回 |
-| TLS | MTA-STS や DANE の方針に合わず送れない | TLS-RPT の報告 | 第 127 回 |
-| SPF | `spf=fail`、`permerror`（10 回の上限） | `Received-SPF` の client-ip と envelope-from | 第 128 回 |
-| DKIM | `dkim=fail`、鍵が見つからない | `header.d` とセレクタ、CNAME の有無、本文の書き換え | 第 129 回 |
-| DMARC | `dmarc=fail` で拒否・隔離 | `header.from` と SPF・DKIM のドメインの揃い、集計報告 | 第 130 回 |
+| DNS | 宛先ドメインの MX が引けない、null MX | `dig MX`、TTL と古いキャッシュ | 第 58 回、第 60 回、第 126 回 |
+| 経路 | 接続できない、4xx で再送が続く | 配信サービスのイベントの応答コード | 第 125 回、第 126 回 |
+| TLS | MTA-STS や DANE の方針に合わず送れない | TLS-RPT の報告 | 第 128 回 |
+| SPF | `spf=fail`、`permerror`（10 回の上限） | `Received-SPF` の client-ip と envelope-from | 第 129 回 |
+| DKIM | `dkim=fail`、鍵が見つからない | `header.d` とセレクタ、CNAME の有無、本文の書き換え | 第 130 回 |
+| DMARC | `dmarc=fail` で拒否・隔離 | `header.from` と SPF・DKIM のドメインの揃い、集計報告 | 第 131 回 |
 | 評判 | 認証は全部 pass なのに迷惑メール | Postmaster Tools、苦情率、ブロックリスト、急な送信量の増加 | この回 |
-| 内容 | 特定のメールだけ迷惑メール | 本文のリンク先のドメイン、短縮 URL、HTML だけで本文がない | 第 126 回、この回 |
-| 受信者 | 届いているが見つからない | 受信者側のフィルタ、転送の設定、アドレスの打ち間違い | 第 132 回 |
+| 内容 | 特定のメールだけ迷惑メール | 本文のリンク先のドメイン、短縮 URL、HTML だけで本文がない | 第 127 回、この回 |
+| 受信者 | 届いているが見つからない | 受信者側のフィルタ、転送の設定、アドレスの打ち間違い | 第 133 回 |
 
 上の段ほど送る側で直せ、下の段ほど受ける側の事情が大きくなります。**上から順に潰す**のが、無駄の少ない順番です。
 
@@ -386,14 +386,14 @@ Authentication-Results: mx.example.jp;
 
 | やりたいこと | 使う部品 | 呼び戻す回 |
 | --- | --- | --- |
-| 相手のサーバへ運ぶ | SMTP、MX、キューと再送 | 第 124 回、第 125 回、第 50 回 |
-| 途中で盗み見られない | STARTTLS、MTA-STS、DANE | 第 127 回、第 101〜105 回、第 61 回 |
-| MAIL FROM の正しさ | SPF、DNS の TXT | 第 128 回、第 58 回 |
-| 改ざんされていないこと | DKIM、署名、鍵の形式 | 第 129 回、第 98 回、第 99 回 |
-| 利用者が見る差出人との結びつき | DMARC のアラインメント | 第 130 回 |
+| 相手のサーバへ運ぶ | SMTP、MX、キューと再送 | 第 125 回、第 126 回、第 50 回 |
+| 途中で盗み見られない | STARTTLS、MTA-STS、DANE | 第 128 回、第 101〜105 回、第 61 回 |
+| MAIL FROM の正しさ | SPF、DNS の TXT | 第 129 回、第 58 回 |
+| 改ざんされていないこと | DKIM、署名、鍵の形式 | 第 130 回、第 98 回、第 99 回 |
+| 利用者が見る差出人との結びつき | DMARC のアラインメント | 第 131 回 |
 | 送信者を信用してよいか | 評判、ブロックリスト、苦情率 | この回 |
 | 判定を利用者側に伝える | Authentication-Results | この回 |
-| アカウントを取り戻す手段としてのメール | パスワード再設定、マジックリンク | 第 109 回、第 132 回 |
+| アカウントを取り戻す手段としてのメール | パスワード再設定、マジックリンク | 第 109 回、第 133 回 |
 
 どれか 1 つだけでは何も保証しません。SPF だけなら From: は偽れる。DKIM だけなら d= は誰のものでもよい。DMARC があっても評判がなければ迷惑メールに入る。評判があっても経路の TLS がなければ途中で読める。
 
