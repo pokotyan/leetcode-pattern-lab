@@ -1,0 +1,356 @@
+---
+title: 大量データの計算エンジンの地図（系譜と一覧）
+description: MapReduce、Hive、Spark、Flink、Trino、BigQuery、DuckDB。20 年あまりの間に現れた計算エンジンは、何を置き換え、何に置き換えられ、今どれが現役なのか。論文と Apache の記録から系譜をたどります
+category: compute
+order: 20
+status: published
+topics:
+  - MapReduce
+  - Apache Hadoop
+  - YARN
+  - Apache Spark
+  - Apache Flink
+  - Apache Beam
+  - Trino
+  - BigQuery
+  - Dremel
+  - MPP
+  - Real-time OLAP
+  - Apache Attic
+  - DuckDB
+  - Managed Service
+basedOn:
+  - kind: article
+    slug: graph-bfs-dfs
+    why: Tez・Spark・Flink・Beam はどれも処理を有向非巡回グラフ（DAG）として受け取り、依存の向きに沿って順に実行する。トポロジカル順序がそのまま実行順になる
+  - kind: article
+    slug: hash-counting
+    why: どの世代のエンジンでも、集計と結合の中心は「同じキーを同じ担当へ集める」ハッシュによる振り分けで、エンジンの違いはその振り分けをディスク経由で行うか、メモリ上で流すかにある
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 5 層のうち「計算エンジン」の層を広げる
+
+<a href={`${import.meta.env.BASE_URL}reading/lake-map/`}>データレイクの地図</a>では、データレイクを 5 つの層で描きました。
+
+```
+Metadata    │ Hive metastore
+Computing   │ Spark  Flink  Trino  Presto  Redshift     ← この連載で掘り下げる層
+Table spec  │ Hive   Hudi   Iceberg  Delta Lake
+File format │ CSV    JSON   Parquet  Avro  ORC
+Storage     │ HDFS   S3     GCS
+```
+
+データレイクの連載では、下の 4 層（置き場所・ファイル形式・テーブル形式・カタログ）を順に見て、計算エンジンは<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>で各エンジンの役回りを 1 表にまとめるところで止めました。この連載は、その Computing の層だけを取り出して掘り下げます。
+
+ただし、Computing の行に並ぶ 5 つの名前は、この 20 年あまりに現れた計算エンジンのごく一部です。その前には MapReduce と Hive があり、横には Impala、Druid、ClickHouse、Storm があり、最近は DuckDB のように 1 台で済ませる方向の道具も増えています。この回では詳しい仕組みには立ち入らず、**著名な計算エンジンを一覧にし、どれが何を置き換えたのか、今も現役なのかを系譜として整理します**。仕組みは次の 6 回で扱います。
+
+処理の型そのもの（map・shuffle・reduce、外部ソート、ストリームの窓、Lambda と Kappa）は<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理（MapReduce とストリーム）</a>で扱ったので、この連載では説明し直さず、**その型が実際のソフトウェアでどう実装され、どう実行されるか**を見ます。
+
+## 地図の読み方
+
+一覧の各行には、次の 5 つを書きます。
+
+1. **登場**：論文の発表、最初の公開、Apache のトップレベルプロジェクト（TLP）になった時期など、確認できた最も早い節目
+2. **出自**：どの会社・研究室で生まれたか
+3. **何をする**：一言の役割
+4. **置き換えた／置き換えられた**：系譜の上での前後関係
+5. **現在**：執筆時点（2026 年 10 月）での状況。次の 3 つに分ける
+
+| 区分 | 判定の根拠 |
+| --- | --- |
+| 現役 | 直近 1 年ほどの間にリリースがあり、新しい機能が入っている |
+| 保守中心 | プロジェクトは存続しているが、リリースの間隔が数年空いている、または上位の製品が後継を勧めている |
+| 退役 | Apache の場合は **Apache Attic**（活動を終えたプロジェクトを引き取る場所）に移ったもの。Incubator の段階で終わったもの。製品の場合は提供が終わったもの |
+
+Apache の各プロジェクトが TLP になった月と最新リリースは、Apache が公開している一覧（[committees.json](https://projects.apache.org/json/foundation/committees.json)、[releases.json](https://projects.apache.org/json/foundation/releases.json)、退役分は [committees-retired.json](https://projects.apache.org/json/foundation/committees-retired.json)）を 2026 年 10 月 1 日に取得して確かめました。以下の表で「TLP 2014-02」のように書いたものはこの一覧の値です。
+
+## 系譜図
+
+先に全体を 1 枚にします。矢印は「影響を与えた」「後継になった」のどちらかで、細かな影響関係をすべて描いたものではありません。
+
+```
+ Google の論文              オープンソース / 製品
+ ─────────────            ─────────────────────────────────────────────────
+
+ GFS (2003) ─────────────▶ HDFS ─────────────────────────▶ S3 / GCS へ（計算とストレージの分離）
+ MapReduce (2004) ───────▶ Hadoop MapReduce (Hadoop 1: JobTracker)
+                               │
+                               ├─▶ Hive (SQL → MR) ──▶ Hive on Tez（MR は非推奨）
+                               ├─▶ Pig (Pig Latin → MR)
+                               ├─▶ Sqoop / Oozie ─────▶ 退役（Attic）
+                               │
+                               ▼  資源管理を切り離す
+                           YARN (Hadoop 2, 2013) ─────────────────────────▶ Kubernetes（2014〜）
+                               │                       Mesos ─────────────▶ 退役（Attic）
+                               ▼  ジョブを DAG で
+            Dryad (2007) ──▶ Tez
+                             Spark (RDD, 2009〜) ──▶ DataFrame / SQL ──▶ Spark 4 系
+                                   │
+                                   └─▶ Spark Streaming (DStream, 保守終了) ─▶ Structured Streaming
+ Bigtable (2006) ────────▶ HBase
+ Dremel (2010) ──────────▶ BigQuery（同年公開）
+                 └──影響──▶ Impala / Drill / Presto ─▶ Trino（2020 改名）
+                                                     └▶ Presto（PrestoDB）
+                           Redshift (2013) / Snowflake / Synapse ─▶ Fabric
+                           Druid / Pinot / ClickHouse / Doris ─▶ StarRocks（リアルタイム OLAP）
+ FlumeJava (2010) ─┐
+ MillWheel (2013) ─┴─────▶ Cloud Dataflow (2015) ──▶ Beam (SDK を寄贈) ──▶ 複数のランナー
+ Dataflow Model (2015) ──┘                                                  （Flink / Spark / Dataflow）
+                           Storm (2011) ──▶ Heron（Incubator で終了）
+                           Stratosphere ──▶ Flink ──▶ Managed Service for Apache Flink
+                           Kafka Streams / Samza（Kafka の上のライブラリ・フレームワーク）
+
+ 1 台へ戻る流れ            DuckDB / Polars / DataFusion / Velox（ベクトル化した実行エンジン）
+```
+
+この図から読み取れる流れは 4 つあります。
+
+- **ディスクからメモリへ**：MapReduce はジョブの段ごとに中間結果をディスクに書きました。Tez と Spark は複数の段を 1 つの DAG にまとめ、段の間をメモリやローカルディスクで受け渡すようにしました
+- **資源管理の分離**：Hadoop 1 では MapReduce と資源管理が一体でした。YARN がこれを切り離し、今は Kubernetes の上で Spark や Flink を動かす形が広がっています
+- **バッチと SQL の分離**：MapReduce や Spark のバッチとは別に、常駐するワーカーで SQL を短時間に返す MPP 型（Impala、Presto/Trino、BigQuery、Redshift）が育ちました
+- **自前運用からマネージドへ**：EMR、Dataproc、Databricks、BigQuery のように、クラスタの運用を提供者が引き受ける形が主流になり、さらにクラスタを意識させないサーバーレス型が増えています
+
+## Google の論文
+
+オープンソースの多くは Google の論文を読んで作られました。Google 自身はこれらのシステムを公開していないので、論文が系譜の起点になります。
+
+| 論文 | 発表 | 何を示したか | 後に何が生まれたか |
+| --- | --- | --- | --- |
+| The Google File System | SOSP 2003（[Google Research](https://research.google/pubs/the-google-file-system/)） | 安価なマシンを多数並べ、大きなファイルをチャンクに分けて複製して置く分散ファイルシステム | HDFS |
+| MapReduce: Simplified Data Processing on Large Clusters | OSDI 2004（[Google Research](https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/)） | map と reduce の 2 つの関数を書けば、分割・shuffle・障害時の再実行は仕組みが受け持つ | Hadoop MapReduce |
+| Bigtable | OSDI 2006（[Google Research](https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/)） | 行キーで並べた疎な表を、多数のサーバーに分けて持つストレージ | HBase |
+| Dremel: Interactive Analysis of Web-Scale Datasets | VLDB 2010（[Google Research](https://research.google/pubs/dremel-interactive-analysis-of-web-scale-datasets-2/)） | 入れ子のデータを列指向で持ち、木構造の集約で数秒で答える対話型の分析 | BigQuery、SQL-on-Hadoop の各エンジン |
+| FlumeJava | PLDI 2010（[Google Research](https://research.google/pubs/flumejava-easy-efficient-data-parallel-pipelines/)） | 複数の MapReduce からなるパイプラインを、遅延評価して最適化してから実行するライブラリ | Cloud Dataflow、Beam のバッチ側 |
+| MillWheel | VLDB 2013（[Google Research](https://research.google/pubs/millwheel-fault-tolerant-stream-processing-at-internet-scale/)） | 状態を持つストリーム処理を、低遅延かつ障害に強く行う仕組み。低水位標（low watermark）の考え方 | Cloud Dataflow のストリーム側 |
+| The Dataflow Model | PVLDB 2015（[Google Research](https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/)） | バッチとストリームを 1 つのモデルで書き、正しさ・遅延・費用の取引を、窓・トリガー・蓄積の指定で選ぶ | Beam のプログラミングモデル |
+
+Dremel の論文には 10 年後の振り返りがあり、2010 年の発表と同じ年に Dremel を土台とする公開サービスとして BigQuery を出したこと、2012 年には Colossus（GFS の後継の分散ファイルシステム）の上に分離した shuffle の基盤を作ったことが書かれています（[Dremel: A Decade of Interactive SQL Analysis at Web Scale](https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf)、VLDB 2020）。BigQuery が実行エンジン Dremel、ストレージ Colossus、クラスタ管理 Borg、ネットワーク Jupiter の組み合わせでできていることは、Google Cloud のブログが説明しています（[BigQuery under the hood](https://cloud.google.com/blog/products/bigquery/bigquery-under-the-hood)）。
+
+## Hadoop とその周辺
+
+Hadoop は、ウェブを巡回して索引を作る Nutch の基盤として作られ、HDFS と MapReduce をその中心に持っていました（[Hadoop Wiki: ProjectDescription](https://cwiki.apache.org/confluence/display/HADOOP2/ProjectDescription)）。Lucene のサブプロジェクトを経て独立した TLP になっています（[ASF Blog](https://news.apache.org/foundation/entry/the_apache_software_foundation_announces16)）。現在の Hadoop は Common、HDFS、YARN、MapReduce の 4 つのモジュールからなり、執筆時点の最新は 3.5.0（2026 年 4 月）です（[hadoop.apache.org](https://hadoop.apache.org/)）。
+
+| ソフトウェア | 登場 | 出自 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| Hadoop MapReduce | TLP 2008-01。1.0.0 が 2011 年 12 月 | Nutch から独立 | MapReduce の実行系。Hadoop 1 では JobTracker が資源管理も兼ねた | Google の MapReduce を再実装。後に Tez・Spark が主な実行系の座を引き継ぐ | 現役（Hadoop 3.5.0 に含まれる）。新規の実行系としては選ばれにくい |
+| HDFS | Hadoop と同時 | GFS の再実装 | 分散ファイルシステム | クラウドでは S3・GCS に置き換わることが多い（<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>） | 現役 |
+| YARN | Hadoop 2.2.0（2013 年 10 月、2.x の GA 版） | Hadoop | 資源管理と、アプリケーションごとのスケジューリングを分けた仕組み | Hadoop 1 の JobTracker を置き換えた | 現役 |
+| Hive | VLDB 2009 の論文。TLP 2010-09 | Facebook | HiveQL を分散処理のジョブに変換する。HMS の本家 | 実行系は MR から Tez へ。対話型の用途は Impala・Presto/Trino に移った | 現役（4.2.1、2026 年 7 月） |
+| Pig | SIGMOD 2008 の論文。TLP 2010-09 | Yahoo! Research | Pig Latin というデータの流れを書く言語を MR に変換する | Spark の DataFrame などに用途を譲った | 保守中心（0.17.0 が 2017 年、次の 0.18.0 が 2025 年 6 月） |
+| HBase | TLP 2010-04 | Bigtable を手本にした | HDFS の上の、行キーで引く分散ストア | 計算エンジンではないが、Hadoop の上の随時読み書きを担う | 現役（3.0.0、2026 年 8 月） |
+| Tez | TLP 2014-07。SIGMOD 2015 の論文 | Hadoop 周辺 | YARN の上で、タスクの DAG を 1 つのジョブとして実行する土台 | 段ごとにディスクへ書く MR を、Hive・Pig の下で置き換えた | 現役だが更新は緩やか（0.10.5、2025 年 5 月） |
+| Sqoop | TLP 2012-03 | Hadoop 周辺 | RDB と Hadoop の間の一括転送 | 後継を定めずに終了 | 退役（2021 年 6 月、Attic） |
+| Oozie | TLP 2012-08 | Hadoop 周辺 | Hadoop のジョブを流すワークフローのスケジューラ | Airflow などの汎用のワークフロー管理に用途が移った | 退役（2025 年 2 月、Attic への移管は 4 月） |
+
+各行の論文と記録の出典は次のとおりです。Hive は [VLDB 2009 の論文](https://www.vldb.org/pvldb/vol2/vldb09-938.pdf)、Pig は [SIGMOD 2008 の論文](http://i.stanford.edu/~olston/publications/sigmod08.pdf)、Tez は [SIGMOD 2015 の論文](https://dblp.org/rec/conf/sigmod/SahaSSVMC15.html)、YARN は [Hadoop 2.2.0 のリリース告知](https://hadoop.apache.org/release/2.2.0.html)と [YARN の文書](https://hadoop.apache.org/docs/stable/hadoop-yarn/hadoop-yarn-site/YARN.html)、HBase は [hbase.apache.org](https://hbase.apache.org/)（「Google Bigtable を手本にした」と書いている）、Sqoop と Oozie は Attic の [Sqoop](https://attic.apache.org/projects/sqoop.html)・[Oozie](https://attic.apache.org/projects/oozie.html) のページです。
+
+Hive の実行系の移り変わりは、Hive の課題管理に記録があります。MapReduce による実行は Hive 2.0 で非推奨になり（[HIVE-12300](https://issues.apache.org/jira/browse/HIVE-12300)）、一時期あった Hive on Spark は 2022 年に主系統から取り除かれました（[HIVE-26134](https://issues.apache.org/jira/browse/HIVE-26134)）。今の Hive の実行系の中心は Tez です。
+
+## DAG とインメモリの汎用エンジン
+
+MapReduce の弱点は、map と reduce の 1 組を超える処理を、複数のジョブをディスク経由でつなぐことでしか書けない点でした。これを「任意の DAG を 1 つのジョブとして実行する」形に一般化したのが次の世代です。
+
+| ソフトウェア | 登場 | 出自 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| Dryad | EuroSys 2007 の論文 | Microsoft Research | 頂点（処理）と通路（データの受け渡し）からなるデータフローのグラフを、多数のマシンで実行する | DAG による一般化の早い例。製品としては広がらなかった | 研究プロジェクトとしては終了し、ソースが公開されている |
+| Apache Spark | 2009 年に AMPLab で開始、2010 年に公開。TLP 2014-02 | UC Berkeley AMPLab | RDD（後に DataFrame）を単位に、DAG をメモリ中心で実行する汎用エンジン | MR を多くの用途で置き換えた | 現役（4.2.0。3.5・4.0・4.1 系も保守） |
+| Ray | OSDI 2018 の論文 | UC Berkeley の研究から。後に Anyscale | Python の関数とアクター（状態を持つ処理）を分散して実行する汎用の土台。機械学習の用途が中心 | Spark と用途が一部重なる | 現役（2.58.0）。2025 年 10 月に PyTorch Foundation（Linux Foundation の傘下）へ移った |
+| Dask | — | Python のコミュニティ | pandas や NumPy の操作を分割して並列・分散に実行する | 1 台の pandas を超える規模を Python のまま扱う | 現役（2026.8.0） |
+
+出典は、Dryad が [EuroSys 2007 の論文](https://www.microsoft.com/en-us/research/wp-content/uploads/2007/03/eurosys07.pdf)と [Microsoft Research のプロジェクトページ](https://www.microsoft.com/en-us/research/project/dryad/)（「以下の情報の大半は歴史的なもの」とし、ソースを GitHub で公開と書いている）、Spark が [ASF の TLP 告知](https://news.apache.org/foundation/entry/the_apache_software_foundation_announces50)と [RDD の論文（NSDI 2012）](https://spark.apache.org/research.html)、Ray が [OSDI 2018 の論文](https://www.usenix.org/conference/osdi18/presentation/moritz)と [Linux Foundation の発表](https://www.linuxfoundation.org/press/pytorch-foundation-welcomes-ray-to-deliver-a-unified-open-source-ai-compute-stack)、Dask が [Dask の文書](https://docs.dask.org/en/stable/)です。Dask の始まりの年は、公式の記述で確かめられなかったので空欄にしました。
+
+## MPP と対話型 SQL
+
+バッチエンジンがジョブごとにタスクを起動するのに対し、**常駐するワーカー**にクエリの断片を配り、結果をメモリ上で流して数秒から数十秒で返すのが MPP（Massively Parallel Processing）型の SQL エンジンです。仕組みは<a href={`${import.meta.env.BASE_URL}reading/compute-mpp-sql/`}>常駐ワーカーで SQL を分散実行する</a>で見ます。
+
+| ソフトウェア | 登場 | 出自 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| BigQuery | 2010 年（Dremel の論文と同年に公開） | Google | Dremel を実行エンジンとするサーバーレスの DWH（データウェアハウス） | 自前の Hadoop クラスタでの集計を、マネージドの SQL で置き換える選択肢になった | 現役 |
+| Impala | CIDR 2015 の論文。TLP 2017-11 | Cloudera | HDFS や HBase のデータに対する MPP の SQL エンジン。Hive とメタデータを共有する | Hive の対話型の用途を置き換えた | 現役（4.5.2、2026 年 9 月） |
+| Presto | 2012 年秋に開発開始、2013 年 11 月に公開 | Facebook | 複数のデータ源にまたがる対話型の分散 SQL エンジン | Hive の対話型の用途を置き換えた | 現役（PrestoDB として別の団体で継続） |
+| Trino | 2020 年 12 月に PrestoSQL から改名 | Presto の作者たちが 2019 年に独立して作った系統 | Presto と同じ形の分散 SQL エンジン | Presto から分かれた | 現役（Trino 483） |
+| Apache Drill | TLP 2014-11 | MapR など | スキーマを先に定めずに JSON などを SQL で読むエンジン | — | 保守中心（1.22.0、2025 年 6 月） |
+| Amazon Redshift | 2013 年 | AWS | 列指向の MPP の DWH。Spectrum で S3 の外部表も読む | — | 現役 |
+| Snowflake | SIGMOD 2016 の論文 | Snowflake | ストレージを共有し、計算のクラスタ（仮想ウェアハウス）を複数立てる DWH | 計算とストレージを分けた DWH の代表 | 現役 |
+| Azure Synapse Analytics | 2019 年 11 月 | Microsoft | Azure SQL Data Warehouse の後継。DWH と Spark を 1 つにまとめた | SQL Data Warehouse を置き換えた。後に Microsoft Fabric へ流れが移る | 存続。Microsoft は Fabric を Synapse の次の世代から生まれたものと説明している |
+| Microsoft Fabric | 2023 年 11 月 GA | Microsoft | OneLake を共通の置き場所とし、Spark・DWH・リアルタイム分析などを 1 つの SaaS にまとめた | Synapse・Data Factory・Power BI を統合した | 現役 |
+
+出典は、BigQuery が上の [Dremel の振り返り論文](https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf)、Impala が [CIDR 2015 の論文](https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper28.pdf)と [impala.apache.org](https://impala.apache.org/overview.html)、Presto が [Facebook の公開時のブログ](https://engineering.fb.com/2013/11/06/core-infra/presto-interacting-with-petabytes-of-data-at-facebook/)、Trino が[改名の告知](https://trino.io/blog/2020/12/27/announcing-trino.html)（2018 年に Facebook の経営側がプロジェクトの統制を強めようとしたため作者たちが離れ、2019 年 1 月に Presto Software Foundation を作ったと書いている）と [Trino の文書](https://trino.io/docs/current/)、Redshift が [Amazon Redshift Re-invented](https://www.amazon.science/publications/amazon-redshift-re-invented)（SIGMOD 2022）、Snowflake が [SIGMOD 2016 の論文](https://dl.acm.org/doi/10.1145/2882903.2903741)、Synapse が [Azure のブログ](https://azure.microsoft.com/en-us/blog/azure-sql-data-warehouse-is-now-azure-synapse-analytics/)、Fabric が [GA の告知](https://www.microsoft.com/en-us/microsoft-fabric/blog/2023/11/15/prepare-your-data-for-ai-innovation-with-microsoft-fabric-now-generally-available/)と [Fabric の概要](https://learn.microsoft.com/en-us/fabric/fundamentals/microsoft-fabric-overview)です。Drill の出自と、Dremel からの影響の度合いは公式の記述で確かめられなかったので、系譜図では「影響」とだけ描きました。
+
+## リアルタイム OLAP
+
+MPP の DWH が「分析者が投げる重いクエリ」を想定するのに対し、取り込んだばかりのデータを、**多数の利用者からの短いクエリに 1 秒未満で返す**ことに寄せたのがリアルタイム OLAP の系統です。サービスの画面に集計を出す用途（利用者向けの分析）でよく使われます。この連載では詳説せず、<a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a>の列指向・ベクトル化の節で触れる程度にします。
+
+| ソフトウェア | 登場 | 出自 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| Apache Druid | SIGMOD 2014 の論文。TLP 2019-12 | Metamarkets | 列指向・シェアードナッシング（ノード間で何も共有しない構成）・索引を組み合わせ、取り込みと同時に集計できるストア | — | 現役（38.0.0、2026 年 9 月） |
+| Apache Pinot | TLP 2021-07 | LinkedIn | 利用者向けの分析のための、低遅延・高スループットの分散 OLAP ストア | — | 現役（1.5.1） |
+| ClickHouse | 2009 年に開発開始、2016 年に公開 | 大規模なウェブ解析の基盤として開発。2021 年に ClickHouse, Inc. | 列指向の OLAP データベース | — | 現役 |
+| Apache Doris | 2017 年に公開。TLP 2022-06 | Baidu（旧名 Palo） | MPP のリアルタイム分析データベース | — | 現役（4.1.4 系） |
+| StarRocks | 2020 年 | CelerData。2023 年 2 月に Linux Foundation へ寄贈 | MPP・ベクトル化した実行エンジンを持つ分析データベース。レイクの表も直接読む | — | 現役 |
+
+出典は、Druid が [SIGMOD 2014 の論文](https://dl.acm.org/doi/10.1145/2588555.2595631)、Pinot が [Pinot の文書](https://docs.pinot.apache.org/)、ClickHouse が [ClickHouse の沿革](https://clickhouse.com/docs/about-us/history)、Doris が [ASF の TLP 告知](https://news.apache.org/foundation/entry/the-apache-software-foundation-announces81)と [Doris のブログ](https://doris.apache.org/blog/Annoucing/)、StarRocks が [StarRocks の文書](https://docs.starrocks.io/docs/introduction/StarRocks_intro/)と [CelerData の発表](https://www.globenewswire.com/en/news-release/2023/02/14/2607982/0/en/CelerData-Contributes-StarRocks-Project-to-the-Linux-Foundation.html)です。StarRocks と Doris のコードの関係はよく言及されますが、一次資料で確かめられなかったので表には書いていません。
+
+## ストリーム処理
+
+| ソフトウェア | 登場 | 出自 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| Apache Storm | 2011 年 9 月に公開。TLP 2014-09 | BackType（Twitter が買収） | 終わりのないストリームを 1 件ずつ処理する分散の仕組み。「バッチにとっての Hadoop を、リアルタイムで」 | Twitter 社内では Heron に置き換えられた。状態と時刻の扱いは Flink に先を譲った | 現役（3.1.0、2026 年 9 月） |
+| Heron | 2015 年に発表 | Twitter | Storm と API の互換を保ったまま中身を作り直したストリーム処理 | Twitter 社内で Storm を置き換えた | 退役（Apache Incubator で 2023 年 1 月に終了） |
+| Apache Samza | TLP 2015-01 | Kafka と組み合わせて使われてきた | Kafka などから読んで状態を持つ処理をする分散ストリーム処理 | — | 保守中心（最新は 1.8.0、2023 年 1 月） |
+| Apache Flink | 2009 年の研究プロジェクト Stratosphere が起源。TLP 2014-12 | TU Berlin などの研究グループ | 境界のある・ないストリームに対する状態を持つ計算。チェックポイントで exactly-once を保つ | Storm の後の、状態を持つストリーム処理の中心 | 現役（2.3.0、2026 年 6 月） |
+| Kafka Streams | Kafka 0.10.0（2016 年） | Apache Kafka | Kafka のトピックを読み書きするアプリケーションに組み込むライブラリ。クラスタを別に持たない | — | 現役（Kafka 4.2 系） |
+| Spark Streaming（DStream） | Spark の初期から。SOSP 2013 の論文 | AMPLab | ストリームを短い間隔のバッチの列として処理する | Structured Streaming に置き換えられた | 保守終了（文書が「更新はもう行わないレガシーのプロジェクト」と明記） |
+| Spark Structured Streaming | — | Spark | DataFrame の API でストリームを書く。既定はマイクロバッチ | DStream を置き換えた | 現役 |
+| Google Cloud Dataflow | 2015 年 4 月ベータ、8 月 GA | Google | Dataflow Model を実装したマネージドの実行サービス | 社内の FlumeJava と MillWheel の外販版にあたる | 現役 |
+| Apache Beam | 2016 年初めに Incubator へ。TLP 2016-12 | Google が Dataflow の SDK とランナーを寄贈 | バッチとストリームを 1 つのモデルで書き、実行は Flink・Spark・Dataflow などのランナーに任せる | — | 現役（2.76.0、2026 年 8 月） |
+| Amazon Managed Service for Apache Flink | 2023 年 8 月に改名 | AWS | マネージドの Flink | 旧名 Amazon Kinesis Data Analytics | 現役 |
+
+出典は、Storm が [Twitter のブログ（2011 年 8 月）](https://blog.twitter.com/engineering/en_us/a/2011/a-storm-is-coming-more-details-and-plans-for-release)と [storm.apache.org](https://storm.apache.org/)、Heron が [Twitter のブログ](https://blog.x.com/engineering/en_us/a/2015/flying-faster-with-twitter-heron)と [Incubator の記録](https://incubator.apache.org/projects/heron.html)、Samza が [samza.apache.org](https://samza.apache.org/)、Flink が [ASF の TLP 告知](https://news.apache.org/foundation/entry/the_apache_software_foundation_announces69)と [Flink の文書](https://flink.apache.org/what-is-flink/flink-architecture/)、Kafka Streams が [Kafka 0.10.0 の Streams の文書](https://kafka.apache.org/0100/streams/)、DStream が [Spark Streaming Programming Guide](https://spark.apache.org/docs/latest/streaming-programming-guide.html)、Dataflow が [Dataflow のリリースノート](https://docs.cloud.google.com/dataflow/docs/release-notes)、Beam が [Beam の沿革](https://beam.apache.org/about/)、Managed Flink が [AWS の告知](https://aws.amazon.com/about-aws/whats-new/2023/08/amazon-managed-service-apache-flink/)です。Structured Streaming が入った版と、Samza の出自は公式の記述で確かめられなかったので、表では空欄、または「Kafka と組み合わせて使われてきた」と書くにとどめました。
+
+## 資源管理
+
+計算エンジンは、どのマシンのどれだけの CPU とメモリを使うかを、資源管理の仕組みから借ります。
+
+| ソフトウェア | 登場 | 出自 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| YARN | Hadoop 2（2013 年）。SoCC 2013 の論文 | Hadoop | クラスタ全体の ResourceManager と、アプリケーションごとの ApplicationMaster に役割を分ける | Hadoop 1 の JobTracker を置き換えた | 現役 |
+| Apache Mesos | NSDI 2011 の論文。TLP 2013-06 | UC Berkeley | 資源を「申し出（resource offer）」として各フレームワークに渡す 2 段のスケジューリング | Kubernetes に用途を譲った | 退役（2025 年 8 月、Attic への移管は 10 月） |
+| Kubernetes | 2014 年 6 月に最初のコミット | Google | コンテナの配置と管理 | YARN や Mesos の役割を、コンテナの世界で引き受けつつある | 現役 |
+| Spark on Kubernetes | Spark 2.3 から | Spark | ドライバとエグゼキュータを Kubernetes の Pod として動かす | YARN の上で動かす形と並ぶ選択肢 | 現役 |
+
+出典は、YARN が [YARN の論文](https://dl.acm.org/doi/10.1145/2523616.2523633)、Mesos が [NSDI 2011 の論文](https://www.usenix.org/conference/nsdi11/mesos-platform-fine-grained-resource-sharing-data-center)と [Attic のページ](https://attic.apache.org/projects/mesos.html)、Kubernetes が [10 周年の記事](https://kubernetes.io/blog/2024/06/06/10-years-of-kubernetes/)、Spark on Kubernetes が [Running Spark on Kubernetes](https://spark.apache.org/docs/latest/running-on-kubernetes.html) です。
+
+## マネージドサービス
+
+ここまでのオープンソースを、クラウドの提供者がクラスタごと運用するのがマネージドサービスです。責任の分担や料金の単位は<a href={`${import.meta.env.BASE_URL}reading/compute-managed/`}>マネージドの分散処理</a>で扱い、ここでは名前と位置だけを押さえます。
+
+| サービス | 登場 | 提供 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| Amazon EMR | 2009 年 4 月（当時の名前は Elastic MapReduce） | AWS | Hadoop・Spark などのクラスタを EC2 上に立てる。EKS 上で動かす形もある | — | 現役 |
+| Amazon EMR Serverless | — | AWS | クラスタを構成せずに Spark や Hive のジョブを実行する | EMR のクラスタ管理を不要にする選択肢 | 現役 |
+| AWS Glue | 2017 年 8 月 GA | AWS | サーバーレスの ETL。Spark でジョブを動かし、Data Catalog とクローラを持つ | — | 現役 |
+| Dataproc（Dataproc on Compute Engine） | 2015 年にベータ、2016 年 2 月に GA | Google Cloud | Spark・Hadoop のマネージドクラスタ | — | 現役。2026 年 4 月 3 日から **Managed Service for Apache Spark** のクラスタ型という扱い |
+| Dataproc Serverless | — | Google Cloud | クラスタを持たずに Spark のバッチを実行する | 改名を経て Google Cloud Serverless for Apache Spark に | 現役。同じく Managed Service for Apache Spark のサーバーレス型という扱い |
+| Databricks | — | Databricks（文書は Spark・Delta Lake・MLflow を自社の社員が作ったオープンソースとして挙げる） | Spark を中心にしたデータと AI の統合基盤 | — | 現役 |
+| Azure HDInsight | — | Microsoft | Hadoop・Spark・Kafka・HBase などのマネージドクラスタ | — | 存続。後から出た HDInsight on AKS は 2025 年 1 月 31 日に終了し、Fabric などへの移行が案内された |
+
+出典は、EMR が [AWS の発表（2009 年）](https://aws.amazon.com/blogs/aws/announcing-amazon-elastic-mapreduce/)、[What is Amazon EMR?](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-what-is-emr.html)、[EMR on EKS](https://docs.aws.amazon.com/emr/latest/EMR-on-EKS-DevelopmentGuide/emr-eks.html)、EMR Serverless が [EMR Serverless の文書](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/emr-serverless.html)、Glue が [GA の告知](https://aws.amazon.com/blogs/aws/launch-aws-glue-now-generally-available/)、Dataproc が [GA の告知](https://cloud.google.com/blog/products/gcp/google-cloud-dataproc-managed-spark-and-hadoop-service-now-ga/)と[現在の概要](https://docs.cloud.google.com/dataproc/docs/concepts/overview)、サーバーレス版が[サーバーレスの概要](https://docs.cloud.google.com/dataproc-serverless/docs/overview)、Databricks が [Databricks の文書](https://docs.databricks.com/aws/en/introduction/)、HDInsight が [HDInsight の概要](https://learn.microsoft.com/en-us/azure/hdinsight/hdinsight-overview)と [HDInsight on AKS の記録](https://learn.microsoft.com/en-us/previous-versions/azure/hdinsight-aks/whats-new)です。
+
+<Callout type="note" title="Dataproc の名前の変化">
+  Google Cloud のリリースノートは、2026 年 4 月 3 日に Dataproc と Google Cloud Serverless for Apache Spark を Managed Service for Apache Spark という 1 つの名前のもとにまとめたと告知しています（[Managed Service for Apache Spark release notes](https://docs.cloud.google.com/managed-spark/docs/release-notes)）。概要の文書も、これを「Dataproc on Compute Engine（クラスタ型）と Google Cloud Serverless for Apache Spark（サーバーレス型）と呼ばれていた製品の新しい名前」と説明しています（[概要](https://docs.cloud.google.com/dataproc/docs/concepts/overview)）。サーバーレス型は Dataproc Serverless から Google Cloud Serverless for Apache Spark を経て、今の名前になりました。同じ告知は、Dataproc の API、クライアントライブラリ、gcloud CLI、IAM のロールと権限の名前は変わらないとしています。`gcloud dataproc` のコマンドや古い記事には Dataproc の名前が残るので、両方の名前で探す必要があります。
+</Callout>
+
+## 1 台へ戻る流れ
+
+2010 年代の前半は「1 台に載らないから分散する」が前提でした。ところが 1 台のマシンのメモリと CPU コアの数が増え、列指向の形式とベクトル化した実行（値を 1 つずつではなく、まとまり単位で処理する方式）が広がった結果、**数十 GB から数百 GB 程度なら 1 台で十分に速い**場面が増えました。もう 1 つの流れは、実行エンジンを部品として切り出し、別のエンジンの中に組み込む動きです。
+
+| ソフトウェア | 登場 | 出自 | 何をする | 置き換えた／置き換えられた | 現在 |
+| --- | --- | --- | --- | --- | --- |
+| DuckDB | 1.0.0 が 2024 年 6 月 | オランダの研究機関 CWI の開発者 | アプリケーションのプロセスの中で動く分析用データベース。列指向でベクトル化した実行エンジン | 小〜中規模の集計で、分散エンジンを立てる手間を不要にする | 現役（1.5.6） |
+| Polars | — | オープンソース | Rust で書かれた DataFrame ライブラリ。全コアを使い、遅延評価の API とメモリに載らない量を扱うストリーミング実行を持つ | 1 台の pandas の置き換え | 現役（1.44.2） |
+| Apache DataFusion | TLP 2024-04 | Apache Arrow から独立 | Rust で書かれた、組み込んで使う拡張可能なクエリエンジン | 他のシステムの部品として使われる | 現役（55.1.0、2026 年 9 月） |
+| Velox | VLDB 2022 の論文 | Meta | C++ のデータ処理部品のライブラリ。Presto や Spark の実行部分をこれに差し替えて速くする | エンジンごとに作り直していた実行部分を共通化する | 現役 |
+| Apache Gluten | TLP 2026-02 | Apache Incubator を経た | Spark など JVM のエンジンの SQL の実行を、Velox などのネイティブ（機械語で動く）実行に肩代わりさせる中間層 | — | 現役 |
+
+出典は、DuckDB が [Why DuckDB](https://duckdb.org/why_duckdb) と [1.0.0 の告知](https://duckdb.org/2024/06/03/announcing-duckdb-100)、Polars が [Polars の文書](https://docs.pola.rs/)、DataFusion が [datafusion.apache.org](https://datafusion.apache.org/)、Velox が [VLDB 2022 の論文](https://www.vldb.org/pvldb/vol15/p3372-pedreira.pdf)、Gluten が [Incubator の一覧](https://incubator.apache.org/projects/)（2026 年 2 月に卒業）です。
+
+## ワークフロー管理
+
+計算エンジンそのものではありませんが、複数のジョブを順番どおり、決まった時刻に動かす**ワークフロー管理**（オーケストレータ）は必ずセットで出てきます。
+
+| ソフトウェア | 登場 | 何をする | 現在 |
+| --- | --- | --- | --- |
+| Oozie | TLP 2012-08 | Hadoop のジョブ向けのワークフロー | 退役（2025 年、Attic） |
+| Apache Airflow | 2014 年 10 月に Airbnb で開始。TLP 2018-12 | Python でタスクの DAG を書き、スケジュールして実行する | 現役（3.3 系） |
+| Dagster | — | データ資産を単位に、系譜や観測の機能を持つオーケストレータ | 現役 |
+
+出典は [Airflow の沿革](https://airflow.apache.org/docs/apache-airflow/stable/project.html)と [Dagster の文書](https://docs.dagster.io/)です。Dataflow や Spark が「1 つのジョブの中の DAG」を実行するのに対し、Airflow が扱うのは「ジョブ同士の DAG」です。同じ DAG という言葉でも、粒度が違います。
+
+## Apache Attic に入ったもの
+
+Apache のプロジェクトは、活動が続かなくなると理事会の決議で退役し、Attic に移されます。Attic は、プロジェクトが終わりを迎えたことを誰にでもわかる形にするために 2008 年 11 月に作られた仕組みで、退役したプロジェクトのページと記録を残しています（[The Apache Attic](https://attic.apache.org/)）。この地図に関係するものを Attic の記録（退役した月）とともに並べます。
+
+| プロジェクト | 役割 | TLP になった月 | 退役した月 |
+| --- | --- | --- | --- |
+| Apex | バッチとストリームを扱う処理基盤 | 2016-04 | 2019-09 |
+| Crunch | MapReduce のパイプラインを書くライブラリ | 2013-02 | 2020-06 |
+| Tajo | Hadoop 上の SQL エンジン | 2014-03 | 2020-09 |
+| Sqoop | RDB と Hadoop の一括転送 | 2012-03 | 2021-06 |
+| Giraph | Hadoop 上のグラフ処理 | 2012-05 | 2023-10 |
+| HAWQ | Hadoop 上の MPP の SQL エンジン | 2018-08 | 2024-07 |
+| Oozie | Hadoop のワークフロー | 2012-08 | 2025-02 |
+| Mesos | クラスタの資源管理 | 2013-06 | 2025-08 |
+
+月は [committees-retired.json](https://projects.apache.org/json/foundation/committees-retired.json) の値で、Sqoop・Oozie・Mesos・Apex は Attic の各ページ（[Sqoop](https://attic.apache.org/projects/sqoop.html)、[Oozie](https://attic.apache.org/projects/oozie.html)、[Mesos](https://attic.apache.org/projects/mesos.html)、[Apex](https://attic.apache.org/projects/apex.html)）とも一致することを確かめました。
+
+並べると、**Hadoop の上に何かを足す形のプロジェクトが多く退役している**ことがわかります。RDB との転送は Spark や各クラウドの取り込み機能が、ワークフローは Airflow が、資源管理は Kubernetes が、Hadoop 上の SQL は Hive on Tez・Impala・Trino が引き受けました。一方、Hadoop 本体、Hive、HBase、Tez、Pig、Storm、Samza、Drill は退役しておらず、リリースの間隔に差はあっても存続しています。「古いから終わった」とは限らないので、使う前に各プロジェクトのリリースの記録を確かめるのが確実です。
+
+## 何を詳しく見るか
+
+この連載の残りの 6 回では、上の地図から次のものを選んで中身を見ます。
+
+| 選んだもの | 選んだ理由 |
+| --- | --- |
+| Hadoop MapReduce と YARN | 今は新規には選ばれにくいが、**後の世代はすべて「MapReduce の何が遅かったか」への答えとして作られている**。spill、shuffle の取得、投機実行など、他のエンジンにも残る仕組みの原型がここにある。YARN は今も Spark や Flink の資源管理として使われる |
+| Spark | バッチの汎用エンジンとして現在の中心。RDD と lineage、ステージ分割、Catalyst の最適化、AQE と、**バッチの分散処理の考え方を 1 つのソフトで一通り見られる** |
+| Flink と Beam / Dataflow | 状態を持つストリーム処理の中心。Beam / Dataflow は Google の論文の系譜の到達点で、**時刻と窓と遅延データの扱いを、実装（Flink）とモデル（Beam）の両面から見られる** |
+| Trino と BigQuery | MPP 型の代表をオープンソース（Trino）とマネージド（BigQuery）から 1 つずつ。**同じ SQL でも、バッチとは起動・障害・データの流し方がどう違うか**を比べられる |
+| マネージドサービス | 実務で多くの人が触るのは、エンジンそのものよりマネージドサービス。**誰が何を運用し、何に課金されるか**が選択を左右する |
+| 共通項 | エンジンの違いを除くと、局所性、分割、shuffle、結合方式、偏り、spill、障害耐性、出力の確定が残る。**最後にソフト非依存の概念として整理し直す** |
+
+逆に、リアルタイム OLAP（Druid・Pinot・ClickHouse など）、Ray と Dask、DuckDB と Polars は詳説しません。リアルタイム OLAP は保存と索引を自前で持つデータベースの性格が強く、データレイクの 5 層の「計算エンジン」の層からはみ出すこと、Ray は機械学習の分散実行が中心であること、1 台のエンジンは分散の仕組みを持たないことが理由です。列指向・ベクトル化の考え方は共通項の回で触れます。
+
+## この先の 6 回
+
+| 回 | 題材 | この回の地図でいうと |
+| --- | --- | --- |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の中身</a> | MapReduce の実行経路、YARN、Hive on MR / Tez の位置 | 「Hadoop とその周辺」と「資源管理」の YARN |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a> | RDD、実行計画、shuffle、Catalyst、AQE | 「DAG とインメモリの汎用エンジン」の Spark |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>状態を持つストリーム処理</a> | Flink の状態とチェックポイント、Beam のモデル、Dataflow | 「ストリーム処理」と Google の論文の後半 |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-mpp-sql/`}>常駐ワーカーで SQL を分散実行する</a> | Trino の実行モデル、Dremel / BigQuery | 「MPP と対話型 SQL」 |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-managed/`}>マネージドの分散処理</a> | Dataproc（Managed Service for Apache Spark）、EMR、Databricks、HDInsight、Glue | 「マネージドサービス」 |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a> | 局所性、分割、shuffle、結合方式、偏り、spill、障害耐性、出力の確定 | 地図全体に共通する仕組み |
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| 計算エンジン | データを読み、計画を立てて、分散して計算するプログラム |
+| MapReduce | map と reduce の 2 つの関数で書く分散処理のモデル。またはその Hadoop の実装 |
+| DAG（有向非巡回グラフ） | 処理を頂点、データの受け渡しを辺とし、循環のないグラフ。Tez・Spark・Flink の実行の単位 |
+| インメモリ | 中間結果を、ジョブの段ごとにディスクへ書かず、メモリ上に持つこと |
+| 資源管理 | クラスタの CPU とメモリを、どのアプリケーションに割り当てるかを決める仕組み。YARN、Kubernetes など |
+| MPP | 多数のノードがクエリの一部ずつを並列に処理する方式 |
+| 対話型 SQL | 人や BI ツールが投げた SQL に、数秒から数十秒で答えること |
+| DWH（データウェアハウス） | 分析用に整えたデータを管理し、SQL で集計させる専用のシステム |
+| リアルタイム OLAP | 取り込んだばかりのデータへの短い集計クエリに、低遅延で多数答えることに寄せた分析データベース |
+| ストリーム処理 | 終わりのないデータの流れを、届くそばから処理すること |
+| マイクロバッチ | ストリームを短い間隔で区切り、小さなバッチの列として処理する方式 |
+| ランナー | Beam で書いたパイプラインを、実際に実行するエンジンへの橋渡し |
+| マネージドサービス | クラスタの構築・更新・監視などを、クラウドの提供者が引き受ける形 |
+| サーバーレス | 利用者がクラスタの台数や大きさを決めず、ジョブ単位で資源を借りる形 |
+| ベクトル化 | 値を 1 つずつではなく、列のまとまり単位で処理する実行方式 |
+| TLP（トップレベルプロジェクト） | Apache で、Incubator を卒業して独立した運営になったプロジェクト |
+| Apache Attic | 活動を終えた Apache のプロジェクトを引き取り、記録を残す場所 |
+| ワークフロー管理（オーケストレータ） | 複数のジョブを依存関係と時刻に従って動かす仕組み |
+
+似た用語の区別を 3 つ補います。
+
+- **Dataflow と Dataflow Model と Beam**：Dataflow Model は 2015 年の論文のモデル、Cloud Dataflow はそれを実装した Google Cloud のサービス、Beam はそのモデルで書くための SDK をオープンソースにしたものです。Beam で書いたものは Dataflow 以外（Flink、Spark）でも動きます。
+- **Presto と Trino と PrestoDB**：同じ Presto から分かれた 2 つの系統で、PrestoSQL が改名したのが Trino、もう一方が今の Presto（PrestoDB）です。<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>でも触れました。
+- **ジョブの DAG とワークフローの DAG**：Spark や Tez の DAG は 1 つのジョブの中の処理のつながりで、Airflow の DAG はジョブ同士の実行順です。前者はエンジンが最適化し、後者は人が設計します。
+
+## まとめ
+
+- データレイクの 5 層の「計算エンジン」の層には、20 年あまりの間に多くのソフトが現れた。この連載はその層だけを掘り下げる
+- 系譜の起点は Google の論文で、GFS は HDFS、MapReduce は Hadoop、Bigtable は HBase、Dremel は BigQuery と SQL-on-Hadoop、FlumeJava・MillWheel・Dataflow Model は Dataflow と Beam につながる
+- 大きな流れは 4 つ。ディスクからメモリへ（MR から Tez・Spark へ）、資源管理の分離（JobTracker から YARN、Kubernetes へ）、バッチと対話型 SQL の分離（MPP 型の登場）、自前運用からマネージド・サーバーレスへ
+- 執筆時点で、Sqoop・Oozie・Mesos・Apex・Giraph などは Apache Attic に移り、Heron は Incubator で終わった。Spark Streaming（DStream）は保守を終え、Hive の MR 実行は非推奨、Hive on Spark は取り除かれた
+- 一方で Hadoop 本体、Hive、HBase、Storm などは存続している。古さと退役は別なので、リリースの記録で確かめる
+- 名前は変わる。PrestoSQL は Trino に、Kinesis Data Analytics は Managed Service for Apache Flink に、Dataproc とそのサーバーレス版は Managed Service for Apache Spark（2026 年 4 月）になった
+- 1 台で済ませる DuckDB・Polars と、実行部分を部品にする Velox・DataFusion・Gluten が、分散エンジンの外側と内側の両方から地図を変えつつある
+
+次の回では、地図の起点にある Hadoop MapReduce を実際に動かす側から見ます。map タスクはメモリのどこに出力をため、いつディスクへこぼし（spill）、reduce はそれをどうやって取りに来るのか。そして、なぜその作りが遅く、Tez と Spark を生む動機になったのかを、<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の中身</a>で見ていきます。

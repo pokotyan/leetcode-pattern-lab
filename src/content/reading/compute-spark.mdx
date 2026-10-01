@@ -1,0 +1,702 @@
+---
+title: Spark の中身（RDD・実行計画・shuffle）
+description: Spark はプログラムをどう分割して動かしているのか。RDD 論文の定義と依存の 2 分類から始めて、ステージへの分割、shuffle のファイル、Catalyst の各段、コード生成、AQE、メモリの分け方までを、pyspark 4.2.0 の実測とともに追います
+category: compute
+order: 22
+status: published
+topics:
+  - Apache Spark
+  - RDD
+  - Lineage
+  - Narrow and Wide Dependencies
+  - DAGScheduler
+  - Sort-based Shuffle
+  - External Shuffle Service
+  - Catalyst Optimizer
+  - Whole-Stage Code Generation
+  - Adaptive Query Execution
+  - Broadcast Hash Join
+  - Sort-Merge Join
+  - Unified Memory Management
+basedOn:
+  - kind: article
+    slug: graph-bfs-dfs
+    why: RDD の lineage はデータセットを頂点、依存を辺とする DAG で、スケジューラはアクションの対象から親へ辿り、広い依存の手前で区切ってステージを組み立てる
+  - kind: article
+    slug: hash-counting
+    why: shuffle は各行のキーのハッシュ値から行き先のパーティションを決める振り分けで、broadcast hash join は小さい側の表をハッシュ表にして大きい側の各行で引く
+  - kind: article
+    slug: two-pointers
+    why: sort-merge join は両側をキーで並べ替えたうえで、2 つの列を先頭から 1 本ずつのポインタで進めて一致する組を拾う
+---
+
+import Callout from '../../components/Callout.astro'
+
+## この回で扱うこと
+
+<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>では、Spark のプログラムがドライバ（計画を立てるプロセス）とエグゼキュータ（タスクを実行するプロセス）に分かれ、1 回の処理がステージに分かれ、ステージの境目で shuffle（パーティションをまたいだデータの配り直し）が起きる、というところまでを 1 段落で見ました。この回はその先、**ステージはどういう規則で切られるのか、shuffle ではディスクに何が書かれるのか、SQL や DataFrame の処理はどう物理的な計画に変わるのか**を扱います。
+
+map・shuffle・reduce の原理そのものは<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理</a>で、Spark が置き換えた Hadoop MapReduce の実行経路は<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の中身</a>で扱っています。版の情報は、執筆時点の最新の Spark 4.2.0 の文書と、PyPI の pyspark 4.2.0 による実測に基づきます。
+
+## RDD：論文の定義から始める
+
+Spark の土台は、2012 年の NSDI で発表された論文「Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing」（Zaharia ほか、[USENIX](https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf)）です。論文は RDD（Resilient Distributed Dataset）を次のように定義しています。
+
+> Formally, an RDD is a read-only, partitioned collection of records. RDDs can only be created through deterministic operations on either (1) data in stable storage or (2) other RDDs.
+
+**読み取り専用で、パーティションに分かれたレコードの集まり**であり、作り方は「安定したストレージ上のデータ」か「別の RDD」に対する決定的な操作に限られます。この操作を**変換**（transformation。`map`、`filter`、`join` など）と呼びます。論文は続けて、RDD は常に実体化している必要はなく、自分がどの RDD からどう作られたか（**lineage**、系譜）を知っているので、ストレージ上のデータから自分のパーティションを計算し直せる、と書いています。「障害のあとに作り直せない RDD をプログラムは参照できない」という性質が、Resilient（回復できる）の意味です。
+
+論文は、どの RDD も同じ 5 つの情報を返すインタフェースで表すことを提案しています（論文の Table 3）。
+
+| 操作 | 意味 |
+| --- | --- |
+| `partitions()` | パーティションの一覧 |
+| `preferredLocations(p)` | パーティション p を速く読めるノード（データ局所性） |
+| `dependencies()` | 親 RDD への依存の一覧 |
+| `iterator(p, parentIters)` | 親のパーティションの反復子から p の要素を計算する |
+| `partitioner()` | ハッシュ分割か範囲分割か、という分割方法の情報 |
+
+HDFS のファイルを表す RDD なら、パーティションはブロックごとに 1 つ、`preferredLocations` はそのブロックを持つノードです（HDFS のブロックと局所性は<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>を参照）。その RDD に `map` をかけた結果は、親と同じパーティションと同じ優先ノードを持ち、`iterator` の中で親の要素に関数を適用するだけです。スケジューラは個々の変換の中身を知らず、この 5 つだけを見て動きます。論文は、このおかげでほとんどの変換を 20 行未満で実装できた、と書いています。
+
+変換に対して、結果をドライバに返すか外部に書き出す操作を**アクション**（`count`、`collect`、`save` など）と呼びます。Spark の文書は「Spark の変換はすべて遅延評価される」と書いています（[RDD Programming Guide](https://spark.apache.org/docs/latest/rdd-programming-guide.html)）。変換は計算をせずに「何をしたか」を記録するだけで、アクションが呼ばれたときに初めて、記録をまとめて実行します。まとめて見られるので、たとえば `map` の結果を `reduce` するだけなら、大きな中間結果をドライバに返さずに済みます。
+
+## 狭い依存と広い依存
+
+論文がインタフェースの設計で最も重要だとしたのが、依存の表し方です。依存は 2 種類に分けられます。
+
+- **狭い依存**（narrow dependency）：親 RDD の各パーティションが、子 RDD の**高々 1 つ**のパーティションからしか使われない。例は `map`、`filter`、`union`、同じ分割方法で分割済みの入力どうしの `join`
+- **広い依存**（wide dependency）：親の 1 つのパーティションを、子の**複数**のパーティションが使う。例は `groupByKey`、分割方法がそろっていない入力どうしの `join`
+
+```
+  狭い依存（map, filter）          広い依存（groupByKey, reduceByKey）
+  親        子                     親          子
+  [p0] ──▶ [p0]                    [p0] ─┬─▶ [q0]
+  [p1] ──▶ [p1]                    [p1] ─┼─▶ [q1]
+  [p2] ──▶ [p2]                    [p2] ─┴─▶ [q2]   （全対全に線が引かれる）
+```
+
+論文はこの区別が役立つ理由を 2 つ挙げています。1 つめは実行の形です。狭い依存なら 1 つのノードの上で、`map` の次に `filter` を 1 要素ずつ流す**パイプライン実行**ができます。広い依存では、親の全パーティションのデータがそろってから、MapReduce と同じようにノード間で shuffle しなければなりません。2 つめは障害からの回復です。狭い依存なら失われた親のパーティションだけを、複数のノードで並列に計算し直せば済みます。広い依存では、1 つのノードが落ちただけで祖先のすべての RDD から少しずつパーティションが失われ、全体の再実行が必要になることがあります。
+
+## lineage による再計算とチェックポイント
+
+lineage による回復は、データそのものを複製しないで済む代わりに、計算をやり直す時間がかかります。論文の 5.4 節は、lineage が長く、広い依存を含む RDD（PageRank の繰り返しで更新される順位のデータなど）は安定したストレージに**チェックポイント**する価値がある一方、安定したストレージ上のデータに狭い依存しか持たない RDD では、チェックポイントが割に合うことはまず無い、と整理しています。今の Spark でも `RDD.checkpoint()` は lineage を切ってデータを書き出す操作として残っています。
+
+もう 1 つ、文書が明記している実装上の工夫があります。**shuffle の中間データは、利用者が `persist` を呼ばなくても自動的にディスクに残ります**（[RDD Programming Guide: RDD Persistence](https://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence)）。shuffle の途中でノードが落ちても入力全体を計算し直さずに済むようにするためで、Spark 1.3 以降、これらのファイルは対応する RDD が使われなくなり、ガベージコレクションされるまで保持されます（同文書の Shuffle operations の節）。実験 1 では、この保持によってステージが丸ごと省かれる様子を見ます。
+
+## DAGScheduler：アクションからステージとタスクへ
+
+アクションが呼ばれると、ドライバの中の **DAGScheduler** が動きます。論文の 5.1 節によると、スケジューラは対象の RDD の lineage を調べてステージの DAG（有向非巡回グラフ）を作り、**各ステージに狭い依存の変換をできるだけ多くパイプラインとして詰め込み**、ステージの境目を「広い依存に必要な shuffle」か「計算済みで再利用できるパーティション」に置きます。そのうえで、足りないパーティションを計算するタスクを、ステージごとに起動していきます。
+
+今のソースでも構成は同じです。`DAGScheduler.scala` のクラスのコメントは、DAGScheduler をステージ単位のスケジューリングを実装する上位のスケジューラと位置づけ、ステージを **TaskSet**（同じステージのタスクの集まり）として下位の **TaskScheduler** に渡す、と書いています（[DAGScheduler.scala](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala)）。ステージには 2 種類あります。
+
+| ステージ | 役割 |
+| --- | --- |
+| ShuffleMapStage | 後続の shuffle のために、map 側の出力ファイルを書く |
+| ResultStage | アクションの最後のステージ。結果をドライバに返すか、書き出す |
+
+TaskScheduler は、TaskSet のタスクをエグゼキュータの空きに割り当てます。このとき論文の記述どおり、パーティションがメモリにあるノード、次に `preferredLocations` が示すノード、の順に局所性を優先します。タスクが失敗すれば別のノードで再実行し、shuffle の map 側の出力が失われて読めなくなった場合（取得の失敗、FetchFailed）は、DAGScheduler がその出力を作った前のステージを再投入します。
+
+## 実験の準備
+
+実験はすべて、Docker の中で pyspark 4.2.0 を動かして行いました。Spark 4.2.0 の文書は対応する Java を 17、21、25 としているので（[Spark Overview](https://spark.apache.org/docs/latest/)）、Python の公式イメージに OpenJDK 17 を入れています。ドライバのヒープは 1 GB、`local[2]`（1 つの JVM の中で 2 スレッドをエグゼキュータとして使う形）です。クラスタではないので、「ノード間の転送」はすべて同じマシンの中で起きます。
+
+```dockerfile
+# Dockerfile
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-headless procps && apt-get clean
+RUN pip install --no-cache-dir pyspark==4.2.0
+WORKDIR /work
+```
+
+```yaml
+# docker-compose.yml
+name: cmp-compute-spark
+services:
+  spark:
+    build: .
+    image: cmp-compute-spark-pyspark:4.2.0
+    container_name: cmp-compute-spark-pyspark
+    mem_limit: 2g
+    environment:
+      PYSPARK_SUBMIT_ARGS: "--master local[2] --driver-memory 1g pyspark-shell"
+    volumes:
+      - ./work:/work
+    command: ["sleep", "infinity"]
+```
+
+各スクリプトが共通に使う補助関数です。`stages_of` は、ジョブのグループ名から、そのジョブに属するステージと、各ステージのタスク数・完了したタスク数を取り出します。
+
+```python
+# common.py
+from pyspark.sql import SparkSession
+
+def session(**conf):
+    b = SparkSession.builder.appName("cmp-compute-spark").config("spark.ui.enabled", "false")
+    for k, v in conf.items():
+        b = b.config(k, v)
+    spark = b.getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")
+    return spark
+
+def stages_of(sc, group):
+    t = sc.statusTracker()
+    out = []
+    for jid in sorted(t.getJobIdsForGroup(group)):
+        for sid in sorted(t.getJobInfo(jid).stageIds):
+            s = t.getStageInfo(sid)
+            out.append((jid, sid, s.numTasks if s else -1, s.numCompletedTasks if s else -1,
+                        s.name.split(" at ")[0] if s else "(no info)"))
+    return out
+```
+
+実行は `docker compose up -d` のあと `docker exec cmp-compute-spark-pyspark python <スクリプト>` で、出力からは Spark の起動時の警告と進捗表示を除いています。
+
+## 実験 1：ステージ数を数える
+
+RDD の API で、狭い依存だけのジョブ、`reduceByKey` を 1 回含むジョブ、さらに `join` を重ねたジョブを順に動かし、最後に同じ `join` の結果をもう一度 `collect` しました（`exp2_stages.py`）。
+
+```python
+base = sc.parallelize(range(1_000_000), 4)
+
+sc.setJobGroup("narrow", "narrow")
+narrow = base.map(lambda x: x * 2).filter(lambda x: x % 3 == 0)
+narrow.count()
+
+sc.setJobGroup("wide", "wide")
+summed = base.map(lambda x: (x % 10, 1)).reduceByKey(lambda a, b: a + b, 3)
+summed.collect()
+
+sc.setJobGroup("two_shuffles", "two_shuffles")
+names = sc.parallelize([(k, f"k{k}") for k in range(10)], 2)
+joined = summed.join(names, 2).map(lambda kv: (kv[1][1], kv[1][0]))
+joined.collect()
+
+sc.setJobGroup("again", "again")
+joined.collect()
+# このあと stages_of で各グループのステージを表示し、joined.toDebugString() と
+# spark.local.dir の下の shuffle_* ファイルを一覧する
+```
+
+```
+--- narrow
+job=0 stage=0 tasks=4 completed=4 count
+--- wide
+job=1 stage=1 tasks=4 completed=4 reduceByKey
+job=1 stage=2 tasks=3 completed=3 collect
+--- two_shuffles
+job=2 stage=3 tasks=4 completed=0 reduceByKey
+job=2 stage=4 tasks=5 completed=5 join
+job=2 stage=5 tasks=2 completed=2 collect
+--- again
+job=3 stage=6 tasks=4 completed=0 reduceByKey
+job=3 stage=7 tasks=5 completed=0 join
+job=3 stage=8 tasks=2 completed=2 collect
+```
+
+`map` と `filter` だけのジョブは **1 ステージ・4 タスク**（入力のパーティション数）です。2 つの変換は 1 つのタスクの中でパイプラインになっています。`reduceByKey` を入れると **2 ステージ**になり、map 側は入力と同じ 4 タスク、reduce 側は指定した 3 パーティションに合わせて 3 タスクです。
+
+3 つめのジョブには 3 つのステージがありますが、`reduceByKey` のステージは**完了タスク 0**、つまり実行されていません。前のジョブが書いた shuffle のファイルが残っているので、DAGScheduler はそのステージを飛ばしました（Spark の Web UI では skipped と表示される状態です）。最後のジョブでは、2 つの shuffle の map 側が両方とも省かれ、最後の 2 タスクだけが動いています。論文の「計算済みのパーティションもステージの境目になる」の実例です。
+
+`join` のステージが 5 タスクなのは、pyspark の RDD の `join` が、両側を 1 つにまとめた（`union`）うえで 1 回の shuffle で配り直す実装になっているためで、lineage の表示にもそれが出ています。
+
+```
+(2) PythonRDD[15] at collect at /work/exp2_stages.py:20 []
+ |  MapPartitionsRDD[14] at mapPartitions at PythonRDD.scala:197 []
+ |  ShuffledRDD[13] at partitionBy at NativeMethodAccessorImpl.java:0 []
+ +-(5) PairwiseRDD[12] at join at /work/exp2_stages.py:19 []
+    |  PythonRDD[11] at join at /work/exp2_stages.py:19 []
+    |  UnionRDD[10] at union at NativeMethodAccessorImpl.java:0 []
+    |  PythonRDD[8] at RDD at PythonRDD.scala:59 []
+    |  MapPartitionsRDD[5] at mapPartitions at PythonRDD.scala:197 []
+    |  ShuffledRDD[4] at partitionBy at NativeMethodAccessorImpl.java:0 []
+    +-(4) PairwiseRDD[3] at reduceByKey at /work/exp2_stages.py:14 []
+       |  PythonRDD[2] at reduceByKey at /work/exp2_stages.py:14 []
+       |  ParallelCollectionRDD[0] at readRDDFromFile at PythonRDD.scala:326 []
+    |  PythonRDD[9] at RDD at PythonRDD.scala:59 []
+    |  ParallelCollectionRDD[7] at readRDDFromFile at PythonRDD.scala:326 []
+```
+
+行頭の `+-` で字下げが 1 段深くなるところが shuffle、つまりステージの境目で、括弧の数字はその段のパーティション数です。4 パーティションの入力が shuffle で 3 つになり、名前の 2 パーティションと合わせた 5 パーティションがもう一度 shuffle されて 2 つになる、という形が読み取れます。
+
+## shuffle の中身：sort-based shuffle
+
+shuffle の実装は一度入れ替わっています。初期の Spark は、map タスクごとに reduce 側のパーティションの数だけファイルを作る hash-based shuffle でした。map が M 個、reduce が R 個なら M × R 個のファイルができます。Spark 1.2.0 で既定の `spark.shuffle.manager` が `hash` から `sort` に変わり（[Spark 1.2.0 release notes](https://spark.apache.org/releases/spark-release-1-2-0.html)）、2.0.0 で hash-based shuffle manager は削除されました（[Spark 2.0.0 release notes](https://spark.apache.org/releases/spark-release-2-0-0.html) の Removals）。
+
+今の `SortShuffleManager` のコメントによれば、sort-based shuffle では、**入ってきたレコードを行き先のパーティション番号で並べ替えて、map タスクごとに 1 つの出力ファイルに書き**、reducer はそのファイルの中の自分の担当の連続した区間を読みます。メモリに収まらなければ、並べ替えた部分を書き出し（spill）、最後にマージします（[SortShuffleManager.scala](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/shuffle/sort/SortShuffleManager.scala)）。書き手には 3 通りの経路があります。
+
+| 書き方 | 使われる条件（ソースのコメントより） |
+| --- | --- |
+| bypass merge sort | map 側の集約が無く、reduce 側のパーティションが `spark.shuffle.sort.bypassMergeThreshold`（既定 200）以下。パーティションごとに別ファイルへ書いてから連結する |
+| serialized sorting | map 側の集約が無く、直列化した値を並べ替えで動かせる直列化方式で、出力パーティションが 16777216 以下。直列化したバイト列のまま並べ替える |
+| 通常の経路 | それ以外（map 側で集約する `reduceByKey` など） |
+
+実験 1 で `spark.local.dir` の下に残っていた、最初の shuffle（番号 0）のファイルです。ファイル名の後ろの数字はバイト数です。
+
+```
+--- shuffle files: 27
+shuffle_0_4_0.checksum.ADLER32 24
+shuffle_0_4_0.data 251
+shuffle_0_4_0.index 32
+shuffle_0_5_0.checksum.ADLER32 24
+shuffle_0_5_0.data 251
+shuffle_0_5_0.index 32
+...（shuffle_0_6_0, shuffle_0_7_0 も同じ大きさ）
+```
+
+map タスク 4 つのそれぞれについて、`.data`（本体）と `.index`（区切りの位置）と `.checksum` の 3 ファイルが 1 組ずつあります。M × R 個ではなく、**map タスク 1 つにつき本体 1 つ**です。`.index` の 32 バイトは 8 バイトの整数 4 つ分で、reduce 側の 3 パーティションの区切り（先頭と各区間の終わり）を表していると読めます。`.data` が 251 バイトしかないのは、`reduceByKey` が map 側で先に集約（combiner に相当）して、10 個のキーの部分和だけを書いたからです。
+
+reduce 側のタスクは、各 map 出力から自分の区間を取ってきます。1 つの reduce タスクが同時に取りに行く量の上限は `spark.reducer.maxSizeInFlight`（既定 48m）、map 出力の圧縮は `spark.shuffle.compress`（既定 true）、書き込みのバッファは `spark.shuffle.file.buffer`（既定 32k）です（[Spark: Configuration](https://spark.apache.org/docs/latest/configuration.html)）。文書は、shuffle はディスク I/O、データの直列化、ネットワーク I/O を伴う高価な操作だと書いています。
+
+## 外部 shuffle サービス：エグゼキュータを消してもファイルを配る
+
+shuffle のファイルは、書いたエグゼキュータ自身が、他のエグゼキュータからの取得に応える形で配ります（[Job Scheduling: Dynamic Resource Allocation](https://spark.apache.org/docs/latest/job-scheduling.html)）。ここで、負荷に応じてエグゼキュータを増減させる**動的割り当て**（dynamic allocation）を使うと問題が起きます。暇になったエグゼキュータを消すと、そのエグゼキュータが持っていた shuffle のファイルも配れなくなり、作り直しになるからです。
+
+その対策が**外部 shuffle サービス**です。文書の説明では、これは各ノードで Spark のアプリケーションやエグゼキュータとは独立に動き続けるプロセスで、有効にするとエグゼキュータどうしではなくこのサービスから shuffle のファイルを取得するので、**ファイルを書いたエグゼキュータが終わったあとも配り続けられます**。設定は `spark.shuffle.service.enabled`（既定 false）、待ち受けポートは `spark.shuffle.service.port`（既定 7337）です。YARN では、各 NodeManager の `yarn-site.xml` の `yarn.nodemanager.aux-services` に `spark_shuffle` を足し、NodeManager の補助サービスとして動かします（[Running on YARN](https://spark.apache.org/docs/latest/running-on-yarn.html)）。
+
+Spark 4.2.0 の文書は、動的割り当てで shuffle のファイルを失わないための選択肢として、次の 4 つを挙げています。
+
+- 外部 shuffle サービス（`spark.shuffle.service.enabled=true`）
+- shuffle の追跡（`spark.dynamicAllocation.shuffleTracking.enabled=true`）。shuffle のファイルを持つエグゼキュータを消さずに残す
+- 退役（decommission）時の移送（`spark.decommission.enabled=true` と `spark.storage.decommission.shuffleBlocks.enabled=true`）。消す前にファイルを別のエグゼキュータへ移す
+- 信頼できる保存先に shuffle を書く独自のプラグイン（`spark.shuffle.sort.io.plugin.class`）
+
+文書は、**Kubernetes 上の Spark はまだ外部 shuffle サービスに対応していない**ので `spark.shuffle.service.enabled` は使えない、とも明記しています。Kubernetes で動的割り当てを使うときは、残りの方法のどれかになります。
+
+<Callout type="note" title="push-based shuffle（Magnet）">
+  Spark 3.2 では、LinkedIn が開発した push-based shuffle が入りました（[LinkedIn Engineering](https://engineering.linkedin.com/blog/2021/push-based-shuffle-in-apache-spark)）。map タスクが出力のブロックを外部 shuffle サービスへ押し出し、パーティションごとにマージしておく方式で、reduce 側の小さなランダム読み込みを大きな連続読み込みに変えます。文書の記載では、使えるのは YARN 上で外部 shuffle サービスを有効にした場合に限られ、`spark.shuffle.push.enabled`（既定 false）で有効にします（[Spark: Configuration](https://spark.apache.org/docs/latest/configuration.html)）。
+</Callout>
+
+## DataFrame と Catalyst
+
+ここまでは RDD の話でした。今の Spark の利用者の多くは、列に名前と型がある DataFrame の API か SQL で書きます。RDD の関数は Spark から見ると中身の分からない処理ですが、DataFrame の式は「どの列に何をするか」が分かるので、Spark が計画を書き換えられます。その書き換えを担うのが **Catalyst** です。
+
+2015 年の SIGMOD の論文「Spark SQL: Relational Data Processing in Spark」（Armbrust ほか、[論文 PDF](https://people.csail.mit.edu/matei/papers/2015/sigmod_spark_sql.pdf)）は、Catalyst を「木を表し、規則を当てて書き換える汎用のライブラリ」の上に関係演算向けの規則群を載せたものとして説明し、問い合わせの処理を 4 つの段に分けています。
+
+| 段 | 何をするか（論文の記述より） |
+| --- | --- |
+| 解析（analysis） | 未解決の論理計画の列名や表名を、カタログを引いて解決する。同じ値を指す属性に一意の ID を振り、式の型を伝えて必要なら型変換を入れる |
+| 論理最適化（logical optimization） | 規則による標準的な最適化。定数の畳み込み、述語の押し下げ、射影の刈り込み、null の伝播、真偽式の簡約など |
+| 物理計画（physical planning） | 論理計画から、実行エンジンの演算子を使った物理計画を 1 つ以上作り、コストのモデルで選ぶ。論文の時点ではコストで選ぶのは結合の方式だけで、小さいと分かっている表には broadcast join を使う |
+| コード生成（code generation） | 問い合わせの一部を Java のバイトコードにコンパイルする。論文の時点では Scala の quasiquote で生成していた |
+
+## 実験 2：explain で Catalyst の各段を見る
+
+100 万行の注文と 1000 人の利用者を結合し、条件で絞ってから地域ごとに合計する DataFrame を作り、`explain(mode="extended")` で 4 つの計画を表示しました（`exp1_plans.py`）。物理計画そのものを見たいので、ここでは AQE（後述）を止めています。
+
+```python
+spark = session(**{"spark.sql.adaptive.enabled": "false"})
+orders = spark.range(0, 1_000_000).select(
+    F.col("id").alias("order_id"),
+    (F.col("id") % 1000).alias("user_id"),
+    (F.col("id") % 97).alias("amount"))
+users = spark.range(0, 1000).select(
+    F.col("id").alias("user_id"),
+    (F.col("id") % 5).alias("region"))
+q = (orders.join(users, "user_id")
+     .where(F.col("amount") > F.lit(10) + F.lit(40))
+     .groupBy("region").agg(F.sum("amount").alias("total")))
+q.explain(mode="extended")
+q.explain(mode="formatted")
+```
+
+```
+== Parsed Logical Plan ==
+'Aggregate ['region], ['region, 'sum('amount) AS total#7]
++- Filter (amount#3L > cast((10 + 40) as bigint))
+   +- Project [user_id#2L, order_id#1L, amount#3L, region#6L]
+      +- Join Inner, (user_id#2L = user_id#5L)
+         :- Project [id#0L AS order_id#1L, (id#0L % cast(1000 as bigint)) AS user_id#2L, (id#0L % cast(97 as bigint)) AS amount#3L]
+         :  +- Range (0, 1000000, step=1, splits=Some(2))
+         +- Project [id#4L AS user_id#5L, (id#4L % cast(5 as bigint)) AS region#6L]
+            +- Range (0, 1000, step=1, splits=Some(2))
+
+== Analyzed Logical Plan ==
+region: bigint, total: bigint
+Aggregate [region#6L], [region#6L, sum(amount#3L) AS total#7L]
++- Filter (amount#3L > cast((10 + 40) as bigint))
+   ...（以下は Parsed と同じ）
+
+== Optimized Logical Plan ==
+Aggregate [region#6L], [region#6L, sum(amount#3L) AS total#7L]
++- Project [amount#3L, region#6L]
+   +- Join Inner, (user_id#2L = user_id#5L)
+      :- Project [(id#0L % 1000) AS user_id#2L, (id#0L % 97) AS amount#3L]
+      :  +- Filter (((id#0L % 97) > 50) AND isnotnull((id#0L % 1000)))
+      :     +- Range (0, 1000000, step=1, splits=Some(2))
+      +- Project [id#4L AS user_id#5L, (id#4L % 5) AS region#6L]
+         +- Range (0, 1000, step=1, splits=Some(2))
+
+== Physical Plan ==
+*(3) HashAggregate(keys=[region#6L], functions=[sum(amount#3L)], output=[region#6L, total#7L])
++- Exchange hashpartitioning(region#6L, 200), ENSURE_REQUIREMENTS, [plan_id=48]
+   +- *(2) HashAggregate(keys=[region#6L], functions=[partial_sum(amount#3L)], output=[region#6L, sum#14L])
+      +- *(2) Project [amount#3L, region#6L]
+         +- *(2) BroadcastHashJoin [user_id#2L], [user_id#5L], Inner, BuildRight, false, false
+            :- *(2) Project [(id#0L % 1000) AS user_id#2L, (id#0L % 97) AS amount#3L]
+            :  +- *(2) Filter (((id#0L % 97) > 50) AND isnotnull((id#0L % 1000)))
+            :     +- *(2) Range (0, 1000000, step=1, splits=2)
+            +- BroadcastExchange HashedRelationBroadcastMode(List(input[0, bigint, false]),false), [plan_id=42]
+               +- *(1) Project [id#4L AS user_id#5L, (id#4L % 5) AS region#6L]
+                  +- *(1) Range (0, 1000, step=1, splits=2)
+```
+
+段ごとに何が変わったかを読みます。
+
+- **Parsed → Analyzed**：先頭に `'` の付いた `'Aggregate`、`'region`、`'sum` は未解決の名前です。解析のあとは `region#6L` のように ID（`#6`）と型（`L` は 64 ビット整数）が付き、出力の列の型 `region: bigint, total: bigint` が確定しています
+- **Analyzed → Optimized**：4 つの書き換えが見えます。`cast((10 + 40) as bigint)` は `50` に畳み込まれました（定数の畳み込み）。結合の上にあった `Filter` は、注文側の `Range` の直上まで下がりました（述語の押し下げ）。使われない `order_id` は計画から消えました（射影の刈り込み）。結合の条件から、`user_id` が null でないという条件 `isnotnull(...)` が推論されて足されています
+- **Optimized → Physical**：論理的な `Join` は `BroadcastHashJoin` に、`Aggregate` は `partial_sum` の `HashAggregate` と、`Exchange hashpartitioning(region, 200)` をはさんだ最終の `HashAggregate` の 2 段に変わりました。**`Exchange` が shuffle**で、ここがステージの境目です。200 は `spark.sql.shuffle.partitions` の既定値です（[Performance Tuning](https://spark.apache.org/docs/latest/sql-performance-tuning.html)）
+
+`*(2)` のような星印と番号は、次の節で扱う whole-stage codegen の単位です。`explain(mode="formatted")` は同じ物理計画を、木の概形と演算子ごとの詳細に分けて表示します（抜粋）。
+
+```
+== Physical Plan ==
+* HashAggregate (11)
++- Exchange (10)
+   +- * HashAggregate (9)
+      +- * Project (8)
+         +- * BroadcastHashJoin Inner BuildRight (7)
+            :- * Project (3)
+            :  +- * Filter (2)
+            :     +- * Range (1)
+            +- BroadcastExchange (6)
+               +- * Project (5)
+                  +- * Range (4)
+
+(2) Filter [codegen id : 2]
+Input [1]: [id#0L]
+Condition : (((id#0L % 97) > 50) AND isnotnull((id#0L % 1000)))
+```
+
+## Tungsten と whole-stage codegen
+
+物理計画の演算子を、そのまま 1 つずつ動かすとどうなるでしょうか。2016 年の Databricks のブログ（Agarwal、Liu、Xin、[Apache Spark as a Compiler](https://www.databricks.com/blog/2016/05/23/apache-spark-as-a-compiler-joining-a-billion-rows-per-second-on-a-laptop.html)）は、従来の方式を **Volcano 型の反復子モデル**として説明しています。各演算子が `next()` を持ち、木の上の演算子に 1 行ずつ渡す方式です。ブログは、この方式が手で書いた Java のループより 1 桁遅い理由として、行ごとの仮想関数呼び出し、中間データが CPU のレジスタではなくメモリに置かれること、呼び出しの込み入った構造ではコンパイラが最適化しにくいことを挙げています。
+
+Spark 2.0 の **whole-stage code generation** は、パイプラインでつながる複数の演算子を、実行時に **1 つの関数に融合したコード**として生成します。explain の `*` はこの対象になった演算子の印で、`*(2)` の 2 が同じ関数にまとめられた単位の番号です。Spark 2.0 のリリースノートは、この技法で SQL と DataFrame の一般的な演算子が 2〜10 倍速くなったと書いています（[Spark 2.0.0 release notes](https://spark.apache.org/releases/spark-release-2-0-0.html)）。これは 2015 年に始まった **Project Tungsten**（明示的なメモリ管理とバイナリ形式での処理、キャッシュを意識した計算、コード生成の 3 つを柱とする取り組み、[Databricks Blog](https://www.databricks.com/blog/2015/04/28/project-tungsten-bringing-spark-closer-to-bare-metal.html)）の流れの上にあります。
+
+`explain(mode="codegen")` で、`Range → Filter → Project` を 1 つにまとめたコードを見られます（`exp6_codegen.py`）。
+
+```python
+spark = session()
+q = spark.range(0, 1000).where(F.col("id") % 3 == 0).select((F.col("id") * 2).alias("x"))
+q.explain(mode="codegen")
+
+def big():
+    return spark.range(0, 200_000_000).where(F.col("id") % 3 == 0).agg(F.sum("id"))
+
+for flag in ["true", "false"]:
+    spark.conf.set("spark.sql.codegen.wholeStage", flag)
+    big().collect()
+    ts = []
+    for _ in range(3):
+        t = time.time(); big().collect(); ts.append(time.time() - t)
+    print(f"wholeStage={flag}: {sorted(ts)[1]:.2f}s (median of 3)")
+```
+
+前半の出力です（抜粋）。
+
+```
+Found 1 WholeStageCodegen subtrees.
+== Subtree 1 / 1 (maxMethodCodeSize:346; maxConstantPoolSize:204(0.31% used); numInnerClasses:0) ==
+*(1) Project [(id#0L * 2) AS x#4L]
++- *(1) Filter ((id#0L % 3) = 0)
+   +- *(1) Range (0, 1000, step=1, splits=2)
+
+Generated code:
+/* 006 */ final class GeneratedIteratorForCodegenStage1 extends org.apache.spark.sql.execution.BufferedRowIterator {
+...
+/* 093 */       for (int range_localIdx_0 = 0; range_localIdx_0 < range_localEnd_0; range_localIdx_0++) {
+/* 094 */         long range_value_0 = ((long)range_localIdx_0 * 1L) + range_nextIndex_0;
+...
+/* 104 */             filter_value_1 = (long)(range_value_0 % 3L);
+...
+/* 111 */           if (filter_isNull_0 || !filter_value_0) continue;
+```
+
+`Range` は `for` ループに、`Filter` はそのループの中の `if ... continue` になっています。演算子どうしの `next()` の呼び出しは消え、値は局所変数 `range_value_0` のまま次の演算子の処理に渡ります。
+
+後半では、2 億行に `id % 3 == 0` の条件をかけて合計する処理を、`spark.sql.codegen.wholeStage` を true と false にして 3 回ずつ測りました（各回で DataFrame を作り直し、最初の 1 回は捨てています）。
+
+```
+wholeStage=true: 0.27s (median of 3)
+wholeStage=false: 1.89s (median of 3)
+```
+
+この環境では約 7 倍の差でした。1 台・2 スレッドの小さな測定なので、倍率はあくまで目安です。
+
+<Callout type="warn" title="同じ DataFrame を 2 回 collect すると速すぎる">
+  最初はこの測定で、同じ DataFrame オブジェクトに `collect()` を繰り返していました。すると 2 回目以降が 0.04 秒ほどになりました。1 回目の実行のあと、この DataFrame の計画は AQE の最終計画（`isFinalPlan=true`）になっており、shuffle の map 側（`ShuffleQueryStage`）は実行済みです。2 回目以降は、残った shuffle のファイルを読むだけになっていたと考えられます。実験 1 で見た「ステージが省かれる」現象と同じです。計算の速さを比べるときは、DataFrame を毎回作り直す必要があります。
+</Callout>
+
+## 結合の方式と、ブロードキャストの閾値
+
+物理計画を選ぶ段で最も影響が大きいのが、結合の方式です。代表的な 2 つを比べます。
+
+| 方式 | 動き | shuffle |
+| --- | --- | --- |
+| BroadcastHashJoin | 小さい側の表を全エグゼキュータに配り、ハッシュ表にして、大きい側の各行で引く | 大きい側は shuffle しない |
+| SortMergeJoin | 両側を結合キーで shuffle し、各パーティションの中でキーの順に並べ替えて、先頭から突き合わせる | 両側とも shuffle する |
+
+どちらを使うかは、まず表の大きさの見積もりで決まります。見積もりが `spark.sql.autoBroadcastJoinThreshold`（既定 10485760、10 MB）以下の側は配られ、`-1` にすると自動のブロードキャストは無効になります（[Performance Tuning](https://spark.apache.org/docs/latest/sql-performance-tuning.html)）。SQL のヒントで `BROADCAST`、`MERGE`、`SHUFFLE_HASH`、`SHUFFLE_REPLICATE_NL` を指定することもでき、両側に違うヒントがあれば、この順で優先されます。方式ごとの得失の一般論は<a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a>で扱います。
+
+実験 3 では、300 万行の表と 5 万行の表を結合して集計し、閾値を 4 通りに変えて物理計画と時間を見ました（`exp3_join.py`）。閾値の効果だけを見るため、ここでも AQE を止めています。
+
+```python
+spark = session(**{"spark.sql.adaptive.enabled": "false"})
+big = spark.range(0, 3_000_000).select(F.col("id"), (F.col("id") % 50_000).alias("k"))
+small = spark.range(0, 50_000).select(F.col("id").alias("k"), (F.col("id") % 7).alias("v"))
+print("estimated size of small:", small._jdf.queryExecution().optimizedPlan().stats().sizeInBytes())
+
+for th in ["10485760", "-1", "100k", "1m"]:
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", th)
+    q = big.join(small, "k").groupBy("v").count()
+    # q.collect() を 3 回測って中央値を出し、最後の回のステージと
+    # 物理計画のうち Join と Exchange の行を表示する（ウォームアップを 1 回先に実行）
+```
+
+```
+estimated size of small: 600000
+threshold=10485760  median 0.56s  stages=2 tasks=[2, 200]
+    +- Exchange hashpartitioning(v#4L, 200), ENSURE_REQUIREMENTS, [plan_id=120]
+    +- *(2) BroadcastHashJoin [k#1L], [k#3L], Inner, BuildRight, false, false
+    +- BroadcastExchange HashedRelationBroadcastMode(List(input[0, bigint, false]),false), [plan_id=114]
+threshold=-1  median 0.79s  stages=4 tasks=[2, 2, 200, 200]
+    +- Exchange hashpartitioning(v#4L, 200), ENSURE_REQUIREMENTS, [plan_id=205]
+    +- *(5) SortMergeJoin [k#1L], [k#3L], Inner
+    :  +- Exchange hashpartitioning(k#1L, 200), ENSURE_REQUIREMENTS, [plan_id=190]
+    +- Exchange hashpartitioning(k#3L, 200), ENSURE_REQUIREMENTS, [plan_id=196]
+threshold=100k  median 1.15s  stages=4 tasks=[2, 2, 200, 200]
+    （-1 と同じ計画）
+threshold=1m  median 0.70s  stages=2 tasks=[2, 200]
+    （10485760 と同じ計画）
+```
+
+小さい側の見積もりは 600000 バイトです。閾値がこれより大きい 10 MB と 1m では `BroadcastHashJoin` が選ばれ、`Exchange` は集計のための 1 つだけです。閾値を無効（`-1`）にするか、見積もりより小さい 100k にすると `SortMergeJoin` になり、**両側の結合キーで `Exchange` が 1 つずつ増え、ステージも 2 つから 4 つに増えました**。時間はブロードキャストの方が短めでしたが、1 台の中の転送なので差は小さく、回によってばらつきもありました。実際のクラスタでは、shuffle が 2 つ増える分のネットワーク転送とディスクへの書き出しが効いてきます。なお、ここで数えたステージに、小さい側を集めて配る処理は現れていません。
+
+## AQE：実行しながら計画を直す
+
+ここまでの計画は、実行の前に、見積もりだけを頼りに決めたものです。見積もりは外れます。条件で絞った結果が何行になるか、キーがどれだけ偏っているかは、実行してみないと分かりません。**AQE**（Adaptive Query Execution、適応的なクエリ実行）は、実行時の統計を使って計画を選び直す仕組みで、Spark 3.0.0 で入り（[Spark 3.0.0 release notes](https://spark.apache.org/releases/spark-release-3-0-0.html)）、Spark 3.2.0 から既定で有効です。全体のスイッチは `spark.sql.adaptive.enabled` です（[Performance Tuning: Adaptive Query Execution](https://spark.apache.org/docs/latest/sql-performance-tuning.html#adaptive-query-execution)）。
+
+AQE は shuffle の境目で計画を区切り、手前のステージ（クエリステージ）を実際に動かして、出力の大きさを見てから残りの計画を書き換えます。主な機能は 3 つで、関係する設定と既定値は次のとおりです（すべて上の文書による）。
+
+| 機能 | 何をするか | 主な設定（既定値） |
+| --- | --- | --- |
+| shuffle 後のパーティションの合体 | 小さすぎるパーティションを隣どうしでまとめ、タスクを減らす | `spark.sql.adaptive.coalescePartitions.enabled`（true）、`advisoryPartitionSizeInBytes`（64 MB）、`coalescePartitions.minPartitionSize`（1MB）、`coalescePartitions.parallelismFirst`（true） |
+| 結合方式の切り替え | 実際の大きさが閾値以下なら、sort-merge join を broadcast join に変える | `spark.sql.adaptive.autoBroadcastJoinThreshold`（未設定なら `spark.sql.autoBroadcastJoinThreshold` と同じ） |
+| 偏った結合の分割 | 中央値の 5 倍より大きく、かつ 256MB より大きいパーティションを分割し、相手側を複製する | `spark.sql.adaptive.skewJoin.enabled`（true）、`skewedPartitionFactor`（5.0）、`skewedPartitionThresholdInBytes`（256MB） |
+
+`parallelismFirst` が既定の true のときは、目標の 64 MB を無視し、最小の 1MB だけを守って並列度を優先する、と文書は書いています。
+
+### 実験 4：パーティションの合体
+
+200 万行を 1000 種類のキーで集計し、AQE を無効と有効で比べました（`exp4_aqe.py`）。
+
+```python
+df = spark.range(0, 2_000_000, numPartitions=4).select((F.col("id") % 1000).alias("k"), F.col("id"))
+for aqe in ["false", "true"]:
+    spark.conf.set("spark.sql.adaptive.enabled", aqe)
+    q = df.groupBy("k").agg(F.sum("id").alias("s"))
+    q.collect()   # このあとステージと実行後の物理計画を表示
+```
+
+```
+=== AQE=false rows=1000
+job=0 stage=0 tasks=4 completed=4 collect
+job=0 stage=1 tasks=200 completed=200 collect
+=== AQE=true rows=1000
+job=1 stage=2 tasks=4 completed=4 collect
+job=2 stage=3 tasks=4 completed=0 collect
+job=2 stage=4 tasks=1 completed=1 collect
+AdaptiveSparkPlan isFinalPlan=true
++- == Final Plan ==
+   ResultQueryStage 1
+   +- *(2) HashAggregate(keys=[k#1L], functions=[sum(id#0L)], output=[k#1L, s#9L])
+      +- AQEShuffleRead coalesced
+         +- ShuffleQueryStage 0
+            +- Exchange hashpartitioning(k#1L, 200), ENSURE_REQUIREMENTS, [plan_id=54]
+               ...
+```
+
+AQE が無いと、集計の後半は `spark.sql.shuffle.partitions` の 200 個のタスクになります。1000 個のキーの部分和しか無いデータを 200 に分けているので、ほとんどのタスクは空に近い状態です。AQE を有効にすると、ジョブが 2 つに分かれました。最初のジョブで map 側（4 タスク）を動かし、出力の大きさを見たあとで、次のジョブでは map 側を省き（完了 0）、**200 個のパーティションを 1 つに合体した 1 タスク**で後半を動かしています。計画の `AQEShuffleRead coalesced` がその印です。shuffle の出力全体が最小の 1MB に届かないので、1 つにまとまったと考えられます。
+
+### 実験 4 の続き：実行時に結合方式を変える
+
+同じスクリプトの後半では、300 万行どうしを結合し、片側に `id % 10000 == 0` の条件をかけました。条件をかけたあとの行数は 300 行しかありませんが、実行前の計画は `SortMergeJoin` でした。実行前の見積もりでは、どちらの側も閾値の 10 MB を超えると判断されたことになります。
+
+```python
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+a = spark.range(0, 3_000_000).select(F.col("id").alias("k"), F.col("id"))
+b = spark.range(0, 3_000_000).where(F.col("id") % 10000 == 0).select(F.col("id").alias("k"), F.lit(1).alias("one"))
+j = a.join(b, "k")
+print(j._jdf.queryExecution().executedPlan().toString())   # 実行前
+j.count()
+j2 = a.join(b, "k"); j2.collect()
+print(j2._jdf.queryExecution().executedPlan().toString())  # 実行後
+```
+
+```
+=== before execution
+AdaptiveSparkPlan isFinalPlan=false
++- Project [k#17L, id#16L, 1 AS one#23]
+   +- SortMergeJoin [k#17L], [k#22L], Inner
+      :- Sort [k#17L ASC NULLS FIRST], false, 0
+      :  +- Exchange hashpartitioning(k#17L, 200), ENSURE_REQUIREMENTS, [plan_id=100]
+      :     +- Project [id#16L AS k#17L, id#16L]
+      :        +- Filter ((id#16L % 10000) = 0)
+      ...（右側も Sort と Exchange と Filter）
+=== after execution
+AdaptiveSparkPlan isFinalPlan=true
++- == Final Plan ==
+   ResultQueryStage 3
+   +- *(3) Project [k#17L, id#16L, 1 AS one#23]
+      +- *(3) BroadcastHashJoin [k#17L], [k#22L], Inner, BuildLeft, false, false
+         :- BroadcastQueryStage 2
+         :  +- BroadcastExchange HashedRelationBroadcastMode(List(input[0, bigint, false]),false), [plan_id=395]
+         :     +- AQEShuffleRead local
+         :        +- ShuffleQueryStage 0
+         ...
+         +- AQEShuffleRead local
+            +- ShuffleQueryStage 1
+```
+
+実行後の計画は `BroadcastHashJoin` に変わりました。両側の shuffle の map 側はすでに動いたあとなので `ShuffleQueryStage` として残っていますが、`AQEShuffleRead local` は、shuffle の出力をパーティションごとに集め直さず、map 側の出力をそのまま読む読み方です。また、条件 `(id % 10000) = 0` は、条件をかけていない左側にも入っています。結合のキーが `k = id` なので、右側の条件が左側にも成り立つと Catalyst が推論して足したものです。結果として両側とも小さくなり、左側（`BuildLeft`）が配られています。
+
+### 実験 5：偏った結合の分割
+
+最後に、行の 8 割がキー 0 を持つ 200 万行の表と 1000 行の表を結合しました（`exp5_skew_cache.py`）。1 台で偏りを判定させるために、閾値を小さくしています。
+
+```python
+spark = session(**{
+    "spark.sql.autoBroadcastJoinThreshold": "-1",
+    "spark.sql.adaptive.autoBroadcastJoinThreshold": "-1",
+    "spark.sql.shuffle.partitions": "8",
+    "spark.sql.adaptive.coalescePartitions.enabled": "false",
+    "spark.sql.adaptive.advisoryPartitionSizeInBytes": "64k",
+    "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "64k",
+})
+left = spark.range(0, 2_000_000, numPartitions=8).select(
+    F.when(F.col("id") % 10 < 8, F.lit(0)).otherwise(F.col("id") % 1000).alias("k"), F.col("id"))
+right = spark.range(0, 1000).select(F.col("id").alias("k"), (F.col("id") * 2).alias("w"))
+for skew in ["false", "true"]:
+    spark.conf.set("spark.sql.adaptive.skewJoin.enabled", skew)
+    left.join(right, "k").groupBy("w").count().collect()
+# 最後に、左側をキーで 8 つにハッシュ分割したときの各パーティションの行数を数える
+```
+
+```
+=== skewJoin.enabled=false
+job=2 stage=4 tasks=8 completed=8 collect
+    +- *(5) SortMergeJoin [k#1L], [k#3L], Inner
+=== skewJoin.enabled=true
+job=6 stage=13 tasks=15 completed=15 collect
+    +- *(5) SortMergeJoin(skew=true) [k#1L], [k#3L], Inner
+    :  +- AQEShuffleRead skewed
+=== rows per reduce partition when left is hash-partitioned into 8
+[42000, 58000, 48000, 56000, 48000, 1650000, 38000, 60000]
+```
+
+（ステージの一覧は、結合を行うステージの行だけを抜き出しています。）
+
+キーで 8 つに分けると、キー 0 が入る 6 番目のパーティションだけが 165 万行になります。分割が無効のときは、結合のステージは 8 タスクで、この 1 タスクが全体の終わりを決めます。有効にすると `SortMergeJoin(skew=true)` と `AQEShuffleRead skewed` が現れ、結合のステージは **15 タスク**になりました。偏ったパーティションが 8 つに分かれ（8 + 7 = 15）、相手側の対応するパーティションはそれぞれに複製されます。分割の目安は `advisoryPartitionSizeInBytes` で、最初にこれを 256k にして試したときは 9 タスク（2 つに分割）でした。
+
+## メモリ管理：実行とキャッシュで 1 つの領域を分け合う
+
+エグゼキュータの JVM ヒープの使い道は、大きく 2 つに分かれます。shuffle・結合・並べ替え・集約の計算に使う**実行用のメモリ**と、キャッシュや内部データの配布に使う**保存用のメモリ**です。Spark 1.6 からは、この 2 つが固定の割り当てではなく 1 つの領域を共有する方式（unified memory management）になりました（[Spark 1.6.0 release notes](https://spark.apache.org/releases/spark-release-1-6-0.html)）。
+
+Spark 4.2.0 の文書（[Tuning: Memory Management Overview](https://spark.apache.org/docs/latest/tuning.html#memory-management-overview)）による規則は次のとおりです。
+
+- 共有の領域 M の大きさは、（JVM のヒープ − 300MiB）× `spark.memory.fraction`（既定 0.6）。残りの 4 割は、利用者のデータ構造、Spark 内部のメタデータ、想定外に大きなレコードへの備えに使われる
+- 実行用が使っていなければ、保存用は M を全部使える。逆も同じ
+- 実行用は必要なら保存用（キャッシュ）を追い出せるが、保存用が M × `spark.memory.storageFraction`（既定 0.5）の R を下回るところまでに限る。**R の中のキャッシュは追い出されない**
+- 保存用が実行用を追い出すことはない（実装が複雑になるため、と文書は書いている）
+
+ドライバのヒープを 1 GB にした実験の環境で、この値を確かめました（`exp7_memory.py`）。
+
+```python
+spark = session()
+sc = spark.sparkContext
+print("JVM maxMemory (MiB):", sc._jvm.java.lang.Runtime.getRuntime().maxMemory() // 2**20)
+it = sc._jsc.sc().getExecutorMemoryStatus().iterator()
+while it.hasNext():
+    kv = it.next()
+    print("executor", kv._1(), "max storage+execution (MiB):", kv._2()._1() // 2**20)
+for k in ["spark.memory.fraction", "spark.memory.storageFraction"]:
+    print(k, "=", sc.getConf().get(k, "(unset: default)"))
+```
+
+```
+JVM maxMemory (MiB): 1024
+executor 9f2f9547b0e9:39381 max storage+execution (MiB): 434
+spark.memory.fraction = (unset: default)
+spark.memory.storageFraction = (unset: default)
+```
+
+キャッシュに使える最大量として報告された 434 MiB は、（1024 − 300）× 0.6 = 434.4 と一致します。実行用が何も使っていない状態なので、M 全体が保存用に使える、と報告されています。
+
+## キャッシュ：lineage を短くする仕組み
+
+同じ RDD や DataFrame を何度も使うなら、`cache()` か `persist()` で実体を残せます。RDD の `cache()` の既定は `MEMORY_ONLY`（JVM のオブジェクトのままメモリに置き、入りきらないパーティションは毎回計算し直す）で、他に `MEMORY_AND_DISK`、`DISK_ONLY`、2 つのノードに複製する `_2` 付きの水準などがあります（[RDD Programming Guide: RDD Persistence](https://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence)）。文書は、キャッシュは障害に強く、パーティションが失われても元の変換で自動的に計算し直される、と書いています。キャッシュは lineage を捨てるわけではなく、lineage の途中に「ここから先は計算済み」という近道を置くもの、と言えます。
+
+DataFrame の `cache()` は、Spark SQL のメモリ上の列指向の形式で保存し、必要な列だけを読み、列ごとに圧縮方式を選びます（`spark.sql.inMemoryColumnarStorage.compressed`、既定 true。[Performance Tuning: Caching Data](https://spark.apache.org/docs/latest/sql-performance-tuning.html#caching-data)）。実験 5 の後半で、100 万行の DataFrame をキャッシュしてから条件をかけた計画です。
+
+```python
+df = spark.range(0, 1_000_000).select(F.col("id"), (F.col("id") % 10).alias("m"))
+df.cache()
+print("storage level:", df.storageLevel)
+df.count()
+q = df.where("m = 3").select("id")   # この q の物理計画と、getRDDStorageInfo() の内容を表示
+```
+
+```
+storage level: Disk Memory Deserialized 1x Replicated
+    *(1) Project [id#19L]
+    +- *(1) Filter (isnotnull(m#20L) AND (m#20L = 3))
+       +- InMemoryTableScan [id#19L, m#20L], [isnotnull(m#20L), (m#20L = 3)]
+             +- InMemoryRelation [id#19L, m#20L], StorageLevel(disk, memory, deserialized, 1 replicas)
+                   +- *(1) Project [id#19L, (id#19L % 10) AS m#20L]
+                      +- *(1) Range (0, 1000000, step=1, splits=2)
+cached: *(1) Project [id#19L, (id#19L % 10) AS m#20L]
++- *(1) Range  partitions 2 mem bytes 2031736 disk bytes 0
+```
+
+RDD と違い、**DataFrame の `cache()` の水準はメモリとディスクの両方を使う水準**（`StorageLevel(disk, memory, deserialized, 1 replicas)`）でした。計画では、元の `Range` と `Project` は `InMemoryRelation` の下に退き、実際の読み込みは `InMemoryTableScan` になっています。条件 `m = 3` はスキャンにも渡されています。キャッシュは 2 パーティション、メモリ上で約 2.0 MB、ディスクは 0 バイトでした。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| RDD | 読み取り専用で、パーティションに分かれたレコードの集まり。決定的な変換でのみ作られる |
+| 変換 / アクション | 新しい RDD を定義するだけの遅延された操作 / 計算を起動して結果を返すか書き出す操作 |
+| lineage | RDD がどの RDD からどの変換で作られたかの記録。失われたパーティションの再計算に使う |
+| 狭い依存 / 広い依存 | 親の各パーティションを子の高々 1 つが使う / 子の複数が使う依存。後者で shuffle が要る |
+| チェックポイント | lineage を切って RDD を安定したストレージに書き出すこと |
+| DAGScheduler / TaskScheduler | ステージの DAG を作って TaskSet を渡すスケジューラ / タスクをエグゼキュータに割り当てるスケジューラ |
+| ShuffleMapStage / ResultStage | shuffle の map 側の出力を書くステージ / アクションの最後のステージ |
+| sort-based shuffle | 行き先のパーティション番号で並べ替え、map タスクごとに本体と索引の 1 組を書く shuffle |
+| 外部 shuffle サービス | エグゼキュータとは独立に各ノードで動き、shuffle のファイルを配るプロセス |
+| 動的割り当て | 負荷に応じてエグゼキュータの数を増減させる機能 |
+| Catalyst | Spark SQL の最適化器。解析・論理最適化・物理計画・コード生成の段を持つ |
+| `Exchange` | 物理計画の中の shuffle（または broadcast）の演算子。ステージの境目 |
+| whole-stage codegen | パイプラインでつながる演算子を 1 つの関数のコードに融合して生成する方式 |
+| BroadcastHashJoin / SortMergeJoin | 小さい側を配ってハッシュ表で引く結合 / 両側を shuffle して並べ替えて突き合わせる結合 |
+| AQE | 実行時の統計で、パーティションの合体・結合方式の切り替え・偏りの分割を行う仕組み |
+| unified memory | 実行用と保存用のメモリが 1 つの領域を共有する管理方式 |
+
+似た用語の区別を 3 つ補います。
+
+- **ステージとタスクとジョブ**：ジョブはアクション 1 回分の計算、ステージはその中の shuffle で区切られた段、タスクはステージの中の 1 パーティション分の処理です。実験 4 のように、AQE を使うと 1 回のアクションが複数のジョブに分かれることがあります。
+- **`spark.sql.shuffle.partitions` と `spark.default.parallelism`**：前者は DataFrame と SQL の shuffle 後のパーティション数（既定 200）、後者は RDD の `reduceByKey` や `join` などで指定が無いときのパーティション数です（[Configuration](https://spark.apache.org/docs/latest/configuration.html)）。
+- **キャッシュとチェックポイント**：キャッシュは lineage を残したまま計算結果を手元に置き、失われれば計算し直します。チェックポイントは安定したストレージに書いて lineage を切ります。
+
+## まとめ
+
+- RDD は「読み取り専用で、パーティションに分かれたレコードの集まり」で、パーティション・依存・計算の関数・分割方法・優先ノードの 5 つで表される。lineage を持つので、失われたら作り直せる
+- 依存は狭い依存と広い依存に分かれる。狭い依存は 1 つのタスクの中でパイプラインになり、広い依存の手前で shuffle が入ってステージが切れる。実験では `map` と `filter` だけなら 1 ステージ、`reduceByKey` を入れると 2 ステージになった
+- shuffle のファイルは残るので、同じ shuffle を使う後続のジョブではステージが省かれる。実験では、2 回目の `collect` で 2 つの map 側のステージが完了タスク 0 だった
+- sort-based shuffle は map タスクごとに `.data` と `.index` の 1 組を書く。外部 shuffle サービスは、エグゼキュータを消したあともそのファイルを配るためのもので、Kubernetes では使えない
+- Catalyst は解析・論理最適化・物理計画・コード生成の 4 段で、explain で各段の計画が見える。実験では定数の畳み込み、述語の押し下げ、射影の刈り込みが確認できた
+- whole-stage codegen は演算子を 1 つのループに融合する。実験では無効にすると約 7 倍遅くなった
+- 結合の方式は、見積もりと `spark.sql.autoBroadcastJoinThreshold`（既定 10 MB）で決まる。閾値を見積もりより下げると、BroadcastHashJoin が SortMergeJoin に変わり、shuffle とステージが増えた
+- AQE（3.2.0 から既定で有効）は実行時の大きさで計画を直す。実験では 200 個のパーティションが 1 つに合体し、SortMergeJoin が BroadcastHashJoin に変わり、偏ったパーティションが分割されて 8 タスクが 15 タスクになった
+- 実行用と保存用のメモリは（ヒープ − 300MiB）× 0.6 の領域を共有する。1 GB のヒープでは 434 MiB だった
+
+Spark はバッチを細かなステージに分け、ステージの間は shuffle のファイルを介してつなぎます。ストリームでも、Structured Streaming はこの仕組みの上で小さなバッチを繰り返します。では、データを 1 件ずつ流し続け、状態を持ったまま止まらずに動くエンジンは、障害のあとにどこから再開するのでしょうか。<a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>状態を持つストリーム処理</a>で、Flink のチェックポイントと、Beam と Dataflow のモデルを見ていきます。

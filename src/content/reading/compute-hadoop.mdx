@@ -1,0 +1,475 @@
+---
+title: Hadoop の中身（MapReduce の実行と YARN）
+description: map・shuffle・reduce の原理は知っている。では Hadoop は 1 つのジョブを実際にどう動かしているのか。入力の分割から出力の確定まで、メモリ上のバッファ、ディスクへの書き出し、HTTP での取得を、ジョブのカウンタとログで追います
+category: compute
+order: 21
+status: published
+topics:
+  - Hadoop MapReduce
+  - YARN
+  - InputSplit
+  - Spill
+  - Combiner
+  - Partitioner
+  - Shuffle
+  - OutputCommitter
+  - Speculative Execution
+  - ResourceManager
+  - ApplicationMaster
+  - Capacity Scheduler
+  - JobTracker
+  - Apache Tez
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: map の出力をどの reduce へ送るかは、キーのハッシュ値を reduce の数で割った余りで決まる。同じキーが必ず同じ担当に集まるのは、ハッシュで振り分けているから
+  - kind: article
+    slug: heap-topk
+    why: map が何度もディスクに書き出した整列済みの断片は、最後に k 本ずつまとめてマージされる。io.sort.factor は k-way merge の k そのもの
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 原理の次は、実際の実行経路
+
+<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理</a>では、MapReduce を「map で (キー, 値) を吐き出し、shuffle で同じキーを集め、reduce で畳む」という型として見ました。外部ソートの考え方もそこで扱っています。この回は、その型を **Hadoop がどういう部品で、どういう順に実行しているか**を見ます。<a href={`${import.meta.env.BASE_URL}reading/compute-map/`}>計算エンジンの地図</a>でいえば、第 1 世代のバッチ処理の本体です。
+
+対象は執筆時点の最新の安定版 Hadoop 3.5.0 です。2026 年 4 月 2 日に公開された 3.5 系の最初の安定版で、サーバー側は Java 17 が必須になりました（[Apache Hadoop 3.5.0](https://hadoop.apache.org/docs/r3.5.0/index.html)、[Releases](https://hadoop.apache.org/releases.html)）。本文に出てくる設定の既定値は、3.5.0 の [mapred-default.xml](https://hadoop.apache.org/docs/r3.5.0/hadoop-mapreduce-client/hadoop-mapreduce-client-core/mapred-default.xml) と [yarn-default.xml](https://hadoop.apache.org/docs/r3.5.0/hadoop-yarn/hadoop-yarn-common/yarn-default.xml) で確認したものです。挙動の細部は 3.5.0 のタグのソースコードで確かめました。
+
+<Callout type="warn" title="「stable」の文書は古い版を指している">
+  Hadoop のサイトの `docs/stable/` は、執筆時点では 3.3.5 の文書を表示していました（ページの版表示が 3.3.5）。最新版の文書は `docs/current/` か、`docs/r3.5.0/` のように版を明示した URL で読む必要があります。既定値を調べるときは、URL の版を必ず確認してください。
+</Callout>
+
+1 つのジョブの流れを先に示します。
+
+```
+ クライアント        ResourceManager        NodeManager の上のコンテナ
+ ─────────────      ───────────────        ──────────────────────────────────────
+ 入力を分割(split)
+ jar と設定を HDFS へ
+ 投入 ────────────▶ AM 用のコンテナを割当 ─▶ MRAppMaster（ジョブ 1 つにつき 1 つ）
+                                              │ map 用・reduce 用のコンテナを要求
+                    コンテナを割当 ◀──────────┘
+                                             map タスク × split の数
+                                              RecordReader → map() → 環状バッファ
+                                              → 並べ替え → (combiner) → spill
+                                              → マージ → file.out（ローカルディスク）
+                                             reduce タスク × 指定した数
+                                              HTTP で各 map の自分の担当分を取得
+                                              → マージ → reduce() → HDFS の一時領域
+                                             OutputCommitter が出力を確定 → _SUCCESS
+```
+
+## ジョブの投入と ApplicationMaster
+
+クライアント（`hadoop jar` を実行したプロセス）は、まず入力を **InputSplit**（1 つの map タスクが処理する入力の範囲）に分けます。実験のログでは、投入の時点で `number of splits:2` と出ています。分割の結果、ジョブの jar、設定は HDFS のステージング用ディレクトリに置かれ、ジョブは ResourceManager に投入されます。
+
+ResourceManager は、まずそのジョブ専用の **ApplicationMaster**（AM。MapReduce の場合は `MRAppMaster`）を動かすコンテナを 1 つ割り当てます。AM の既定のメモリは `yarn.app.mapreduce.am.resource.mb = 1536` MB です。以降、map と reduce のコンテナを ResourceManager に要求し、タスクの進み具合を見張り、失敗したら再実行するのは AM の仕事です。この分担は後半の YARN の節で詳しく見ます。
+
+reduce のコンテナは、map が全部終わるのを待たずに要求されます。`mapreduce.job.reduce.slowstart.completedmaps = 0.05` は、map の 5% が終わったら reduce の割り当てを始める、という意味です。早く始めた reduce は、終わった map から順に出力を取りに行けます。
+
+ごく小さいジョブのために、**uber モード**（map と reduce を AM と同じ JVM の中で順に実行する最適化）もありますが、既定では無効です（`mapreduce.job.ubertask.enable = false`）。
+
+## map 側：入力の範囲から 1 つの出力ファイルまで
+
+### InputSplit と RecordReader
+
+ファイルを入力とする場合、split の大きさは `FileInputFormat` の次の式で決まります（3.5.0 の [FileInputFormat.java](https://github.com/apache/hadoop/blob/rel/release-3.5.0/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/FileInputFormat.java)）。
+
+```java
+protected long computeSplitSize(long blockSize, long minSize, long maxSize) {
+  return Math.max(minSize, Math.min(maxSize, blockSize));
+}
+```
+
+最小値（`mapreduce.input.fileinputformat.split.minsize`、既定 0）と最大値を指定しなければ、**split の大きさは HDFS のブロックの大きさ（既定 128 MiB）**になります。<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で見たデータ局所性は、ここで効きます。split 1 つがブロック 1 つに対応するので、AM はそのブロックを持つノードに map を置けます。実験のカウンタにも `Data-local map tasks=2` と出ました。公式のチュートリアルは、10 TB の入力をブロック 128 MB で読むと約 82,000 個の map になる、という例を挙げています（[MapReduce Tutorial](https://hadoop.apache.org/docs/r3.5.0/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html)）。
+
+split はバイトの範囲でしかないので、行の途中で切れることがあります。行に直すのは **RecordReader** の仕事です。テキスト用の `LineRecordReader` は、先頭以外の split では最初の 1 行を読み捨て、自分の範囲の終わりを越えてもう 1 行読みます。こうすると、境界をまたぐ行は前の split の側で 1 回だけ処理されます（[LineRecordReader.java](https://github.com/apache/hadoop/blob/rel/release-3.5.0/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java) のコメント）。
+
+### 環状のメモリバッファ
+
+`map()` が `context.write(key, value)` で出した (キー, 値) は、すぐにはディスクに行きません。`MapTask` の中の `MapOutputBuffer` という 1 本のバイト配列に、直列化されて追記されます（[MapTask.java](https://github.com/apache/hadoop/blob/rel/release-3.5.0/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/MapTask.java)）。
+
+- 配列の大きさは `mapreduce.task.io.sort.mb`（既定 100 MB）。ソースでは `sortmb << 20` バイトを確保している
+- 同じ配列に、レコード本体と、レコード 1 件ごとの**メタデータ**（パーティション番号、キーの開始位置、値の開始位置、値の長さの 4 つの int、16 バイト）を、**赤道**（equator）と呼ぶ位置から互いに逆向きに書いていく
+- 使用量が `mapreduce.map.sort.spill.percent`（既定 0.80）を超えると、別スレッドが中身をディスクに書き出し始める。書き出している間も、map は残りの領域に書き続けられる。残りも埋まったときだけ map が止まる
+
+配列の端まで来たら先頭に戻って続けるので、これは**環状バッファ**です。実験の map タスクのログには、起動時に次の行が出ていました。
+
+```
+MapTask: mapreduce.task.io.sort.mb: 100
+MapTask: soft limit at 83886080
+MapTask: kvstart = 26214396; length = 6553600
+```
+
+`83886080` は 100 MiB × 0.80 です。注意したいのは、**メタデータが 1 件 16 バイトと、本体より大きくなりうる**ことです。単語数え（word count）の出力は、5 文字前後の単語と 4 バイトの整数なので、本体は 1 件あたり約 8.8 バイトでした（実験の `Map output bytes` ÷ `Map output records`）。1 件あたりバッファを約 25 バイト使う計算になり、100 MB のバッファでも 340 万件ほどで書き出しが始まります。
+
+### パーティショナと並べ替え
+
+バッファに書くとき、レコードごとに**パーティション番号**（どの reduce に送るか）が決まります。既定の `HashPartitioner` は 1 行です。
+
+```java
+return (key.hashCode() & Integer.MAX_VALUE) % numReduceTasks;
+```
+
+書き出すときは、メタデータの側を**パーティション番号 → キー**の順に並べ替えます（既定の並べ替えは `QuickSort`）。本体は動かさず、16 バイトのメタデータだけを入れ替えるので、可変長のレコードを動かすより安く済みます。
+
+### spill と combiner
+
+バッファの中身を整列してディスクに書き出すことを **spill** と呼びます。spill 1 回でローカルディスクにファイルが 1 つでき、中はパーティションごとに整列済みの区画に分かれています。どの区画がファイルのどこにあるかは、別の索引に記録されます。
+
+**combiner**（map 側で同じキーの値を先にまとめる処理）が設定されていれば、spill のたびに、パーティションごとに整列した列に対して combiner が走ってから書かれます。word count なら、`(w1, 1)` が 3 万件並んでいても `(w1, 30000)` の 1 件になって書かれます。
+
+### マージ
+
+map が終わると、それまでの spill のファイルをパーティションごとにマージして、**1 つの `file.out` とその索引 `file.out.index`** にまとめます（ファイル名は [MapOutputFile.java](https://github.com/apache/hadoop/blob/rel/release-3.5.0/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/MapOutputFile.java)）。spill が 1 回だけなら、そのファイルがそのまま最終出力になります。
+
+- 一度に開いてマージするファイルの数は `mapreduce.task.io.sort.factor`（既定 10）。それより多いと、何回かに分けてマージする
+- マージのときにも combiner を走らせるのは、spill が `mapreduce.map.combine.minspills` 回以上あったときだけ。この値は mapred-default.xml には載っていませんが、ソースの既定値は 3 です（`job.getInt(JobContext.MAP_COMBINE_MIN_SPILLS, 3)`）
+
+この 2 つ目の条件は、後の実験ではっきり数字に出ます。
+
+<Callout type="note" title="map の出力は HDFS に書かれない">
+  `file.out` は、map を実行したノードのローカルディスク（`yarn.nodemanager.local-dirs` の下）に置かれ、HDFS には書かれません。複製を作らないので書き込みは軽いのですが、**そのノードが落ちると、map が成功していても出力が失われ、map をやり直すことになります。** 一方、reduce の出力は HDFS に書かれ、複製されます。
+</Callout>
+
+## shuffle：reduce が HTTP で取りに行く
+
+map の出力を reduce へ運ぶのは、map ではありません。**各 NodeManager の中で動く `ShuffleHandler` という HTTP サーバーが map の出力を配り、reduce の側がそれを取りに行きます。** チュートリアルは、reduce は「全 map の出力のうち関係するパーティションを HTTP で取得する」と書いています（[MapReduce Tutorial](https://hadoop.apache.org/docs/r3.5.0/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html)）。
+
+- ShuffleHandler は NodeManager の**補助サービス**（aux service）として登録する。単一ノードの設定手順でも `yarn.nodemanager.aux-services = mapreduce_shuffle` を書く（yarn-default.xml の既定値は空）
+- 待ち受けポートは `mapreduce.shuffle.port = 13562`。3.5.0 の実装は Netty（Java の非同期ネットワークの部品）を使う
+- reduce は AM から「どの map が終わったか」を受け取り、`mapOutput?job=...&reduce=...&map=...` という URL で、自分の番号の区画だけを要求する（[ShuffleSchedulerImpl.java](https://github.com/apache/hadoop/blob/rel/release-3.5.0/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/ShuffleSchedulerImpl.java)）。URL にはジョブの秘密鍵で作ったハッシュを付け、別のジョブの出力を取れないようにしている
+- 同時に取りに行く数は `mapreduce.reduce.shuffle.parallelcopies = 5`
+
+取ってきた map の出力は、reduce のヒープの中に置くか、直接ディスクに書くかを 1 つずつ決めます。関係する設定は 4 つです。
+
+| 設定 | 既定値 | 意味 |
+| --- | --- | --- |
+| `mapreduce.reduce.shuffle.input.buffer.percent` | 0.70 | ヒープのうち、取得した map 出力を置いてよい割合 |
+| `mapreduce.reduce.shuffle.memory.limit.percent` | 0.25 | 上の領域のうち、map 出力 1 つが使ってよい割合。超えるものは直接ディスクへ |
+| `mapreduce.reduce.shuffle.merge.percent` | 0.66 | 上の領域がこの割合まで埋まったら、メモリ上でマージしてディスクに書く |
+| `mapreduce.reduce.input.buffer.percent` | 0.0 | reduce を始めるとき、メモリに残してよい map 出力の割合。0 なので全部いったんディスクへ |
+
+実験の reduce のログ（`syslog.shuffle`）には、この計算の結果がそのまま出ていました。ヒープは 256 MB に設定しています。
+
+```
+MergeManagerImpl: MergerManager: memoryLimit=181665792, maxSingleShuffleLimit=45416448,
+                  mergeThreshold=119899424, ioSortFactor=10, memToMemMergeOutputsThreshold=10
+Fetcher: fetcher#1 about to shuffle output of map attempt_..._m_000000_0 decomp: 319421 len: 319425 to MEMORY
+Fetcher: fetcher#1 about to shuffle output of map attempt_..._m_000001_0 decomp: 319434 len: 319438 to MEMORY
+ShuffleSchedulerImpl: localhost:13562 freed by fetcher#1 in 193ms
+MergeManagerImpl: finalMerge called with 2 in-memory map-outputs and 0 on-disk map-outputs
+MergeManagerImpl: Merged 2 segments, 638855 bytes to disk to satisfy reduce memory limit
+```
+
+`memoryLimit` は JVM が使えるヒープの 70%、`maxSingleShuffleLimit` はその 25%、`mergeThreshold` はその 66% です。最後の行が `input.buffer.percent = 0.0` の効果で、**メモリに収まっていた map 出力も、reduce を始める前にいったんディスクに書かれています。** 既定でメモリを reduce 本体のために空けておく、という選択です。
+
+## reduce と出力の確定
+
+ディスク上の断片をキー順にマージしながら、同じキーの値の列を 1 つずつ `reduce()` に渡します。reduce の出力は HDFS に書かれますが、いきなり最終の場所には書きません。**OutputCommitter**（タスクとジョブの出力を確定させる部品）が、一時ディレクトリから最終の場所へ移す役を持ちます。既定は `FileOutputCommitter` です。
+
+確定の手順には 2 つの版があり、3.5.0 の既定は `mapreduce.fileoutputcommitter.algorithm.version = 2` です（ソースの `FILEOUTPUTCOMMITTER_ALGORITHM_VERSION_DEFAULT = 2` でも確認しました）。mapred-default.xml の説明を要約します。
+
+| | タスクの確定（commitTask） | ジョブの確定（commitJob） |
+| --- | --- | --- |
+| 版 1 | タスクの一時ディレクトリを、ジョブの一時ディレクトリの下へ rename | 全タスクの出力を最終ディレクトリへ移し、`_temporary` を消して `_SUCCESS` を書く。単一スレッドで、全タスクの終了を待ってから始まる |
+| 版 2 | タスクの出力ファイルを、**直接最終ディレクトリへ** rename | `_temporary` を消して `_SUCCESS` を書くだけ |
+
+版 1 は、出力ファイルが多いとジョブの最後の確定に数分かかる、という性能の問題がありました（説明は MAPREDUCE-4815 を挙げています）。版 2 はタスクが終わるたびに最終の場所へ移すので速い代わりに、**ジョブが途中で失敗すると、終わったタスクの出力だけが最終ディレクトリに残ります。** 読む側は `_SUCCESS` の有無で完了を判断する必要があります。この「rename で確定する」方式が S3 では成り立たない話と、その代わりの S3A コミッタは、<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で扱いました。
+
+## 失敗と遅いタスク
+
+MapReduce の障害対策は「タスクをやり直す」が基本です。
+
+- タスクの試行は最大 `mapreduce.map.maxattempts = 4`、`mapreduce.reduce.maxattempts = 4` 回。入力も出力も進捗の報告もないまま `mapreduce.task.timeout = 600000` ミリ秒（10 分）経つと、そのタスクは止められる
+- AM 自体が落ちた場合は、ResourceManager が AM を再起動する。試行回数の既定は `yarn.resourcemanager.am.max-attempts = 2`
+- reduce が map の出力を取れないときは、上の Callout のとおり、その map がやり直される
+
+もう 1 つが**投機実行**（speculative execution）です。他より明らかに遅いタスクがあると、AM は同じタスクを別のコンテナでもう 1 つ動かし、先に終わったほうを採用します。既定で map も reduce も有効（`mapreduce.map.speculative = true`、`mapreduce.reduce.speculative = true`）で、同時に投機実行してよいのは実行中のタスクの 10%（`speculative-cap-running-tasks = 0.1`）までです。同じタスクの 2 つの試行が同じ出力先に書いても壊れないのは、試行ごとに一時ディレクトリが分かれ、OutputCommitter が勝ったほうだけを確定させるからです（チュートリアルの OutputCommitter の節）。
+
+## 実験：カウンタで中身を確かめる
+
+### 準備
+
+Docker で Hadoop の公式イメージ `apache/hadoop:3.5.0` を 1 つ動かし、NameNode、DataNode、ResourceManager、NodeManager を同じコンテナで起動しました（擬似分散）。イメージは amd64 用しかなく、Apple Silicon の Mac では変換しながら動くので、**所要時間は参考にならない**ことに注意してください。他のコンテナと同時に動かすため、コンテナ全体を 3 GB に制限し、各デーモンのヒープは 192 MB、map と reduce のヒープは 256 MB にしています。
+
+```yaml
+# docker-compose.yml
+name: cmp-compute-hadoop
+services:
+  hadoop:
+    image: apache/hadoop:3.5.0
+    platform: linux/amd64
+    container_name: cmp-compute-hadoop-node
+    hostname: localhost
+    mem_limit: 3g
+    environment:
+      HADOOP_CONF_DIR: /conf
+    volumes:
+      - ./conf:/conf:ro
+      - ./start.sh:/start.sh:ro
+      - ./data:/data
+    command: ["/start.sh"]
+networks:
+  default:
+    name: cmp-compute-hadoop-net
+```
+
+```bash
+#!/usr/bin/env bash
+# start.sh
+set -e
+export HADOOP_HEAPSIZE_MAX=192m
+hdfs namenode -format -force -nonInteractive >/dev/null 2>&1
+hdfs --daemon start datanode
+export HADOOP_OPTS="-XX:+UseSerialGC -XX:MaxMetaspaceSize=128m -XX:ActiveProcessorCount=2"
+hdfs --daemon start namenode
+yarn --daemon start resourcemanager
+yarn --daemon start nodemanager
+tail -f /dev/null
+```
+
+`conf/` には、イメージ同梱の設定ファイルを写したうえで、次の値を書きました（抜粋）。`fs.defaultFS = hdfs://localhost:9000`、`dfs.replication = 1`、`mapreduce.framework.name = yarn`、`yarn.nodemanager.aux-services = mapreduce_shuffle`、`yarn.nodemanager.resource.memory-mb = 1536`、`mapreduce.map.memory.mb = 384`（ヒープ `-Xmx256m`）、`mapreduce.reduce.memory.mb = 384`（同）、`yarn.app.mapreduce.am.resource.mb = 512`。
+
+最初は各デーモンのヒープを 256 MB にし、ジョブ履歴サーバーも起動していましたが、ジョブの途中でコンテナがメモリ上限に達し、`OOMKilled` で ResourceManager が強制終了されました。上の構成は、そこから減らしたものです。また、`HADOOP_OPTS` を付けた DataNode は Web サーバーのスレッド不足（`Insufficient configured threads`）で起動に失敗したので、DataNode だけ付けずに起動しています。さらに、実験 3 に続けて試した追加の条件（combiner なしで `io.sort.mb = 5`。結果は得られず、本文には載せていない）と実験 4 の最初の試行で、NodeManager がコンテナを起動した直後から応答しなくなり、10 分後（`yarn.nm.liveness-monitor.expiry-interval-ms = 600000`）に ResourceManager から `LOST` と判定されました。原因は特定できていません。実験 4 は、クラスタを作り直し、NodeManager を `HADOOP_OPTS` なし・ヒープ 320 MB で起動し直してから行いました。
+
+入力は、5 万語の語彙から Zipf 分布（順位 k の語が 1/k に比例して出る）で選んだ単語を 1 行 10 語ずつ、50 万行のファイル 2 つです（各約 23 MB、計 1,000 万語）。
+
+```python
+# gen.py
+import itertools, random
+random.seed(42)
+vocab = [f"w{i}" for i in range(50000)]
+cum = list(itertools.accumulate(1 / (i + 1) for i in range(50000)))
+for n in range(2):
+    with open(f"data/input-{n}.txt", "w") as f:
+        for _ in range(500_000):
+            f.write(" ".join(random.choices(vocab, cum_weights=cum, k=10)) + "\n")
+```
+
+ジョブは公式チュートリアルの WordCount とほぼ同じですが、combiner の有無を設定で切り替えられるようにしました。変えたのは `main` の 1 行だけです。
+
+```java
+if (conf.getBoolean("wc.combiner", true)) job.setCombinerClass(IntSumReducer.class);
+```
+
+reduce は 2 つにし（`-D mapreduce.job.reduces=2`）、各条件で 1 回ずつ実行しました。ファイルは 2 つとも 128 MiB より小さいので、split も map も 2 つです。
+
+### 実験 1：既定の設定でカウンタを読む
+
+`mapreduce.task.io.sort.mb = 100`（既定）、combiner ありの実行で、ジョブの終わりに表示されたカウンタです（抜粋）。
+
+```
+Map input records=1000000
+Map output records=10000000
+Map output bytes=87714407
+Map output materialized bytes=2537566
+Combine input records=10000000
+Combine output records=198614
+Reduce input groups=50000
+Reduce shuffle bytes=2537566
+Reduce input records=198614
+Reduce output records=50000
+Spilled Records=595842
+Shuffled Maps =4
+```
+
+- `Map output records` の 1,000 万件（88 MB）が、combiner を通ると 198,614 件になり、shuffle で運ばれたのは **2.5 MB** だった
+- 各 map のログには `Finished spill 0` と `Finished spill 1` があり、**map 1 つあたり spill は 2 回**だった。上で計算したとおり、約 340 万件でバッファの 80% に達し、map 1 つは 500 万件を出すから
+- `Shuffled Maps =4` は、map 2 つ × reduce 2 つの組の数。reduce はそれぞれ、2 つの map から自分の区画を取得した
+- `Spilled Records` の 595,842 は、ちょうど 198,614 の 3 倍。同じ件数が「spill で書く」「map の最後のマージで書く」「reduce が始める前にディスクへ書く」の 3 回ディスクを通ったと読める
+
+1 つ引っかかる数字があります。語彙は 5 万語、map は 2 つなので、combiner が完全に効けば shuffle される件数は最大 10 万件のはずです。**198,614 件はその約 2 倍です。** 理由は spill の回数にあります。spill ごとに combiner は走りますが、別々の spill に出た同じ単語は 2 件のまま残ります。最後のマージでもう一度 combiner を走らせれば 1 件にできますが、それは spill が 3 回（`minspills`）以上のときだけで、2 回では走りません。
+
+### 実験 2：sort.mb を小さくする
+
+バッファを小さくして spill の回数を増やしました。数字はジョブ全体（map 2 つの合計）です。
+
+| `io.sort.mb` | spill の回数（map 1 つあたり） | Combine input → output | Reduce shuffle bytes | Reduce input records | Spilled Records | ローカルディスクへの書き込み |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100 | 2 | 10,000,000 → 198,614 | 2,537,566 | 198,614 | 595,842 | 8.9 MB |
+| 50 | 3 | 10,296,402 → 396,397 | 1,277,739 | 99,995 | 496,392 | 7.6 MB |
+| 20 | 8 | 10,685,349 → 785,344 | 1,277,739 | 99,995 | 885,339 | 12.6 MB |
+| 5 | 30 | 11,568,077 → 1,668,072 | 1,277,739 | 99,995 | 2,964,203 | 38.7 MB |
+
+読み取れることは 3 つです。
+
+**1 つめ。spill が 3 回になった時点で shuffle の量が半分になりました。** `io.sort.mb = 50` では、最後のマージで combiner がもう一度走り、`Reduce input records` が 99,995 件（5 万語 × map 2 つから、どちらかの map に出なかった 5 語を引いた数）になりました。`Combine input records` が 1,000 万を超えているのは、マージのときの combiner の入力（spill の出力の合計）が足されているからです。**バッファを小さくしたほうが shuffle が減る**という、一見逆向きの結果ですが、仕組みどおりです。
+
+**2 つめ。spill が増えるほど、ローカルディスクの読み書きが増えました。** 30 回の spill では、`Spilled Records` が 296 万件、ローカルディスクへの書き込みが 38.7 MB と、既定の約 4 倍です。spill のたびに combiner が走ってもすべての語がまとまるわけではなく、spill の数だけ同じ単語が重複して書かれるからです。
+
+**3 つめ。spill が `io.sort.factor` を超えると、マージが何段にも分かれました。** `io.sort.mb = 5` の map のログです。
+
+```
+MapTask: soft limit at 4194304
+MapTask: Finished spill 29
+Merger: Merging 30 sorted segments
+Merger: Merging 3 intermediate segments out of a total of 30
+Merger: Merging 10 intermediate segments out of a total of 28
+Merger: Merging 10 intermediate segments out of a total of 19
+Merger: Down to the last merge-pass, with 10 segments left of total size: 4944388 bytes
+```
+
+30 個の断片を、10 個ずつしか開けない条件でマージしています。最初に 3 個だけまとめて 28 個にし、そこから 10 個ずつまとめて 19 個、10 個と減らし、最後の 1 回で 10 個を 1 つにしています。最初の回の数を半端にしておくと、以後の回がすべてちょうど 10 個になり、無駄な読み書きが減ります。**同じデータを何回ディスクに通すか**が、MapReduce の性能を調整するときに見る中心の量です。
+
+### 実験 3：combiner を外す
+
+`io.sort.mb` を既定に戻し、combiner だけを外しました。
+
+| | combiner あり | combiner なし |
+| --- | --- | --- |
+| Map output materialized bytes | 2,537,566 | 107,714,431 |
+| Reduce shuffle bytes | 2,537,566 | 107,714,431 |
+| Reduce input records | 198,614 | 10,000,000 |
+| Spilled Records | 595,842 | 30,000,000 |
+| ローカルディスクの読み / 書き | 5.1 MB / 8.9 MB | 215 MB / 324 MB |
+| CPU time spent | 25,850 ms | 44,840 ms |
+
+**combiner を外すと、shuffle の量は 2.5 MB から 108 MB と約 42 倍になりました。** map の出力 88 MB より shuffle の量が大きいのは、ディスク上の形式（IFile）がレコードごとにキーと値の長さを書き足すからです。`Spilled Records` の 3,000 万件は、やはり 1,000 万件が 3 回ディスクを通った数です。reduce の側では、2 つの map から各 28 MB を取得してメモリに置き、それでも reduce の前に 56 MB をディスクに書き直していました（`Merged 2 segments, 56327664 bytes to disk to satisfy reduce memory limit`）。
+
+単一ノードなので、ここでの shuffle はネットワークを越えていません。複数のノードなら、この 108 MB がノード間の通信になります。word count のように偏りの大きい分布では、combiner の効果がそのまま通信量に出ます。
+
+### 実験 4：2 つのジョブをつなぐ
+
+Hadoop に同梱の例 `grep` は、正規表現に合う文字列を数えるジョブ（`grep-search`）と、その結果を件数の順に並べるジョブ（`grep-sort`）の 2 本を順に投入します。ソースを読むと、1 本目の出力先は HDFS 上の一時ディレクトリ `grep-temp-<乱数>` で、2 本目はそこを入力として読み、終わったら消しています（[Grep.java](https://github.com/apache/hadoop/blob/rel/release-3.5.0/hadoop-mapreduce-project/hadoop-mapreduce-examples/src/main/java/org/apache/hadoop/examples/Grep.java)）。同じ入力に対して `w1[0-9]` で実行しました。
+
+```
+$ hadoop jar hadoop-mapreduce-examples-3.5.0.jar grep /in /out/grep 'w1[0-9]'
+05:45:24 Submitted application application_1790832026475_0005     ← grep-search
+05:45:58 Job job_1790832026475_0005 completed successfully
+         HDFS: Number of bytes read=47714609   HDFS: Number of bytes written=286
+         Map input records=1000000   Reduce output records=10
+05:45:58 Submitted application application_1790832026475_0006     ← grep-sort
+05:46:31 Job job_1790832026475_0006 completed successfully
+         HDFS: Number of bytes read=417   HDFS: Number of bytes written=110
+         Map input records=10   Reduce output records=10
+         Total time spent by all map tasks (ms)=5349
+         Total time spent by all reduce tasks (ms)=5720
+```
+
+ジョブは YARN の別々のアプリケーションになり、1 本目が HDFS に書いた 286 バイトを、2 本目が HDFS から読み直しています（417 バイトとの差の 131 バイトは、カウンタ `Input split bytes` と一致するので split の記述の分）。注目すべきは 2 本目の所要時間です。**入力は 10 件しかないのに、投入から完了まで 33 秒かかりました。** map と reduce が実際に動いた時間は合わせて約 11 秒で、残りは AM のコンテナの起動、タスク用のコンテナの割り当てと起動、出力の確定といった、ジョブ 1 本ごとの固定費です。この環境はエミュレーションで遅いので秒数そのものは割り引いて読む必要がありますが、**データの量に関係なく、ジョブを 1 本増やすごとに固定費が足される**という形は変わりません。この例では中間結果が小さいので目立ちませんが、結合や集計を何段も重ねる処理では、各段の結果がすべて HDFS に書かれ、複製され、次のジョブに読み直されます。
+
+## YARN：資源の管理とジョブの実行を分ける
+
+ここまで「AM がコンテナを要求する」と書いてきた仕組みが YARN です。YARN の文書は、その基本の考えを「**資源の管理と、ジョブのスケジューリング・監視を、別々のデーモンに分けること**」と述べています（[Apache Hadoop YARN](https://hadoop.apache.org/docs/r3.5.0/hadoop-yarn/hadoop-yarn-site/YARN.html)）。
+
+| 構成要素 | 数 | 役割 |
+| --- | --- | --- |
+| ResourceManager（RM） | クラスタに 1 つ（高可用構成では待機系あり） | 全アプリケーションの間で資源を調停する最終的な権限を持つ。中は Scheduler と ApplicationsManager に分かれる |
+| Scheduler（RM の中） | 1 つ | キューや容量の制約に従って資源を割り当てる。文書は「純粋なスケジューラ」で、アプリケーションの状態の監視も、失敗したタスクの再起動の保証もしない、と書いている |
+| ApplicationsManager（RM の中） | 1 つ | ジョブの投入を受け付け、AM 用の最初のコンテナを確保し、AM が落ちたら再起動する |
+| NodeManager（NM） | ノードごとに 1 つ | コンテナを起動し、CPU・メモリ・ディスク・ネットワークの使用量を監視して RM に報告する。ShuffleHandler のような補助サービスもここで動く |
+| ApplicationMaster（AM） | アプリケーションごとに 1 つ | フレームワーク固有のライブラリ。Scheduler と資源を交渉し、NM と協力してタスクを実行・監視する |
+| Container | 要求ごと | メモリや CPU コアなどの資源の束。タスク 1 つ、または AM がこの中で動く |
+
+**MapReduce に固有の知識は AM にしかない**、という点が要です。RM は「メモリ 384 MB・1 コアの箱を、できればこのノードに」という要求に応えるだけで、それが map なのか、Tez の頂点なのか、Spark のエグゼキュータなのかを知りません。YARN の文書も、アプリケーションは単一のジョブでも、ジョブの DAG（有向非巡回グラフ）でもよい、と書いています。
+
+コンテナの大きさの既定値は次のとおりです。
+
+| 設定 | 既定値 | 意味 |
+| --- | --- | --- |
+| `yarn.scheduler.minimum-allocation-mb` | 1024 | これより小さい要求は、この値に切り上げられる（実験では 256 に下げた） |
+| `yarn.scheduler.maximum-allocation-mb` | 8192 | これより大きい要求はエラーになる |
+| `yarn.scheduler.maximum-allocation-vcores` | 4 | 1 コンテナの CPU コア数の上限 |
+| `yarn.nodemanager.resource.memory-mb` | -1 | ノードがコンテナに貸せるメモリ。-1 でハードウェアの自動検出が有効なら計算し、そうでなければ 8192 MB |
+| `yarn.nodemanager.pmem-check-enabled` | true | コンテナが物理メモリの上限を超えたら止める |
+| `yarn.resourcemanager.nodemanagers.heartbeat-interval-ms` | 1000 | NM が RM に状態を報告する間隔 |
+
+map のメモリ `mapreduce.map.memory.mb` の既定値は -1 で、指定がなければ `-Xmx` から逆算し、それも無ければ 1024 MB とする、と説明されています。ヒープは既定でコンテナの 0.8 倍（`mapreduce.job.heap.memory-mb.ratio = 0.8`）です。コンテナの上限とヒープの上限は別物で、ヒープの外（スタックやネイティブのバッファ）も物理メモリの監視の対象になる点に注意が要ります。
+
+### スケジューラ：Capacity と Fair
+
+Scheduler は差し替えられる部品で、3.5.0 の既定は `CapacityScheduler` です（`yarn.resourcemanager.scheduler.class`）。もう 1 つの代表が `FairScheduler` です。
+
+| | Capacity Scheduler | Fair Scheduler |
+| --- | --- | --- |
+| 考え方 | 組織ごとに**容量を保証**したうえで 1 つの大きなクラスタを共有する | 全アプリケーションが、時間を平均すると**等しい取り分**を得る |
+| 中心の概念 | 階層化したキューと、その容量（%、重み、絶対量） | 階層化したキューと、その重み・最低保証量 |
+| 余った資源 | 他のキューが使ってよい（弾力性）。必要になったら返してもらう。プリエンプション（実行中のコンテナを止めて取り戻す）にも対応 | 使っていないキューの最低保証分は、他のアプリケーションに分けられる |
+| 資源の数え方 | 既定はメモリだけ（`DefaultResourceCalculator`）。CPU も数えるなら `DominantResourceCalculator` | 既定はメモリだけ。DRF（Dominant Resource Fairness。各利用者が最も多く使っている資源の割合をそろえる方式）も選べる |
+| 出典 | [Capacity Scheduler](https://hadoop.apache.org/docs/r3.5.0/hadoop-yarn/hadoop-yarn-site/CapacityScheduler.html) | [Fair Scheduler](https://hadoop.apache.org/docs/r3.5.0/hadoop-yarn/hadoop-yarn-site/FairScheduler.html) |
+
+Capacity Scheduler の文書は、組織ごとに専用のクラスタを持つと、ピークに合わせた大きさが必要になって平均の利用率が低くなる、だから共有したい、しかし他の組織に資源を取られるのは困る、という動機から書き起こしています。Fair Scheduler の文書は、1 つのアプリケーションだけならクラスタ全体を使い、後から来たアプリケーションには空いた資源から順に回して、最終的にほぼ同じ量に近づける、と説明しています。3.5.0 の主な変更点には、Capacity Scheduler の新しい管理画面の追加が挙がっています（[Apache Hadoop 3.5.0](https://hadoop.apache.org/docs/r3.5.0/index.html)）。
+
+## Hadoop 1 から 2 へ：JobTracker が抱えていたもの
+
+YARN の前、Hadoop 1 の MapReduce は、マスターの **JobTracker** と、各ノードの **TaskTracker** でできていました。YARN の論文（Vavilapalli ほか、SoCC 2013。[ACM DL](https://dl.acm.org/doi/10.1145/2523616.2523633)）の付録は、当時の構成を次のように説明しています。
+
+- TaskTracker には、運用者が決めた**固定の数の map スロットと reduce スロット**があった
+- TaskTracker は定期的に JobTracker へハートビートを送り、JobTracker はそのたびに、空いたスロットにデータ局所性を考えてタスクを割り当てた
+- JobTracker は、資源の割り当てに加えて、受け付けの制御、TaskTracker の死活監視、失敗したタスクの再実行、投機実行、ジョブの状態を見せる Web サーバー、監査ログ、利用者の認証なども 1 か所で担い、そのそれぞれが規模の上限を作っていた
+
+論文の本文は、これが生んだ問題を 2 つ挙げています。
+
+**スロットの型が固定されていたこと。** map スロットと reduce スロットの数は運用者が決めるので、空いている map スロットで reduce を動かすことはできず、その逆もできません。2 つの段は終わる速さが違うので、どう設定しても釣り合わず、利用率が下がりました。
+
+**MapReduce しか動かせなかったこと。** 機械学習のように同じデータを何度も繰り返し処理する計算や、グラフの計算は、MapReduce のジョブの列として書くとスケジューリングの負担で大きく遅れます。それでも Hadoop のクラスタしか無かったので、利用者は「map だけのジョブ」の中で別のフレームワークを起動するという使い方をし、スケジューラの前提を崩して利用率の低下やデッドロックを招いていた、と論文は書いています。
+
+YARN はこの 2 つを、**資源をスロットの型ではなく「メモリと CPU の量」で表す**ことと、**ジョブ固有の仕事を AM に移して JobTracker を解体する**ことで解きました。Hadoop 2 系の一般提供版（GA）は 2013 年 10 月 15 日の 2.2.0 です（[Release 2.2.0](https://hadoop.apache.org/release/2.2.0.html)）。YARN の文書は、Hadoop 2 の MapReduce は 1 系と API の互換性を保ち、既存のジョブは再コンパイルだけで YARN の上で動く、と書いています。
+
+論文が報告した Yahoo! の数字が、効果をよく表しています。最も混んでいた 2,500 台のクラスタで、運用チームが無理なく回せるジョブの数は約 7.7 万件から約 10 万件に増え、1 日 12.5 万件の処理を持続できました。CPU 使用率は 1 台あたり 16 コア中約 3.2 コア相当から約 6 コア相当へとほぼ倍になりました。論文は、この改善の大きな理由の 1 つが、map と reduce のスロットの固定的な分割を無くしたことだ、と書いています。一方で、1 クラスタの台数は YARN の前と同じ 4,000 台を超えて増やしておらず、利用率の改善で足りたので規模を広げる必要がなくなった、とも報告しています。
+
+| | Hadoop 1（MRv1） | Hadoop 2 以降（YARN） |
+| --- | --- | --- |
+| マスター | JobTracker（資源もジョブも全部） | ResourceManager（資源だけ） |
+| ジョブの管理 | JobTracker | ジョブごとの ApplicationMaster |
+| ワーカー | TaskTracker | NodeManager |
+| 資源の単位 | map スロット / reduce スロット（数は固定） | コンテナ（メモリと CPU の量） |
+| 動かせるもの | MapReduce だけ | AM を書けば何でも（MapReduce、Tez、Spark、Flink など） |
+
+## なぜ遅かったのか、そして Tez と Spark へ
+
+1 つのジョブの中だけ見ても、実験で見たとおり、map の出力はローカルディスクに書かれ、マージで書き直され、reduce の前にもう一度ディスクを通ります。これは障害に強くするための選択で、どのタスクが落ちても、ディスクに残った中間結果からやり直せます。
+
+**本当に重いのは、ジョブとジョブの間です。** MapReduce の 1 ジョブは「map → shuffle → reduce」の 1 段しか表せません。SQL の `JOIN` してから `GROUP BY` して `ORDER BY` するような処理は、何本ものジョブの列になり、**前のジョブの結果は毎回 HDFS に書かれ、次のジョブがそれを読み直します。** HDFS への書き込みは既定で 3 つの複製を作るので、中間結果を書くたびにネットワークとディスクに 3 倍の量が流れます。そのうえ、ジョブごとに AM とコンテナを起動する固定費がかかります。
+
+Spark の RDD の論文（Zaharia ほか、NSDI 2012。[PDF](https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf)）は、この点を動機として正面から書いています。既存のフレームワークでは、計算と計算の間（たとえば 2 つの MapReduce ジョブの間）でデータを使い回す唯一の方法は、分散ファイルシステムのような外部の安定したストレージに書くことで、複製、ディスクの入出力、直列化の負担が実行時間の大半を占めうる、という指摘です。同じ論文は、何もしない Hadoop のジョブでも、ジョブの準備、タスクの起動、後片付けだけで少なくとも 25 秒かかったと測っています。
+
+この問題に対する答えは 2 つの方向に分かれました。
+
+- **Apache Tez** は、YARN の上で**タスクの DAG を 1 つのジョブとして実行する**フレームワークです。Tez のサイトは、Hive や Pig が複雑な DAG を実行できるようにし、以前は複数の MR ジョブが必要だった処理を 1 つの Tez ジョブでできる、と説明しています（[Apache Tez](https://tez.apache.org/)。執筆時点の最新版は 2025 年 5 月 30 日の 0.10.5）。1 つのジョブにまとまるので、段と段の間の結果を、次のジョブのために HDFS へ書き戻す必要がなくなります。論文は SIGMOD 2015 で発表されました（[ACM DL](https://dl.acm.org/doi/10.1145/2723372.2742790)）
+- **Apache Spark** は、中間結果を**メモリに置いたまま次の計算に渡し**、失われたときは、どの変換で作ったかの記録（lineage）から作り直す、という方法を取りました。RDD の論文は、繰り返し計算で Hadoop より最大 20 倍速いと報告しています。中身は<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>で見ます
+
+Hive はこの流れの中で実行エンジンを MapReduce から Tez へ移しました。Hive の論文（Camacho-Rodríguez ほか、SIGMOD 2019。[arXiv](https://arxiv.org/abs/1903.10970)）は、Tez への移行と列指向の形式・ベクトル化によって、Hive のクエリの遅延が桁違いに下がったと書いています。執筆時点の最新の Hive 4.2.1 のソースでは、`hive.execution.engine` の既定値は `tez`、選べる値は `tez` と `mr` の 2 つだけで、`mr` には「歴史的なエンジンで、Hive 2 系で非推奨になっており、予告なく削除されうる」と注記されています（[HiveConf.java](https://github.com/apache/hive/blob/rel/release-4.2.1/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java)）。
+
+それでも MapReduce と YARN の設計は、後の世代にそのまま残っています。map の出力をパーティションごとに整列してローカルディスクに書き、reduce の側が取りに行くという shuffle の形は Spark の sort-based shuffle に、NodeManager の補助サービスとして shuffle のファイルを配る形は Spark の外部 shuffle サービス（YARN 上では NodeManager の補助サービスとして動かす。[Spark: Running on YARN](https://spark.apache.org/docs/latest/running-on-yarn.html#configuring-the-external-shuffle-service)）に、ほぼ同じ形で受け継がれています。分散処理に共通するこれらの仕組みは、<a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a>でまとめて整理します。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| InputSplit | 1 つの map タスクが処理する入力の範囲。ファイルなら既定でブロック 1 つ分 |
+| RecordReader | split のバイト列を (キー, 値) のレコードに直す部品。行の境界の処理もここ |
+| 環状バッファ（`MapOutputBuffer`） | map の出力を溜めるメモリ上の配列。大きさは `io.sort.mb` |
+| spill | バッファの中身を整列してローカルディスクに書き出すこと |
+| パーティショナ | map の出力をどの reduce に送るかを決める部品。既定はキーのハッシュ値による |
+| combiner | map の側で同じキーの値を先にまとめる処理。spill のときと、spill が 3 回以上あれば最後のマージのときに走る |
+| ShuffleHandler | NodeManager の中で map の出力を HTTP で配るサービス |
+| OutputCommitter | タスクとジョブの出力を確定させる部品。既定は rename で確定する `FileOutputCommitter` |
+| 投機実行 | 遅いタスクを別の場所でもう 1 つ動かし、先に終わったほうを使うこと |
+| ResourceManager / NodeManager | YARN のクラスタ全体の資源の管理者 / ノードごとの実行役 |
+| ApplicationMaster | アプリケーションごとに 1 つ動き、資源を交渉してタスクを実行・監視するプロセス |
+| コンテナ | メモリと CPU コアの量で表した資源の束 |
+| JobTracker / TaskTracker | Hadoop 1 のマスター / ワーカー。YARN で解体された |
+| スロット | Hadoop 1 の、型（map 用か reduce 用か）と数が固定された実行枠 |
+| Apache Tez | YARN の上でタスクの DAG を 1 つのジョブとして実行するフレームワーク |
+
+似た用語の区別を 3 つ補います。
+
+- **spill と Spilled Records**：spill は map のバッファからの書き出しのことですが、カウンタの `Spilled Records` は、map のマージや reduce の側でディスクに書いた件数も含みます。実験で `Spilled Records` が shuffle の件数のちょうど 3 倍になったのはこのためです。
+- **combiner と reducer**：word count では同じクラスを使えますが、combiner は 0 回も複数回も走りうるので、何回まとめても結果が変わらない演算（足し算や最大値）にしか使えません。平均はそのままでは使えず、「合計と件数」の組にして送る必要があります。
+- **ResourceManager と ApplicationMaster**：RM はどのアプリケーションにどれだけの資源を渡すかだけを決め、AM はもらった資源で何をするかを決めます。Hadoop 1 の JobTracker は、この両方を 1 つで行っていました。
+
+## まとめ
+
+- Hadoop のジョブは、クライアントが入力を split に分けて投入し、ジョブごとの ApplicationMaster が map と reduce のコンテナを要求して実行する
+- map の出力は 100 MB（`io.sort.mb`）の環状バッファに溜まり、80% で spill され、パーティション → キーの順に整列して、ローカルディスクの 1 つのファイルにマージされる。メタデータは 1 件 16 バイトで、小さいレコードほどバッファを早く使い切る
+- reduce は NodeManager の ShuffleHandler から HTTP で自分の区画を取得し、メモリとディスクを使い分けながらマージする。既定では reduce の前に全部いったんディスクに書く
+- 出力は OutputCommitter が確定させる。3.5.0 の既定は、タスクごとに最終ディレクトリへ移す版 2 で、完了は `_SUCCESS` で判断する
+- 実験では、spill が 2 回だと最後のマージで combiner が走らず、shuffle の件数が 2 倍になった。バッファを小さくして spill を 3 回以上にすると shuffle は半分になったが、ローカルディスクの読み書きは spill の数とともに増え、10 を超えるとマージが何段にも分かれた
+- combiner を外すと、shuffle の量は約 42 倍の 108 MB になった
+- YARN は資源の管理（RM）とジョブの管理（AM）を分け、資源を固定のスロットではなくメモリと CPU の量で表した。これで利用率が上がり、MapReduce 以外のフレームワークも同じクラスタで動かせるようになった
+- MapReduce が遅かった主な理由は、ジョブとジョブの間の中間結果が毎回 HDFS（複製 3 つ）を経由し、ジョブごとに起動の固定費がかかること。Tez は DAG を 1 つのジョブにし、Spark は中間結果をメモリに置いて lineage で作り直す方向に進んだ
+
+この回で見た「段と段の間でデータをどう渡すか」の答えを、メモリと lineage の側に大きく振ったのが Spark です。RDD とは何か、ジョブがどこでステージに分かれ、shuffle のファイルがどう書かれ、SQL がどう最適化されるのかを、<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>で実際に動かしながら見ていきます。

@@ -1,0 +1,388 @@
+---
+title: マネージドの分散処理（Dataproc・EMR・Databricks）
+description: Spark を動かすマシンを、誰が用意し、誰が直し、誰が止めるのか。Dataproc・EMR・Databricks・Glue を、運用の責任分担と課金の単位から読み比べます
+category: compute
+order: 25
+status: published
+topics:
+  - Managed Service for Apache Spark
+  - Dataproc
+  - Amazon EMR
+  - EMR Serverless
+  - Databricks
+  - Photon
+  - AWS Glue
+  - Azure HDInsight
+  - Spot VM
+  - Autoscaling
+  - Graceful Decommissioning
+  - Ephemeral Cluster
+  - Shared Responsibility
+  - Data Compute Unit
+basedOn:
+  - kind: article
+    slug: line-sweep
+    why: 常時稼働のクラスタの大きさは、ジョブの開始と終了をイベントとして時刻順に並べ、同時に走るジョブの最大数を数えることで決まる
+  - kind: article
+    slug: difference-array
+    why: 自動スケーリングのあるクラスタの課金量（何台を何秒動かしたか）は、時刻ごとの台数の増減を記録し、最後に累積して足し合わせる形をしている
+---
+
+import Callout from '../../components/Callout.astro'
+
+## エンジンの中身から、エンジンを載せる台へ
+
+ここまでの回では、<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop</a>、<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark</a>、<a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>Flink と Beam</a>、<a href={`${import.meta.env.BASE_URL}reading/compute-mpp-sql/`}>Trino と BigQuery</a> の内部を見てきました。どのエンジンも、最後は誰かが用意したマシンの上で動きます。今回はその「台」の側を扱います。
+
+自分で Spark を動かすなら、VM を借り、OS を入れ、Hadoop と Spark の版を揃え、YARN を設定し、壊れたノードを入れ替え、使い終わったら止める必要があります。**マネージドサービスは、この作業のどこまでを事業者が引き受けるかで区別できます。** 同じ「マネージドの Spark」でも、クラスタを丸ごと渡されて大きさは自分で決めるものから、コードを渡すだけで台数すら見えないものまで幅があります。
+
+この回は実際には動かさず、各社の公式文書を突き合わせて書いています。執筆時点は 2026 年 10 月 1 日です。版番号や料金はこの日付時点のもので、変わりやすいことに注意してください。
+
+<Callout type="note" title="Dataproc は「Managed Service for Apache Spark」になりました">
+  Google Cloud は 2026 年 4 月 3 日、Dataproc と Google Cloud Serverless for Apache Spark（その前の名前は Dataproc Serverless for Spark）をコンソール上で **Managed Service for Apache Spark** という 1 つの名前にまとめました。リリースノートは、機能の削除はなく、Dataproc API、クライアントライブラリ、gcloud CLI、IAM のロール名と権限名には影響しないと述べています（[Managed Service for Apache Spark release notes, April 03, 2026](https://docs.cloud.google.com/managed-spark/docs/release-notes)）。旧 Dataproc on Compute Engine は**クラスタ展開**、旧 Serverless for Apache Spark は**サーバーレス展開**と呼ばれます（[Compare deployments](https://docs.cloud.google.com/managed-spark/docs/concepts/serverless-spark-compare)）。コマンドは今も `gcloud dataproc ...` で、文書の URL も `/managed-spark/` と `/dataproc/` が混在しています。この記事では、通じやすさを優先して「Dataproc」とも書きます。
+</Callout>
+
+## 何を預けるのか：責任分担の表
+
+まず全体像です。行は「やらなければならない作業」、列はサービスの形です。「利用者」は自分でやる、「事業者」はサービスがやる、「選ぶ」は値を選べば後はサービスがやる、という意味です。
+
+| 作業 | VM に自前で構築 | Dataproc クラスタ / EMR on EC2 | EMR on EKS | Databricks クラシック | Dataproc サーバーレス / EMR Serverless / Glue / Databricks サーバーレス |
+| --- | --- | --- | --- | --- | --- |
+| VM の調達と起動 | 利用者 | 事業者（利用者のプロジェクト・アカウント内に作る） | 利用者（EKS のノード） | 事業者（利用者のアカウント内に作る） | 事業者（VM は見えない） |
+| OS と Hadoop/Spark の導入、版の組み合わせ | 利用者 | 選ぶ（イメージ版・リリース版） | 選ぶ（リリース版） | 選ぶ（ランタイム版） | 選ぶ（ランタイム版。細かい版は事業者） |
+| 台数と機種 | 利用者 | 利用者（自動スケーリングの方針を書く） | 利用者（Kubernetes 側） | 利用者（最小・最大を書く） | 事業者（上限だけ書ける場合が多い） |
+| 回収・故障したノードの補充 | 利用者 | 事業者（Spot の回収後の補充など） | Kubernetes と利用者 | 事業者 | 事業者 |
+| 使っていないときに止める | 利用者 | 利用者（自動削除の設定はある） | 利用者 | 利用者（自動終了の設定はある） | 事業者 |
+| ジョブのコードと Spark の設定 | 利用者 | 利用者 | 利用者 | 利用者 | 利用者（変えられる設定は限られる） |
+| データの置き場所とテーブルの台帳 | 利用者 | 利用者 | 利用者 | 利用者 | 利用者 |
+
+この表は各社の文書の記述をもとにした概略で、細部はサービスや設定によって違います。右に行くほど利用者の作業が減りますが、**最後の 2 行はどの列でも利用者に残ります。** どんなに管理を預けても、何を計算するか、データをどこに置き、どの台帳で表として見せるかは利用者の仕事です。もう 1 つの違いは、**どこまで中に手を入れられるか**です。左の列ほど、OS の設定や任意のソフトウェアまで変えられ、右の列ほど変えられることが減ります。たとえば Dataproc では、クラスタ展開は VM に SSH で入れますが、サーバーレス展開は入れません。Google Cloud の比較表も、クラスタ展開は「クラスタの構成、機種、ソフトウェアをより細かく制御できる」、サーバーレス展開は「インフラの制御が少なく、コードの提出と Spark のパラメータ指定に集中する」と整理しています（[Compare deployments](https://docs.cloud.google.com/managed-spark/docs/concepts/serverless-spark-compare)）。
+
+## Dataproc のクラスタ展開
+
+### クラスタとジョブ
+
+クラスタ展開の基本単位は**クラスタ**（Compute Engine の VM の集まり）と**ジョブ**（PySpark のスクリプトや Hive のクエリなど、1 回の仕事）です。ジョブはクラスタに直接投げるのではなく Dataproc の API に提出し、Dataproc が実行を管理します（[Key concepts](https://docs.cloud.google.com/managed-spark/docs/overview/key-concepts)）。クラスタの中身は普通の Hadoop です。マスターノードで YARN の ResourceManager と HDFS の NameNode が動き、ワーカーで NodeManager と DataNode が動きます。YARN の仕組みそのものは<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の中身</a>で見たとおりです。
+
+料金の面では、Dataproc は「平均 90 秒以内に起動・拡縮・停止できる」ことと、秒単位・最小 1 分の課金を利点に挙げています（[Clusters overview](https://docs.cloud.google.com/managed-spark/docs/concepts/clusters-overview)）。起動が数分かからないことが、後で見る「ジョブごとにクラスタを作って捨てる」使い方の前提になります。
+
+### イメージバージョン
+
+クラスタに入る OS、Hadoop、Spark、Hive、Cloud Storage コネクタなどの組み合わせは、**イメージバージョン**という 1 つの番号で決まります。`2.3-debian12` のように「マイナー版 + OS」で指定し、Debian なら OS の部分を省けます（[Image version lists](https://docs.cloud.google.com/managed-spark/docs/concepts/versioning/image-version-lists)）。執筆時点のサポート状況は次のとおりです。
+
+| イメージ | 公開日 | サポート終了 | 作成できなくなる日 |
+| --- | --- | --- | --- |
+| 3.0 | 2026-07-15 | 2028-07-15 | 2030-07-15 |
+| 2.3 | 2025-06-09 | 2027-06-09 | 2029-06-09 |
+| 2.2 | 2023-12-08 | 2027-03-31 | 2027-12-31 |
+| 2.1 | 2022-12-12 | 2026-03-31（終了済み） | 2026-12-31 |
+
+各イメージは公開から 24 か月サポートされ、1.x と 2.0 は 2026 年 8 月 25 日にクラスタを作れなくなりました（同ページ）。3.0 は Hadoop 3.5.0、Hive 4.2.0、Spark 4.1.2、Java 21 を含む「中核の部品だけを入れた軽いイメージ」で、Flink や Trino などは作成時に**オプションコンポーネント**として追加します（[Image version 3.0](https://docs.cloud.google.com/managed-spark/docs/concepts/versioning/image-release-3.0)、[release notes, July 15, 2026](https://docs.cloud.google.com/managed-spark/docs/release-notes)）。
+
+ここで大事なのは、**一度作ったクラスタのイメージは古いまま残る**ことです。新しい細かい版（サブマイナー版）が出ても、動いているクラスタは自動では上がりません。2026 年には、Conda の既定チャネルを外した新イメージへの移行に伴い、「既存クラスタは削除して作り直す必要がある場合がある」という告知も出ています（[release notes, June 22, 2026](https://docs.cloud.google.com/managed-spark/docs/release-notes)）。**長く動かし続けるクラスタほど、版の追従を自分で計画しなければなりません。**
+
+### 初期化アクション
+
+イメージに無いものを入れる手段が**初期化アクション**です。Cloud Storage に置いたスクリプトを指定すると、クラスタの全ノードで、セットアップ直後に root 権限で実行されます。既定のタイムアウトは 10 分で、ノードの役割（Master / Worker など）はメタデータから読んで分岐させます（[Initialization actions](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/init-actions)）。
+
+```bash
+# 公式文書の例を簡略化したもの（実行はしていない）
+gcloud dataproc clusters create my-cluster \
+    --region=us-central1 \
+    --initialization-actions=gs://my-bucket/init/v1.0/install-deps.sh \
+    --initialization-action-timeout=10m
+```
+
+同じ文書には運用上の注意が並んでいます。初期化アクションは**拡縮で追加されたノードでも実行される**こと。そのため、スクリプトをその場で書き換えると、後から増えたノードだけが新しいスクリプトで作られ、ノード間で中身が食い違うこと。対策として、版名を付けた新しいフォルダに置き直すこと。Google が公開しているサンプルのバケットを本番から直接参照せず、自分のバケットにコピーすること。起動のたびに同じ処理をするのが重いなら、あらかじめ焼き込んだ**カスタムイメージ**を使う方法もあります。
+
+### Component Gateway
+
+クラスタの中では YARN の ResourceManager、Spark History Server、Jupyter などが Web 画面を持っています。**Component Gateway** は、SSH トンネルやファイアウォールの穴あけなしに、これらの画面へ認証付きでつなぐ仕組みです。有効にすると、最初のマスターノードに Apache Knox と Inverting Proxy が追加され、`dataproc.clusters.use` 権限を持つ利用者だけが Google Cloud コンソールのリンクから画面を開けます。Knox の既定の証明書はクラスタ作成から 13 か月有効で、切れると画面に入れなくなります（[Component Gateway](https://docs.cloud.google.com/managed-spark/docs/concepts/accessing/gateways)）。
+
+YARN の Web 画面と同じポートでは REST API も動いており、画面に届く人はアプリケーションの投入もできてしまいます（[Cluster web interfaces](https://docs.cloud.google.com/managed-spark/docs/concepts/accessing/cluster-web-interfaces)）。**Web 画面のポートをインターネットに開けない**のが前提で、Component Gateway はその前提のまま画面を見るための道具です。
+
+### プライマリワーカーとセカンダリワーカー
+
+Dataproc のワーカーは 2 種類あります。**プライマリワーカー**は HDFS の DataNode を持ち、**セカンダリワーカー**は計算だけを担います（[Autoscaling](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/autoscaling)）。セカンダリワーカーのディスクはローカルのキャッシュ用で、HDFS には使われません（[Secondary workers](https://docs.cloud.google.com/managed-spark/docs/concepts/compute/secondary-vms)）。
+
+この区別が意味を持つのは、**セカンダリワーカーには安い VM を使える**からです。種類は次の 3 つです（同ページ）。
+
+| 種類 | 性質 |
+| --- | --- |
+| 標準のプリエンプティブル VM（既定） | Google Cloud の都合で回収されうる。最長 24 時間 |
+| Spot VM | 新しい形のプリエンプティブル VM。料金体系は同じで、最長時間の制限が無い |
+| 非プリエンプティブル VM | 通常の VM。回収されない |
+
+Spot と非プリエンプティブルを混ぜることもできます。たとえばセカンダリワーカー 15 台、`standardCapacityBase` を 5、`standardCapacityPercentAboveBase` を 30% にすると、まず通常 VM を 5 台、残り 10 台のうち 30% の 3 台を通常 VM、7 台を Spot にします（同ページ）。
+
+回収されうる VM は**データを持たせない**ことが鉄則です。HDFS のブロックを持つノードが突然消えると、複製の作り直しが走り、最悪はデータを失います。DataNode を持たないセカンダリワーカーだけを安い VM にするのは、この危険を避けるための分け方です。それでも、回収されたノードで動いていたタスクは失敗するので、文書は「プリエンプティブルの台数は全ワーカーの 50% 未満に抑える」こと、タスクの再試行回数を増やすことを勧め、回収で実行時間が延びれば**かえって高くつくことがある**とも注意しています（同ページ）。EMR も同じ考え方で、HDFS を持つコアノードに Spot を使うことには注意を促し、Spot は主に計算専用のタスクノードに使うとしています（[Amazon EMR: primary, core, and task nodes](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-master-core-task-nodes.html)）。
+
+### 自動スケーリングポリシー
+
+台数を負荷に合わせて変えるのが**自動スケーリングポリシー**です。YAML で書き、クラスタと同じリージョンに登録します。公式の例を見ます（[Autoscaling](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/autoscaling)）。
+
+```yaml
+# 公式文書の例（標準クラスタ用、必須項目のみ）
+workerConfig:
+  minInstances: 10
+  maxInstances: 10        # プライマリは増減させない
+secondaryWorkerConfig:
+  maxInstances: 50
+basicAlgorithm:
+  cooldownPeriod: 4m      # 既定は 2m
+  yarnConfig:
+    scaleUpFactor: 0.05
+    scaleDownFactor: 1.0
+    gracefulDecommissionTimeout: 1h
+```
+
+判断の材料は YARN の空き具合と待ち行列のメモリ量で、`scaleUpFactor` は「足りない分のうちどれだけを一度に足すか」、`scaleDownFactor` は「余っている分のうちどれだけを一度に減らすか」です。`cooldownPeriod` は 1 回の変更のあと次の判断までに待つ時間です。
+
+この例でプライマリワーカーの最小と最大を同じ 10 にしているのは偶然ではありません。文書は「プライマリワーカーを増減させない」ことを推奨し、HDFS の NameNode には廃止処理が止まったまま進まなくなる競合があり得ると説明しています（同ページ）。**増減させるのはデータを持たないセカンダリワーカーだけ**、というのが前の節と同じ原則です。
+
+なお、3.0 イメージでは YARN の資源計算が DominantResourceCalculator（メモリと CPU のうち逼迫しているほうで判断する方式）に変わり、自動スケーリングの判断にも影響します（[Image version 3.0](https://docs.cloud.google.com/managed-spark/docs/concepts/versioning/image-release-3.0)）。また、プライマリワーカーを持たずセカンダリワーカーだけを 0 台から増減させる `ZERO_SCALE` という種類のクラスタもあります（[Autoscaling](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/autoscaling)）。
+
+### グレースフル・デコミッションと shuffle
+
+台数を減らすとき、動いているジョブはどうなるのでしょうか。ノードを即座に消すと、そこで動いていたタスクと、そこに置かれていた **shuffle の中間データ**（<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>で見た、次のステージが取りに来るファイル）が失われます。次のステージは取りに行けず、前のステージをやり直すことになります。
+
+**グレースフル・デコミッション**（穏やかな廃止）は、YARN の機能を使い、ノードに新しい仕事を割り当てるのをやめたうえで、実行中のアプリケーションが終わるのを待ってから消す仕組みです。待つ上限が `gracefulDecommissionTimeout` で、gcloud から手動で縮める場合の既定は 0（即座に消す）、上限は 1 日です（[gcloud dataproc clusters update](https://docs.cloud.google.com/sdk/gcloud/reference/dataproc/clusters/update)）。自動スケーリングの文書は、この値を**クラスタで最も長いジョブより長く**するよう勧め、1 時間を超えるジョブは専用のエフェメラルクラスタに移すことも勧めています。また、廃止処理の途中は自動スケーリングが台数を増やさないことにも触れています（[Autoscaling](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/autoscaling)）。長いジョブが 1 本あるだけで、縮小も拡大も止まりうるわけです。
+
+もう 1 つの対策が **Enhanced Flexibility Mode（EFM）** です。Spark の shuffle データを、セカンダリワーカーではなくプライマリワーカーに書かせます。セカンダリワーカーが消えても中間データは残るので、回収や縮小の影響を受けにくくなります。代わりにプライマリワーカーの CPU、ディスク、ネットワークに shuffle の負荷が集まるので、文書はまずプライマリとセカンダリを 1 対 1 で始め、プライマリの負荷を監視するよう勧めています。EFM はグレースフル・デコミッションと目的がぶつかるため併用は推奨されず、EFM を使う自動スケーリングでは廃止のタイムアウトを `0s` にします（[Enhanced Flexibility Mode](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/enhanced-flexibility-mode)、[Autoscaling](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/autoscaling)）。
+
+shuffle の中間データを計算ノードの外に逃がすという考え方は、Spark の外部 shuffle サービスや、BigQuery の分離された shuffle 層と同じ方向です。一般論は<a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a>で扱います。
+
+### エフェメラルクラスタとワークフローテンプレート
+
+ここまでの設定を毎回手で行うのは大変です。**ワークフローテンプレート**は、ジョブの依存関係（DAG）と、それをどこで動かすかを 1 つの定義にまとめたものです。動かす場所の指定には 2 種類あります（[Workflow templates overview](https://docs.cloud.google.com/managed-spark/docs/concepts/workflows/overview)）。
+
+- **マネージドクラスタ**：ワークフローの開始時にクラスタを作り、ジョブを流し、終わったら削除する。これが**エフェメラル**（その場限り）なクラスタ
+- **クラスタセレクタ**：ラベルで既存のクラスタを選び、その上で流す。終わってもクラスタは消さない
+
+文書は、エフェメラルなクラスタは 1 種類の仕事しか流さないので大きさを決めやすいこと、作成、投入、完了待ち、削除の手順を 1 つの操作にまとめられることを利点に挙げています。どれか 1 つのジョブが失敗すると、ワークフロー全体が失敗し、並行中のジョブも止められます（[Use workflows](https://docs.cloud.google.com/managed-spark/docs/concepts/workflows/use-workflows)）。
+
+テンプレートを使わない場合でも、**スケジュール削除**でクラスタの消し忘れを防げます。`--delete-max-idle` はジョブが無い状態が指定時間続いたら削除する設定で、最小 5 分、最大 14 日です。作成からの経過時間や日時で削除する `--delete-max-age` / `--delete-expiration-time` もあります。既定では YARN のアプリケーションも見て「暇かどうか」を判断します（[Scheduled deletion](https://docs.cloud.google.com/managed-spark/docs/concepts/configuring-clusters/scheduled-deletion)）。
+
+### Dataproc Metastore
+
+クラスタを使い捨てにすると、困るのがテーブルの台帳です。クラスタの中で Hive metastore を動かしていたら、クラスタを消すと表の定義も消えます。**Dataproc Metastore** は、Hive metastore（HMS）をクラスタの外に置くマネージドサービスで、複数のエフェメラルクラスタから同じ台帳を共有する使い方が想定されています（[Dataproc Metastore overview](https://docs.cloud.google.com/dataproc-metastore/docs/overview)）。新しい世代の Dataproc Metastore 2 は横方向の拡張とリージョンをまたぐ高可用性を持ちます。HMS そのものの役割は<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>で見たとおりです。Iceberg の表を中心にする場合は、BigQuery 側のカタログ（Google は旧 BigLake metastore に代えて Lakehouse runtime catalog を勧めています）を使う道もあります（[Manage open source metadata](https://docs.cloud.google.com/bigquery/docs/manage-open-source-metadata)）。
+
+## Dataproc のサーバーレス展開
+
+クラスタ展開を「Spark のクラスタを貸す」サービスとすれば、サーバーレス展開は「Spark のジョブを請け負う」サービスです。利用者はバッチ（1 回のジョブ）か対話セッションを投げるだけで、VM も YARN も見えません。比較表から主な違いを抜き出します（[Compare deployments](https://docs.cloud.google.com/managed-spark/docs/concepts/serverless-spark-compare)）。
+
+| 項目 | サーバーレス展開 | クラスタ展開 |
+| --- | --- | --- |
+| 動かせるもの | Spark のバッチと対話セッション | Spark に加え Hive、Flink、Trino、Kafka など |
+| 資源の管理 | サーバーレス | YARN |
+| 起動時間（表の値） | 50 秒 | 120 秒 |
+| 課金の対象 | ジョブの実行中に使った資源。起動と停止の時間は含まない | クラスタが動いている時間。起動と停止の時間を含む |
+| 版の固定 | マイナー版まで。細かい版は事業者が上げる | マイナー版とサブマイナー版まで固定できる |
+| SSH | できない | できる |
+| Spot VM、予約の再利用 | できない | できる |
+
+サーバーレス展開には標準とプレミアムの 2 つの階層があります。プレミアムでは、C++ で書かれたベクトル化実行エンジン **Lightning Engine** が既定で有効になり、GPU や対話セッションもこの階層で扱われます（[Tiers](https://docs.cloud.google.com/managed-spark/docs/tiers)）。リリースノートでは Lightning Engine の実体として Velox（Meta 発の C++ 実行ライブラリ）と Gluten の設定名が現れます（[release notes, September 04, 2026](https://docs.cloud.google.com/managed-spark/docs/release-notes)）。クラスタ展開でも追加料金で使えます。
+
+## Amazon EMR
+
+AWS の EMR には、計算資源の持ち方が違う 3 つの形があります。
+
+### EMR on EC2：プライマリ、コア、タスク
+
+最も古い形で、Dataproc のクラスタ展開に当たります。ノードは 3 種類です（[Amazon EMR: primary, core, and task nodes](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-master-core-task-nodes.html)）。
+
+| ノード | 役割 | Dataproc での対応 |
+| --- | --- | --- |
+| プライマリノード | YARN ResourceManager と HDFS NameNode。3 台構成で高可用にできる（5.23.0 以降） | マスターノード |
+| コアノード | HDFS の DataNode と計算 | プライマリワーカー |
+| タスクノード | 計算だけ。HDFS を持たない | セカンダリワーカー |
+
+タスクノードには Spot がよく使われるため、EMR は YARN の**ノードラベル**で、ジョブ全体を見張る ApplicationMaster をコアノード（7.x では On-Demand のノードとも指定できる）だけに置けるようにしています。ApplicationMaster が Spot の回収で消えると、ジョブ全体が失敗するからです（同ページ）。
+
+台数と機種の指定には 2 つの方式があります。**インスタンスグループ**は、1 つのグループに 1 種類の機種と 1 つの購入方式（On-Demand か Spot）を割り当てる方式です。**インスタンスフリート**は、ノードの種類ごとに複数の機種を候補として並べ、「On-Demand で何単位、Spot で何単位」という目標容量を書く方式です。候補はコンソールで最大 5 種類、CLI か API で割り当て戦略を使えば最大 30 種類で、Spot の割り当て戦略は 6.10.0 以降 `price-capacity-optimized`（空きが多く安いプールから取る）が既定です。Spot が取れないときに一定時間で On-Demand に切り替える設定もあります（[Instance fleets](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-instance-fleet.html)）。**特定の機種が品切れでも、別の機種で容量を埋められる**ことが、Spot を大量に使うときの要点です。Dataproc にも、機種の候補に順位を付けて並べる Flexible VM があり、3.0 イメージでは機種を指定しないとこれが使われます。
+
+台数の自動調整は **EMR マネージドスケーリング**が担い、最小・最大の容量、On-Demand の上限、コアノードの上限を指定します。YARN 上のアプリケーション（Spark、Hive、Flink など）だけが対象で、Presto や HBase には効きません。縮小時には shuffle データを持つノードを避ける仕組みも入っています（[Managed scaling](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-managed-scaling.html)）。初期化アクションに当たるものは**ブートストラップアクション**です。
+
+使い終わったら消す使い方も用意されています。最後のステップ（投入した仕事）が終わったら EC2 インスタンスを終了させる設定（CLI の `--auto-terminate`）があり、API で作ったクラスタではこれが既定です。逆にコンソールや CLI で作ったクラスタは既定で常時稼働で、止めるまで料金がかかります（[Long-running and transient clusters](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-plan-longrunning-transient.html)）。
+
+執筆時点の最新は EMR 7.14.0（2026 年 9 月 8 日公開）で、Spark 3.5.8、Hadoop 3.4.2、Trino 479 などを含みます（[Amazon EMR release 7.14.0](https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-7140-release.html)）。
+
+### EMRFS から S3A へ
+
+EMR で S3 を読み書きする部品は、長く **EMRFS** でした。HDFS と同じインタフェースで S3 を扱う、EMR 独自の実装です。S3 がまだ結果整合だった頃は、オブジェクトのメタデータを DynamoDB の表に記録して一覧と読み出しの整合性を確かめる「consistent view」という機能もありましたが、S3 が 2020 年 12 月 1 日に強い整合性を持つようになって不要になりました（[Consistent view](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-plan-consistent-view.html)、<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>）。出力の確定には、rename に頼らない **EMRFS S3 最適化コミッタ**を使います。文書は、このコミッタを使わずに Spark の投機実行（遅いタスクの複製を走らせる機能）を有効にすると、データが欠けることがあると警告しています（[EMR File System (EMRFS)](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-fs.html)）。
+
+そして **EMR 7.10.0 から、既定の S3 コネクタは EMRFS から Apache Hadoop の S3A に替わりました**（同ページ）。Glue 6.0 では EMRFS が取り除かれ、S3A が唯一の S3 コネクタです（[AWS Glue versions](https://docs.aws.amazon.com/glue/latest/dg/release-notes.html)）。事業者独自の部品が、オープンソースの部品へ戻っていく流れです。
+
+### EMR on EKS と EMR Serverless
+
+**EMR on EKS** は、利用者が持っている Kubernetes（Amazon EKS）のクラスタの上で EMR の Spark を動かす形です。EMR を登録した Kubernetes の名前空間を**仮想クラスタ**と呼び、ジョブはこの仮想クラスタに投げます。仮想クラスタ自体は課金の対象になる資源を作りません（[EMR on EKS concepts](https://docs.aws.amazon.com/emr/latest/EMR-on-EKS-DevelopmentGuide/emr-eks-concepts.html)）。**ノードの調達と管理は Kubernetes 側、つまり利用者の仕事に残る**ので、すでに EKS を運用しているチームが、他のアプリケーションと計算資源を共有したいときに向きます。
+
+**EMR Serverless** は、Dataproc のサーバーレス展開に当たります。利用者は「アプリケーション」を作り、そこにジョブを投げます。起動を速くしたい場合は、**事前初期化容量**としてドライバとワーカーを温めておけますが、温めている間はジョブが無くても料金がかかります。アプリケーションは暇になると自動で止まり、事前初期化容量を手放すまでの既定の待ち時間は 15 分です（[Pre-initialized capacity](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/pre-init-capacity.html)）。「起動の速さ」と「暇なときの料金」の取引が、サーバーレスにも形を変えて残っているわけです。
+
+## Databricks
+
+Databricks は、Spark の作者たちが作った会社のサービスで、AWS、Azure、Google Cloud の上で動きます。
+
+### 制御プレーンと 2 つの計算プレーン
+
+Databricks の構成は、Databricks のアカウントにある**制御プレーン**（ワークスペース、ジョブの管理などの裏側）と、実際に計算する**計算プレーン**に分かれます。計算プレーンは 2 種類あります。**クラシック計算プレーン**は利用者のクラウドアカウントの中にあり、VM も利用者のアカウントで動きます。**サーバーレス計算プレーン**は Databricks のアカウントの中にあります（[High-level architecture](https://docs.databricks.com/aws/en/getting-started/high-level-architecture)）。責任分担の表で Databricks のクラシックが「事業者が VM を作るが、置き場所は利用者のアカウント」になっているのはこのためです。
+
+### 計算資源の種類
+
+Databricks の文書は計算資源を次のように分けています（[Compute](https://docs.databricks.com/aws/en/compute/)）。
+
+| 種類 | 内容 |
+| --- | --- |
+| ノートブック用サーバーレス | 対話的な Python と SQL。インフラの管理は不要 |
+| ジョブ用サーバーレス | Lakeflow Jobs（Databricks のジョブ実行機能）を、インフラを設定せずに動かす |
+| パイプライン用サーバーレス | Lakeflow のパイプラインを動かす |
+| クラシック計算 | 利用者が作り、設定し、管理する。複数人で共有する Standard と、1 人または 1 グループ専用の Dedicated がある |
+| インスタンスプール | 起動済みの VM を待機させ、起動時間を縮める |
+| SQL ウェアハウス | SQL と BI 向け。サーバーレスとクラシックがある |
+
+クラシック計算には、対話的に使い続ける**汎用（all-purpose）計算**と、ジョブの実行時に作られ、終わると消える**ジョブ計算**があります。ジョブ計算は Dataproc のマネージドクラスタと同じ「エフェメラル」な使い方で、Databricks のコスト最適化の文書は、対話的でない処理はジョブ計算で動かすほうが汎用計算より大幅に安いと述べています（[Jobs compute](https://docs.databricks.com/aws/en/jobs/compute)、[Cost optimization best practices](https://docs.databricks.com/aws/en/lakehouse-architecture/cost-optimization/best-practices)）。ジョブのタスクでは、対応するものはサーバーレスが既定です。
+
+サーバーレス計算には制約もあります。Spark Connect（クライアントとサーバーを分け、計画をサーバー側で解析する Spark の接続方式）の API だけが使え、RDD の API は使えません。ノートブックでは Scala と R も使えず、変えられる Spark の設定も限られます（[Serverless compute limitations](https://docs.databricks.com/aws/en/compute/serverless/limitations)）。**管理を預けるほど、中に手を入れる自由が減る**という責任分担の表の傾向が、ここでも現れています。
+
+### Photon
+
+**Photon** は Databricks のベクトル化実行エンジンで、対応している演算については JVM の Spark SQL の実行部分を C++ の実装に置き換えます。Spark の API と互換で、クラシックの汎用計算、ジョブ計算、クラシックのパイプラインでは既定で有効です。UDF、RDD、Dataset の API には効かず、状態を持つストリーミングにも対応しません。もともと 2 秒以内で終わるクエリは速くならないとも書かれています（[Photon](https://docs.databricks.com/aws/en/compute/photon)）。
+
+Google の Lightning Engine も同じ方向の部品です。<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>で見た Catalyst による計画づくりは残し、計画を実行する部分だけを列単位・C++ に替えるという設計が、各社の差別化の中心になっています。列単位で処理する利点そのものは<a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a>で扱います。テーブル形式の Delta Lake は、<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式</a>の回を参照してください。
+
+## AWS Glue
+
+**AWS Glue** の ETL ジョブは、Spark のジョブをサーバーレスで動かすサービスです。資源の単位は **DPU**（Data Processing Unit）で、1 DPU は 4 vCPU と 16 GB のメモリです。Spark のジョブには最低 2 DPU が必要で、既定では 10 DPU が割り当てられます（[AWS Glue pricing](https://aws.amazon.com/glue/pricing/)）。執筆時点の版は、既定の 5.1 が Spark 3.5.6、最新の 6.0 が Spark 4.1.1 で、0.9、1.0、2.0 は 2026 年 4 月 1 日にサポートを終えました（[AWS Glue versions](https://docs.aws.amazon.com/glue/latest/dg/release-notes.html)）。
+
+Glue と EMR Serverless はどちらも「AWS のサーバーレス Spark」ですが、Glue はクローラ、データカタログ、ジョブブックマーク（前回どこまで処理したかの記録）などの ETL 向けの道具と一体になっているのが違いです。Glue Data Catalog は EMR や Athena からも Hive metastore の代わりに使われる台帳で、<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>で扱いました。急がない処理には、空いている資源で動かす代わりに安い **Flex 実行**も選べます（[AWS Glue pricing](https://aws.amazon.com/glue/pricing/)）。
+
+## Azure HDInsight の現状
+
+Microsoft の **HDInsight** は、Azure の上で Hadoop、Spark、Kafka、HBase などのクラスタを提供してきたサービスです。執筆時点で作成できるのは HDInsight 5.1（Spark 3.3）だけで、4.0 と 5.0 は 2025 年 3 月 31 日に廃止されました（[HDInsight component versioning](https://learn.microsoft.com/en-us/azure/hdinsight/hdinsight-component-versioning)）。5.1 の Spark 3.3 は、Dataproc の 3.0 イメージや Glue 6.0 の Spark 4.1 と比べると、3.4、3.5、4.0 を挟んだ古い版です。
+
+Kubernetes の上に作り直した後継の **HDInsight on AKS** は、プレビューのまま 2025 年 1 月 31 日に廃止され、移行先として Microsoft Fabric などが案内されています（[What is Azure HDInsight on AKS?](https://learn.microsoft.com/en-us/azure/hdinsight-aks/overview)）。Azure の上で新しく Spark を動かすなら、Fabric の Spark や Azure Databricks が主な選択肢になっている、というのが執筆時点の状況です。
+
+## 同じ考え方の、各社での名前
+
+ここまでに出てきた仕組みを、サービスごとの名前で並べます。
+
+| 考え方 | Dataproc | EMR | Databricks |
+| --- | --- | --- | --- |
+| ソフトウェアの版の組み合わせ | イメージバージョン | リリースラベル（`emr-7.14.0`） | Databricks Runtime |
+| 起動時に追加のソフトを入れる | 初期化アクション | ブートストラップアクション | 初期化スクリプト |
+| データを持つノード | プライマリワーカー | コアノード | （HDFS を前提にしない） |
+| 計算だけのノード、安い VM の置き場 | セカンダリワーカー | タスクノード | ワーカー（ドライバは On-Demand を推奨） |
+| 複数機種で容量を埋める | Flexible VM | インスタンスフリート | （クラウドごとの設定） |
+| 台数の自動調整 | 自動スケーリングポリシー | マネージドスケーリング | 自動スケーリング（ワーカーの最小・最大） |
+| 仕事ごとに作って捨てる | ワークフローテンプレートのマネージドクラスタ | ステップ実行後に終了 | ジョブ計算 |
+| 消し忘れの防止 | スケジュール削除 | 自動終了 | 自動終了 |
+| クラスタ外の台帳 | Dataproc Metastore | Glue Data Catalog | Unity Catalog |
+| ジョブを請け負う形 | サーバーレス展開 | EMR Serverless、Glue | サーバーレス計算 |
+| C++ の実行エンジン | Lightning Engine | （該当の名前は確認できず） | Photon |
+
+Databricks のクラシック計算では、Spot を使う設定でも最初の 1 台（ドライバ）は必ず On-Demand になり、ランタイムの版、ワーカーの最小・最大、操作が無い時間による自動終了を作成時に指定します（[Compute configuration reference](https://docs.databricks.com/aws/en/compute/configure)、[Cost optimization best practices](https://docs.databricks.com/aws/en/lakehouse-architecture/cost-optimization/best-practices)）。ドライバを Spot にしないのは、回収でドライバが消えるとジョブ全体が失敗するからで、EMR が ApplicationMaster をコアノードに置くのと同じ理由です。Unity Catalog の行は名前の対応だけを示しており、詳細はこの記事では確かめていません。
+
+## 料金の単位
+
+金額は変わりやすいので、**何に対して課金されるか**を中心に並べます。
+
+| サービス | 課金の対象 | 時間の刻み |
+| --- | --- | --- |
+| Dataproc クラスタ展開 | 全ノードの vCPU 数 × 稼働時間の管理料金 + Compute Engine の VM とディスクの料金 | 秒単位、最小 1 分 |
+| Dataproc サーバーレス展開 | DCU（Data Compute Unit）時間 + shuffle 用ストレージ + GPU | 秒単位、最小 1 分 |
+| EMR on EC2 | インスタンスごとの EMR 料金 + EC2 と EBS の料金 | 秒単位、最小 1 分 |
+| EMR on EKS | 使った vCPU とメモリ（EC2 か Fargate の料金は別） | 秒単位、最小 1 分（料金ページ冒頭の EMR 全体の記載） |
+| EMR Serverless | ワーカーが使った vCPU、メモリ、ストレージの合計 | 秒単位に切り上げ、最小 1 分 |
+| Glue（Spark ジョブ） | DPU 時間 | 秒単位、最小 1 分（Glue 2.0 以降） |
+| Databricks クラシック | DBU（Databricks Unit）+ クラウドの VM、ディスク、ネットワークの料金 | — |
+| Databricks サーバーレス | DBU（計算資源はサービス側） | — |
+
+出典は [Managed Service for Apache Spark pricing](https://cloud.google.com/products/managed-service-for-apache-spark/pricing)、[Amazon EMR pricing](https://aws.amazon.com/emr/pricing/)、[AWS Glue pricing](https://aws.amazon.com/glue/pricing/)、Databricks の [Cost optimization best practices](https://docs.databricks.com/aws/en/lakehouse-architecture/cost-optimization/best-practices) です。Databricks の課金の刻みは、確認した範囲の公式ページに明記がなかったので空欄にしています。
+
+構造で見ると、**クラスタ型は「VM の料金 + 管理料金」の 2 階建て、サーバーレス型は「独自の単位 × 時間」の 1 階建て**です。2 階建ての場合、VM の部分には Spot や確約利用割引が効きますが、管理料金の部分には効きません。1 階建ての場合、VM の割引は使えない代わりに、起動や停止の時間、暇な時間に払う必要がありません。
+
+参考までに、Google Cloud の料金ページの us-central1 の例（2026 年 10 月 1 日に確認）では、クラスタ展開の管理料金が vCPU 1 個あたり 1 時間 0.010 ドル、サーバーレス展開の DCU が標準階層で 1 時間 0.060 ドル、プレミアム階層で 0.089 ドルです（[pricing](https://cloud.google.com/products/managed-service-for-apache-spark/pricing)）。同じページの計算例では、ドライバ 4 コアと 4 コアのエグゼキュータ 2 台の構成を 12 DCU として計算しています。
+
+## エフェメラルか、常時稼働か
+
+クラスタ型を使うなら、**仕事ごとに作って捨てる（エフェメラル）か、1 つを動かし続けて共有する（常時稼働）か**を決める必要があります。
+
+| 観点 | エフェメラル | 常時稼働 |
+| --- | --- | --- |
+| 暇な時間の料金 | 払わない | 払う |
+| 起動の待ち時間 | 毎回かかる（数十秒〜数分） | かからない |
+| 大きさ | 1 種類の仕事に合わせて決められる | 同時に走る仕事の山に合わせる必要がある |
+| 版の追従 | 次に作るときに新しい版になる | 作り直しを自分で計画する |
+| 仕事どうしの干渉 | 無い | 資源の取り合い、設定の衝突が起きうる |
+| 状態（HDFS、台帳、ログ） | クラスタの外に置く必要がある | 中に置いてしまいがち |
+| 向く仕事 | 定時のバッチ、重さが日によって違う仕事 | 対話的な分析、絶え間なく流れる仕事 |
+
+料金の比較は単純な形をしています。1 日に T 時間だけ仕事がある 20 台のクラスタを考えます。常時稼働なら 20 台 × 24 時間ぶんを払い、エフェメラルなら 20 台 ×（T + 起動と停止の時間）ぶんを払います。T が 3 時間なら、常時稼働で払う時間のうち仕事に使われているのは 1 割余りにすぎません。逆に、仕事が絶え間なく来るなら、作っては捨てる起動時間のほうが無駄になります。EMR の文書も、常時稼働が有効なのは、対話的に問い合わせ続けるときや、新しいクラスタを毎回立ち上げてデータを読み込むのが非効率なほど頻繁に処理するときだとしています（[Long-running and transient clusters](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-plan-longrunning-transient.html)）。
+
+常時稼働のクラスタの大きさは、**同時に走るジョブの数の最大値**で決まります。各ジョブの開始と終了をイベントとして時刻順に並べ、開始で +1、終了で −1 しながら最大値を取れば求まります。これは区間の重なりを数える Line Sweep そのもので、夜間に 10 本のジョブが重なり、昼間は 1 本しか無いなら、昼間の 9 本分の空きが常時稼働の無駄になります。自動スケーリングはこの山と谷に台数を追わせる仕組みですが、すでに見たとおり、データを持つノードを減らせないこと、shuffle の中間データ、長いジョブの完了待ちによって、谷まで素直には縮みません。
+
+**サーバーレス型は、この判断を事業者に預けたもの**と見ることができます。料金はジョブの実行中の資源にだけかかるので、暇な時間の問題は消えます。その代わりに、Spot や VM の割引、SSH、任意のソフトウェアといった「中に手を入れる自由」を手放します。EMR Serverless の事前初期化容量のように、起動を速くしたければ暇な時間の料金を払い直すことになる点も、取引が消えたわけではないことを示しています。
+
+## なぜ HDFS ではなく GCS や S3 に置くのか
+
+エフェメラルなクラスタが成り立つのは、**データがクラスタの外にあるから**です。Dataproc の FAQ は、Cloud Storage のデータはクラスタを止めても残るが、HDFS のデータはクラスタを止めると消える（事前に永続的な場所へ移さない限り）と書き、これを Cloud Storage を選ぶ理由の 1 つに挙げています（[FAQ](https://docs.cloud.google.com/managed-spark/docs/resources/faq)）。ノードのブートディスクはクラスタの削除と同時に消え、HDFS のデータも、プライマリワーカーが既定でそこに置きます（[HDFS and storage](https://docs.cloud.google.com/managed-spark/docs/concepts/hdfs)）。
+
+Cloud Storage コネクタの文書は、ほかの利点も挙げています。HDFS へ先に移さなくても `gs://` で直接読めること。Spark、Hadoop、Google のサービスの間でデータを共有できること。ファイルシステムの点検や版の上げ下げといった保守が要らないこと。HDFS では NameNode がセーフモード（起動直後にブロックの所在を集め終えるまでの読み取り専用の状態）を抜けるまでジョブを始められないが、Cloud Storage ならタスクノードが起動したらすぐ始められること（[Cloud Storage connector](https://docs.cloud.google.com/managed-spark/docs/concepts/connectors/cloud-storage)）。
+
+まとめると、データを外に置くことで次の 3 つが同時に手に入ります。
+
+- **クラスタの寿命とデータの寿命を切り離せる。** 計算用のマシンを消しても、データは残る
+- **計算だけを増減できる。** データを持たないノードは、回収されうる安い VM にも、すぐ消せるノードにもできる
+- **複数のエンジンで同じデータを読める。** Spark で書いた表を Trino や BigQuery が読める
+
+代償は、データ局所性を失い、すべての読み書きがネットワーク越しになることと、オブジェクトストレージに rename が無いことです。これは<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で詳しく見たとおりで、EMRFS S3 最適化コミッタや S3A コミッタのような「rename に頼らない出力の確定」が各社で用意されているのはこのためです。HDFS が完全に要らなくなるわけではなく、shuffle の中間データやジョブの一時ファイルは、今もノードのローカルディスクや HDFS に置かれます。
+
+## オンプレの Hadoop から移すときの型
+
+オンプレミス（自社の設備）の Hadoop クラスタをクラウドへ移す場合、多くは次の段階を踏みます。
+
+1. **データを先に移す。** HDFS からオブジェクトストレージへ、大量のデータを転送する。Google Cloud の Storage Transfer Service は HDFS を転送元にでき、その場合の転送先は Cloud Storage に限られる（[Transfer from HDFS](https://docs.cloud.google.com/storage-transfer/docs/create-transfers/agent-based/hdfs)）。AWS では S3DistCp（EMR に入っている、S3 向けに最適化した分散コピー）が使える
+2. **パスを書き換える。** `hdfs://` を `gs://` や `s3://` に替える。コネクタが HDFS と同じインタフェースを持つので、多くのコードはパス以外を変えずに動く
+3. **台帳を外に出す。** クラスタの中の Hive metastore を、Dataproc Metastore や Glue Data Catalog に移す
+4. **1 つの大きなクラスタを、仕事ごとの小さなクラスタに分ける。** 共有の常時稼働クラスタを、エフェメラルなクラスタやサーバーレスのジョブへ置き換える
+5. **データを持たないノードから安くする。** セカンダリワーカーやタスクノードに Spot を使い、自動スケーリングを入れる
+
+Google Cloud のリージョン間移行の文書は、クラスタの使い方を「Cloud Storage にデータを置くエフェメラルクラスタ」「外部にデータを置く常時稼働クラスタ」「クラスタの中（主に HDFS）にデータを置く常時稼働クラスタ」の 3 つに分け、最後のものが最も移しにくいとしています。データと計算が分かれていないので、片方だけ移すと食い違いが生じやすいからです。入出力の場所をコードに書き込まず引数で渡すこと、環境の構築を自動化しておくことも、移しやすさの条件に挙げています（[Prepare data and batch workloads for migration across regions](https://docs.cloud.google.com/architecture/migrate-across-regions/prepare-data-and-batch-workloads)）。リージョン間の移行についての文書ですが、オンプレミスからの移行にもそのまま当てはまる整理です。
+
+段階 1 から 3 だけで止める「そのまま持ち上げる」移行も、段階 4 と 5 まで進める作り直しの移行もあります。Dataproc の比較表がクラスタ展開の用途に「既存の Hadoop と Spark の移行」を、サーバーレス展開の用途に「新しいパイプライン」を挙げているように（[Compare deployments](https://docs.cloud.google.com/managed-spark/docs/concepts/serverless-spark-compare)）、**まずクラスタ型で移し、作り直す段階でサーバーレス型へ寄せる**という順序が、各社の文書に共通する筋道です。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| Managed Service for Apache Spark | 2026 年 4 月からの、Dataproc とそのサーバーレス版をまとめた Google Cloud の名前 |
+| クラスタ展開 / サーバーレス展開 | 上のサービスの 2 つの形。クラスタを貸すか、ジョブを請け負うか |
+| イメージバージョン | Dataproc のクラスタに入る OS と各ソフトウェアの版の組み合わせ |
+| 初期化アクション | クラスタの全ノードで起動直後に実行するスクリプト。EMR ではブートストラップアクション |
+| Component Gateway | クラスタ内の Web 画面へ、SSH トンネルなしに認証付きでつなぐ仕組み |
+| プライマリワーカー / セカンダリワーカー | HDFS を持つワーカーと、計算だけのワーカー。EMR ではコアノードとタスクノード |
+| Spot VM / プリエンプティブル VM | クラウド事業者の都合で回収されうる、安い VM |
+| インスタンスフリート | EMR で、複数の機種と購入方式を候補にして目標容量を埋める指定方式 |
+| グレースフル・デコミッション | 実行中の仕事が終わるのを待ってからノードを外す縮小の方法 |
+| Enhanced Flexibility Mode | Spark の shuffle データをプライマリワーカーに書かせ、セカンダリワーカーの消失に強くする Dataproc の設定 |
+| エフェメラルクラスタ | 仕事のために作り、終わったら消すクラスタ |
+| ワークフローテンプレート | Dataproc で、ジョブの依存関係と実行場所をまとめた再利用できる定義 |
+| DCU / DPU / DBU | Dataproc サーバーレス、Glue、Databricks の、それぞれの計算量の課金単位 |
+| 事前初期化容量 | EMR Serverless で、起動を速くするために温めておくワーカー。暇でも課金される |
+| Photon / Lightning Engine | Databricks と Google の、Spark の実行部分を C++ で置き換えたエンジン |
+
+似た言葉を 2 組補います。**プリエンプティブル VM と Spot VM** は、どちらも回収されうる安い VM ですが、Google Cloud の前者には最長 24 時間の制限があり、後者には無い点が違います。**グレースフル・デコミッションと EFM** は、どちらも縮小や回収で仕事を壊さないための仕組みですが、前者は「消すのを待つ」、後者は「消えても困らない場所に置く」という逆向きの対策で、Dataproc では併用が推奨されていません。
+
+## まとめ
+
+- マネージドの分散処理は、VM の調達、版の組み合わせ、台数、故障対応、停止のどこまでを事業者が担うかで区別できる。ジョブのコードとデータの置き場所は、どの形でも利用者に残る
+- Dataproc は 2026 年 4 月に Managed Service for Apache Spark へ名前がまとまり、クラスタ展開とサーバーレス展開の 2 つの形になった。API と gcloud の名前は変わっていない
+- クラスタ型では、データを持つノード（プライマリワーカー、コアノード）と計算だけのノード（セカンダリワーカー、タスクノード）を分け、後者だけを Spot にし、後者だけを増減させるのが共通の原則
+- 縮小で困るのは実行中のタスクと shuffle の中間データ。グレースフル・デコミッションは終わるのを待ち、EFM は中間データを消えないノードに置く
+- エフェメラルなクラスタ（ワークフローテンプレート、ステップ後の終了、ジョブ計算）は暇な時間の料金を消す。常時稼働のクラスタは、同時に走る仕事の山に合わせた大きさと、版の追従を自分で引き受ける
+- 料金は、クラスタ型が「VM の料金 + 管理料金」、サーバーレス型が「DCU、DPU、DBU、vCPU 時間などの独自単位 × 時間」。多くは秒単位で最小 1 分
+- エフェメラルなクラスタが成り立つのは、データを HDFS ではなく GCS や S3 に置き、台帳もクラスタの外に出しているから。代わりに局所性と rename を失う
+- EMR の S3 コネクタは 7.10.0 から S3A が既定になり、Glue 6.0 では EMRFS が無くなった。HDInsight は 5.1 だけが残り、HDInsight on AKS は廃止された
+- 移行は、データを移す、パスを替える、台帳を外に出す、クラスタを仕事ごとに分ける、データを持たないノードから安くする、の順に進むことが多い
+
+次の回は連載の締めくくりとして、ここまでのどのエンジンにも、どのサービスにも出てきた仕組みを、ソフトウェアから切り離して整理します。shuffle、偏り、遅いタスク、spill、出力の確定、計算とストレージの分離を、<a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a>でまとめて見ていきます。

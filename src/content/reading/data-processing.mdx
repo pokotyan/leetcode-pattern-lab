@@ -109,6 +109,8 @@ def reduce_phase(groups):
   偏りの対策として、reduce の前に各マシンで部分集計してしまう（combiner）という手があります。`(a,1) (a,1) (a,1)` を送る代わりに `(a,3)` を送れば、通信量が減ります。**足し算のように、部分的にまとめても結果が変わらない演算**でのみ使える最適化です。
 </Callout>
 
+この原理を Hadoop と Spark が実際にどう実行しているかは、<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の中身</a>と<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>で扱います。偏りや部分集約のような、どのエンジンにも共通する課題は<a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a>にまとめています。
+
 ## メモリに載らないものを並べ替える
 
 MapReduce の内部でも使われている基本操作が、外部ソートです。100 GB のデータを 8 GB のメモリで並べ替える、という状況です。
@@ -179,6 +181,8 @@ sliding では、**合計がイベントの総和より大きくなります。*
 
   **正確さと待ち時間のどちらを取るか**という選択であり、技術的に一方が正しいわけではありません。
 </Callout>
+
+watermark と遅れて届くデータを Flink が実際にどう扱うかは、<a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>状態を持つストリーム処理</a>で実験しています。
 
 ## バッチとストリームを両方持つ
 

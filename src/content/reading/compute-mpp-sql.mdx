@@ -1,0 +1,527 @@
+---
+title: 常駐ワーカーで SQL を分散実行する（Trino・BigQuery）
+description: 同じ集計でも、バッチのジョブなら数分、Trino や BigQuery なら数秒で返ることがある。差を生むのは、常駐するワーカー、ステージ間をメモリで流す交換、そして障害時の割り切りです。Trino の実行計画と、Dremel の 2 本の論文から確かめます
+category: compute
+order: 24
+status: published
+topics:
+  - MPP
+  - Trino
+  - Coordinator
+  - Stage
+  - Split
+  - Driver
+  - Exchange
+  - Pipelined Execution
+  - Fault-tolerant Execution
+  - Broadcast Join
+  - Dremel
+  - BigQuery
+  - Slot
+  - Disaggregated Shuffle
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: Trino の結合は片側からハッシュ表を作って他方で引く方式で、ステージ間の HASH 交換も「同じキーを同じタスクへ集める」ハッシュによる振り分けになっている
+  - kind: article
+    slug: heap-topk
+    why: Dremel の木構造の集約や ORDER BY ... LIMIT は、各ワーカーが手元で上位だけを残し、上の段でそれを併合して最終の上位を決める形で、部分的な上位 k 件を併合する考え方そのもの
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 数分と数秒の差はどこから来るか
+
+<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop</a> の MapReduce では、ジョブを投げるとタスクごとにコンテナが起動し、map の出力はディスクに書かれてから reduce 側へ運ばれました。<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark</a> はメモリを活用しますが、shuffle の境目では中間ファイルをディスクに書きます（[Spark: RDD Programming Guide](https://spark.apache.org/docs/latest/rdd-programming-guide.html#performance-impact)）。どちらも、途中で何かが壊れても**書いておいた中間結果からやり直せる**ことを重視した設計です。
+
+人が BI ツールから集計を投げて結果を待つ用途では、この安全策がそのまま待ち時間になります。そこで別の割り切りをしたのが、この回で扱う **MPP 型の SQL エンジン**（Massively Parallel Processing。多数のノードがクエリの一部ずつを並列に処理する方式）です。要点は次の 3 つです。
+
+1. **ワーカーが常駐している**：クエリのたびにプロセスを起動しない
+2. **ステージの間をメモリで流す**：中間結果をディスクに書かず、できた分から次の段へ送る
+3. **障害時は割り切る**：既定では、ノードが 1 つ落ちたらクエリごと失敗し、やり直しは利用者に任せる
+
+前半は Trino の実行の中身を、公式文書（執筆時点の版は Trino 483）と、その前身である Presto の論文から見ます。Trino の「カタログ」（コネクタの接続設定）と、Presto と Trino が分かれた経緯は<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>で扱ったので繰り返しません。後半は、Google の Dremel と、それを土台にした BigQuery を、2010 年と 2020 年の 2 本の論文と Google Cloud の文書から見ます。
+
+## Trino の部品：コーディネータとワーカー
+
+Trino のクラスタは 2 種類のサーバーでできています。Trino の文書の定義は次のとおりです（[Trino: Concepts](https://trino.io/docs/current/overview/concepts.html)）。
+
+- **コーディネータ**（coordinator）：文を解析し、クエリの計画を立て、ワーカーを管理するサーバー
+- **ワーカー**（worker）：タスクを実行し、データを処理するサーバー
+
+どちらも常駐する Java のプロセスです。クエリが来るとコーディネータが計画を立て、すでに動いているワーカーに仕事を配ります。Google も 2020 年の論文で、分散 SQL エンジンはあらかじめ立ち上げておけば投げた瞬間に処理を始められ、MapReduce のジョブを各自が書いていた頃にあったマシンの割り当て、バイナリの転送、起動の待ち時間がなくなる、と書いています（[Dremel: A Decade of Interactive SQL Analysis at Web Scale](https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf)、7 節の Stand-by server pool）。
+
+## クエリが分解される 5 段
+
+1 つのクエリは、次の 5 つの単位に分解されて実行されます（[Trino: Concepts](https://trino.io/docs/current/overview/concepts.html)）。
+
+| 単位 | 何か | どこで動くか |
+| --- | --- | --- |
+| ステージ（stage） | 分散実行計画の一区画。クエリのステージは木を成し、根のステージが他のステージの出力を集める | ステージ自体は動かない。コーディネータが計画を表すための単位 |
+| タスク（task） | ステージを実際に実行するもの。1 つのステージは複数のタスクで並列に実行される | ワーカー |
+| split | 大きなデータの一区画。最下段のステージはコネクタから split 単位でデータを読み、上の段は他のステージから読む | タスクに割り当てられる |
+| ドライバ（driver） | オペレータの実体を並べた列。タスクの中で並列に動く、Trino の並列性の最小単位 | タスクの中のスレッド |
+| オペレータ（operator） | データを受け取り、変換し、出力する部品。テーブルの走査、フィルタ、結合、集約など | ドライバの中 |
+
+Presto の論文は、タスクの中にはさらに**パイプライン**（オペレータの並び）が複数ありうると説明しています（[Presto: SQL on Everything](https://trino.io/Presto_SQL_on_Everything.pdf)、ICDE 2019、IV-D 節）。たとえばハッシュ結合を行うタスクには、ハッシュ表を作る**ビルド側のパイプライン**と、もう一方の入力を流して表を引く**プローブ側のパイプライン**が少なくとも 1 つずつあり、パイプラインどうしはタスク内のメモリ上の振り分け（local shuffle）でつながります。ドライバは、このパイプラインの実体です。
+
+## 交換：ステージの間をメモリで流す
+
+ステージとステージの間でデータを受け渡す仕組みを**交換**（exchange）と呼びます。文書の説明では、タスクは出力を**出力バッファ**に書き、他のタスクの出力を**exchange クライアント**で受け取ります（[Trino: Concepts](https://trino.io/docs/current/overview/concepts.html)）。
+
+Presto の論文は、この受け渡しをもう少し具体的に書いています（IV-E 節）。
+
+- 交換は **HTTP 越しの、メモリにバッファした shuffle** である。タスクが作ったデータは、他のワーカーが取りに来るまでバッファに置かれる
+- 受け手は **HTTP のロングポーリング**（応答を返せるデータができるまで要求を保留しておく方式）で次の区切りを要求する。前の応答に入っていたトークンを次の要求に付けるので、受け取りの確認が転送の手順そのものに含まれる
+- この方式は shuffle のデータをディスクに永続化する他のシステムよりはるかに遅延が小さい、と論文は Spark SQL と Hive を挙げて比べている
+
+`EXPLAIN` の出力で、ステージは `Fragment` として現れます。Fragment の後ろの角括弧は、そのステージが何台で、入力をどう分けて動くかを表します（[Trino: EXPLAIN](https://trino.io/docs/current/sql/explain.html)）。
+
+| 種類 | 意味 |
+| --- | --- |
+| `SINGLE` | 1 台で実行する |
+| `HASH` | 決まった台数で実行し、入力はハッシュ関数で振り分ける |
+| `ROUND_ROBIN` | 決まった台数で実行し、入力は順番に振り分ける |
+| `BROADCAST` | 決まった台数で実行し、入力は全台へ配る |
+| `SOURCE` | 入力の split を読める場所で実行する |
+
+各 Fragment の `Output partitioning` は、そのステージの出力を次の段へどう送るかです。計画の中の `RemoteSource` は「別のステージから交換で受け取る」箇所、`LocalExchange` は「同じタスクの中のドライバ間で振り分け直す」箇所です。後者が論文の local shuffle にあたります。
+
+## 既定ではディスクに書かない
+
+Presto の論文は実行の方針を次のようにまとめています（III 節）。**実行はできるかぎりパイプライン化され、データはできた分からタスク間を流れる。クエリの形によっては、全データを処理し終える前に結果を返し始められる。中間データと状態は、可能なかぎりメモリに置く。**
+
+この方針は、メモリが足りないときの扱いにも表れます。
+
+- 1 つのクエリが 1 台のワーカーで使えるメモリには上限があり、既定値はそのノードの最大ヒープの 30% です。上限に達したクエリは強制終了されます（[Trino: Resource management properties](https://trino.io/docs/current/admin/properties-resource-management.html) の `query.max-memory-per-node`）
+- ディスクへの退避（spill）の機能はありますが、既定では無効（セッションプロパティ `spill_enabled` の既定値は `false`）です。文書はこの機能を「古い機能」と位置づけ、代わりに後で述べる障害耐性のある実行を使うよう勧めています（[Trino: Spill to disk](https://trino.io/docs/current/admin/spill.html)）
+- 論文によれば、Facebook の運用ではどのクラスタも spill を有効にしていなかった。数 TB の分散メモリを持つ規模があり、利用者は全部メモリで動くときの予測しやすい遅延を好み、ローカルディスクを足せば機材の費用が上がるからだ、と説明しています（IV-F 節）
+
+ワーカーの中のスケジューリングも、対話的な用途に合わせてあります。論文によれば、1 つの split がスレッドを占有できるのは最大 1 秒で、それを過ぎると待ち行列に戻ります。出力バッファが満杯（下流が追いつかない）か入力バッファが空（上流が追いつかない）なら、1 秒を待たずに別のタスクへ切り替えます（IV-F 節）。多数のクエリが 1 つのクラスタを共有しても、短いクエリが長いクエリの後ろで待たされにくくするための**協調的マルチタスク**です。
+
+## 障害時：既定ではクエリごと失敗する
+
+ステージ間をメモリで流すと、途中のワーカーが落ちたとき、そのワーカーのバッファにあったデータは消えます。どこからやり直せばよいかの記録もありません。Trino の文書ははっきり書いています。**既定では、ノードがタスクを実行する資源を欠くか、実行中に落ちた場合、クエリは失敗し、手動でやり直す必要がある。クエリが長いほど、こうした失敗に遭いやすい**（[Trino: Fault-tolerant execution](https://trino.io/docs/current/admin/fault-tolerant-execution.html)）。
+
+論文は、2018 年末の時点で、コーディネータやワーカーの停止に対して意味のある障害耐性を持っていないと認めたうえで、その理由を述べています（IV-G 節）。チェックポイントや部分的な復旧は計算の費用が大きく、結果をできた分から返すシステムでは実装も難しい。ノードの平均故障間隔、1,000 台程度のクラスタ、そして大半のクエリが数時間以内に終わるという実測を考えると、費用に見合うか分からない。だから、失敗したクエリは利用者の側で自動的に再実行してもらう、という割り切りです。
+
+この割り切りを緩めるのが、2022 年に Project Tardigrade として公開された**障害耐性のある実行**（fault-tolerant execution）です（[Trino blog: Project Tardigrade launch](https://trino.io/blog/2022/05/05/tardigrade-launch.html)）。設定の要点は次のとおりです（[Trino: Fault-tolerant execution](https://trino.io/docs/current/admin/fault-tolerant-execution.html)）。
+
+| 項目 | 内容 |
+| --- | --- |
+| `retry-policy` | `NONE`（既定）、`QUERY`（クエリ全体をやり直す）、`TASK`（失敗したタスクだけをやり直す） |
+| `QUERY` の向き先 | 小さなクエリが大半を占める用途。結果が 32MB を超えるクエリには既定で効かない（コーディネータのメモリ上のバッファ `exchange.deduplication-buffer-size` の既定値が 32MB） |
+| `TASK` の向き先 | 大きなバッチクエリ。exchange manager の設定が必須 |
+| exchange manager | 中間の交換データを外部の保存先に書き出す（spool）部品。S3 互換、Azure Blob Storage、GCS、HDFS に置け、ローカルのファイルシステムは単体の非本番環境向け |
+| 対応コネクタ | BigQuery、Delta Lake、Hive、Iceberg、MariaDB、MongoDB、MySQL、Oracle、PostgreSQL、Redshift、SQL Server |
+
+有効にすると、**交換のデータが外部の保存先に書かれ、ワーカーが落ちても別のワーカーがそれを読んで続けられる**ようになります。つまり、既定の Trino が省いていた「中間結果を書いておく」ことを、必要なクラスタだけが選んで取り戻す仕組みです。代償として、文書は `TASK` は短いクエリを大量に流す用途では遅延が大きくなりうるので、大きなバッチ用のクラスタを短いクエリ用とは分けて立てるよう勧めています。
+
+## 実験：Trino を 1 台で動かして実行計画を読む
+
+公式イメージ `trinodb/trino:latest`（起動ログの版は 483）を、コーディネータとワーカーを兼ねる 1 台だけで動かしました。データは組み込みの `tpch` カタログ（TPC-H のデータをその場で生成するコネクタ）の `sf1`（customer 15 万行、orders 150 万行、lineitem 約 600 万行）です。他の作業と同じマシンで動かすため、JVM のヒープを 1GB に絞りました。
+
+```yaml
+# docker-compose.yml
+name: cmp-compute-mpp-sql
+services:
+  trino:
+    image: trinodb/trino:latest
+    container_name: cmp-compute-mpp-sql-trino
+    mem_limit: 2000m
+    volumes:
+      - ./etc/jvm.config:/etc/trino/jvm.config:ro
+networks:
+  default:
+    name: cmp-compute-mpp-sql-net
+```
+
+```
+# etc/jvm.config（イメージ既定のものからヒープ指定などを変えた）
+-server
+-XX:+UseG1GC
+-Xmx1G
+-XX:G1HeapRegionSize=32M
+-XX:+ExplicitGCInvokesConcurrent
+-XX:+ExitOnOutOfMemoryError
+-XX:ReservedCodeCacheSize=128M
+-XX:MaxDirectMemorySize=256M
+-Djdk.attach.allowAttachSelf=true
+-Djdk.nio.maxCachedBufferSize=2000000
+```
+
+クエリは `docker exec cmp-compute-mpp-sql-trino trino --output-format=CSV_UNQUOTED --execute "..."` で投げ、セッションプロパティは `--session join_distribution_type=PARTITIONED` のように付けました。以下の計画は、`Layout`・`Estimates` の行と列の対応（`:=` の行）を省いた抜粋です。
+
+<Callout type="warn" title="Trino 483 の EXPLAIN は既定で分散計画">
+  文書の記載どおり、`EXPLAIN` は既定で分散実行計画を表示します（[Trino: EXPLAIN](https://trino.io/docs/current/sql/explain.html)）。`EXPLAIN (TYPE LOGICAL)` は非推奨で、実際に実行すると「LOGICAL はもう対応していないので DISTRIBUTED の出力を表示する」という警告とともに分散計画が返りました。古い記事にある論理計画の例は、483 では再現できません。
+</Callout>
+
+### 実験 1：小さい表は全台へ配られる
+
+顧客の市場区分ごとに注文数と金額を集計します。
+
+```sql
+SELECT c.mktsegment, count(*) AS orders, sum(o.totalprice) AS total
+FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey = o.custkey
+GROUP BY c.mktsegment
+```
+
+```
+Fragment 0 [HASH]
+    Output partitioning: SINGLE []
+    Output[columnNames = [mktsegment, orders, total]]
+    └─ Aggregate[type = FINAL, keys = [mktsegment]]
+          └─ RemoteSource[sourceFragmentIds = [1]]
+
+Fragment 1 [tpch:orders:1500000]
+    Output partitioning: HASH [mktsegment]
+    Aggregate[type = INTERMEDIATE, keys = [mktsegment]]
+    └─ InnerJoin[criteria = (custkey_1 = custkey), distribution = REPLICATED]
+       ├─ Aggregate[type = PARTIAL, keys = [custkey_1]]
+       │  └─ ScanFilter[table = tpch:sf1:orders, dynamicFilters = {custkey_1 = #df_236}]
+       └─ LocalExchange[partitioning = SINGLE]
+          └─ RemoteSource[sourceFragmentIds = [2]]
+
+Fragment 2 [SOURCE]
+    Output partitioning: BROADCAST []
+    TableScan[table = tpch:sf1:customer]
+```
+
+読み方は下から上です。
+
+- **Fragment 2** が customer を読み、出力を `BROADCAST`、つまり結合を行う全タスクへ同じものを配ります。見積もりは 15 万行・2.00MB でした
+- **Fragment 1** は orders を読むステージで、配られた customer からハッシュ表を作り、orders の行で引きます。結合が `distribution = REPLICATED`（ビルド側を全台に複製する方式。文書の用語ではブロードキャスト結合）になっているのはこのためです
+- 結合の前に `Aggregate[type = PARTIAL, keys = [custkey_1]]` があります。orders を結合する前に、`custkey` ごとに件数と金額を先に足し込んでおき、結合する行を減らしています（セッションプロパティ `push_partial_aggregation_through_join` の既定値は `true`）
+- 結合後は `mktsegment` ごとに中間集計（`INTERMEDIATE`）し、`HASH [mktsegment]` で振り分けて、**Fragment 0** が最後の集計（`FINAL`）をします
+- `dynamicFilters` は**動的フィルタ**です。ビルド側で実際に現れた `custkey` の範囲を集め、プローブ側の走査に条件として渡します（[Trino: Dynamic filtering](https://trino.io/docs/current/admin/dynamic-filtering.html)）
+
+`join_distribution_type` の既定値は `AUTOMATIC` で、統計から費用を見積もってブロードキャストか分割かを選びます。自動で選ぶとき、複製する側の大きさは既定で 100MB までに制限されます（[Trino: Cost-based optimizations](https://trino.io/docs/current/optimizer/cost-based-optimizations.html)、`SHOW SESSION` で見た `join_max_broadcast_table_size` も `100MB`）。customer の 2MB はこの範囲に収まるので、ブロードキャストが選ばれました。`join_distribution_type=BROADCAST` を指定した計画は、この自動選択の計画と 1 文字も違いませんでした。
+
+### 実験 2：分割結合にすると、交換が 1 つ増える
+
+同じクエリを `join_distribution_type=PARTITIONED` で計画させました。
+
+```
+Fragment 1 [HASH]
+    Output partitioning: HASH [mktsegment]
+    Aggregate[type = INTERMEDIATE, keys = [mktsegment]]
+    └─ InnerJoin[criteria = (custkey_1 = custkey), distribution = PARTITIONED]
+       ├─ RemoteSource[sourceFragmentIds = [2]]
+       └─ LocalExchange[partitioning = SINGLE]
+          └─ RemoteSource[sourceFragmentIds = [3]]
+
+Fragment 2 [tpch:orders:1500000]
+    Output partitioning: HASH [custkey_1]
+    Aggregate[type = PARTIAL, keys = [custkey_1]]
+    └─ ScanFilter[table = tpch:sf1:orders, dynamicFilters = {custkey_1 = #df_241}]
+
+Fragment 3 [SOURCE]
+    Output partitioning: HASH [custkey]
+    TableScan[table = tpch:sf1:customer]
+```
+
+（Fragment 0 は実験 1 と同じなので省略）
+
+ステージが 3 つから 4 つに増えました。customer も orders も**結合キー `custkey` のハッシュで振り分け**られ（`HASH [custkey]` と `HASH [custkey_1]`）、結合は独立した `HASH` のステージ（Fragment 1）で行われます。
+
+| | ブロードキャスト（`REPLICATED`） | 分割（`PARTITIONED`） |
+| --- | --- | --- |
+| ビルド側（customer）の送り方 | 全タスクへ同じものを配る | `custkey` のハッシュで分ける |
+| プローブ側（orders）の送り方 | 送らない。読んだ場所でそのまま結合 | `custkey` のハッシュで分ける |
+| 各ノードのハッシュ表 | ビルド側の全体 | ビルド側の 1/N |
+| 向いている場面 | ビルド側が小さい | ビルド側も大きい |
+
+文書の説明もこの表のとおりで、分割結合は両方の表を結合キーのハッシュで配り直す必要があるのではるかに遅くなりうるが、より大きな結合を扱える。ブロードキャスト結合は、フィルタ後のビルド側が各ノードのメモリに収まらなければならない、としています（[Trino: Cost-based optimizations](https://trino.io/docs/current/optimizer/cost-based-optimizations.html)）。ワーカーが N 台あれば、ブロードキャストではビルド側の 2MB が N 回送られ、分割ではプローブ側の部分集計後の 38 万行（`EXPLAIN ANALYZE` で 9.84MB）が 1 回送られます。どちらが安いかは N と両側の大きさで決まります。
+
+実行時間も 5 回ずつ交互に測りましたが、ブロードキャストが 0.69〜1.51 秒、分割が 0.76〜1.83 秒で、回ごとのばらつきのほうが大きく、差は読み取れませんでした（この計測は、後述の理由で設定を変える前の `mem_limit: 1600m` の状態で行ったもの）。ノードが 1 台では、ブロードキャストの「N 回送る」も N = 1 で、交換はすべて同じプロセスの中で済むからです。**この方式の差が効くのは、ワーカーが増えてネットワーク越しの転送が生じたとき**です。
+
+### 実験 3：同じ分け方の表どうしは、配り直さずに結合できる
+
+orders と lineitem を `orderkey` で結合すると、計画は違う形になりました。
+
+```sql
+SELECT o.orderpriority, count(*) AS n, sum(l.extendedprice) AS revenue
+FROM tpch.sf1.orders o JOIN tpch.sf1.lineitem l ON o.orderkey = l.orderkey
+WHERE l.shipdate >= DATE '1995-01-01'
+GROUP BY o.orderpriority ORDER BY o.orderpriority
+```
+
+```
+Fragment 3 [tpch:orders:1500000]
+    Output partitioning: HASH [orderpriority]
+    Aggregate[type = INTERMEDIATE, keys = [orderpriority]]
+    └─ InnerJoin[criteria = (orderkey_1 = orderkey), distribution = PARTITIONED]
+       ├─ Aggregate[type = PARTIAL, keys = [orderkey_1]]
+       │  └─ ScanFilterProject[table = tpch:sf1:lineitem, filterPredicate = (date '1995-01-01' <= shipdate), ...]
+       └─ LocalExchange[partitioning = HASH, arguments = [orderkey::bigint]]
+          └─ TableScan[table = tpch:sf1:orders]
+```
+
+結合は `PARTITIONED` なのに、lineitem も orders も同じステージの中で読まれ、間に `RemoteSource` がありません。Fragment の種類 `[tpch:orders:1500000]` は、tpch コネクタが「orders と lineitem は `orderkey` で同じように分割されている」とエンジンに伝えている印です。両側がすでに結合キーで同じように分かれているので、**配り直さずに、同じ区画どうしをその場で結合できます**。これを**同一配置結合**（colocated join）と呼びます。セッションプロパティ `colocated_join`（既定 `true`）を `false` にすると、orders を読む Fragment 4 が別に立ち、`Output partitioning: tpch:orders:1500000 [orderkey]` の交換を経て結合のステージへ送られる計画に変わりました。Hive や Iceberg の表でも、バケットやパーティションの分け方をコネクタが伝えれば同じことが起こります。
+
+### 実験 4：EXPLAIN ANALYZE とタスクの一覧
+
+`EXPLAIN ANALYZE` は実際にクエリを実行し、ステージごと・オペレータごとの実測を付けて計画を表示します（[Trino: EXPLAIN ANALYZE](https://trino.io/docs/current/sql/explain-analyze.html)）。実験 2 の分割結合の出力から、ステージの見出しの行を抜き出します（フラグメントの番号は `EXPLAIN` のときより 1 つずつずれて表示されました）。
+
+```
+Queued: 5.49ms, Analysis: 22.96ms, Planning: 171.44ms, Execution: 1.18s, Finishing: 0.00ns
+Fragment 2 [HASH]
+    CPU: 147.33ms, Scheduled: 254.61ms, Blocked 10.85s (Input: 10.14s, Output: 0.00ns), Input: 532050 rows (13.13MB) ...
+    └─ InnerJoin[criteria = (custkey_1 = custkey), distribution = PARTITIONED]
+       │   Left (probe) Input avg.: 47756.25 rows, Input std.dev.: 46.24%
+       │   Right (build) Input avg.: 150000.00 rows, Input std.dev.: 0.00%
+Fragment 3 [tpch:orders:1500000]
+    CPU: 1.58s, Scheduled: 2.71s, Blocked 0.00ns ..., Input: 1500000 rows (25.75MB) ..., Output: 382050 rows (9.84MB)
+           Input: 1500000 rows (25.75MB), Filtered: 0.00%, Splits: 4, Splits generation wait time: 0.01ms
+Fragment 4 [SOURCE]
+    CPU: 757.67ms, Scheduled: 1.09s, Blocked 0.00ns ..., Input: 150000 rows (3.29MB) ...
+        Input: 150000 rows (3.29MB), Splits: 4, Splits generation wait time: 0.02ms
+```
+
+読み取れることは 3 つです。
+
+- 走査のステージはどちらも `Splits: 4` でした。tpch カタログの設定ファイルに `tpch.splits-per-node=4` と書かれているとおり、1 ノードあたり 4 つの split に分けて読んでいます
+- 結合のステージ（Fragment 2）は CPU 時間が 0.15 秒しかないのに、`Blocked` が 10.85 秒あり、そのほとんどが `Input`（入力待ち）です。この時間は複数のドライバの待ち時間の合計なので壁時計の時間より長くなりますが、**下の段が流してくるのを待っていた**ことは分かります。ステージが順番ではなく同時に動き、上の段が下の段の出力を待ち構えている、パイプライン実行の姿です
+- 部分集計の効果も数字で見えます。orders の 150 万行は、送り出す前の `PARTIAL` 集計で 38 万 2,050 行に減っています
+
+タスクの単位は、システム表 `system.runtime.tasks` で見られます。同じクエリを実行した直後に、そのクエリのタスクを取り出しました。
+
+```
+           stage_id            |              task_id              | splits | completed_splits | in_rows | out_rows | net_in_bytes | physical_written_bytes
+-------------------------------+-----------------------------------+--------+------------------+---------+----------+--------------+------------------------
+ 20261001_041430_00028_xfyx9.0 | 20261001_041430_00028_xfyx9.0.0.0 |     16 |               16 |      40 |        5 |         1808 |                      0
+ 20261001_041430_00028_xfyx9.1 | 20261001_041430_00028_xfyx9.1.0.0 |     17 |               17 |  532050 |       40 |     12319934 |                      0
+ 20261001_041430_00028_xfyx9.2 | 20261001_041430_00028_xfyx9.2.0.0 |      4 |                4 | 1500000 |   382050 |            0 |                      0
+ 20261001_041430_00028_xfyx9.3 | 20261001_041430_00028_xfyx9.3.0.0 |      4 |                4 |  150000 |   150000 |            0 |                      0
+```
+
+ノードが 1 台なので、各ステージのタスクは 1 つずつです。この表の `splits` という列は、Trino 483 のソースではタスクの**ドライバ数**（`totalDrivers`）を出しています（[TaskSystemTable.java](https://github.com/trinodb/trino/blob/483/core/trino-main/src/main/java/io/trino/connector/system/TaskSystemTable.java)）。走査のステージは split 4 つに 4 つのドライバ、交換から受け取る上の段は 16〜17 のドライバで動いていました。結合のステージ（stage 1）だけが交換で 12.3MB を受け取り、どのタスクもディスクへの書き込み（`physical_written_bytes`）は 0 です。
+
+### 実験 5：メモリが足りないとき、障害耐性のある実行では
+
+メモリを多く使う集計として、供給者（1 万社）ごとに lineitem の `comment` を配列に集めました。
+
+```sql
+SELECT count(*), sum(cardinality(c))
+FROM (SELECT suppkey, array_agg(comment) AS c FROM tpch.sf1.lineitem GROUP BY suppkey)
+```
+
+既定の設定（`retry-policy=NONE`）では失敗しました。
+
+```
+Query 20261001_042113_00004_84wnw failed: Query exceeded per-node memory limit of 307.20MB
+[Allocated: 300.54MB, Delta: 8.12MB, Top Consumers: {HashAggregationOperator=294.91MB, LazyOutputBuffer=3.23MB, PagePartitioner=1.21MB}]
+```
+
+307.20MB は 1GB のヒープの 30% で、上で見た `query.max-memory-per-node` の既定値どおりです。集約のハッシュ表がほぼすべてを使っています。`--session spill_enabled=true` を付けると、`No spill paths configured`（退避先のディレクトリが設定されていない）で失敗しました。spill は退避先を設定しないと使えない機能です。
+
+次に、`config.properties` に `retry-policy=TASK` を加え、exchange manager をローカルのファイルシステムで設定して再起動しました。
+
+```
+# etc/config-fte.properties（/etc/trino/config.properties として差し込む）
+coordinator=true
+node-scheduler.include-coordinator=true
+discovery.uri=http://localhost:8080
+catalog.management=${ENV:CATALOG_MANAGEMENT}
+retry-policy=TASK
+
+# etc/exchange-manager.properties
+exchange-manager.name=filesystem
+exchange.base-directories=/tmp/trino-exchange-manager
+```
+
+同じ集計は、今度は成功しました（`10000,6001215`）。`EXPLAIN ANALYZE` では、最後の集計を行う `HASH` のステージが `Tasks count: 3` と 3 つのタスクに分かれていました。既定の設定では同じステージのタスクは 1 つです。ハッシュ表が 3 つのタスクに分かれたことが成功の理由だと考えられますが、タスクごとのメモリの内訳までは確かめていません。Tardigrade の告知も、この方式ではクラスタの空きメモリより多くを必要とするクエリでも成功しうる、と書いています。
+
+いちばんはっきり違ったのは、**ステージの動く順番**です。実験 2 のクエリを両方の設定で実行し、各タスクの開始と終了の時刻を、最初のタスクの作成時刻からの経過ミリ秒にして並べました（タスク名は「ステージ番号.区画番号.試行番号」）。
+
+```
+-- retry-policy=NONE（既定）
+ task  | drivers | output_rows | start_ms | end_ms
+-------+---------+-------------+----------+--------
+ 0.0.0 |      16 |           5 |        9 |    480
+ 1.0.0 |      17 |          35 |       13 |    462
+ 2.0.0 |       4 |      382050 |       34 |    450
+ 3.0.0 |       4 |      150000 |       19 |    199
+
+-- retry-policy=TASK
+ task  | drivers | output_rows | start_ms | end_ms
+-------+---------+-------------+----------+--------
+ 0.0.0 |      16 |           3 |      503 |    506
+ 0.1.0 |      16 |           1 |      514 |    517
+ 0.2.0 |      16 |           1 |      524 |    528
+ 1.0.0 |      17 |          40 |      430 |    448
+ 1.1.0 |      17 |          20 |      457 |    469
+ 1.2.0 |      17 |          20 |      477 |    489
+ 2.0.0 |       4 |      382050 |      105 |    411
+ 3.0.0 |       4 |      150000 |       11 |     88
+```
+
+既定では、4 つのステージが 9〜34 ミリ秒の間にすべて始まり、ほぼ同時に終わっています。根のステージ 0 は、最下段がまだ読んでいるうちから動き出して待ち構えています。`TASK` では、ステージ 3（customer を読む）が 88 ミリ秒に終わってからステージ 2（orders を読む）が 105 ミリ秒に始まり、その後にステージ 1、ステージ 0 と、**前の段が書き終えてから次の段が始まって**います。各段の出力は exchange manager の置き場所に書かれ、実行中にコンテナの中を見ると、`/tmp/trino-exchange-manager/<識別子>.<クエリ ID>.external-exchange-3.0/0/0_0.data` というデータファイルと `committed` という印のファイルが現れ、クエリが終わると消えました。
+
+**既定の Trino はステージを同時に動かしてメモリで流し、TASK の Trino はステージを順に動かして段ごとに書き出す**。これは MapReduce や Spark のバッチ実行と同じ形で、だからこそタスク単位でやり直せます。
+
+やり直しも実際に起きました。最初に `TASK` を試したとき（ヒープ 1GB、`mem_limit: 1600m`）、5 回の計測のうち 1 回だけ 11.65 秒かかりました。サーバーのログには次の行がありました。
+
+```
+WARN  ...EventDrivenFaultTolerantQueryScheduler  Rescheduling task 20261001_041621_00005_kn9yt.1.2.0 due to GENERIC_INTERNAL_ERROR error
+java.lang.IllegalStateException: ChildAggregatedMemoryContext is already closed
+INFO  ...QueryMonitor  TIMELINE: Query 20261001_041621_00005_kn9yt :: FINISHED :: elapsed 11716ms ...
+```
+
+タスクが内部エラーで失敗し、スケジューラがそのタスクだけを再スケジュールして、クエリは最後まで成功しています。再スケジュールの記録が 04:16:23.3、クエリの終了が 04:16:33.7 で、その差の約 10 秒は、セッションプロパティ `retry_initial_delay` の既定値 `10.00s`（再試行までの最初の待ち時間）とほぼ一致します。エラーそのものの原因は調べていません。
+
+<Callout type="warn" title="障害耐性のある実行はメモリも多く使った">
+  `retry-policy=TASK` にした状態では、コンテナの上限 1,600MB で 2 回、コンテナがメモリ不足で強制終了されました（`docker inspect` の `OOMKilled` が `true`）。ヒープは 1GB のままなので、JVM のヒープ外のメモリが増えたことになります。そこで `-XX:ReservedCodeCacheSize` を 256M から 128M に下げ、`-XX:MaxDirectMemorySize=256M` を加え、上限を 2,000MB に上げて続けました。上の構成ファイルはこの最終の状態です。小さな環境で試すときは、ヒープだけでなくコンテナ全体の上限に余裕を持たせる必要があります。
+</Callout>
+
+## Dremel：2010 年の論文
+
+ここから BigQuery の側に移ります。BigQuery は動かしていないので、論文と公式文書に書かれていることだけを扱います。
+
+Dremel は、読み取り専用の入れ子のデータを対話的に分析するための Google の社内システムで、2010 年の VLDB で論文が発表されました（[Dremel: Interactive Analysis of Web-Scale Datasets](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/36632.pdf)）。要旨は、**多段の実行木と列指向のデータ配置を組み合わせることで、1 兆行の表に対する集計を数秒で実行できる**というものです。同じ年に、Dremel を土台とする BigQuery が一般に公開されました（2020 年の論文の 1 節）。
+
+### 入れ子のデータを列に分ける
+
+Dremel が扱うのは、Protocol Buffers のような**入れ子で、繰り返しのあるレコード**です。これを列ごとに分けて保存すると、値だけでは「この値は同じレコードの中の 2 つめなのか、次のレコードの 1 つめなのか」「この欠けた値は、どの階層から欠けているのか」が分からなくなります。論文は値ごとに 2 つの小さな整数を付けてこれを解決しました（4.1 節）。
+
+- **繰り返しレベル**（repetition level）：その値が、経路上のどの繰り返しフィールドで繰り返されたか。0 は新しいレコードの始まり
+- **定義レベル**（definition level）：省略可能なフィールドが欠けたとき、経路上のどの階層までは存在していたか
+
+2020 年の論文は、Parquet がこの符号化を採用し、ORC と Arrow は繰り返しの長さやオフセットを持つ別の方式を取った、と整理しています（6 節）。Parquet の列の形は<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>で扱いました。
+
+### 木構造の集約
+
+実行は**多段の配信木**（serving tree）で行います（2010 年の論文の 5 節）。根のサーバーがクエリを受け取り、表を構成する**タブレット**（表の水平な区画）を調べて、クエリを書き換えて下の段へ送ります。
+
+```sql
+-- 根が受け取るクエリ
+SELECT A, COUNT(B) FROM T GROUP BY A
+-- 根が書き換えたクエリ（R_i は 1 段下のサーバー i に送ったクエリの結果）
+SELECT A, SUM(c) FROM (R_1 UNION ALL ... R_n) GROUP BY A
+-- サーバー i に送るクエリ（T_i は i が受け持つタブレットの集まり）
+SELECT A, COUNT(B) AS c FROM T_i GROUP BY A
+```
+
+各段が同じ書き換えを繰り返し、最後に葉のサーバーがタブレットを並列に走査します。結果は上に戻る途中で、中間のサーバーが部分的に集計していきます。Trino の `PARTIAL` → `INTERMEDIATE` → `FINAL` と同じ考え方を、木の段数だけ重ねたものです。論文自身、この形は結果が小さめから中程度の集計に向いていて、大きな集計などは並列 DBMS や MapReduce の仕組みに頼る必要がある、と範囲を限っています。
+
+### スロットと遅いタスクへの対策
+
+論文は、処理の単位を**スロット**と呼びました。スロットは葉のサーバーの実行スレッド 1 本にあたり、3,000 台の葉のサーバーがそれぞれ 8 スレッドを使えば 24,000 スロットになる。10 万タブレットの表なら、1 スロットに約 5 タブレットを割り当てて処理する、という例が挙がっています（5 節）。クエリの振り分け役（query dispatcher）は、タブレットの処理時間の分布をとり、極端に時間のかかるものを別のサーバーで再実行します。さらに、結果を返す前に走査を終えていなければならないタブレットの割合を指定でき、100% ではなく 98% にするだけで大きく速くなることがある、とも書いています。**遅い 2% を待たない**という割り切りです。
+
+## BigQuery へ：2020 年の振り返り論文
+
+10 年後、元の著者を含む Google の研究者が、Dremel がどう変わったかを振り返る論文を出しました（[Dremel: A Decade of Interactive SQL Analysis at Web Scale](https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf)、VLDB 2020）。この回の主題に関わる変化は 4 つあります。
+
+**1. ストレージを分けた**（3.1 節）。Dremel は当初、数百台の共有なし（shared-nothing）のサーバーで、各サーバーがデータの一部をローカルディスクに持っていました。2009 年に社内のクラスタ管理システム Borg へ移ると、ディスクを他の仕事と共有することになり、各表を 3 台のローカルディスクに複製する方式に変えました。それでも、ストレージを増やすには計算も増やす必要があり、データは Dremel からしか読めない、といった問題が残りました。そこで分散ファイルシステム GFS の上に移し、最初の実験では 1 桁遅くなったものの、形式やメタデータを調整して、最終的にはローカルディスクの方式より速くなった、と論文は書いています。その後 GFS は後継の **Colossus** に移りました。
+
+**2. shuffle の置き場所をメモリの層として分けた**（3.2 節）。2010 年の論文の後、Dremel は分散結合のために shuffle を加えました。最初は MapReduce にならってローカルの RAM とディスクに中間結果を置きましたが、計算ノードと shuffle の置き場所が密に結びついていると、送り手と受け手の数の積で増える shuffle の規模に追いつけず、資源の偏りも生じました。2012 年に Colossus を使った shuffle を作り、2014 年に**完全にメモリ上で実行できる、分離された shuffle の基盤**に落ち着きます。shuffle の中間データを置く RAM とディスクを、計算とは別の分散一時記憶システムで管理する方式です。導入によって shuffle の遅延が 1 桁下がり、1 桁大きな shuffle が可能になり、サービスの資源費用が 20% 以上減りました。執筆時点の論文で、この分離されたメモリはサービス全体のメモリ使用量の 80% を占め、同じ基盤が Cloud Dataflow の shuffle にも使われている、とあります。
+
+**3. 固定の木をやめ、shuffle を区切りにした DAG にした**（5.2 節）。2012 年にスケジューリングを集中化し、コーディネータがクエリごとに実行計画を**ステージの DAG**（有向非巡回グラフ）として組み、スケジューラから渡されたワーカーに配るようになりました。葉のステージのワーカーはストレージから読んで **shuffle の永続化層**に書き、他のステージのワーカーはその層から読み書きします。論文はこの層の結果を**クエリ実行状態のチェックポイント**として使うと書き、資源が足りないときにはワーカーを途中で取り上げて他の仕事に回せる、としています。
+
+**4. 実行中に計画を変える**（同節）。結合の方式について、Dremel はまず両側を shuffle するハッシュ結合で始め、片側が早く終わって十分小さいと分かれば、もう一方の shuffle を取り消してブロードキャスト結合に切り替えます。実行前の行数の見積もりは結合を重ねるほど誤差が大きくなるので、実際に流れた量を見てから決める、という考え方です。
+
+列指向の形式も、2014 年から **Capacitor** に移りました（6 節）。Capacitor はデータを読む部品の中に小さなクエリ処理器を持ち、SQL の条件で不要な区画を飛ばしたり、行の並べ替えで圧縮を効かせたりします。
+
+<Callout type="note" title="Trino の交換と BigQuery の shuffle の違い">
+  どちらもステージの間をメモリで受け渡しますが、**置き場所が違います**。Trino の既定では、交換のデータは送り手のワーカー自身の出力バッファにあり、受け手が HTTP で取りに来ます。送り手が落ちればデータも消えます。BigQuery の shuffle は、ワーカーとは別の層に置かれ、論文はそれをチェックポイントとして扱えると書いています。ワーカーを差し替えても、shuffle の層にある中間結果は残ります。Trino の障害耐性のある実行は、交換のデータを exchange manager の置き場所に書くことで、この「ワーカーの外に置く」形に寄せたものと読めます。違いは、Trino がその置き場所に S3 や GCS といったオブジェクトストレージを使うのに対し、BigQuery は専用のメモリ中心の層を持つ点です。
+</Callout>
+
+## スロットと料金
+
+BigQuery の文書は、スロットを「SQL のクエリなどを実行するために BigQuery が使う仮想的な計算の単位」と定義し、クエリが使うスロット数は処理するデータ量、クエリの複雑さ、使えるスロット数から BigQuery が自動で決め、利用者が手で変えることはできない、と書いています（[BigQuery: Understand slots](https://docs.cloud.google.com/bigquery/docs/slots)、2026-09-24 更新）。実行の流れの説明は、2020 年の論文とよく対応しています。
+
+- SQL はステージの並びからなる実行計画に変換され、ステージ間のデータは**分散 shuffle** で受け渡される
+- 計画は実行中に変わりうる。データの分布に合わせて作業の配分を変え、他のクエリの開始や終了、自動スケールによって使える容量も変わる。複数のステージを同時に動かし、投機的な実行（遅いタスクの複製）や、ステージの区画の分け直しも行う
+- あるステージが 2,000 スロットを要求し、1,000 しか空いていなければ、1,000 単位の仕事を待ち行列に入れ、スロットが空くたびに拾って実行する。要求が使える量を超えても追加の料金はかからず、待つだけになる
+
+クエリの実行計画の文書も、ステージは shuffle という「高速な分散メモリのアーキテクチャ」で通信すると書き、ステージごとの統計に `shuffleOutputBytesSpilled`（ステージ間で大量のデータを送るときに、ディスクへ退避した量）を挙げています（[BigQuery: Query plan and timeline](https://docs.cloud.google.com/bigquery/docs/query-plan-explanation)、2026-09-30 更新）。メモリが基本で、あふれたときだけディスクを使う設計だと分かります。
+
+料金は、計算とストレージを別々に請求します（[BigQuery storage overview](https://docs.cloud.google.com/bigquery/docs/storage_overview)）。計算の料金には 2 つの方式があります（[BigQuery pricing](https://cloud.google.com/bigquery/pricing)、執筆時点の表示）。
+
+| 方式 | 何に払うか | 執筆時点の記載 |
+| --- | --- | --- |
+| オンデマンド | クエリが処理したバイト数 | Iowa（us-central1）で 1 TiB あたり 6.25 米ドル。毎月最初の 1 TiB は無料。参照する表ごと・クエリごとに最低 10MB。プロジェクトあたり概ね最大 2,000 の同時スロット |
+| 容量課金 | 予約したスロットの時間（スロット時間） | Standard、Enterprise、Enterprise Plus の 3 つのエディション。従量課金は秒単位で最低 1 分 |
+
+オンデマンドで課金されるのは**選んだ列**のデータ量で、列ごとの量はその列の型から計算される、と料金の文書は書いています。列指向で保存しているので、読まない列はそもそも読まれず、請求もされない、という対応です。`SELECT *` を避ける、パーティションで絞る、といった BigQuery の定番の注意は、この料金の数え方から来ています。ストレージと計算を分けたからこそ、「保存している量」と「計算に使った量」を別々に数えられる、という点も押さえておきます。
+
+## Trino と BigQuery を並べる
+
+| 観点 | Trino（既定） | Trino（`retry-policy=TASK`） | BigQuery（2020 年の論文と文書） |
+| --- | --- | --- | --- |
+| 計画を立てる側 | コーディネータ | コーディネータ | クエリごとのコーディネータと集中スケジューラ |
+| 実行する側 | 常駐するワーカー（台数は利用者が用意） | 同左 | 共有のワーカーの池。スロットで割り当て |
+| ステージの動かし方 | 同時に動かし、できた分から流す | 前の段の出力が書き終わってから次の段 | 複数のステージを同時に動かせる。shuffle の層を区切りに使う |
+| ステージ間の受け渡し | 送り手のメモリ上の出力バッファを HTTP で取りに行く | exchange manager の置き場所（S3、GCS など）に書く | ワーカーとは別の、メモリ中心の shuffle の層 |
+| 障害時 | クエリ全体が失敗 | 失敗したタスクだけをやり直す | 小さな部分だけを別のワーカーでやり直す。遅いタスクは複製する |
+| データの置き場所 | コネクタの先（S3 上の Iceberg、RDB など） | 同左 | Colossus 上の Capacitor 形式（外部表も読める） |
+
+## バッチエンジンとの違い
+
+最後に、連載のこれまでの回と比べます。
+
+| 観点 | MapReduce | Spark | Trino（既定） |
+| --- | --- | --- | --- |
+| プロセスの起動 | タスクごとにコンテナを起動（<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の回</a>） | アプリケーションごとにエグゼキュータを起動し、そのアプリケーションの間は動き続ける（[Spark: Cluster Mode Overview](https://spark.apache.org/docs/latest/cluster-overview.html)） | ワーカーは常駐。クエリはすでに動いているプロセスに配られる |
+| ステージ間の中間データ | ディスクに書き、HTTP で取得 | shuffle の境目でディスク上の中間ファイルに書く | メモリ上のバッファから直接流す |
+| ステージの動かし方 | map が終わってから reduce の処理 | 前のステージが終わってから次のステージ | 全ステージを同時に動かすパイプライン |
+| 障害時 | 失敗したタスクを再実行 | 系譜（lineage）と shuffle ファイルからタスクを再計算 | クエリ全体が失敗（障害耐性のある実行を有効にすればタスク単位で再実行） |
+| 向いている用途 | 大きなバッチ | 大きなバッチと反復計算 | 人が待つ対話的な集計 |
+
+Presto の論文は、Spark SQL はメモリ上の中間結果を扱えるが、端から端までのパイプライン化はせず、ステージ間の shuffle ではふつうファイルシステムにデータを書く、それは障害耐性を高めるが、増える遅延のために対話的な用途には向きにくい、と比較しています（VIII 節）。**ディスクに書く手間と、失敗したときにやり直せる範囲は、表裏の関係にあります。**MPP 型のエンジンはその手間を省いて速さを取り、Trino の障害耐性のある実行や BigQuery の shuffle の層は、書く先を速くするか選べるようにすることで、両方を得ようとしています。
+
+## ほかの MPP 型エンジン
+
+この連載では詳しく扱いませんが、同じ系統の主なエンジンを、この回の観点で並べます。系譜と現役かどうかは<a href={`${import.meta.env.BASE_URL}reading/compute-map/`}>計算エンジンの地図</a>にまとめました。
+
+| エンジン | 実行する側 | データの置き場所 | 出典 |
+| --- | --- | --- | --- |
+| Apache Impala | 各ノードの `impalad` がクエリを受け付け、並列化してクラスタに配る。`statestored` が各デーモンの状態を見張り、`catalogd` がメタデータの変更を配る | HDFS の DataNode と同居するのが典型。別の計算クラスタから遠隔のストレージを読む形もある | [Impala: Components](https://impala.apache.org/docs/build/html/topics/impala_components.html) |
+| Snowflake | 仮想ウェアハウス（他と計算資源を共有しない、独立した MPP の計算クラスタ） | 計算とは別のデータベースストレージ層。調整はクラウドサービス層 | [Snowflake: Key concepts and architecture](https://docs.snowflake.com/en/user-guide/intro-key-concepts) |
+| Amazon Redshift | リーダーノードが計画を立ててコードをコンパイルし、コンピュートノードのスライスが並列に実行 | Redshift Managed Storage（S3 を使い、SSD を一次キャッシュにする）。計算とストレージを別々に増やせる | [Redshift: System architecture](https://docs.aws.amazon.com/redshift/latest/dg/c_high_level_system_architecture.html) |
+| ClickHouse | 各サーバーが自分のデータを処理。Distributed エンジンの表は自分ではデータを持たず、読み取りを複数サーバーに並列化し、集約の中間状態を問い合わせ元で合わせる | 各サーバーのローカル（MergeTree 系の表） | [ClickHouse: Distributed table engine](https://clickhouse.com/docs/engines/table-engines/special/distributed) |
+
+Snowflake と Redshift の RA3 系は、BigQuery と同じく**ストレージと計算の分離**の側に寄っています。Impala と ClickHouse は、計算するノードがデータの近くにいる形を基本にしています。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| MPP | 多数のノードがクエリの一部ずつを並列に処理する方式 |
+| コーディネータ / ワーカー | Trino で計画を立てて管理するサーバー / タスクを実行するサーバー |
+| ステージ（Fragment） | 分散実行計画の一区画。木を成す |
+| タスク | ステージをワーカー上で実行する実体 |
+| split | データの一区画。最下段のタスクが読む単位 |
+| ドライバ | タスクの中で並列に動く、オペレータの列の実体 |
+| オペレータ | 走査、フィルタ、結合、集約などの部品 |
+| 交換（exchange） | ステージ間でデータを受け渡す仕組み。既定は出力バッファと HTTP |
+| パイプライン実行 | ステージを同時に動かし、できた分から次へ流す実行の仕方 |
+| ブロードキャスト結合（`REPLICATED`） | ビルド側を全ノードに配って結合する方式 |
+| 分割結合（`PARTITIONED`） | 両側を結合キーのハッシュで配り直して結合する方式 |
+| 同一配置結合 | 両側がすでに結合キーで同じように分かれているとき、配り直さずに結合すること |
+| 動的フィルタ | ビルド側で現れたキーを、実行中にプローブ側の走査条件として渡す仕組み |
+| 障害耐性のある実行 | Trino で中間データを外部に書き、クエリやタスクをやり直せるようにする実行の方式 |
+| exchange manager | 障害耐性のある実行で、交換のデータを書き出す先を管理する部品 |
+| 繰り返しレベル / 定義レベル | 入れ子のデータを列に分けたとき、値がどこで繰り返され、どこまで定義されていたかを表す整数 |
+| 配信木 | Dremel の 2010 年の論文の、根・中間・葉のサーバーからなる多段の実行木 |
+| スロット | BigQuery の仮想的な計算の単位。料金の単位にもなる |
+| shuffle の層 | BigQuery で、ワーカーとは別に中間データを置くメモリ中心の層 |
+| Colossus / Capacitor | Google の分散ファイルシステム / BigQuery の列指向形式 |
+
+似た用語の区別を 2 つ補います。
+
+- **Trino の split と BigQuery のスロット**：split は「データの一区画」、スロットは「計算資源の一区画」です。Dremel の 2010 年の論文の例では、10 万のタブレット（データの区画）を 24,000 のスロット（計算の区画）に割り当てていました。
+- **Trino の spill と障害耐性のある実行**：どちらもディスクやストレージに書きますが、spill はメモリが足りない演算子の状態を手元のディスクに退避するもの、障害耐性のある実行はステージ間の交換のデータを外部に書いてやり直しに備えるものです。文書は前者を古い機能とし、後者を勧めています。
+
+## まとめ
+
+- MPP 型の SQL エンジンの速さは、常駐するワーカー、ステージ間をメモリで流す交換、既定でディスクに書かないことから来る
+- Trino のクエリは、ステージ → タスク → ドライバ → オペレータに分解され、最下段は split を読む。ステージの間は出力バッファと HTTP のロングポーリングでつながる
+- 実験では、小さい customer は全台に配られ（`REPLICATED`）、`join_distribution_type=PARTITIONED` にすると両側を `custkey` のハッシュで配り直すステージが 1 つ増えた。同じ分け方の orders と lineitem は配り直さずに結合された
+- 既定の Trino は全ステージを同時に動かし、メモリが足りなければクエリを止め、ノードが落ちればクエリごと失敗する。それが速さの代償である
+- `retry-policy=TASK` にすると、ステージは前の段を書き終えてから順に動き、交換のデータは外部に書かれる。実験では、既定では 307MB の上限で失敗した集計が成功し、内部エラーで失敗したタスクが約 10 秒後に再実行されてクエリが完了した
+- Dremel は入れ子のデータを繰り返しレベルと定義レベルで列に分け、多段の木で部分集計を重ねた。Parquet はこの符号化を採用した
+- BigQuery は、ストレージ（Colossus）と shuffle（メモリ中心の層）を計算から切り離し、shuffle の層をチェックポイントとして使うことで、メモリで流す速さと、小さな単位でやり直せることを両立させた
+- BigQuery のオンデマンド料金は読んだ列のバイト数、容量課金はスロット時間で数える。どちらも計算とストレージの分離が前提にある
+
+この回までで、Hadoop、Spark、Flink、Trino、BigQuery の中身を見てきました。どのエンジンも、最後は誰かが用意したマシンの上で動きます。クラスタを自分で持つか、借りるか、サーバーレスにするかで、運用の責任と料金の形がどう変わるのかを、<a href={`${import.meta.env.BASE_URL}reading/compute-managed/`}>マネージドの分散処理</a>で見ていきます。

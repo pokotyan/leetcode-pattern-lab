@@ -1,0 +1,483 @@
+---
+title: 状態を持つストリーム処理（Flink・Beam・Dataflow）
+description: 流れ続けるデータを集計するエンジンは、覚えている途中の値をどこに置き、落ちたときにどこまで戻り、遅れて届いた行をどう扱うのか。Flink のチェックポイントと watermark を実際に動かして確かめ、Beam のモデルと Dataflow の実行の仕組みまでを見ます
+category: compute
+order: 23
+status: published
+topics:
+  - Apache Flink
+  - JobManager
+  - TaskManager
+  - Operator Chaining
+  - Keyed State
+  - RocksDB
+  - Checkpoint Barrier
+  - Unaligned Checkpoint
+  - Savepoint
+  - Watermark
+  - Two-Phase Commit
+  - Credit-based Flow Control
+  - Apache Beam
+  - Google Cloud Dataflow
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: keyBy は「キーのハッシュで担当を決める」振り分けで、Flink はハッシュ値をキーグループに畳み、キーグループ単位で状態をサブタスクに割り当てる
+  - kind: article
+    slug: heap-topk
+    why: イベント時刻のタイマーは「次に発火すべき最小の時刻」を取り出し続ける優先度付きキューに入り、watermark が進むたびに先頭から発火する
+  - kind: article
+    slug: sliding-window
+    why: 窓の状態は watermark が窓の終わりと許容遅延を越えた時点で捨てられ、窓から外れたものを捨てる形がそのまま状態の掃除になる
+---
+
+import Callout from '../../components/Callout.astro'
+
+## ストリーム処理の難しさは「状態」と「時刻」にある
+
+<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理（MapReduce とストリーム）</a>では、ストリームを窓（tumbling、sliding、session）で区切って集計する考え方と、バッチとストリームを併用する Lambda / Kappa の構成を見ました。この回はその続きで、**それを実際に動かすエンジンの中身**を扱います。
+
+ストリームの集計が難しいのは、次の 2 つがあるからです。
+
+1. **状態**：「ユーザーごとの今日の合計」は、何時間も前のイベントから積み上げた途中の値です。これを覚えておく場所が要り、プロセスが落ちても失ってはいけません。しかも入力は止まらないので、バッチのように「最初からやり直す」ことができません。
+2. **時刻**：イベントは起きた順に届くとは限りません。「10:00〜10:10 の窓」をいつ締めてよいかは、データを見ているだけでは決まりません。
+
+**状態を失わずに再開する仕組み（チェックポイント）と、窓を締める時期を決める仕組み（watermark）**が、この回の 2 本の柱です。前半で Flink の内部をこの 2 つを中心に見て、実際に Flink を動かして観察します。後半では、同じ問題を「計算の書き方」として整理した Beam のモデルと、そのマネージドな実行環境である Google Cloud Dataflow を扱います。配送保証の一般論（at-least-once と exactly-once の違い、冪等キー）は<a href={`${import.meta.env.BASE_URL}reading/messaging/`}>メッセージング</a>で扱ったので、ここではエンジンの中でそれをどう実現しているかに絞ります。
+
+執筆時点（2026 年 10 月）で確認した版は、Flink 2.3.0、Beam 2.76.0、Kafka 4.3.1、Spark 4.2.0 です。各エンジンの系譜は<a href={`${import.meta.env.BASE_URL}reading/compute-map/`}>計算エンジンの地図</a>にあります。
+
+## Flink の実行体：JobManager・TaskManager・スロット
+
+Flink の実行時の構成は、1 つの **JobManager** と 1 つ以上の **TaskManager** という 2 種類のプロセスです（[Flink 2.3: Flink Architecture](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/flink-architecture/)）。
+
+| 構成要素 | 役割 |
+| --- | --- |
+| JobManager / ResourceManager | タスクスロットを管理する。YARN、Kubernetes、単独構成など環境ごとに資源を確保する |
+| JobManager / Dispatcher | ジョブ投入用の REST の口と Web UI を持ち、ジョブごとに JobMaster を起動する |
+| JobManager / JobMaster | 1 つのジョブ（JobGraph）の実行を管理する。チェックポイントの開始と完了の判定もここで行う |
+| TaskManager | データフローのタスクを実行し、タスク間でデータを受け渡す。ワーカーにあたる |
+| タスクスロット | TaskManager の資源の最小単位。文書によれば、スロットは管理メモリの決まった一部を表し、**CPU の分離は行わない** |
+
+同じジョブであれば、別の演算子のサブタスクどうしも 1 つのスロットを共有できます（**スロット共有**）。そのため、ジョブに必要なスロット数は演算子の数の合計ではなく、**最も大きい並列度**と同じで済みます。
+
+もう 1 つの最適化が**オペレータチェーン**（operator chaining）です。前後の演算子を 1 つのタスクにまとめ、同じスレッドの関数呼び出しで受け渡すことで、スレッド間の受け渡しと直列化を省きます。既定で有効で、`disableChaining()` や `startNewChain()` で個別に切れます（[Flink 2.3: Operators](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/overview/)）。後の実験 1 のログには、実行されたタスクの名前が次のように出ていました。
+
+```
+Source: Sequence Source -> Map (1/1)
+KeyedProcess -> (Map -> Sink: Print to Std. Out, Sink: Writer -> Sink: Committer) (1/1)
+```
+
+プログラムでは 6 つの演算子を書きましたが、タスクは 2 つです。境目は `keyBy` で、キーごとに担当のサブタスクへ配り直す必要があるため、ここでネットワーク越しの受け渡し（Spark でいう shuffle）が入り、チェーンが切れます。`keyBy` の後ろは、2 つの sink への分岐も含めて 1 つのタスクにまとまっています。
+
+## キー付き状態と状態バックエンド
+
+`keyBy` の後ろの演算子は、キーごとの**キー付き状態**（keyed state）を持てます。文書はこれを「埋め込みのキーと値のストアのようなもの」と説明し、状態はストリームの振り分けと厳密にそろっている、つまり**あるキーの状態は、そのキーのイベントを処理するサブタスクにしか無い**と書いています（[Flink 2.3: Stateful Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/)）。状態の読み書きはローカルで済み、ネットワーク越しの問い合わせが要りません。
+
+並列度を変えるとき、状態はキー 1 つずつではなく**キーグループ**（key group）という単位で移ります。文書はキーグループを「キー付き状態を再配置する原子的な単位」と呼び、その数は**最大並列度**と同じです。割り当ては Flink のソース（[KeyGroupRangeAssignment.java](https://github.com/apache/flink/blob/release-2.3.0/flink-runtime/src/main/java/org/apache/flink/runtime/state/KeyGroupRangeAssignment.java)）で次のように計算されます。
+
+```
+キーグループ   = murmurHash(key.hashCode()) % maxParallelism
+担当サブタスク = キーグループ * parallelism / maxParallelism
+```
+
+キーグループは連続した範囲ごとにサブタスクへ割り当てられるので、並列度を 4 から 8 にしても、各サブタスクは自分の範囲のキーグループの状態をまとめて読み込むだけで済みます。最大並列度は並列度の上限でもあり、指定しなければおおよそ「並列度 + 並列度 / 2」で、下限 128、上限 32768 になります（[Flink 2.3: Parallel Execution](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/execution/parallel/)）。**最大並列度は後から変えられない**ので、将来の規模を見込んで決めておく値です。
+
+状態の実体をどこに置くかを決めるのが**状態バックエンド**です。Flink 2.3 の文書には 3 つあります（[Flink 2.3: State Backends](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/state_backends/)）。
+
+| 状態バックエンド | `state.backend.type` | 状態の置き場所 | 向いている場合 |
+| --- | --- | --- | --- |
+| HashMapStateBackend（既定） | `hashmap` | Java ヒープ上のオブジェクト | 状態が小さく、速さを優先する |
+| EmbeddedRocksDBStateBackend | `rocksdb` | TaskManager のローカルディスク上の RocksDB（キーと値を LSM 木で持つ組み込み DB） | 状態がメモリに載らない。増分チェックポイントを使いたい |
+| ForStStateBackend（実験的） | `forst` | LSM 木のファイルを S3 や HDFS などのリモートのファイルシステムに置ける | 計算と状態の置き場所を分けたい |
+
+RocksDB は状態を直列化してディスクに置くので、ヒープの大きさに縛られない代わりに、読み書きのたびに直列化の費用がかかります。文書は、キーと値の大きさの上限がそれぞれ 2^31 バイトだとも注記しています。RocksDB と ForSt では、前回から変わったファイルだけを記録する**増分チェックポイント**が使えます（設定は `execution.checkpointing.incremental`。2.3.0 の既定値は `false`）。
+
+窓の締め切りのような「イベント時刻 t になったら呼んでほしい」という予約は**タイマー**として状態と一緒に持たれ、時刻の小さい順に取り出す優先度付きキューに入ります。RocksDB を使う場合、タイマーも既定で RocksDB に置かれます（`state.backend.rocksdb.timer-service.factory` の既定値 `ROCKSDB`。[RocksDBOptions.java](https://github.com/apache/flink/blob/release-2.3.0/flink-state-backends/flink-statebackend-rocksdb/src/main/java/org/apache/flink/state/rocksdb/RocksDBOptions.java)）。
+
+## チェックポイント：流れに印を混ぜて、全体の写真を撮る
+
+状態をローカルに持つと、TaskManager が落ちたときに失われます。Flink は定期的に全演算子の状態を耐久性のあるストレージ（S3、HDFS など）へ写し、落ちたら最新の写しから再開します。問題は、**止まらずに流れているデータフローの、どの瞬間の写真を撮れば矛盾しないか**です。演算子 A が「イベント 100 まで処理した状態」を、演算子 B が「イベント 90 まで受け取った状態」を記録してしまうと、再開したときに 91〜100 の効果が二重になるか失われます。
+
+Flink の答えは、分散スナップショットの古典である Chandy-Lamport のアルゴリズム（1985 年）を、データフロー向けに変えた**非同期バリアスナップショット**です。文書はその根拠として論文 [Lightweight Asynchronous Snapshots for Distributed Dataflows](https://arxiv.org/abs/1506.08603)（Carbone ほか、2015 年）を挙げています（[Stateful Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/)）。手順は次のとおりです。
+
+1. JobMaster のチェックポイント調整役が、チェックポイント n の開始をソースに指示する。ソースは自分の読み取り位置（Kafka ならオフセット）を記録し、**バリア n** という印をデータの流れに差し込む
+2. バリアはレコードと同じ流れに乗って下流へ進み、レコードを追い越さない。したがって、バリア n より前のレコードはチェックポイント n に含まれ、後ろのレコードは含まれない
+3. 演算子は、**すべての入力からバリア n が届いた時点**で自分の状態を写し、バリアを下流へ送る。入力が複数あるとき、先にバリアが届いた入力は、残りの入力のバリアが届くまで読むのを止めて待つ。これを**整列**（alignment）と呼ぶ
+4. 状態の写しは、まずローカルで取って処理を再開し、耐久ストレージへの書き出しは裏で行う（非同期）
+5. すべての sink がバリア n を受け取り、全演算子の写しが書き終わったら、チェックポイント n が完了する
+
+```
+  ソース1 ──r9──r8──|n|──r7──▶┐
+                               ├─▶ 結合演算子：入力 1 は |n| が届いたので一時停止
+  ソース2 ──r6──r5──r4──|n|──▶┘    入力 2 の |n| を待つ → 届いたら状態を写し、|n| を下流へ
+  （|n| = バリア n。右へ流れる。|n| より右のレコードはチェックポイント n に含まれる）
+```
+
+Chandy-Lamport との違いは、通信路上を流れている途中のメッセージを記録しない点です。整列によって「バリアより前のものはすべて状態に反映済み、後ろのものは未処理」という切れ目を作るので、写すのは各演算子の状態とソースの位置だけで済みます。再開時は、ソースを記録した位置へ巻き戻して読み直します。**ソースが読み直せること**（Kafka のオフセット、ファイルの位置）が前提です。
+
+整列を省くと、待たずに処理を続けられる代わりに、バリアより後ろのレコードが状態に混ざります。文書はこれを at-least-once のモードとして説明し、復旧時に重複が起こりうると書いています。設定は `execution.checkpointing.mode`（既定値 `EXACTLY_ONCE`、ほかに `AT_LEAST_ONCE`）です。
+
+## 整列と非整列：バックプレッシャーの下でのチェックポイント
+
+整列には弱点があります。下流が詰まっていると、演算子間のバッファにレコードが溜まり、バリアはその後ろに並ぶしかありません。文書は、強いバックプレッシャーの下ではチェックポイントにかかる時間の大半が**バリアが全演算子に届くまでの時間**になる、と説明しています（[Flink 2.3: Checkpointing under backpressure](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/checkpointing_under_backpressure/)）。チェックポイントが終わらなければ、障害時に戻る位置がどんどん古くなります。
+
+対策は 2 つあります。
+
+| 方法 | 設定 | 仕組み | 代償 |
+| --- | --- | --- | --- |
+| 非整列チェックポイント | `execution.checkpointing.unaligned.enabled`（既定 `false`） | バリアがバッファ内のレコードを追い越して先へ進む。追い越したレコード（流れている途中のデータ）も状態の一部として保存する | チェックポイントが大きくなり、ストレージへの書き込みが増える |
+| 整列の時間切れ | `execution.checkpointing.aligned-checkpoint-timeout` | 整列で始め、指定時間を超えたら非整列に切り替える | 同上（切り替えたときだけ） |
+| バッファの縮小（buffer debloating） | `taskmanager.network.memory.buffer-debloat.enabled`（既定 `false`） | 演算子間に溜めるデータの量を、処理速度に合わせて自動で減らす。1.14 で導入 | 整列のままでもバリアの待ち行列が短くなる |
+
+非整列チェックポイントは、Chandy-Lamport が通信路上のメッセージも記録したことに、ある意味で戻った形です。文書は制限として、非整列チェックポイントは同時に複数走らせられないこと、復旧時には途中のデータが watermark の後に流れ直すため整列の場合と結果が変わりうること、などを挙げています。設定名は、2.x で `execution.checkpointing.unaligned` から `.enabled` 付きに変わっています（旧名も非推奨の別名として残っています。Flink 2.3.0 の `CheckpointingOptions` で確認）。
+
+## 実験 1：途中で落として、チェックポイントから再開する
+
+チェックポイントからの復旧で、状態と出力がどうなるかを確かめました。環境は macOS 上の JDK 11（Temurin 11.0.15）で、Flink 2.3.0 の jar を Maven Central から取得し、1 つの JVM の中で JobManager と TaskManager を動かすローカルの MiniCluster で実行しています（ヒープは `-Xmx1g`）。Docker は使っていません。本物のクラスタではプロセスが分かれますが、チェックポイントと再開の手順は同じコードで動きます。
+
+ジョブは、1〜60 の数を 1 件 100 ミリ秒ずつ流し、3 で割った余りをキーにして累計を状態に持ち、結果を 2 つの sink に書きます。1 つは標準出力に書くだけの sink、もう 1 つはチェックポイントと連動してファイルを確定させる `FileSink` です。初回の実行（attempt 0）でだけ、n=40 のときに例外を投げます。状態バックエンドは RocksDB、チェックポイントは 1 秒ごとです。コードは次のとおりです（import 文は省略）。
+
+```java
+public class Recovery {
+    static class SlowAndFailOnce extends RichMapFunction<Long, Long> {
+        int attempt;
+        public void open(OpenContext ctx) {
+            attempt = getRuntimeContext().getTaskInfo().getAttemptNumber();
+            System.out.println("[map] open, attempt=" + attempt);
+        }
+        public Long map(Long n) throws Exception {
+            Thread.sleep(100);
+            if (attempt == 0 && n == 40) throw new RuntimeException("injected failure at n=" + n);
+            return n;
+        }
+    }
+    static class RunningSum extends KeyedProcessFunction<Long, Long, String> {
+        ValueState<Long> sum;
+        public void open(OpenContext ctx) {
+            sum = getRuntimeContext().getState(new ValueStateDescriptor<>("sum", Types.LONG));
+        }
+        public void processElement(Long n, Context ctx, Collector<String> out) throws Exception {
+            long s = (sum.value() == null ? 0 : sum.value()) + n;
+            sum.update(s);
+            out.collect("key=" + ctx.getCurrentKey() + " n=" + n + " sum=" + s);
+        }
+    }
+    public static void main(String[] args) throws Exception {
+        String base = args[0];
+        Configuration conf = new Configuration();
+        conf.setString("state.backend.type", "rocksdb");
+        conf.setString("execution.checkpointing.dir", "file://" + base + "/checkpoints");
+        conf.setString("execution.checkpointing.interval", "1 s");
+        conf.setString("restart-strategy.type", "fixed-delay");
+        conf.setString("restart-strategy.fixed-delay.attempts", "1");
+        conf.setString("restart-strategy.fixed-delay.delay", "1 s");
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(conf);
+        env.setParallelism(1);
+
+        DataStream<String> out = env.fromSequence(1, 60)
+            .map(new SlowAndFailOnce())
+            .keyBy(n -> n % 3)
+            .process(new RunningSum());
+        out.map(s -> "[print] " + s).print();
+        out.sinkTo(FileSink.forRowFormat(new Path(base + "/out"), new SimpleStringEncoder<String>())
+            .withRollingPolicy(OnCheckpointRollingPolicy.build())
+            .build());
+        env.execute("recovery");
+    }
+}
+```
+
+```
+$ javac -d classes -cp "$CP" Recovery.java
+$ java -Xmx1g -cp "classes:$CP" Recovery $PWD/run2 > run2/stdout.log 2>&1
+```
+
+ログの該当行を抜き出したものです（スレッド名、ジョブ ID、タスクの識別子を削り、行を間引いています）。
+
+```
+[map] open, attempt=0
+[print] key=1 n=1 sum=1
+...
+Completed checkpoint 4 (29277 bytes, checkpointDuration=83 ms)
+[print] key=1 n=37 sum=247
+[print] key=2 n=38 sum=260
+[print] key=0 n=39 sum=273
+Source: Sequence Source -> Map (1/1)#0 switched from RUNNING to FAILED with failure cause:
+java.lang.RuntimeException: injected failure at n=40
+Restoring job ... from Checkpoint 4 @ 1790828046876 ...
+KeyedProcess -> (...) (1/1)#1 INFO RocksDBIncrementalRestoreOperation - Starting RocksDB incremental recovery ...
+[map] open, attempt=1
+[print] key=1 n=37 sum=247
+[print] key=2 n=38 sum=260
+[print] key=0 n=39 sum=273
+[print] key=1 n=40 sum=287
+...
+[print] key=0 n=60 sum=630
+```
+
+標準出力の sink と `FileSink` の出力を数えた結果です。
+
+```
+-- [print] の行数: 63      重複した行: n=37, 38, 39 の 3 行
+-- FileSink の確定済みファイル（名前が . で始まらないもの）
+part-e4ecba69-...-0    7 行  n=1..7       ← 1 回目の実行。チェックポイント 1〜4 で 1 つずつ確定
+part-e4ecba69-...-1   10 行  n=8..17
+part-e4ecba69-...-2   10 行  n=18..27
+part-e4ecba69-...-3    9 行  n=28..36
+part-b998090d-...-0   10 行  n=37..46     ← 2 回目の実行
+part-b998090d-...-1   10 行  n=47..56
+part-b998090d-...-2    4 行  n=57..60
+-- 合計 60 行、重複 0 行
+-- 確定していないファイル
+.part-e4ecba69-...-4.inprogress.9506964d-...   3 行  n=37..39
+```
+
+読み取れることは 3 つです。
+
+**1. 状態は巻き戻り、二重に数えられていない。** チェックポイント 4 は n=36 までを処理した状態を持っていました。再開後のソースは n=37 から読み直し、累計の状態も n=36 の時点に戻ったので、再処理した n=37 の累計は 1 回目と同じ 247 です。最後の累計 630 は 1+2+…+60 と一致します。**エンジンの中の状態について、exactly-once は保たれています。**
+
+**2. 外への書き込みは、sink の作り次第で二重になる。** 標準出力の sink は書いたものを取り消せないので、チェックポイント 4 のあとに 1 回目が書いた n=37〜39 が、再開後にもう一度書かれました。63 行のうち 3 行が重複です。exactly-once が「処理が 1 回だけ起きる」ことではなく、「状態と確定した出力が、1 回だけ処理したのと同じになる」ことだというのは<a href={`${import.meta.env.BASE_URL}reading/messaging/`}>メッセージング</a>で見たとおりで、それがそのまま観察できます。
+
+**3. `FileSink` の確定済みの出力は 60 行ちょうど。** 1 回目の実行がチェックポイント 4 のあとに書いた n=37〜39 は、確定されないまま隠しファイル（`.part-...inprogress...`）に残り、確定済みのファイルには入っていません。`FileSink` の文書は、ファイルが「書き込み中 → 確定待ち → 確定」と状態を移り、確定待ちのファイルは**チェックポイントが成功したときにだけ**確定すると説明しています（[Flink 2.3: FileSystem connector](https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/datastream/filesystem/)）。読む側が名前が `.` で始まるファイルを無視する前提で、出力の側でも exactly-once になっています。なお、残った隠しファイルを Flink は自動では消しませんでした。
+
+## セーブポイント
+
+チェックポイントと同じ仕組みで、利用者が手で取るのが**セーブポイント**です。文書は両者を次のように対比しています（[Flink 2.3: Checkpoints vs. Savepoints](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/checkpoints_vs_savepoints/)）。
+
+| | チェックポイント | セーブポイント |
+| --- | --- | --- |
+| 誰が作り、消すか | Flink が自動で作り、古いものを消す | 利用者が作り、利用者が消すまで残る |
+| 目的 | 予期しない障害からの復旧 | 計画的な操作（プログラムの更新、並列度の変更、Flink の版の更新） |
+| 形式 | 状態バックエンドに固有の形式 | 既定は状態バックエンドに依存しない共通の形式（固有の形式も選べる） |
+| 状態バックエンドの変更 | できない | 共通の形式ならできる |
+| 任意のジョブの更新・Flink のマイナー版の更新 | 整列チェックポイントならできる。非整列ではできない | できる |
+
+**プログラムを書き換えて再デプロイするときは、セーブポイントを取って止め、新しいプログラムをそこから起動する**のが基本の手順です。このとき演算子の状態は演算子の ID で対応づけられるので、`uid()` で ID を明示しておかないと、書き換えで自動生成の ID が変わり、状態を引き継げなくなります。
+
+## イベント時刻と watermark
+
+次は時刻の柱です。窓の集計は、イベントが起きた時刻（**イベント時刻**）で行うのが基本です。処理したマシンの時計（**処理時刻**）で区切ると、遅延や再処理で結果が変わってしまうからです。しかしイベント時刻で区切ると、「10:00〜10:10 の窓のデータがもう全部届いた」とはいつ言えるのか、という問題が生まれます。
+
+Flink はこれを **watermark** で表します。watermark(t) は「このストリームでは、イベント時刻が t 以下のイベントはもう来ないとみなす」という宣言で、データと同じ流れに乗って下流へ進みます。窓の演算子は、watermark が窓の終わりを越えた時点で窓を締めて結果を出します。
+
+最もよく使う作り方 `WatermarkStrategy.forBoundedOutOfOrderness(遅れの上限)` は、それまでに見た最大のイベント時刻から、遅れの上限と 1 ミリ秒を引いた値を watermark にします（[Flink 2.3: Generating Watermarks](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/)）。watermark を出す間隔は `pipeline.auto-watermark-interval`（既定 200 ミリ秒）で、特定のイベントを見たときに即座に出す作り方もできます。
+
+並列に動く場合の規則が重要です。複数の入力を持つ演算子の watermark は、**全入力の watermark の最小値**になります。そのため、データの来ないパーティションが 1 つあるだけで、全体の watermark が止まり、どの窓も締まらなくなります。対策として、一定時間データが来ない入力を計算から外す `withIdleness(Duration)` と、速すぎるソースの読み込みを抑えて入力間の差を一定以内に保つ `withWatermarkAlignment(...)` があります（同じ文書）。
+
+watermark はあくまで推定です。Dataflow Model の論文（後述）は、watermark には 2 つの欠点があると指摘しています（[Akidau ほか, PVLDB 8(12), 2015](https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf)）。**速すぎる**ことがあり、そのときは watermark の後ろから遅れたデータが届く。**遅すぎる**ことがあり、全体の進み具合の指標なので、遅いデータ 1 つでパイプライン全体の watermark が引き止められ、結果が出るのが遅れる。前者に対する Flink の道具が、窓を締めたあとも一定時間だけ遅れたデータを受け付ける**許容遅延**（allowed lateness）です。
+
+- 許容遅延の既定値は 0。watermark が「窓の終わり + 許容遅延」を越えると、窓の状態は捨てられる
+- 許容遅延の内側で届いた遅れたデータは、窓をもう一度発火させ、更新された結果を出す
+- 許容遅延を越えて届いたデータは捨てられる。`sideOutputLateData(OutputTag)` を付けると、捨てる代わりに別のストリームへ出せる
+
+（[Flink 2.3: Windows](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/)）
+
+## 実験 2：watermark と遅れて届く要素
+
+イベント時刻つきの 9 件を、わざと順番を崩して流しました。窓は 10 秒の tumbling、遅れの上限は 2 秒、許容遅延は 3 秒です。watermark の動きを 1 件ずつ見るため、`forBoundedOutOfOrderness` と同じ式で、イベントごとに即座に watermark を出す生成器を書いています（import 文は省略）。
+
+```java
+public class LateData {
+    static final long[] ARRIVALS = {1, 4, 3, 12, 13, 8, 25, 5, 21};   // 到着順のイベント時刻（秒）
+
+    static class EveryEventWatermarks implements WatermarkGenerator<Tuple2<String, Long>> {
+        long maxTs = Long.MIN_VALUE + 2000 + 1;
+        public void onEvent(Tuple2<String, Long> e, long ts, WatermarkOutput out) {
+            maxTs = Math.max(maxTs, ts);
+            long wm = maxTs - 2000 - 1;
+            System.out.printf("arrive t=%2ds  -> watermark %6d ms%n", ts / 1000, wm);
+            out.emitWatermark(new Watermark(wm));
+        }
+        public void onPeriodicEmit(WatermarkOutput out) {}
+    }
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
+        List<Tuple2<String, Long>> data = new ArrayList<>();
+        for (long s : ARRIVALS) data.add(Tuple2.of("a", s * 1000));
+        OutputTag<Tuple2<String, Long>> late = new OutputTag<>("late", Types.TUPLE(Types.STRING, Types.LONG));
+
+        SingleOutputStreamOperator<String> result = env
+            .fromData(data, Types.TUPLE(Types.STRING, Types.LONG))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Tuple2<String, Long>>forGenerator(c -> new EveryEventWatermarks())
+                    .withTimestampAssigner((e, t) -> e.f1))
+            .keyBy(e -> e.f0)
+            .window(TumblingEventTimeWindows.of(Duration.ofSeconds(10)))
+            .allowedLateness(Duration.ofSeconds(3))
+            .sideOutputLateData(late)
+            .process(new ProcessWindowFunction<Tuple2<String, Long>, String, String, TimeWindow>() {
+                public void process(String key, Context ctx, Iterable<Tuple2<String, Long>> in, Collector<String> out) {
+                    List<Long> secs = new ArrayList<>();
+                    for (Tuple2<String, Long> e : in) secs.add(e.f1 / 1000);
+                    long wm = ctx.currentWatermark();
+                    out.collect(String.format("  FIRE window [%d,%d) at watermark %s : %s",
+                        ctx.window().getStart() / 1000, ctx.window().getEnd() / 1000,
+                        wm == Long.MAX_VALUE ? "MAX(end of input)" : wm + " ms", secs));
+                }
+            });
+        result.print();
+        result.getSideOutput(late).map(e -> "  LATE (dropped to side output) t=" + e.f1 / 1000 + "s").print();
+        env.execute("late-data");
+    }
+}
+```
+
+実際の出力です（Flink のログ行を除いたもの）。
+
+```
+arrive t= 1s  -> watermark  -1001 ms
+arrive t= 4s  -> watermark   1999 ms
+arrive t= 3s  -> watermark   1999 ms
+arrive t=12s  -> watermark   9999 ms
+arrive t=13s  -> watermark  10999 ms
+arrive t= 8s  -> watermark  10999 ms
+arrive t=25s  -> watermark  22999 ms
+arrive t= 5s  -> watermark  22999 ms
+arrive t=21s  -> watermark  22999 ms
+  FIRE window [0,10) at watermark 9999 ms : [1, 4, 3]
+  FIRE window [0,10) at watermark 10999 ms : [1, 4, 3, 8]
+  FIRE window [10,20) at watermark 22999 ms : [12, 13]
+  LATE (dropped to side output) t=5s
+  FIRE window [20,30) at watermark MAX(end of input) : [25, 21]
+```
+
+1 件ずつ追います。
+
+- **t=3**：t=4 より後に届いた順序の乱れですが、watermark は 1999 ミリ秒で、窓 [0,10) はまだ開いています。遅れたデータではありません。遅れかどうかは「届いた順」ではなく「**watermark がその窓を締めたあとか**」で決まります
+- **t=12**：watermark が 9999 ミリ秒になり、窓 [0,10) の最後の時刻 9999 に達したので、窓が発火して `[1, 4, 3]` を出しました
+- **t=8**：watermark 10999 の時点で届いたので遅れたデータですが、窓 [0,10) の状態は「9999 + 許容遅延 3000 = 12999」まで残っています。窓が**もう一度発火**し、t=8 を加えた `[1, 4, 3, 8]` を出しました。1 回目の結果を置き換える更新として出力されています
+- **t=25**：watermark が 22999 まで進み、窓 [10,20) が発火しました。同時に 12999 を越えたので、窓 [0,10) の状態は捨てられました
+- **t=5**：窓 [0,10) はもう無いので、捨てる代わりに side output に出ました。side output を付けなければ、このイベントは**黙って消えます**
+- **t=21**：窓 [20,30) は入力の終わりまで締まらず、有限の入力が尽きたときに Flink が出す最大の watermark（`Long.MAX_VALUE`）で発火しました
+
+遅れの上限 2 秒は「どれだけ待ってから最初の結果を出すか」、許容遅延 3 秒は「最初の結果のあと、どれだけ訂正を受け付けるか」を決めています。前者を大きくすると結果が遅れ、後者を大きくすると状態を長く持つことになります。**正しさと遅延と状態の量の取引を、2 つの数で選んでいる**わけです。
+
+## end-to-end exactly-once：2 相コミットの sink
+
+実験 1 で見たとおり、チェックポイントが守るのはエンジンの中の状態までです。外部のシステムに書いた結果まで 1 回きりにするには、sink がチェックポイントと歩調を合わせる必要があります。Flink 1.4.0（2017 年 12 月）で入った `TwoPhaseCommitSinkFunction` が、この型を最初に共通化しました（[An Overview of End-to-End Exactly-Once Processing in Apache Flink](https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/)）。
+
+1. **事前コミット**：sink はチェックポイントとチェックポイントの間、外部システムのトランザクションの中に書き込む。バリアが届いたら、そのトランザクションを「いつでも確定できる」状態にして閉じ（事前コミット）、その識別子を状態としてチェックポイントに含める。次のチェックポイントまでの書き込みは新しいトランザクションで始める
+2. **コミット**：全演算子の写しが揃ってチェックポイントが完了すると、JobMaster が各演算子に完了を通知する。sink はそこで初めてトランザクションを確定させる
+3. **障害時**：事前コミットのあと、確定の前に落ちた場合は、再開時にチェックポイントから識別子を読み、そのトランザクションを確定させる。チェックポイントに含まれないトランザクションは破棄される
+
+この記事の当時の `SinkFunction` 系の API は、Flink 2.3.0 では `legacy` パッケージに移され、内部用かつ非推奨の扱いになっています（jar の中のクラスで確認）。今は sink を Writer（書き込み）と Committer（確定）に分けた新しい Sink API が同じ役割を担っています。実験 1 のタスク名にあった `Sink: Writer -> Sink: Committer` がそれで、`FileSink` は「確定待ちのファイルを、チェックポイント完了の通知で確定済みの名前に変える」ことで 2 相コミットをしています。
+
+Kafka へ書く `KafkaSink` では、`DeliveryGuarantee.EXACTLY_ONCE` を選ぶと Kafka のトランザクションを使い、チェックポイントのたびにコミットします（[Flink 2.3: Kafka connector](https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/datastream/kafka/)）。文書の注意は 3 つです。読む側は `isolation.level` を `read_committed` にしないと確定前のレコードまで読んでしまうこと。アプリケーションごとに一意な `transactionalIdPrefix` が要ること。Kafka のトランザクションのタイムアウトを「チェックポイントの間隔 + 再起動にかかる時間の最大」より長くしないと、確定前にトランザクションが打ち切られ、データを失いうること。
+
+<Callout type="warn" title="exactly-once の代償は遅延">
+  2 相コミットの sink では、結果はチェックポイントが完了するまで外から見えません。チェックポイントを 1 分ごとにすれば、下流から見た遅延は最大で 1 分を超えます。実験 1 でも、`FileSink` のファイルはチェックポイントの数だけ確定していました。**低遅延で読ませたいなら、at-least-once で書き、書き込み先を冪等にする**（同じキーの上書きにする）方が向く場合があります。
+</Callout>
+
+## バックプレッシャー：クレジットベースのフロー制御
+
+下流が遅いとき、上流はどう減速するのでしょうか。Flink のタスク間の通信は、同じ TaskManager の組の間では 1 本の TCP 接続に複数のサブタスクの論理的な通信路を相乗りさせます。以前は TCP の流量制御に任せていたため、1 つのサブタスクが詰まると TCP 接続全体が止まり、同じ接続に相乗りしている無関係な通信路まで止まっていました（[A Deep-Dive into Flink's Network Stack](https://flink.apache.org/2019/06/05/a-deep-dive-into-flinks-network-stack/)）。
+
+Flink 1.5 で入った**クレジットベースのフロー制御**では、受信側が「今これだけ受け取れる」という空きバッファの数（クレジット）を送信側に知らせ、送信側はクレジットの分だけ送ります。受信側のバッファは、通信路ごとに専用の**排他バッファ**と、入力全体で共有する**浮動バッファ**からなります。送信側は「まだ送れずに溜まっている量」（backlog）も伝え、受信側はそれを見て浮動バッファを割り当てます。
+
+クレジットが尽きると、**その通信路だけ**が送信を止めます。送れなくなった上流のサブタスクは出力バッファが埋まって処理を止め、その上流も同じように止まり、最後はソースが読む速度を落とします。メッセージングの回で見た「受け取る側が『もう無理』と言える」仕組みを、エンジンの中の通信路 1 本ごとに実装したものです。そして、こうして溜まったバッファの後ろにバリアが並ぶことが、前の節で見た整列チェックポイントの遅さの原因でした。
+
+## Beam：計算の書き方を、実行エンジンから切り離す
+
+ここからは、同じ問題を Google の側から整理したモデルを見ます。Google は社内で、バッチの FlumeJava とストリームの MillWheel を使っていました。2015 年の論文 **The Dataflow Model**（Akidau ほか、PVLDB 8(12)）は、その経験をもとに、境界の無い、順序の乱れたデータの処理を 1 つのモデルで書く方法を示しました（[論文 PDF](https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf)）。論文はパイプラインを次の 4 つの問いに分解します。
+
+| 問い | 論文の言葉 | 決めるもの | Flink での対応 |
+| --- | --- | --- | --- |
+| What | What results are being computed. | 何を計算するか（合計、結合など） | 演算子と集約関数 |
+| Where | Where in event time they are being computed. | イベント時刻のどこで区切るか | 窓の割り当て |
+| When | When in processing time they are materialized. | 処理時刻のいつ結果を出すか | トリガー、watermark、許容遅延 |
+| How | How earlier results relate to later refinements. | 先に出した結果と後の訂正の関係 | 再発火で出す値の作り方 |
+
+そして論文は、これによって**バッチかマイクロバッチかストリームかという実行エンジンの選択が、正しさ・遅延・費用の選択にすぎなくなる**と主張しています。このモデルを SDK にしたのが **Apache Beam** で、Beam のパイプラインは Dataflow、Flink、Spark などの**ランナー**で実行できます。
+
+Beam のデータの単位は **PCollection** です。ファイルや DB から読めば有限（bounded）、Pub/Sub や Kafka から読めば無限（unbounded）になります（[Beam Programming Guide](https://beam.apache.org/documentation/programming-guide/)）。When と How を決めるのが**トリガー**と**蓄積モード**です。
+
+- **トリガーの種類**：イベント時刻（`AfterWatermark`）、処理時刻（`AfterProcessingTime`）、データ件数（`AfterCount`）、およびそれらの組み合わせ。watermark の前に途中経過を出す「早い発火」と、遅れたデータで出し直す「遅い発火」も書ける
+- **既定のトリガー**：watermark が窓の終わりを越えたときに 1 回発火し、その後は遅れたデータが届くたびに発火する。ただし既定の窓の設定では許容遅延が 0 なので、実際には 1 回だけ発火し、遅れたデータは捨てられる。`withAllowedLateness` で許容遅延を付けられる
+
+蓄積モードは、同じ窓が何度も発火したときに何を出すかです。Beam の文書の例（10 分の窓、3 件届くたびに発火）では次のようになります。
+
+```
+                 accumulatingFiredPanes（蓄積）   discardingFiredPanes（破棄）
+1 回目の発火     [5, 8, 3]                         [5, 8, 3]
+2 回目の発火     [5, 8, 3, 15, 19, 23]             [15, 19, 23]
+3 回目の発火     [5, 8, 3, 15, 19, 23, 9, 13, 10]  [9, 13, 10]
+```
+
+蓄積は「前の結果を上書きする」受け手（キーと値のストア、DB の行の更新）に、破棄は「出てきた値を足し込む」受け手に向きます。論文はさらに、新しい値の前に「前に出した値を取り消す」レコードを出す 3 つめのモード（accumulating & retracting）を定義し、結果をさらに別のキーで集計し直す多段のパイプラインではこれが要ると論じています。実験 2 で Flink の窓が再発火したときに `[1, 4, 3, 8]` と全体を出し直したのは、蓄積モードにあたります。
+
+## Dataflow：Beam のマネージドなランナー
+
+**Google Cloud Dataflow** は、Beam のパイプラインを Google Cloud のマネージドサービスとして実行するランナーです。利用者はワーカーの VM を直接は管理せず、ジョブを投入すると、サービスが実行計画の最適化、ワーカーの確保と増減、shuffle と状態の保持を行います。
+
+**融合（fusion）**：Dataflow はパイプラインのグラフを受け取ると、複数の変換を 1 つの段に融合し、途中の PCollection を実体化しないようにします（[Dataflow: Pipeline lifecycle](https://docs.cloud.google.com/dataflow/docs/pipeline-lifecycle)）。Flink のオペレータチェーンと同じ発想です。融合が並列度を下げてしまう場合は、`Redistribute` 変換で融合を切り、データを配り直すよう指示できます。
+
+**Dataflow Shuffle と Streaming Engine**：GroupByKey などの shuffle を、ワーカー VM の外の Dataflow のサービス側で行う仕組みです。バッチのジョブは既定で Dataflow Shuffle を使い、ストリームのジョブは Streaming Engine という別の仕組みを使います（[Dataflow Shuffle for batch jobs](https://docs.cloud.google.com/dataflow/docs/shuffle-for-batch)）。Streaming Engine は、パイプラインの実行の一部をワーカー VM からサービス側へ移します。文書は利点として、ワーカーの CPU・メモリ・永続ディスクの使用量が減ること、入力量の変化に対して自動スケーリングが速く細かく反応すること、サービスの更新にパイプラインの再デプロイが要らないことを挙げ、Python SDK 2.21.0 以降と Go SDK 2.33.0 以降のストリームのジョブでは既定で有効だと書いています（[Dataflow: Streaming Engine](https://docs.cloud.google.com/dataflow/docs/streaming-engine)）。文書は、Streaming Engine を使うとワーカーには小さなブートディスク以外の永続ディスクが要らないとも書いています。Flink が状態を TaskManager のローカルに持ち、並列度を変えるたびにキーグループの状態を移すのと対照的に、**shuffle と実行の重い部分をワーカーの外に出しているので、ワーカーを軽く保ち、細かく増減できる**のが要点です。
+
+**自動スケーリング**：ワーカーの平均 CPU 使用率と、パイプラインの並列度（効率よく処理するのに要るスレッド数の推定）を見てワーカー数を増減します。バッチでは既定で有効で、30 秒ごとに残りの作業量を見積もり直します。ストリームでは Streaming Engine を使うジョブで既定で有効です（[Dataflow: Horizontal Autoscaling](https://docs.cloud.google.com/dataflow/docs/horizontal-autoscaling)）。
+
+**Dynamic Work Rebalancing**：処理の途中で、作業の偏りや予想より遅いワーカー、早く終わったワーカーを検知し、残りの作業を分け直して空いたワーカーへ回します（[Dataflow: Dynamic work rebalancing](https://docs.cloud.google.com/dataflow/docs/dynamic-work-rebalancing)）。<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop</a> の投機実行が遅いタスクを丸ごと複製するのに対し、こちらは遅いタスクの残りの範囲を切り取って渡します。文書の制限は、**1 レコードより細かくは分けられない**ことです。重い「ホットな」レコードやキーがあると、それだけでジョブ全体が遅れます。出力のシャード数を固定した場合も、並列度はその数に制限されます。
+
+**ストリームのモード**：Dataflow のストリームのジョブは既定で exactly-once モードで動き、レコードが落ちも重複もしないことを保証します。重複を許せるなら、`streaming_mode_at_least_once` のサービスオプションで at-least-once モードにでき、文書はこれで費用と遅延を大きく下げられると書いています（[Dataflow: Set the pipeline streaming mode](https://docs.cloud.google.com/dataflow/docs/guides/streaming-modes)）。
+
+## Kafka Streams・Spark Structured Streaming との比較
+
+状態を持つストリーム処理の主な選択肢を、この回の観点で並べます。
+
+| 観点 | Flink | Beam on Dataflow | Kafka Streams | Spark Structured Streaming |
+| --- | --- | --- | --- | --- |
+| 実行の形 | 専用のクラスタ（JobManager と TaskManager） | マネージドサービス。ワーカーはサービスが増減 | アプリに組み込むライブラリ。クラスタは無い | Spark のクラスタ（ドライバとエグゼキュータ） |
+| 処理の単位 | 1 件ずつ流す | 1 件ずつ流す（バッチも同じモデルで書く） | 1 件ずつ流す | 既定はマイクロバッチ（小さなバッチの繰り返し） |
+| 状態の置き場所 | TaskManager のヒープか RocksDB。チェックポイントで外部ストレージへ | Streaming Engine を使えばサービスのバックエンド側。ワーカーに永続ディスクはほぼ要らない | ローカルの状態ストア（永続ストアは RocksDB）と、その変更を記録する Kafka の changelog トピック | エグゼキュータのメモリ（既定）か RocksDB。変更はチェックポイントの場所へ |
+| 障害からの復旧 | 最新のチェックポイントへ全体を巻き戻し、ソースを読み直す | サービスが行う | changelog を読み直して状態を復元。待機用の複製（standby replica）で短縮できる | オフセットの記録と状態から、失敗したマイクロバッチをやり直す |
+| 遅れたデータ | watermark と許容遅延 | watermark、トリガー、許容遅延、蓄積モード | stream time（見たうちの最大の時刻）と猶予期間（grace period） | `withWatermark` |
+| exactly-once | 状態は既定で exactly-once。外部へは 2 相コミットの sink で | 既定で exactly-once モード | `processing.guarantee` の既定は `at_least_once`。`exactly_once_v2` で Kafka のトランザクションを使う（Kafka から Kafka まで） | マイクロバッチで、読み直せるソースと冪等な sink を使えば end-to-end で exactly-once |
+| 並列度の上限 | 最大並列度（キーグループの数） | サービスが決める | 入力トピックのパーティション数 | パーティション数と資源 |
+
+出典は、Kafka Streams が 4.3.1 の文書（[Core Concepts](https://github.com/apache/kafka/blob/4.3.1/docs/streams/core-concepts.md)、[Architecture](https://github.com/apache/kafka/blob/4.3.1/docs/streams/architecture.md)）、Spark が 4.2.0 の文書（[Structured Streaming Programming Guide](https://spark.apache.org/docs/latest/streaming/index.html)）です。Spark の遅延は、文書の記載でマイクロバッチがおよそ 100 ミリ秒、実験的な continuous processing がおよそ 1 ミリ秒（at-least-once）です。さらに Spark 4.1 で Real-Time Mode が入り、1 秒未満の遅延での連続処理が公式に使えるようになりましたが、4.1 の時点では Scala の状態を持たない問い合わせに限られています（[Spark Release 4.1.0](https://spark.apache.org/releases/spark-release-4.1.0.html)）。Spark の内部の詳細は<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>で扱います。
+
+おおまかな選び方としては、入出力が Kafka で完結し、別のクラスタを持ちたくないなら Kafka Streams、大きな状態とイベント時刻の厳密な扱いが要るなら Flink、Google Cloud の上で運用を任せたいなら Beam と Dataflow、既存の Spark のバッチと同じコードと基盤でストリームも扱いたいなら Structured Streaming、が出発点になります。
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| JobManager / TaskManager | Flink でジョブを管理するプロセス / タスクを実行するプロセス |
+| タスクスロット | TaskManager の資源の単位。管理メモリを分けるが CPU は分けない |
+| オペレータチェーン | 前後の演算子を 1 つのタスクにまとめ、同じスレッドで受け渡すこと |
+| キー付き状態 | キーごとに持つ状態。そのキーを担当するサブタスクだけが持つ |
+| キーグループ | キー付き状態を再配置する単位。数は最大並列度と同じ |
+| 状態バックエンド | 状態の実体をヒープや RocksDB などのどこに置くかを決める部品 |
+| チェックポイント | 全演算子の状態とソースの位置を定期的に写したもの。障害からの復旧に使う |
+| バリア | チェックポイントの切れ目を示す、データの流れに差し込む印 |
+| 整列 / 非整列 | 全入力のバリアを待ってから写す / バリアが途中のデータを追い越し、そのデータも保存する |
+| セーブポイント | 利用者が手で取るチェックポイント。更新や並列度の変更に使う |
+| watermark | 「イベント時刻 t 以下はもう来ない」という宣言。窓を締める時期を決める |
+| 許容遅延 | 窓を締めたあとも遅れたデータを受け付ける時間 |
+| side output | 本流とは別に出す出力。捨てる遅れたデータの受け皿にできる |
+| 2 相コミットの sink | チェックポイントで事前コミットし、完了の通知で確定させる sink |
+| クレジットベースのフロー制御 | 受信側が受け取れる量を送信側に知らせ、通信路ごとに流量を絞る仕組み |
+| PCollection | Beam のデータの集まり。有限と無限がある |
+| トリガー / 蓄積モード | 結果をいつ出すか / 再発火で前の結果を含めて出すか差分だけ出すか |
+| Streaming Engine | Dataflow でストリームの shuffle と実行の多くをワーカーの外のサービス側で行う仕組み |
+| Dynamic Work Rebalancing | 遅い作業の残りを切り分けて、空いたワーカーへ回す Dataflow の機能 |
+
+似た用語の区別を 3 つ補います。
+
+- **状態の exactly-once と出力の exactly-once**：チェックポイントだけで守られるのはエンジンの中の状態です。外部への書き込みまで 1 回きりにするには、2 相コミットの sink か冪等な書き込み先が要ります。実験 1 の標準出力と `FileSink` の差がこれです。
+- **順序の乱れと遅れたデータ**：届く順が入れ替わっただけなら、watermark がまだ窓を締めていない限り遅れたデータではありません。遅れたデータとは、watermark が窓を締めたあとに届いたデータです。
+- **Dataflow と Dataflow Model**：Dataflow Model は 2015 年の論文が示した計算の書き方のモデルで、Beam がその SDK です。Google Cloud Dataflow は、そのモデルで書いたパイプラインを動かすマネージドサービスの名前です。
+
+## まとめ
+
+- ストリーム処理の中心問題は、止まらない入力に対して「状態を失わずに再開すること」と「窓を締める時期を決めること」の 2 つ
+- Flink は JobManager と TaskManager で動き、スロットはメモリを分けるが CPU は分けない。演算子はチェーンでタスクにまとまり、`keyBy` で切れる
+- キー付き状態はキーを担当するサブタスクのローカルにあり、キーグループの単位で再配置される。置き場所はヒープ、RocksDB、実験的な ForSt から選ぶ
+- チェックポイントは Chandy-Lamport 系の非同期バリアスナップショット。バリアの整列で切れ目を作るので、写すのは状態とソースの位置だけで済む。バックプレッシャーの下では非整列チェックポイントやバッファの縮小を使う
+- 実験 1 では、n=40 で落としたジョブがチェックポイント 4（n=36 まで）から再開し、累計は正しく、標準出力には 3 行の重複が出て、`FileSink` の確定済みの出力は 60 行ちょうどだった
+- watermark は「最大のイベント時刻 − 遅れの上限 − 1 ミリ秒」で進み、複数の入力では最小値をとる。実験 2 では、許容遅延の内側の遅れたデータで窓が再発火し、外側のデータは side output に出た
+- 外部への exactly-once は 2 相コミットの sink で実現し、その代償として結果はチェックポイントの完了まで見えない
+- Beam は What / Where / When / How の 4 つの問いで計算を書き、トリガーと蓄積モードで結果の出し方を選ぶ。Dataflow は shuffle と実行の多くをワーカーの外に出し、自動スケーリングと Dynamic Work Rebalancing でワーカーを増減・調整する
+
+この回では、ストリームを 1 件ずつ流し続けるエンジンを見ました。次の<a href={`${import.meta.env.BASE_URL}reading/compute-mpp-sql/`}>常駐ワーカーで SQL を分散実行する</a>では、同じく「常駐して流す」設計を、対話的な SQL の速さのために使う Trino と BigQuery を扱います。ステージ間をディスクに書かずに流すとき、障害の扱いがどう変わるかに注目します。

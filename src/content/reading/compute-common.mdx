@@ -1,0 +1,684 @@
+---
+title: 分散処理の共通項（どのエンジンにも出てくる仕組み）
+description: Hadoop、Spark、Flink、Trino、BigQuery は名前も設定も違いますが、解いている問題はほとんど同じです。局所性、分割、shuffle、結合方式、部分集約、偏り、投機実行、spill、障害耐性、出力の確定、資源管理までを、ソフトの名前を外して並べ直し、各エンジンでの現れ方と対応づけます
+category: compute
+order: 26
+status: published
+topics:
+  - Data Locality
+  - Hash Partitioning
+  - Shuffle
+  - Stage
+  - Cost-Based Optimizer
+  - Broadcast Join
+  - Sort-Merge Join
+  - Partial Aggregation
+  - Data Skew
+  - Salting
+  - Speculative Execution
+  - Spill
+  - Lineage
+  - Vectorized Execution
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: ハッシュパーティショニングも hash join も部分集約も、「同じキーを同じ場所に集めて辞書で数える・引く」操作をノードをまたいで行っている
+  - kind: article
+    slug: heap-topk
+    why: メモリに載らない shuffle の出力や sort-merge join の入力は、ソート済みの複数の列をヒープで 1 本にまとめる k-way merge で処理される
+  - kind: math
+    slug: probability-expectation
+    why: 全体の終了時刻は「多数のタスクの所要時間の最大値」で決まるので、1 台の遅れが平均ではなく最大値を通して全体に効く。投機実行はこの最大値を下げる工夫である
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 名前を外すと、同じ問題が並んでいる
+
+この連載では、<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop</a>、<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark</a>、<a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>Flink</a>、<a href={`${import.meta.env.BASE_URL}reading/compute-mpp-sql/`}>Trino と BigQuery</a> の中身を 1 つずつ見てきました。設定の名前は互いにまったく違います。それでも、読み進めると同じ形の問題に何度も出会います。
+
+- データが 1 台に載らないので、**分けて配る**必要がある
+- 集計や結合のために、**同じキーを同じ場所に集め直す**必要がある
+- 何百台もあれば、**どれかが遅く、どれかが壊れる**
+- 結果は、**全部そろったときだけ見えるように**確定させたい
+
+この回では、各エンジンの名前を外して、そこに共通する仕組みを 16 個に分けて並べ直します。各項目では、(a) 何の問題を解くのか、(b) 仕組み、(c) 何を払って何を得るのか（取引）、(d) Hadoop MapReduce・Spark・Flink・Trino・BigQuery での現れ方、の順に書きます。各エンジンの詳しい動きは個別の回に任せ、ここでは横断的な整理に徹します。原理の説明が既存の記事にあるものは、そちらを参照します。
+
+設定名と既定値は、執筆時点の公式文書で確かめました。版は Hadoop 3.5.0、Spark 4.2.0、Flink 2.3.0、Trino 483 です。BigQuery はマネージドサービスなので版はなく、公式文書と Dremel の論文（2020 年）を出典にしています。
+
+<Callout type="note" title="実験について">
+  この回の実験は、標準ライブラリだけを使った Python 3.14 のスクリプト 1 本です。エンジンは動かしていません。キーの偏りとハッシュパーティション、broadcast 結合と shuffle 結合の転送量、部分集約による削減、遅いタスクと投機実行の 4 つを、件数の数え上げと簡単なシミュレーションで確かめます。出力は関係する節の直後に分けて載せ、スクリプトの全文は末尾の「実験のスクリプト」に置きました。実験の番号はスクリプトの実行順なので、本文での登場順（2、3、1、4）とは一致しません。乱数の種は固定しています。
+</Callout>
+
+## 1. データ局所性：計算をデータのそばで動かす
+
+**(a) 問題。** 大量のデータをネットワーク越しに運ぶと、ネットワークが詰まります。
+
+**(b) 仕組み。** 処理（コード）のほうをデータのあるマシンへ送ります。スケジューラはデータの場所を知っていて、なるべくそのマシンでタスクを動かします。HDFS の設計文書の「データを動かすより計算を動かすほうが安い」という考え方で、詳しくは<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で扱いました。
+
+**(c) 取引。** 局所性を得るには、計算とストレージを同じマシンに置く必要があります。その代わり、容量と計算力を別々に増減できなくなります。また、データのあるマシンが空くのを待つと、その間は計算が始まりません。**待つか、諦めて遠くで動かすか**の判断が常に残ります。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：スケジューラが NameNode にブロックの場所を尋ね、そのブロックを持つ DataNode で map タスクを動かそうとする
+- **Spark**：局所性を `PROCESS_LOCAL`（同じ JVM）、`NODE_LOCAL`、`RACK_LOCAL`、`ANY` などの段階で扱い、よい段階のタスク枠が空くのを `spark.locality.wait`（既定 3 秒）だけ待ってから次の段階に落とす（[Spark: Tuning, Data Locality](https://spark.apache.org/docs/latest/tuning.html#data-locality)、[Configuration](https://spark.apache.org/docs/latest/configuration.html)）
+- **Flink**：キー付きの状態は、そのキーを担当する演算子の手元にある埋め込みのキー・値ストアに置かれ、状態の読み書きはローカルな操作になる（[Flink: Stateful Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/)）。入力ではなく**状態の局所性**を重視する設計である
+- **Trino**：`node-scheduler.policy` の既定 `uniform` は、データのあるホストに split を割り当てつつ全ホストに均等に配ろうとする（[Trino: Node scheduler properties](https://trino.io/docs/current/admin/properties-node-scheduler.html)）。ただし S3 などを読む構成では、そもそも局所性は無い
+- **BigQuery**：Dremel は 2009 年にディスクを計算から切り離し、ストレージを分離した構成に移った（[Melnik et al., Dremel: A Decade of Interactive SQL Analysis at Web Scale, VLDB 2020](https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf)、5.1 節）。局所性を捨てて、15 番の弾力性をとった例である
+
+## 2. 分割：入力を切り、キーで配る
+
+**(a) 問題。** 並列に動かすには、仕事を独立した断片に分ける必要があります。分け方は 2 か所で問われます。入力をどう切るかと、途中の結果をどう配り直すかです。
+
+**(b) 仕組み。** 入力は、ファイルのバイト範囲やブロック単位で**入力分割**（split）に切り、1 つの分割を 1 つのタスクが読みます。途中の結果は、キーから行き先を決める関数で配り直します。代表は次の 3 つです。
+
+| 方式 | 行き先の決め方 | 向いている用途 | 弱点 |
+| --- | --- | --- | --- |
+| ハッシュ | `hash(key) % N` | 集約、等値結合 | 1 つのキーに偏ると、その担当だけ重くなる |
+| 範囲 | キーの境界値の表で区間を引く | 全体のソート、範囲での読み飛ばし | 境界値を決めるために事前の標本抽出が要る |
+| ラウンドロビン | 順番に配る | キーに意味が無いときの平準化 | 同じキーが別々の場所に散る |
+
+ハッシュによる振り分けは、<a href={`${import.meta.env.BASE_URL}articles/hash-counting/`}>ハッシュテーブル</a>の「同じキーを同じバケツへ」をノードの単位で行うものです。台数が変わったときに配り直しを減らす方法は<a href={`${import.meta.env.BASE_URL}reading/consistent-hashing/`}>置き場所の決め方</a>で扱いました。
+
+**(c) 取引。** 分割を細かくすると、並列度が上がり、遅いタスクの影響も小さくなります（9 番）。代わりに、タスクの起動や管理の手間、小さなファイルが増えます。粗くすると逆になります。**分割の数は、並列度と固定費の取引**です。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：`InputFormat` が作る `InputSplit` 1 つにつき map タスクが 1 つ起動する。中間結果の行き先は `Partitioner` が決め、既定は `HashPartitioner`。パーティションの数は reduce タスクの数に等しい（[MapReduce Tutorial](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html)）。`mapreduce.job.reduces` の既定は 1（[mapred-default.xml](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/mapred-default.xml)）
+- **Spark**：ファイルを読むときの 1 パーティションの上限が `spark.sql.files.maxPartitionBytes`（既定 128MB）、集約や結合の shuffle 後のパーティション数が `spark.sql.shuffle.partitions`（既定 200）（[Configuration](https://spark.apache.org/docs/latest/configuration.html)、[Performance Tuning](https://spark.apache.org/docs/latest/sql-performance-tuning.html)）
+- **Flink**：キー付きの状態は**キーグループ**に分けられ、キーグループの数は最大並列度に等しい。キーグループが状態を配り直すときの最小単位になる（[Stateful Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/)）
+- **Trino**：コネクタが入力を split に分ける。結合や集約に使うハッシュパーティションの数は `query.max-hash-partition-count`（既定 100）と `query.min-hash-partition-count`（既定 4）の間で決まる（[Query management properties](https://trino.io/docs/current/admin/properties-query-management.html)）
+- **BigQuery**：Dremel の論文の例では、最初のステージがストレージから読み、集約キーのハッシュで shuffle する（上記論文、5.2 節）。利用者が直接決めるのは、表の側のパーティション分割とクラスタリングである
+
+## 3. shuffle の一般形：全員が全員に送る
+
+**(a) 問題。** 集約や結合では、同じキーの行がばらばらのマシンにあります。これを 1 か所に集めない限り計算できません。
+
+**(b) 仕組み。** 上流の M 個のタスク（書き手）が、出力を下流の R 個のパーティションに分けて書き、下流の R 個のタスク（読み手）が、全上流から自分の分を取りに行きます。**M × R 本の流れ**ができる全対全の転送です。MapReduce での原理は<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理</a>で扱いました。実装上の分かれ目は、上流の出力を**どこに置くか**です。
+
+| 置き場所 | 利点 | 欠点 |
+| --- | --- | --- |
+| 上流タスクのローカルディスク | 下流が遅れても失敗しても、出力が残っていれば読み直せる | ディスクの読み書きが増える。上流のマシンが消えると出力も消える |
+| メモリのまま流す（パイプライン） | 速い。上流と下流が同時に動ける | 下流が詰まると上流も止まる。障害時に途中から再開しにくい |
+| 計算ノードの外の shuffle 層 | 計算ノードを自由に増減・停止できる。出力が「途中経過の記録」を兼ねる | 別の層を運用する費用。ネットワークの往復が増える |
+
+**(c) 取引。** M × R 本の流れは、台数に対して 2 乗で増えます。Dremel の論文は、shuffle を計算ノードと同じマシンに置くと、この 2 乗の性質を抑えられず、資源の断片化と隔離の悪さを招いたと書いています（上記論文、3.2 節）。**出力を残すほど障害と弾力性に強くなり、流すほど速くなる**、という取引です。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：map の出力はソートされてローカルディスクに書かれ、reduce は全 map の自分の分を HTTP で取りに行く（[MapReduce Tutorial](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html)）。同時に取りに行く数が `mapreduce.reduce.shuffle.parallelcopies`（既定 5）、map の何割が終わったら reduce を起動するかが `mapreduce.job.reduce.slowstart.completedmaps`（既定 0.05）
+- **Spark**：map 側の結果は、収まる限りメモリに置き、収まらなくなると行き先のパーティション順にソートして 1 つのファイルに書く。reduce 側はそのソート済みの塊を読む（[RDD Programming Guide: Shuffle operations](https://spark.apache.org/docs/latest/rdd-programming-guide.html#shuffle-operations)）。エグゼキュータが消えても shuffle ファイルを配れるようにする外部 shuffle サービスは `spark.shuffle.service.enabled`（既定 false）
+- **Flink**：ストリームではメモリ上のバッファで下流へ流し続ける。バッチでは既定で中間結果を全部書いてから下流が読む方式（`execution.batch-shuffle-mode` の既定 `ALL_EXCHANGES_BLOCKING`）で、1.15 からは上流が結果パーティションごとに 1 ファイルを書く Sort Shuffle が既定（[Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/config/)、[Batch Shuffle](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/batch/batch_shuffle/)）
+- **Trino**：実行はできる限りパイプライン化され、中間データと状態は可能な限りメモリに置かれる（[Sethi et al., Presto: SQL on Everything, ICDE 2019](https://trino.io/Presto_SQL_on_Everything.pdf)）。耐障害実行を有効にすると、**exchange manager** が中間データを外部のストレージに書き出す（[Fault-tolerant execution](https://trino.io/docs/current/admin/fault-tolerant-execution.html)）
+- **BigQuery**：ステージ間は shuffle という高速な分散メモリの仕組みでつながる（[BigQuery: Query plan and timeline](https://docs.cloud.google.com/bigquery/docs/query-plan-explanation)）。Dremel は 2014 年に、shuffle の中間データを計算ノードから切り離した一時的な分散ストレージに置く方式に移った（上記論文、3.2 節）。ステージ間の転送がメモリに収まらないときはディスクに落ち、その量は `shuffleOutputBytesSpilled` で分かる
+
+## 4. DAG・ステージ・パイプライン化
+
+**(a) 問題。** 実際の処理は「読む → 絞る → 集約する → 結合する → 並べる → 書く」のように長く、shuffle をはさむ箇所がいくつもあります。どこで区切り、区切りの間をどう流すかを決める必要があります。
+
+**(b) 仕組み。** 処理を演算子の有向非巡回グラフ（DAG）として表し、**shuffle が要る辺で区切って、区切りの間をステージ**とします。同じステージの中では、行を受け取るたびに次の演算子へ渡し、中間結果を書き出しません。これを**パイプライン化**と呼びます。各行がほかの行と無関係に処理できる演算（絞り込み、列の計算）はつなげられ、全部の行がそろわないと始められない演算（ソート、hash join の表の構築）がパイプラインの切れ目になります。
+
+**(c) 取引。** つなげるほど、書き出しと読み直しが減って速くなります。代わりに、途中で失敗したときに戻れる地点が減ります。MapReduce は 1 ジョブが map と reduce の 2 段に固定で、複数のジョブをつなぐときは HDFS を経由しました。これが遅さの原因であり、同時に強さの源でもありました。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：1 ジョブが map と reduce の 2 段に固定。多段の処理はジョブを連ね、ジョブ間は HDFS に書く。Tez はこれを DAG に一般化した（<a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の中身</a>）
+- **Spark**：広い依存（shuffle が要る依存）でステージを区切り、狭い依存はステージの中でつなげる。Spark の文書は、ステージを MapReduce の map と reduce の段に似たものと説明している（[Cluster Mode Overview](https://spark.apache.org/docs/latest/cluster-overview.html)）
+- **Flink**：つなげられる演算子を 1 つのタスクにまとめる**演算子チェーン**を作る。ストリームでは全体がパイプラインで動く（[Flink Architecture](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/flink-architecture/)）
+- **Trino**：計画を fragment（ステージ）に分け、ステージの中はさらにパイプラインとドライバに分かれる。ステージの起動順は `query.execution-policy`（既定 `phased`）で決まる（[Query management properties](https://trino.io/docs/current/admin/properties-query-management.html)）
+- **BigQuery**：問い合わせの計画は、ステージの DAG として組まれ、コーディネータがスケジューラから受け取ったワーカーにそれを配る（上記 Dremel 論文、5.2 節）
+
+## 5. 論理計画・物理計画・コストベース最適化
+
+**(a) 問題。** 同じ SQL にも実行の仕方は無数にあります。結合の順番、結合の方式、絞り込みをどこまで先に行うかで、速さが何桁も変わります。
+
+**(b) 仕組み。** SQL を解析して**論理計画**（何を計算するか。結合・集約・絞り込みの木）を作り、規則で書き換え（絞り込みを読み込みの近くへ押し下げる、など）、**物理計画**（どう計算するか。どの結合方式で、どこで shuffle するか）に落とします。**コストベース最適化**（CBO）は、表の行数や列の値の種類数などの統計から各候補の費用を見積もり、安いものを選びます。統計は間違うので、近年のエンジンは**実行中に分かった実際の大きさで計画を直す**仕組み（適応的な実行）を持っています。
+
+**(c) 取引。** 実行前の見積もりは、統計を集める手間がかかり、しかも結合を重ねるほど誤差が増えます。Dremel の論文は、計画時に正確な行数の見積もりを得るのは難しく、誤差は結合を通じて指数的に広がる、と書いています（上記論文、5.2 節）。実行中に直す方式は、そのための区切り（ステージの完了）を待つ必要があり、パイプラインを長くつなぐ設計とはぶつかります。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：最適化器は無い。計画は利用者のプログラムそのもの。Hive が SQL から MapReduce のジョブを組み立てる
+- **Spark**：Catalyst が、論理計画の解析、論理計画の最適化、物理計画、コード生成の 4 段で動く。物理計画では複数の候補を費用で比べることがある（[Armbrust et al., Spark SQL, SIGMOD 2015](https://people.csail.mit.edu/matei/papers/2015/sigmod_spark_sql.pdf)、4.3 節）。統計を使う CBO の `spark.sql.cbo.enabled` は既定 false、実行中に計画を直す AQE の `spark.sql.adaptive.enabled` は既定 true（[Configuration](https://spark.apache.org/docs/latest/configuration.html)、[Performance Tuning](https://spark.apache.org/docs/latest/sql-performance-tuning.html)）
+- **Flink**：結合の並べ替えの `table.optimizer.join-reorder-enabled` は既定 false。バッチでは、実行時の統計で broadcast 結合に切り替える `table.optimizer.adaptive-broadcast-join.strategy` と、偏りを分割する `table.optimizer.skewed-join-optimization.strategy` がどちらも既定 `auto`（[Table Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/config/)）
+- **Trino**：コネクタが返す表の統計で結合順を選ぶ。`optimizer.join-reordering-strategy` の既定は `AUTOMATIC`、一度に並べ替える結合の数の上限 `optimizer.max-reordered-joins` は既定 8（[Optimizer properties](https://trino.io/docs/current/admin/properties-optimizer.html)、[Cost-based optimizations](https://trino.io/docs/current/optimizer/cost-based-optimizations.html)）。実行時の統計で計画を直す最適化は、耐障害実行を有効にしたときだけ使える（[Adaptive plan optimizations](https://trino.io/docs/current/optimizer/adaptive-plan-optimizations.html)）
+- **BigQuery**：計画は実行中にも変えられ、ステージを足しながらデータの分布に合わせて仕事の配り方を調整する（[BigQuery: Understand slots](https://docs.cloud.google.com/bigquery/docs/slots)）
+
+## 6. 結合方式と選び方
+
+**(a) 問題。** 2 つの表を結合キーで突き合わせるには、同じキーの行どうしを同じマシンに持ってくる必要があります。どちらの表をどう動かすかで、転送量もメモリも変わります。
+
+**(b) 仕組み。** 等値結合の方式は、主に次の 3 つです。どれも「同じキーを同じ場所へ」の方法の違いです。
+
+| 方式 | 動かすもの | 各台でやること | 前提 |
+| --- | --- | --- | --- |
+| broadcast hash join | 小さい表の全体を全台へ複製。大きい表は動かさない | 小さい表でハッシュ表を作り、大きい表の行で引く | 小さい表が 1 台のメモリに載る |
+| shuffle hash join | 両方の表をキーのハッシュで配り直す | 自分の担当分の片方でハッシュ表を作り、もう片方で引く | 担当分のハッシュ表が 1 台のメモリに載る |
+| sort-merge join | 両方の表をキーのハッシュで配り直す | 両方をキーでソートし、先頭から並べて突き合わせる | メモリに載らなくてもよい（外部ソートで処理できる） |
+
+キーの等値でない条件（範囲での結合など）には、総当たりの nested loop join が使われます。
+
+**(c) 取引。** broadcast は大きい表を一切動かさない代わりに、小さい表を**台数ぶん**複製します。shuffle 系は両方を一度だけ動かします。台数が増えるほど broadcast の複製の費用が増え、ある大きさを超えると逆転します。sort-merge join はソートの手間を払う代わりに、メモリに載らない大きさでも確実に終わります。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：結合の演算子は無い。reduce 側で結合するか、小さい表を `DistributedCache` で各タスクに配って map 側で結合するかを、プログラムで書く（[MapReduce Tutorial](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html)）
+- **Spark**：`spark.sql.autoBroadcastJoinThreshold`（既定 10MB）以下の表は broadcast される。ヒントは `BROADCAST`、`MERGE`、`SHUFFLE_HASH`、`SHUFFLE_REPLICATE_NL` で、両側に違うヒントがあればこの順に優先される。AQE は、実行時の大きさが閾値より小さければ sort-merge join を broadcast hash join に、shuffle 後の全パーティションが `spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold` より小さければ shuffled hash join に切り替える（[Performance Tuning](https://spark.apache.org/docs/latest/sql-performance-tuning.html)）
+- **Flink**：バッチの broadcast の閾値は `table.optimizer.join.broadcast-threshold`（既定 1048576 バイト = 1MB）。ヒントは `BROADCAST`、`SHUFFLE_HASH`、`SHUFFLE_MERGE`（sort-merge join）、`NEST_LOOP`（[Table Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/config/)、[Hints](https://nightlies.apache.org/flink/flink-docs-stable/docs/sql/reference/queries/hints/)）。ストリームの結合は、両側の行を状態に持ち続ける別の仕組みになる
+- **Trino**：結合はハッシュ方式だけで、方式の選択は「全台に複製する（broadcast）」か「両方をハッシュで配り直す（partitioned）」かになる。`join-distribution-type` の既定は `AUTOMATIC` で、複製する表の大きさの上限を `join-max-broadcast-table-size` で抑えられる（[Cost-based optimizations](https://trino.io/docs/current/optimizer/cost-based-optimizations.html)、[General properties](https://trino.io/docs/current/admin/properties-general.html)）。計画では `distribution = REPLICATED` と表示される
+- **BigQuery**：計画の段の詳細に `JOIN EACH WITH ALL` とあれば broadcast 結合、`JOIN EACH WITH EACH` とあれば hash 結合（[Query plan and timeline](https://docs.cloud.google.com/bigquery/docs/query-plan-explanation)）。Dremel は両側を shuffle する hash 結合で始め、片側が早く終わって broadcast の閾値を下回れば、もう片方の shuffle を取り消して broadcast 結合に切り替える（上記論文、5.2 節）
+
+### 実験 2：broadcast と shuffle の転送量
+
+大きい表 L を 1 TB に固定し、小さい表 S の大きさと台数 N を変えて、ネットワークを流れる量を計算しました。両表とも最初は N 台に均等に散らばっているとします。shuffle では、各行が `hash(key) % N` の台へ移り、平均して (N − 1)/N の行が別の台へ動きます。broadcast では、各台が自分以外の持つ S を受け取ります。
+
+```
+大きい表 L = 1 TB。両表とも最初は N 台に均等に散らばっている前提
+shuffle:   (L + S) * (N - 1) / N   ……両表の各行が hash(key) % N の台へ移る
+broadcast: S * (N - 1)             ……各台が自分以外の持つ S を受け取る
+       S     N  shuffle (GB)  broadcast (GB)      有利   build 側/台 bcast       shuffle
+  0.01GB    10         900.0             0.1   bcast            10 MB       1.00 MB
+  0.01GB   100         990.0             1.0   bcast            10 MB       0.10 MB
+  0.01GB  1000         999.0            10.0   bcast            10 MB       0.01 MB
+     1GB    10         900.9             9.0   bcast         1,000 MB     100.00 MB
+     1GB   100         991.0            99.0   bcast         1,000 MB      10.00 MB
+     1GB  1000       1,000.0           999.0   bcast         1,000 MB       1.00 MB
+    10GB    10         909.0            90.0   bcast        10,000 MB   1,000.00 MB
+    10GB   100         999.9           990.0   bcast        10,000 MB     100.00 MB
+    10GB  1000       1,009.0         9,990.0 shuffle        10,000 MB      10.00 MB
+   100GB    10         990.0           900.0   bcast       100,000 MB  10,000.00 MB
+   100GB   100       1,089.0         9,900.0 shuffle       100,000 MB   1,000.00 MB
+   100GB  1000       1,098.9        99,900.0 shuffle       100,000 MB     100.00 MB
+損益分岐: S * (N - 1) = (L + S) * (N - 1) / N  →  S = L / (N - 1)
+
+-- 行単位のシミュレーションで式を確かめる（L 20 万行、S 2,000 行、1 行 100 B）
+N=4   shuffle 実測  15.15 MB / 式  15.15 MB   broadcast（式）   0.60 MB
+N=16  shuffle 実測  18.93 MB / 式  18.94 MB   broadcast（式）   3.00 MB
+N=64  shuffle 実測  19.89 MB / 式  19.88 MB   broadcast（式）  12.60 MB
+```
+
+読み取れることは 3 つあります。
+
+1. **shuffle の転送量は、台数を増やしてもほとんど変わらない**（L + S のほぼ全部が動く）。一方 **broadcast の転送量は台数に比例して増える**。損益分岐は S = L/(N − 1) で、1 TB の表に対しては 10 台なら約 111 GB、100 台なら約 10 GB、1,000 台なら約 1 GB です
+2. 転送量だけなら、100 GB の表でも 10 台なら broadcast のほうが少なく済みます。しかし右の 2 列のとおり、broadcast では **各台が S の全部をハッシュ表としてメモリに持つ**必要があり、100 GB を 1 台のメモリに載せるのは現実的ではありません。エンジンの閾値（Spark 10MB、Flink 1MB）が転送量の損益分岐よりずっと小さいのは、**メモリの制約と、見積もりを誤ったときの被害**を重く見ているからだと読めます
+3. 行単位のシミュレーションは、shuffle の式と小数第 2 位まで一致しました。行き先はハッシュで決まり、元の場所はランダムなので、別の台へ動く割合が (N − 1)/N になるという前提が成り立っています
+
+## 7. 集約の 2 段化：送る前に畳む
+
+**(a) 問題。** `GROUP BY` の集約で全行をそのまま shuffle すると、転送量は入力の行数に比例します。
+
+**(b) 仕組み。** shuffle の前に、各タスクが手元の行をキーごとに**部分集約**し、キー 1 つにつき 1 行にしてから送ります。受け取った側は部分集約の結果をさらに集約します（最終集約）。MapReduce では **combiner** と呼びます。ただし、この方法が使えるのは、**部分的にまとめてから合わせても結果が変わる心配のない演算**だけです。合計、件数、最大、最小はそのまま使えます。平均は「(合計, 件数) の組」に直せば使えます。
+
+**(c) 取引。** 部分集約の手間とメモリ（手元でキーごとのハッシュ表を持つ）を払い、shuffle の量を減らします。手元にキーの種類が多く、ほとんど畳めないときは、手間だけ増えて得がありません。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：`Job.setCombinerClass` で指定する。公式の word count の例は、reduce と同じクラスを combiner にしている（[MapReduce Tutorial](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html)）
+- **Spark**：`reduceByKey` や `aggregateByKey` は map 側でまとめるためのデータ構造を作る（[RDD Programming Guide](https://spark.apache.org/docs/latest/rdd-programming-guide.html#shuffle-operations)）。DataFrame では、実行計画に部分集約と最終集約の 2 つの `HashAggregate` が並ぶ（<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>）
+- **Flink**：`table.optimizer.agg-phase-strategy`（既定 `AUTO`、ほかに `TWO_PHASE` と `ONE_PHASE`）。文書は Local-Global 集約を「MapReduce の Combine + Reduce の形に似たもの」と説明している。ストリームでは、ミニバッチ（`table.exec.mini-batch.enabled`、既定 false）で行をためてから集約する（[Performance Tuning](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/tuning/)、[Table Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/config/)）
+- **Trino**：分散実行計画に `Aggregate[type = PARTIAL]`、`INTERMEDIATE`、`FINAL` が並ぶ（<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>の実験 3）
+- **BigQuery**：計画の例では、最初のステージが `COUNT` を計算し、次のステージがそれを `SUM_OF_COUNTS` で合わせる（[Query plan and timeline](https://docs.cloud.google.com/bigquery/docs/query-plan-explanation)）
+
+### 実験 3：部分集約でどれだけ減るか
+
+100 万行を 50 個のタスクに等分し、各タスクがキーごとに 1 行へ畳んでから送るとして、shuffle する行数を数えました。
+
+```
+入力 1,000,000 行を 50 個の map タスクに分ける。各タスクは手元のキーごとに 1 行に畳んでから送る
+キーの分布                    combiner なし   combiner あり     削減率
+一様・1,000 種                 1,000,000        50,000   95.0%
+一様・100 万種                  1,000,000       990,129    1.0%
+Zipf 1.0・10 万種             1,000,000       374,969   62.5%
+Zipf 1.2・10 万種             1,000,000       176,841   82.3%
+
+-- 平均は「平均の平均」にできない。(合計, 件数) の組なら部分集約できる
+タスク A = [10, 10, 10, 10], タスク B = [100]
+平均の平均 = 55.0   (合計, 件数) を足してから割る = 28.0
+```
+
+削減の効き目は、**1 つのタスクの中で同じキーが何回出るか**で決まります。キーが 1,000 種なら各タスクの 2 万行は 1,000 行に畳まれ、95% 減ります。キーが 100 万種あると、ほぼ全部が別々のキーなので 1% しか減りません。偏った分布（Zipf。順位 r のキーが 1/r^s に比例する頻度で現れる分布）では、上位のキーが何度も出るので、偏りが強いほどよく効きます。**部分集約は、次の節の偏りに対する最初の対策**でもあります。最後の例は、平均をそのまま部分集約すると結果が変わることを示しています。
+
+## 8. 偏り（skew）と対策
+
+**(a) 問題。** ハッシュで配ると、キーごとの件数の偏りが、そのままパーティションの偏りになります。1 つのキーの件数は、どう配っても 1 つのパーティションに入ります。全体の終了時刻は最も重いパーティションで決まります。
+
+**(b) 仕組み。** 対策は 4 つの型に分けられます。
+
+1. **送る前に畳む**：部分集約（7 番）。集約にしか使えない
+2. **重いキーを分ける（salting）**：重いキーに 0〜S−1 の乱数（塩）を付けて別々のキーとして配り、集約なら 2 段目で塩を外して合わせる。結合なら、もう片方の表の同じキーの行を S 個に複製する
+3. **重いパーティションを実行時に割る**：実行中に各パーティションの大きさを測り、大きすぎるものを分割して、結合の相手側の対応する部分を複製する
+4. **重いキーだけ別扱いにする**：重いキーの行は broadcast で結合し、残りを通常の shuffle で結合する
+
+**(c) 取引。** salting は、2 段目の集約や相手側の複製という追加の仕事を払い、最大の負荷を下げます。塩を増やすほど平準化は進みますが、複製と 2 段目の量が増えます。実行時の分割は利用者の手間がかかりませんが、大きさを測るためにステージの区切りを待つ必要があります。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：自動の対策は無い。combiner、salting、パーティショナの差し替えをプログラムで行う
+- **Spark**：AQE の `spark.sql.adaptive.skewJoin.enabled`（既定 true）が sort-merge join の偏ったパーティションを分割し、必要なら複製する。中央値の `skewedPartitionFactor`（既定 5.0）倍より大きく、かつ `skewedPartitionThresholdInBytes`（既定 256MB）より大きいパーティションが対象（[Performance Tuning](https://spark.apache.org/docs/latest/sql-performance-tuning.html)）
+- **Flink**：バッチでは `table.optimizer.skewed-join-optimization.strategy`（既定 `auto`）が、shuffle 結合の偏りを実行時に偏ったキーで分割して扱う。ストリームでは、Local-Global 集約と、`COUNT(DISTINCT ...)` を追加のキーで 2 段に分ける `table.optimizer.distinct-agg.split.enabled`（既定 false）が偏りへの対策として説明されている（[Table Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/config/)、[Performance Tuning](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/tuning/)）
+- **Trino**：執筆時点の設定一覧（一般・最適化器・問い合わせ管理）には、偏ったパーティションを自動で分割する設定は見当たらなかった。部分集約と、利用者による書き換えが中心になる
+- **BigQuery**：計画の各ステージの計算時間の最大が平均より大きく離れていれば、一部のデータの処理に時間が偏っている印。`REPARTITION` の段がデータを作業者の間で均し直す（[Query plan and timeline](https://docs.cloud.google.com/bigquery/docs/query-plan-explanation)）
+
+### 実験 1：偏りとハッシュパーティション、そして salting
+
+10 万種のキーから 100 万件を引き、`crc32(key) % 16` で 16 パーティションに配りました。
+
+```
+== 1. キーの偏りとハッシュパーティション（100 万件、16 パーティション）
+分布                  最大件数      平均件数     最大/平均       最多キーの件数
+一様                62,958    62,500      1.01            26
+Zipf s=0.8        79,963    62,500      1.28        21,972
+Zipf s=1.0       130,786    62,500      2.09        83,239
+Zipf s=1.2       228,760    62,500      3.66       196,306
+
+-- Zipf s=1.2 に salting をかける（塩の数 S、対象は上位キーのみ）
+件数が 1 パーティションの平均の 1/4 を超えるキー: 8 個
+   S      最大件数     最大/平均           第 2 段へ送る部分集計の行数
+   1   231,167      3.70                    46,474
+   2   133,377      2.13                    46,482
+   4    92,045      1.47                    46,498
+   8    99,358      1.59                    46,530
+  16    93,484      1.50                    46,594
+  32    89,440      1.43                    46,722
+```
+
+上の表と下の表は別々に引いた標本なので、s = 1.2 の最大件数は 228,760 と 231,167 で少し違います。一様なら最大は平均の 1.01 倍で、ハッシュはよく均します。Zipf の s = 1.2 では、**最多のキー 1 つだけで 196,306 件あり、1 パーティションの平均 62,500 件の 3 倍を超えます。**ハッシュ関数をどう選んでも、このキーが入るパーティションは平均の 3 倍以上になります。偏りはハッシュの質の問題ではなく、**キーの分布の問題**です。
+
+salting は、件数が平均の 1/4 を超える上位 8 キーだけに塩を付けました。塩が 4 つで最大/平均は 3.70 から 1.47 まで下がります。その先はほとんど下がらず、S = 8 では 1.59 とかえって上がっています。残る偏りは、重くないキーどうしがハッシュで同じパーティションに重なる分と、乱数のばらつきです。一方、2 段目に送る部分集計の行数は 46,474 から 46,722 へと、0.5% しか増えていません。**集約での salting は、少ない追加の仕事で最大の負荷を大きく下げられる**ことが分かります。結合で使う場合は、相手側の重いキーの行を S 倍に複製する費用が加わる点が違います。
+
+## 9. 遅いタスク（straggler）と投機実行
+
+**(a) 問題。** 何百台もあれば、ディスクの不調や他の処理との競合で、一部のマシンが遅くなります。全体の終了時刻はいちばん遅いタスクで決まるので、1 台の遅れが全体の遅れになります。
+
+**(b) 仕組み。** 2 つの手を組み合わせます。1 つは、**タスクを細かく分けて、空いた作業者が次のタスクを取りに行く**ことです。遅いマシンは少ないタスクしかこなさなくなります。もう 1 つが**投機実行**で、終わりかけの時点でまだ走っている遅いタスクの**複製を別のマシンで走らせ、先に終わったほうを採用**します。MapReduce の論文はこれを backup task と呼び、無効にすると論文のソートのプログラムは完了までに 44% 長くかかったと報告しています（[Dean and Ghemawat, MapReduce, OSDI 2004](https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf)、3.6 節）。
+
+**(c) 取引。** 複製の分だけ計算資源を余分に使います。そして、**同じタスクが 2 回走っても結果が壊れない**ことが前提になります。外部へ書き込むタスク（データベースへの INSERT など）を投機実行すると、二重に書かれます。出力を「勝ったほうだけ確定する」仕組み（12 番）が必要なのはこのためです。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：`mapreduce.map.speculative` と `mapreduce.reduce.speculative` がどちらも既定 true（[mapred-default.xml](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/mapred-default.xml)）
+- **Spark**：`spark.speculation` は既定 false。有効にすると、タスクの 0.9（`spark.speculation.quantile`）が終わった時点で、中央値の 3 倍（`spark.speculation.multiplier`）より遅いタスクが対象になる（[Configuration](https://spark.apache.org/docs/latest/configuration.html)）
+- **Flink**：バッチだけに投機実行があり、`execution.batch.speculative.enabled` は既定 false（[Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/config/)、[Speculative Execution](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/speculative_execution/)）。ストリームは終わりの無い処理なので、この形の対策は無い
+- **Trino**：執筆時点の設定一覧には、遅いタスクを複製して走らせる設定は見当たらなかった。代わりに、コーディネータは split を少しずつ列挙してタスクへ遅延して割り当て、新しい split は待ち行列の最も短いタスクに渡される。論文は、待ち行列を短く保つことで split ごとの処理の重さの違いやワーカーの性能差に適応できる、と説明している（[Presto: SQL on Everything](https://trino.io/Presto_SQL_on_Everything.pdf)、IV-D 節）
+- **BigQuery**：Dremel は問い合わせを数千の小さなタスクに分けて作業者が取りに行く形にし、さらに終わり際には遅いタスクの複製を出す（上記 Dremel 論文、7 節）
+
+### 実験 4：小さく分けることと投機実行
+
+20 スロットのうち 1 つだけが 6 倍遅い環境で、合計 2,000 単位の仕事を流す時刻を簡単なシミュレーションで比べました。タスクは空いたスロットが順に取ります。投機実行は「遅いスロットで開始から 15 単位を過ぎても終わっていないタスクを、空いた速いスロットで複製し、先に終わったほうを採る」という単純な規則にしています。実際のエンジンの規則とは違います。
+
+```
+== 4. 遅いタスクと投機実行（200 タスク、20 スロット、1 台だけ 6 倍遅い）
+全スロットが同じ速さなら              :  100.0
+200 タスク、投機実行なし              :  122.1
+200 タスク、投機実行あり              :  109.6
+同じ仕事を 20 タスクに束ねる、投機なし :  612.4
+```
+
+同じ仕事を 20 個の大きなタスクにすると、遅いスロットに当たった 1 個が全体を 6 倍以上に引き延ばします。200 個に分けるだけで 122 まで縮み、投機実行を加えると 110 になりました。**効いているのは、まず分割の細かさ、次に投機実行**です。Dremel の論文が「性能が最も遅い部品ではなく、使える資源の総量で決まるようになる」と書いているのは、この 2 つの組み合わせのことです。
+
+## 10. メモリに載らないとき：spill・外部ソート・外部ハッシュ
+
+**(a) 問題。** ソート、集約のハッシュ表、結合のハッシュ表は、メモリに載るとは限りません。
+
+**(b) 仕組み。** 載らなくなったら、途中の結果をディスクに書き出して（**spill**）、メモリを空けて続けます。ソートなら、ソート済みの塊を何本も書き、最後に k-way merge でまとめる**外部ソート**です（原理は<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理</a>、ヒープでのまとめ方は<a href={`${import.meta.env.BASE_URL}articles/heap-topk/`}>ヒープ</a>）。ハッシュなら、キーのハッシュで入力をいくつかの区画に分けてディスクに書き、区画ごとにメモリに載せて処理する**外部ハッシュ**（grace hash join はこの形）になります。
+
+**(c) 取引。** ディスクの読み書きを払って、メモリの上限を超えても**失敗せずに終わる**ことを得ます。速さを優先するエンジンは spill を既定で無効にし、メモリが足りなければ問い合わせを失敗させます。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：map の出力は `mapreduce.task.io.sort.mb`（既定 100MB）の環状のバッファにためられ、`mapreduce.map.sort.spill.percent`（既定 0.80）を超えると裏でディスクに書き出され始める。一度にまとめる本数は `mapreduce.task.io.sort.factor`（既定 10）（[mapred-default.xml](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/mapred-default.xml)）。**常に spill する前提の設計**である
+- **Spark**：shuffle のためのデータ構造がメモリに収まらないと、ディスクに spill し、ディスクの I/O とガベージコレクションの負荷が増える（[RDD Programming Guide](https://spark.apache.org/docs/latest/rdd-programming-guide.html#shuffle-operations)）。実行用と保存用で共有するメモリの割合が `spark.memory.fraction`（既定 0.6）（[Configuration](https://spark.apache.org/docs/latest/configuration.html)）
+- **Flink**：バッチのソート、ハッシュ集約、ハッシュ結合の演算子が spill する。spill するデータの圧縮が `table.exec.spill-compression.enabled`（既定 true）（[Table Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/config/)）
+- **Trino**：既定では、ノードあたりやクエリあたりのメモリの上限を超えた問い合わせは止められる。`spill-enabled` は既定 false で、文書は spill を古い機能と位置づけ、代わりに耐障害実行を使うよう勧めている（[Spill to disk](https://trino.io/docs/current/admin/spill.html)、[Spilling properties](https://trino.io/docs/current/admin/properties-spilling.html)）
+- **BigQuery**：ステージ間の転送がメモリに収まらないとディスクを使う方式に切り替わり、その量が `shuffleOutputBytesSpilled` に出る（[Query plan and timeline](https://docs.cloud.google.com/bigquery/docs/query-plan-explanation)）
+
+## 11. 障害耐性：何を失い、どこからやり直すか
+
+**(a) 問題。** 長い処理の途中でマシンが落ちたとき、最初からやり直すのは高くつきます。
+
+**(b) 仕組み。** やり直しの単位と、それを支える記録の組み合わせで、4 つの型があります。
+
+| 型 | やり直しの単位 | 支える記録 | 前提 |
+| --- | --- | --- | --- |
+| タスクの再実行 | 失敗したタスクだけ | 入力が残っている（HDFS、上流の shuffle 出力） | タスクが決定的で、何度走っても同じ結果 |
+| lineage（系譜）からの再計算 | 失われたパーティションだけ | 「どの入力にどの変換をかけたか」の記録 | 変換が決定的。系譜が長いと再計算が重い |
+| チェックポイント | 最後のチェックポイント以降 | ある時点の状態と入力の位置の写し | 入力を巻き戻せる（Kafka のオフセットなど） |
+| 中間結果の永続化 | 永続化した地点以降 | ステージの出力を計算ノードの外に置く | 置く場所の費用と、書く時間 |
+
+**(c) 取引。** **平時に払う費用と、障害時に払う費用の取引**です。中間結果を毎回書けば、障害時の損失は小さく、平時は遅くなります。全部をメモリで流せば、平時は速く、障害時には最初からになります。Presto の論文は、2018 年末の時点でノードの故障への組み込みの耐性は無く、失敗した問い合わせはクライアントが再実行する、と書き、そのうえで、チェックポイントは結果を早く返す設計と両立させにくく、多くの問い合わせが数時間以内に終わることを考えると費用に見合うか不明だった、と理由を述べています（[Presto: SQL on Everything](https://trino.io/Presto_SQL_on_Everything.pdf)、IV-G 節）。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：失敗したタスクを再実行する。`mapreduce.map.maxattempts` と `mapreduce.reduce.maxattempts` は既定 4（[mapred-default.xml](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/mapred-default.xml)）。ジョブ間は HDFS に書くので、それが永続化の地点になる
+- **Spark**：RDD は自分がどう作られたか（lineage）を記録しており、失われたパーティションだけを再計算できる。系譜が長く広い依存を含むときは、安定したストレージへのチェックポイントが役立つ（[Zaharia et al., Resilient Distributed Datasets, NSDI 2012](https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf)、5.4 節）。shuffle ファイルは系譜を再計算するときに作り直さなくて済むよう残される（[RDD Programming Guide](https://spark.apache.org/docs/latest/rdd-programming-guide.html#shuffle-operations)）。`spark.task.maxFailures` は既定 4
+- **Flink**：ストリームにバリアを流して、各演算子の状態と入力の位置を非同期に写すチェックポイント。`execution.checkpointing.interval` は既定で未設定（チェックポイントは取られない）、`execution.checkpointing.mode` は既定 `EXACTLY_ONCE`、状態の置き場所 `state.backend.type` は既定 `hashmap`（[Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/config/)、[Stateful Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/)）
+- **Trino**：`retry-policy` は既定 `NONE`（失敗したら問い合わせが失敗する）。`QUERY` は問い合わせ全体を、`TASK` は個々のタスクを再試行し、`TASK` には中間データを外部に置く exchange manager が要る（[Fault-tolerant execution](https://trino.io/docs/current/admin/fault-tolerant-execution.html)）
+- **BigQuery**：問い合わせの各サブタスクは決定的で繰り返し実行でき、失敗すれば一部だけを別の作業者で再実行する。shuffle の結果は問い合わせの実行状態のチェックポイントとして使われ、スケジューラはそれを使って作業者を途中で取り上げることもできる（上記 Dremel 論文、5.1 節と 5.2 節）
+
+## 12. 出力の確定：勝ったタスクの結果だけを見せる
+
+**(a) 問題。** 再実行（11 番）と投機実行（9 番）があると、同じタスクが何度も走り、出力も何組もできます。途中で失敗したジョブの書きかけも残ります。読む側には、**成功した 1 組だけが、全部そろってから見える**ようにしたい。
+
+**(b) 仕組み。** 2 段の確定（コミットプロトコル）です。各タスクは自分専用の一時的な場所に書き、成功したタスクの出力だけをタスクの確定で採用し、全タスクがそろったらジョブの確定で一度に見えるようにします。もう 1 つの方針は、**書き込み自体を冪等にする**ことです。同じ場所を同じ内容で上書きする、主キー付きで書く、などで、何回書いても 1 回と同じ結果にします（冪等性は<a href={`${import.meta.env.BASE_URL}reading/messaging/`}>メッセージングの現実</a>で扱いました）。
+
+**(c) 取引。** 確定を慎重にするほど、最後の確定に時間がかかります。ファイルの名前の変更に頼る方式は、名前の変更が速くて原子的なストレージでしか安全ではありません。S3 のようなストレージでの問題と、マルチパートアップロードを使うコミッタは<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で、カタログのポインタを差し替える方式は<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a>で扱いました。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：`OutputCommitter` がジョブとタスクの確定を担う（[MapReduce Tutorial](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html)）。`FileOutputCommitter` には 2 つの方式があり、`mapreduce.fileoutputcommitter.algorithm.version` で選ぶ（mapred-default.xml の値は 2）。版 1 はタスクの確定で一時ディレクトリを名前の変更で移し、ジョブの確定で全部を最終の場所へまとめるので、ファイルが多いとジョブの確定に数分かかる。版 2 はタスクの確定で直接最終の場所へ移すので速い（[mapred-default.xml](https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/mapred-default.xml)）。この手順から、版 2 ではジョブが途中で失敗すると確定済みのタスクの出力が最終の場所に残る、ということが読み取れる
+- **Spark**：ファイルへの書き込みには Hadoop のコミッタを使い、S3 では S3A のコミッタを使う（[S3A Committers](https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/committers.html)）。Iceberg などのテーブル形式では、カタログのポインタの差し替えが確定になる
+- **Flink**：チェックポイントと連動する 2 相コミット。チェックポイントの間に書いた分を「準備」状態にしておき、チェックポイントが完了したら確定する（[Flink: An Overview of End-to-End Exactly-Once Processing](https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/)）
+- **Trino**：書き込みの確定はコネクタが担う。Iceberg のコネクタならスナップショットの確定、つまりカタログのポインタの差し替えになる（<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>）
+- **BigQuery**：問い合わせの結果を表に書く `writeDisposition` の動作（`WRITE_TRUNCATE`、`WRITE_APPEND`、`WRITE_EMPTY`）は原子的で、ジョブが成功したときだけ一度に反映される（[BigQuery API: JobConfigurationQuery](https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/Job)）。Storage Write API の pending 型のストリームは、確定の操作で中身が一度に読めるようになり、この確定は原子的である（[Storage Write API](https://docs.cloud.google.com/bigquery/docs/write-api)）
+
+## 13. 直列化・列指向・ベクトル化・コード生成
+
+**(a) 問題。** ディスクやネットワークの待ちを減らしていくと、最後に CPU が詰まります。1 行ずつ汎用の関数を呼ぶ処理は、関数呼び出し、型の判定、オブジェクトの生成に時間を取られます。shuffle のたびに行をバイト列に変える**直列化**も重い処理です。
+
+**(b) 仕組み。** 3 つの手があります。
+
+- **列指向のメモリ表現**：同じ列の値を連続した領域に並べる。圧縮が効き、必要な列だけ扱える（ファイルの側の話は<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>）
+- **ベクトル化**：1 行ずつではなく、列の値の塊（数千行分）に対して 1 回の関数呼び出しで同じ演算をかける。CPU のキャッシュと SIMD 命令が効く
+- **コード生成**：問い合わせごとに、その問い合わせ専用の処理コードを実行時に生成してコンパイルする。演算子の境目の関数呼び出しが消える
+
+**(c) 取引。** 列指向とベクトル化は、行単位の小さな処理（1 行の更新、行ごとに分岐の多い処理）には向きません。コード生成は、生成とコンパイルの時間を問い合わせごとに払うので、短い問い合わせでは得が小さくなります。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：`Writable` の型で直列化し、`map()` と `reduce()` を 1 レコードずつ呼ぶ行単位の設計
+- **Spark**：`spark.serializer` の既定は Java の直列化で、文書は Kryo のほうがしばしば 10 倍ほど速く小さいと書いている（[Tuning](https://spark.apache.org/docs/latest/tuning.html)）。Catalyst の 4 段目でクエリの一部を Java バイトコードにコンパイルする（上記 Spark SQL 論文）。複数の演算子を 1 つの関数にまとめる whole-stage code generation については [Databricks のブログ（2016）](https://www.databricks.com/blog/2016/05/23/apache-spark-as-a-compiler-joining-a-billion-rows-per-second-on-a-laptop.html) が解説している。Parquet のベクトル化読み込み `spark.sql.parquet.enableVectorizedReader` は既定 true（[Configuration](https://spark.apache.org/docs/latest/configuration.html)）
+- **Flink**：Table/SQL のプランナは演算子のコードを生成する（ソースの [codegen パッケージ](https://github.com/apache/flink/tree/master/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/codegen)）
+- **Trino**：演算子が受け渡す単位の page は、行の並びを列ごとに符号化したもの。式の評価と主要な演算子について JVM のバイトコードを生成する（[Presto: SQL on Everything](https://trino.io/Presto_SQL_on_Everything.pdf)、IV-E 節と V-B 節）
+- **BigQuery**：列指向の形式 Capacitor は、列の塊単位のベクトル化された処理に向いており、Capacitor に組み込まれた評価器がそれを使う（上記 Dremel 論文、6 節）
+
+## 14. 資源管理とスケジューリング
+
+**(a) 問題。** 1 つのクラスタを多くの利用者とジョブで共有します。誰にどれだけ配るか、大きなジョブが小さなジョブを待たせないか、を決める必要があります。
+
+**(b) 仕組み。** 計算資源を、CPU とメモリの決まった量の**枠**（スロット、コンテナ）に切り、タスクを枠に割り当てます。共有のルールには、到着順（FIFO）、利用者やキューごとの取り分を保証する容量の割り当て、動いているジョブで均等に分ける公平な割り当て、があります。
+
+**(c) 取引。** 枠を固定すると隔離が効いて予測しやすくなり、遊ぶ枠も出ます。共有を細かくすると使い切れますが、互いの干渉が増えます。公平な割り当ては短いジョブの応答を守る代わりに、長いジョブを遅らせます。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：YARN の ResourceManager が全体の資源を調停し、各マシンの NodeManager がコンテナを管理し、アプリケーションごとの ApplicationMaster がタスクを動かす（[Apache Hadoop YARN](https://hadoop.apache.org/docs/current/hadoop-yarn/hadoop-yarn-site/YARN.html)）。共有のルールは [Capacity Scheduler](https://hadoop.apache.org/docs/current/hadoop-yarn/hadoop-yarn-site/CapacityScheduler.html) か [Fair Scheduler](https://hadoop.apache.org/docs/current/hadoop-yarn/hadoop-yarn-site/FairScheduler.html)
+- **Spark**：アプリケーションごとにエグゼキュータの集まりを持ち、資源は YARN や Kubernetes から借りる。アプリケーション内のジョブの順番は `spark.scheduler.mode`（既定 `FIFO`、ほかに `FAIR`）（[Job Scheduling](https://spark.apache.org/docs/latest/job-scheduling.html)、[Configuration](https://spark.apache.org/docs/latest/configuration.html)）
+- **Flink**：TaskManager が持つタスクスロットが単位で、`taskmanager.numberOfTaskSlots` は既定 1。スロットは管理メモリを分けるが CPU は隔離しない。同じジョブの異なる演算子が 1 つのスロットを共有できる（slot sharing）（[Flink Architecture](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/flink-architecture/)、[Configuration](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/config/)）
+- **Trino**：常駐のワーカーを全問い合わせが共有し、問い合わせの数や資源を [Resource groups](https://trino.io/docs/current/admin/resource-groups.html) で制限する。1 問い合わせのメモリの上限は `query.max-memory`（既定 20GB）と `query.max-memory-per-node`（既定は最大ヒープの 30%）（[Resource management properties](https://trino.io/docs/current/admin/properties-resource-management.html)）
+- **BigQuery**：スロットは問い合わせを実行するための仮想的な計算の単位。予約の中では、問い合わせを実行中のプロジェクトの間でスロットを均等に分け、さらにプロジェクトの中でジョブの間で分ける。新しい問い合わせが来るたびに配分し直す（[Understand slots](https://docs.cloud.google.com/bigquery/docs/slots)）
+
+## 15. 計算とストレージの分離と弾力性
+
+**(a) 問題。** 夜間の集計にだけ 100 台、昼は 10 台、というように、必要な計算力は時間とともに大きく変わります。台数を増減するたびにデータを移すのでは間に合いません。
+
+**(b) 仕組み。** データを共有のストレージ（S3、GCS、Colossus）に置き、計算ノードを**状態を持たない**ものに近づけます。ただし、計算ノードが抱える状態はデータだけではありません。**shuffle の出力**と**演算子の状態**も、計算ノードの上にあると、その台を止められません。そこで、これらも外に出す仕組みが加わります。外部 shuffle サービス、計算ノードの外の shuffle 層、外部に置く状態です。分離そのものと、局所性を失った分を補う工夫は<a href={`${import.meta.env.BASE_URL}reading/lake-storage/`}>データの置き場所</a>で扱いました。
+
+**(c) 取引。** すべての読み出しがネットワーク越しになり、1 番の局所性を捨てます。その代わり、台数を秒〜分の単位で増減でき、使った分だけ払う課金が可能になります（<a href={`${import.meta.env.BASE_URL}reading/compute-managed/`}>マネージドの分散処理</a>）。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：HDFS と計算を同じマシンに置く、分離しない側の代表
+- **Spark**：動的割り当て `spark.dynamicAllocation.enabled`（既定 false）でエグゼキュータを増減できる。ただし、shuffle ファイルを持つエグゼキュータを外すために、外部 shuffle サービス、shuffle の追跡、廃止時の shuffle ブロックの移送などのいずれかが要る（[Job Scheduling: Dynamic Resource Allocation](https://spark.apache.org/docs/latest/job-scheduling.html#dynamic-resource-allocation)）
+- **Flink**：状態がキーグループ単位で配り直せるので、並列度を変えて再開できる。Flink 2.0 では、状態の保存を計算資源から切り離す状態バックエンド ForSt を含む「Disaggregated State Management」が導入された（[Apache Flink 2.0.0 の告知](https://flink.apache.org/2025/03/24/apache-flink-2.0.0-a-new-era-of-real-time-data-processing/)）
+- **Trino**：ワーカーは S3 などを読み、データを持たない。耐障害実行では中間データも外部に置かれる
+- **BigQuery**：ストレージ（2009 年）とメモリ（shuffle、2014 年）を計算から切り離した。実行中の問い合わせの容量は、ほかの問い合わせの開始や終了、オートスケーラによるスロットの追加で変わる（上記 Dremel 論文、3 節と 5.1 節、[Understand slots](https://docs.cloud.google.com/bigquery/docs/slots)）
+
+## 16. 配送保証と時刻：ストリーム側の共通項
+
+**(a) 問題。** 終わりの無いストリームでは、障害からの復旧で同じイベントを 2 回処理したり、取りこぼしたりします。また、イベントは起きた順には届きません。「10 時台の件数」をいつ確定してよいか分かりません。
+
+**(b) 仕組み。** 配送の保証は、**少なくとも 1 回届ける（at-least-once）ことと、受け取る側の冪等性やトランザクションを組み合わせて、ちょうど 1 回に見せる**のが共通の形です（<a href={`${import.meta.env.BASE_URL}reading/messaging/`}>メッセージングの現実</a>）。エンジンの中では、11 番のチェックポイントで状態と入力の位置を一緒に記録し、12 番の 2 相コミットで外部への出力を確定します。時刻については、できごとが起きた**イベント時刻**と処理した**処理時刻**を分け、「時刻 t より前のイベントはもう来ない」という宣言である**watermark**で窓を閉じます。窓の種類は<a href={`${import.meta.env.BASE_URL}reading/data-processing/`}>大量データの処理</a>で扱いました。
+
+**(c) 取引。** watermarkを遅らせるほど遅れて来たデータを取りこぼしにくくなり、結果を出すのが遅くなります。exactly-once の出力は、確定がチェックポイントの間隔に縛られるので、遅延が増えます。
+
+**(d) 各エンジン。**
+
+- **Hadoop MapReduce**：ストリームは扱わない。バッチでの「ちょうど 1 回」は、ジョブを再実行しても同じ場所を同じ内容で上書きする冪等な作りで実現する
+- **Spark**：Structured Streaming は既定でマイクロバッチで動き、チェックポイントと先行書き込みログで end-to-end の exactly-once を保証する（[Structured Streaming Programming Guide](https://spark.apache.org/docs/latest/streaming/index.html)）
+- **Flink**：チェックポイントのモード（既定 `EXACTLY_ONCE`）と 2 相コミットのシンク。イベント時刻とwatermarkは Flink の時刻の概念の中心にある（[Timely Stream Processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/)、<a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>状態を持つストリーム処理</a>）
+- **Trino**：ストリーム処理はしない
+- **BigQuery**：Storage Write API で、アプリケーションが作ったストリームにオフセットを付けて書くと、ちょうど 1 回の書き込みになる（[Storage Write API](https://docs.cloud.google.com/bigquery/docs/write-api)）
+
+## 概念 × エンジンの対応表
+
+16 個の概念が、各エンジンでどの名前で現れるかをまとめます。設定名の既定値は上の各節に書きました。「—」はその概念に当たる仕組みが無いか、執筆時点の文書で見つけられなかったことを表します。
+
+| 概念 | Hadoop MapReduce | Spark | Flink | Trino | BigQuery |
+| --- | --- | --- | --- | --- | --- |
+| 1 局所性 | ブロックを持つ DataNode で map | `spark.locality.wait`、`NODE_LOCAL` など | キー付き状態をローカルに持つ | `node-scheduler.policy` | ストレージを分離（局所性を捨てる） |
+| 2 分割 | `InputSplit`、`HashPartitioner` | `maxPartitionBytes`、`shuffle.partitions` | キーグループ（= 最大並列度） | split、`max-hash-partition-count` | 集約キーでの hash 分割 |
+| 3 shuffle | ローカルディスク + HTTP で取得 | ソート済みの shuffle ファイル、外部 shuffle サービス | ストリームはバッファで流す、バッチは Sort Shuffle | メモリで流す、耐障害時は exchange manager | 分離されたメモリの shuffle 層 |
+| 4 ステージ | map と reduce の 2 段固定 | 広い依存でステージを区切る | 演算子チェーン | fragment、`execution-policy` | ステージの DAG |
+| 5 最適化 | 無し（プログラムそのもの） | Catalyst、`cbo.enabled`、AQE | `join-reorder-enabled`、適応的 broadcast | CBO、`join-reordering-strategy` | 実行中に計画を変更 |
+| 6 結合方式 | reduce 側結合 / map 側結合を手で書く | `autoBroadcastJoinThreshold`、4 種のヒント | `join.broadcast-threshold`、4 種のヒント | `BROADCAST` / `PARTITIONED`（hash のみ） | `JOIN EACH WITH ALL` / `EACH` |
+| 7 部分集約 | combiner | `partial_` の集約、`reduceByKey` | `agg-phase-strategy`、ミニバッチ | `PARTIAL` / `FINAL` | `COUNT` → `SUM_OF_COUNTS` |
+| 8 偏り | 手で salting | AQE skew join | 偏った結合の実行時分割、distinct の分割 | — | `REPARTITION`、計算時間の最大と平均 |
+| 9 投機実行 | `mapreduce.*.speculative`（既定 true） | `spark.speculation`（既定 false） | バッチのみ（既定 false） | — | 小さなタスク + 複製 |
+| 10 spill | `io.sort.mb`、`spill.percent` | shuffle の spill、統合メモリ | バッチ演算子の spill | `spill-enabled`（既定 false、古い機能） | `shuffleOutputBytesSpilled` |
+| 11 障害耐性 | タスク再実行、`maxattempts` | lineage、checkpoint | バリアによるチェックポイント | `retry-policy`（既定 `NONE`） | 決定的なサブタスクの再実行、shuffle をチェックポイントに |
+| 12 出力の確定 | `OutputCommitter` v1 / v2 | Hadoop / S3A のコミッタ、テーブル形式 | 2 相コミットのシンク | コネクタの確定 | 原子的な `writeDisposition`、pending ストリーム |
+| 13 CPU 効率 | `Writable`、行単位 | Kryo、コード生成、ベクトル化読み込み | プランナのコード生成 | 列の page、バイトコード生成 | Capacitor、ベクトル化 |
+| 14 資源管理 | YARN、Capacity / Fair | エグゼキュータ、`FIFO` / `FAIR` | タスクスロット、slot sharing | Resource groups、メモリの上限 | スロット、均等な分配 |
+| 15 弾力性 | 分離しない | 動的割り当て + shuffle の退避 | 状態の再配分、ForSt | ワーカーはデータを持たない | ストレージとメモリを分離 |
+| 16 配送と時刻 | —（冪等な再実行） | マイクロバッチ、チェックポイント | exactly-once、watermark | — | Write API のオフセット |
+
+表を縦に読むと、各エンジンの性格が見えます。Hadoop MapReduce は**ほとんどを利用者のプログラムに任せ、ディスクに書くことで全部を安全側に倒した**エンジンです。Spark はその上に、最適化器と実行時の計画の修正を積みました。Flink は、ストリームのために**状態とチェックポイント**を中心に据えています。Trino は、**速さのために耐障害性と spill を既定で切り**、必要なら耐障害実行に切り替える設計です。BigQuery は、**shuffle を計算ノードの外に出す**ことで、障害耐性、弾力性、実行時の計画の変更を同時に手に入れています。
+
+## 実験のスクリプト
+
+実験 1〜4 に使ったスクリプトの全文です。Python 3.14.0 で、標準ライブラリだけを使います。`python3 common_lab.py` で 4 つの実験を順に実行し、手元の環境では 8 秒ほどで終わりました。各節に載せた出力は、このスクリプトの出力から該当部分を切り出したもので、数値は加工していません。
+
+```python
+import random
+import zlib
+from collections import Counter
+
+random.seed(42)
+
+
+def zipf_sampler(n_keys, s):
+    cum, total = [], 0.0
+    for rank in range(1, n_keys + 1):
+        total += 1.0 / rank ** s
+        cum.append(total)
+    keys = [f"k{r}" for r in range(1, n_keys + 1)]
+    return lambda k: random.choices(keys, cum_weights=cum, k=k)
+
+
+def part(key, n):
+    return zlib.crc32(key.encode()) % n
+
+
+def stats(counts):
+    mean = sum(counts) / len(counts)
+    return max(counts), mean, max(counts) / mean
+
+
+def exp1_skew():
+    print("== 1. キーの偏りとハッシュパーティション（100 万件、16 パーティション）")
+    n_rec, n_keys, P = 1_000_000, 100_000, 16
+    print(f"{'分布':<14}{'最大件数':>10}{'平均件数':>10}{'最大/平均':>10}{'最多キーの件数':>14}")
+    for label, s in [("一様", 0.0), ("Zipf s=0.8", 0.8), ("Zipf s=1.0", 1.0), ("Zipf s=1.2", 1.2)]:
+        keys = zipf_sampler(n_keys, s)(n_rec)
+        c = Counter(keys)
+        per = [0] * P
+        for k, v in c.items():
+            per[part(k, P)] += v
+        mx, mean, r = stats(per)
+        print(f"{label:<14}{mx:>10,}{mean:>10,.0f}{r:>10.2f}{c.most_common(1)[0][1]:>14,}")
+
+    print("\n-- Zipf s=1.2 に salting をかける（塩の数 S、対象は上位キーのみ）")
+    keys = zipf_sampler(n_keys, 1.2)(n_rec)
+    c = Counter(keys)
+    hot = {k for k, v in c.most_common() if v > n_rec / P / 4}
+    print(f"件数が 1 パーティションの平均の 1/4 を超えるキー: {len(hot)} 個")
+    print(f"{'S':>4}{'最大件数':>10}{'最大/平均':>10}{'第 2 段へ送る部分集計の行数':>26}")
+    for S in [1, 2, 4, 8, 16, 32]:
+        per = [0] * P
+        partials = set()
+        for k in keys:
+            sk = f"{k}#{random.randrange(S)}" if k in hot else k
+            per[part(sk, P)] += 1
+            partials.add(sk)
+        mx, mean, r = stats(per)
+        print(f"{S:>4}{mx:>10,}{r:>10.2f}{len(partials):>26,}")
+
+
+def exp2_join():
+    print("\n== 2. broadcast 結合と shuffle 結合のネットワーク転送量（計算）")
+    print("大きい表 L = 1 TB。両表とも最初は N 台に均等に散らばっている前提")
+    print("shuffle:   (L + S) * (N - 1) / N   ……両表の各行が hash(key) % N の台へ移る")
+    print("broadcast: S * (N - 1)             ……各台が自分以外の持つ S を受け取る")
+    L = 1000.0
+    print(f"{'S':>8}{'N':>6}{'shuffle (GB)':>14}{'broadcast (GB)':>16}{'有利':>8}{'build 側/台 bcast':>18}{'shuffle':>14}")
+    for S in [0.01, 1, 10, 100]:
+        for N in [10, 100, 1000]:
+            sh = (L + S) * (N - 1) / N
+            bc = S * (N - 1)
+            win = "bcast" if bc < sh else "shuffle"
+            print(f"{S:>6g}GB{N:>6}{sh:>14,.1f}{bc:>16,.1f}{win:>8}{S * 1000:>14,.0f} MB{S / N * 1000:>11,.2f} MB")
+    print("損益分岐: S * (N - 1) = (L + S) * (N - 1) / N  →  S = L / (N - 1)")
+
+    print("\n-- 行単位のシミュレーションで式を確かめる（L 20 万行、S 2,000 行、1 行 100 B）")
+    rows_l, rows_s, row_b = 200_000, 2_000, 100
+    for N in [4, 16, 64]:
+        moved = 0
+        for i in range(rows_l + rows_s):
+            home = random.randrange(N)
+            dest = part(f"id{i % rows_s}", N)
+            moved += home != dest
+        sh_sim = moved * row_b
+        sh_formula = (rows_l + rows_s) * row_b * (N - 1) / N
+        bc_formula = rows_s * row_b * (N - 1)
+        print(f"N={N:<3} shuffle 実測 {sh_sim/1e6:6.2f} MB / 式 {sh_formula/1e6:6.2f} MB"
+              f"   broadcast（式） {bc_formula/1e6:6.2f} MB")
+
+
+def exp3_combiner():
+    print("\n== 3. 部分集約（combiner）で shuffle する行数がどれだけ減るか")
+    n_rec, M = 1_000_000, 50
+    print(f"入力 {n_rec:,} 行を {M} 個の map タスクに分ける。各タスクは手元のキーごとに 1 行に畳んでから送る")
+    print(f"{'キーの分布':<22}{'combiner なし':>14}{'combiner あり':>14}{'削減率':>8}")
+    for label, n_keys, s in [("一様・1,000 種", 1_000, 0.0), ("一様・100 万種", 1_000_000, 0.0),
+                             ("Zipf 1.0・10 万種", 100_000, 1.0), ("Zipf 1.2・10 万種", 100_000, 1.2)]:
+        keys = zipf_sampler(n_keys, s)(n_rec)
+        per_task = n_rec // M
+        after = sum(len(set(keys[t * per_task:(t + 1) * per_task])) for t in range(M))
+        print(f"{label:<22}{n_rec:>14,}{after:>14,}{1 - after / n_rec:>8.1%}")
+
+    print("\n-- 平均は「平均の平均」にできない。(合計, 件数) の組なら部分集約できる")
+    tasks = [[10, 10, 10, 10], [100]]
+    avg_of_avg = sum(sum(t) / len(t) for t in tasks) / len(tasks)
+    sums = [(sum(t), len(t)) for t in tasks]
+    true_avg = sum(s for s, _ in sums) / sum(c for _, c in sums)
+    print(f"タスク A = {tasks[0]}, タスク B = {tasks[1]}")
+    print(f"平均の平均 = {avg_of_avg}   (合計, 件数) を足してから割る = {true_avg}")
+
+
+def exp4_straggler():
+    print("\n== 4. 遅いタスクと投機実行（200 タスク、20 スロット、1 台だけ 6 倍遅い）")
+    n_tasks, slots, slow_slot, slow_factor = 200, 20, 0, 6.0
+    base = [random.uniform(9, 11) for _ in range(n_tasks)]
+
+    def run(speculate, task_sizes):
+        free = [0.0] * slots
+        queue = list(range(len(task_sizes)))
+        running = []
+        while queue:
+            s = min(range(slots), key=lambda i: free[i])
+            t = queue.pop(0)
+            d = task_sizes[t] * (slow_factor if s == slow_slot else 1.0)
+            running.append((free[s], free[s] + d, s, t))
+            free[s] += d
+        end = {t: e for _, e, _, t in running}
+        if speculate:
+            for st, e, s, t in running:
+                if s != slow_slot:
+                    continue
+                spare = min(i for i in range(slots) if i != slow_slot and free[i] == min(
+                    free[j] for j in range(slots) if j != slow_slot))
+                copy_start = max(free[spare], st + 1.5 * 10)
+                copy_end = copy_start + task_sizes[t]
+                if copy_end < e:
+                    free[spare] = copy_end
+                    end[t] = copy_end
+        return max(end.values())
+
+    ideal = sum(base) / slots
+    print(f"全スロットが同じ速さなら              : {ideal:6.1f}")
+    print(f"200 タスク、投機実行なし              : {run(False, base):6.1f}")
+    print(f"200 タスク、投機実行あり              : {run(True, base):6.1f}")
+    big = [sum(base[i:i + 10]) for i in range(0, n_tasks, 10)]
+    print(f"同じ仕事を 20 タスクに束ねる、投機なし : {run(False, big):6.1f}")
+
+
+if __name__ == "__main__":
+    exp1_skew()
+    exp2_join()
+    exp3_combiner()
+    exp4_straggler()
+```
+
+<Callout type="warn" title="実験の限界">
+  実験 2 の転送量は式による計算で、圧縮、ネットワークの帯域の差、broadcast を木の形で配る工夫などは入っていません。実験 4 の投機実行の規則は説明のための単純なもので、Hadoop や Spark の実際の判定（進み具合の標準偏差や中央値の倍数を使う）とは違います。数値の大小関係を見るためのもので、実際のエンジンの性能を表すものではありません。
+</Callout>
+
+## この回の用語
+
+| 用語 | 一言の意味 |
+| --- | --- |
+| データ局所性 | データを持つマシンで計算すること |
+| 入力分割（split） | 1 つのタスクが読む入力の断片 |
+| ハッシュ / 範囲パーティショニング | キーのハッシュ / キーの区間で行き先を決める配り方 |
+| shuffle | 集約や結合のため、キーごとにデータをノード間で配り直す全対全の転送 |
+| ステージ | shuffle で区切られた、パイプラインでつながる演算子のまとまり |
+| パイプライン化 | 中間結果を書き出さずに、行を次の演算子へ渡し続けること |
+| 論理計画 / 物理計画 | 何を計算するか / どの方式でどこで計算するか |
+| コストベース最適化（CBO） | 統計から費用を見積もって計画を選ぶこと |
+| 適応的な実行 | 実行中に分かった実際の大きさで計画を直すこと |
+| broadcast hash join | 小さい表を全台へ複製して、各台でハッシュ表を引く結合 |
+| shuffle hash join / sort-merge join | 両方の表をキーで配り直し、ハッシュ表で引く / ソートして突き合わせる結合 |
+| 部分集約（combiner） | shuffle の前に手元でキーごとに畳むこと |
+| 偏り（skew） | 一部のキーやパーティションに件数が集中すること |
+| salting | 重いキーに乱数を付けて複数の担当に分けること |
+| straggler | 全体の終了を遅らせる、異常に遅いタスク |
+| 投機実行 | 遅いタスクの複製を別のマシンで走らせ、先に終わったほうを採ること |
+| spill | メモリに収まらない途中の結果をディスクに書き出すこと |
+| lineage（系譜） | データがどの入力からどの変換で作られたかの記録。失った部分の再計算に使う |
+| チェックポイント | ある時点の状態と入力の位置を写しておき、障害時にそこから再開する仕組み |
+| コミットプロトコル | 成功したタスクの出力だけを、全部そろってから見えるようにする 2 段の確定 |
+| ベクトル化 | 列の値の塊に対して、まとめて同じ演算をかけること |
+| コード生成 | 問い合わせ専用の処理コードを実行時に生成してコンパイルすること |
+| スロット | 計算資源を切り分けた割り当ての単位 |
+| watermark | 「時刻 t より前のイベントはもう来ない」というストリーム上の宣言 |
+
+似た用語の区別を 3 つ補います。
+
+- **パーティション**：この回の「パーティション」は shuffle や読み込みの単位（実行時の分け方）です。<a href={`${import.meta.env.BASE_URL}reading/lake-catalog-engine/`}>カタログと計算エンジン</a>で見た表のパーティション（`dt=...` のディレクトリ）とは別の概念です。表のパーティションは、読む前に読み飛ばすための保存時の分け方です
+- **チェックポイント（Spark と Flink）**：Spark の RDD のチェックポイントは、長い系譜を断ち切るためにデータを安定したストレージへ書くことです。Flink のチェックポイントは、全演算子の状態と入力の位置を同じ時点でそろえて写すことです。同じ名前で、守る対象が違います
+- **broadcast（2 つの意味）**：結合方式の broadcast は「小さい表を全台へ複製する」ことです。Spark の broadcast 変数や Flink の broadcast state は、読み取り専用の値や状態を全タスクに配る仕組みで、結合方式の broadcast はその使い方の 1 つです
+
+## 7 本の振り返り
+
+| 回 | 扱ったもの | 問い | 答えの核 |
+| --- | --- | --- | --- |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-map/`}>計算エンジンの地図</a> | 全体 | どんなエンジンがあり、何が何を置き換えたか | 論文の系譜から、MapReduce、DAG とインメモリ、MPP、ストリーム、単一ノードへの回帰へと、用途ごとに枝分かれしてきた |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-hadoop/`}>Hadoop の中身</a> | MapReduce と YARN | map と reduce は実際にどう動くか | 環状のバッファから spill し、ソートして HTTP で取り合う。ジョブ間はディスク経由なので安全だが遅い |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a> | RDD・実行計画・shuffle | なぜ MapReduce より速いのか | 系譜を持つ不変のデータと DAG でステージ間の書き出しを減らし、最適化器と AQE で計画を直す |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>状態を持つストリーム処理</a> | Flink・Beam・Dataflow | 終わらない入力をどう正しく集計するか | 状態をキーで分けて手元に持ち、バリアでそろえたチェックポイントと watermark で正しさと時刻を扱う |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-mpp-sql/`}>常駐ワーカーで SQL を分散実行する</a> | Trino・BigQuery | 対話的な速さはどこから来るか | 常駐のワーカーとメモリ上のパイプラインで起動と書き出しを省く。障害時の扱いはその代償 |
+| <a href={`${import.meta.env.BASE_URL}reading/compute-managed/`}>マネージドの分散処理</a> | Dataproc・EMR・Databricks | 誰が何を運用し、何に払うのか | 計算とストレージを分け、クラスタを必要なときだけ作る。運用の責任と料金の単位が選択の軸になる |
+| 分散処理の共通項（この回） | ソフトに依らない仕組み | どのエンジンにも出てくるものは何か | 局所性から配送保証までの 16 の仕組みは、どれも「どこに置き、何を残し、何を払うか」の取引で、エンジンの差はその選び方の差 |
+
+## まとめ
+
+- どの分散処理エンジンも、分割して配り、shuffle で同じキーを集め直し、遅いものと壊れるものに備え、結果を確定させる、という同じ問題を解いている。差は、それぞれの取引でどちらを選んだかにある
+- shuffle は M × R 本の全対全の転送で、出力をディスクに残すか、メモリで流すか、計算ノードの外に置くかで、速さ・障害耐性・弾力性の性格が決まる
+- 結合方式は、小さい表を台数ぶん複製する broadcast と、両方を一度だけ配り直す shuffle 系の取引。実験では損益分岐が S = L/(N − 1) になり、台数が増えるほど broadcast の範囲は狭まる。実際の閾値はメモリの制約からさらに小さい
+- 部分集約は、1 タスク内で同じキーが何度も出るほど効く。実験では 95% から 1% まで幅があり、偏りが強いほどよく効いた。平均は (合計, 件数) に直して使う
+- 偏りはキーの分布の問題で、ハッシュの質では消えない。実験では最多の 1 キーが平均のパーティションの 3 倍あり、上位 8 キーへの salting で最大/平均は 3.70 から 1.47 に下がった
+- 遅いタスクには、まず細かく分けること、次に投機実行が効く。投機実行も再実行も、タスクが決定的で、出力の確定が「勝ったほうだけ」になっていることが前提
+- 障害耐性は、平時に払う費用（中間結果の書き出し）と障害時に払う費用（やり直しの範囲）の取引。MapReduce は全部を書き、Trino は既定で何も残さず、BigQuery は shuffle 層をチェックポイントに使う
+- 計算とストレージの分離で弾力性を得るには、データだけでなく shuffle の出力と演算子の状態も計算ノードの外に出す必要がある
+
+7 本を通して見ると、計算エンジンの歴史は、MapReduce が「全部をディスクに書く」ことで手に入れた安全さを、どこまで手放して速さに変えられるかの試行錯誤として読むことができます。Spark は系譜を残すことで書き出しを減らし、Flink はチェックポイントを残すことで流し続け、Trino は残さないことで速さをとり、BigQuery は残す場所を計算ノードの外へ移しました。どの選択も、局所性、shuffle、障害耐性、弾力性のどれかを払って、別のどれかを得ています。新しいエンジンに出会ったときは、この回の 16 の項目について「何を残し、どこに置き、何を払っているか」を問えば、その設計の多くが読み解けるはずです。

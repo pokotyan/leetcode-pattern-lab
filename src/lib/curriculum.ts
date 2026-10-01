@@ -160,6 +160,11 @@ export const READING_SECTIONS: Section[] = [
     title: 'データレイクの中身',
     summary: 'オブジェクトストレージに置いたファイルの山を、表として読み書きするための層。置き場所、ファイル形式、カタログと計算エンジン、そして Iceberg・Delta Lake・Hudi が行の更新とタイムトラベルを実現する仕組み',
   },
+  {
+    id: 'compute',
+    title: '大量データの計算エンジン',
+    summary: 'データレイクの上で計算する側の中身。Hadoop、Spark、Flink と Beam、Trino と BigQuery、Dataproc などのマネージドサービスを系譜から読み、どのエンジンにも共通する分割・shuffle・結合・障害耐性の仕組みを整理する',
+  },
 ]
 
 export const readingSectionById = new Map(READING_SECTIONS.map((s) => [s.id, s]))

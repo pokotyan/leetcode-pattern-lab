@@ -257,6 +257,8 @@ S3 Tables の REST エンドポイントの操作表は、この回の話をよ�
   Amazon Athena のエンジンバージョン 3 について、AWS の文書は、オープンソースの Trino と Presto の変更を継続的に取り込む方式をとったと説明し、追加機能の多くを「オープンソースの Trino から取り入れた機能」として挙げ、関数の一覧は Trino の文書を参照するよう案内しています（[Athena engine version 3](https://docs.aws.amazon.com/athena/latest/ug/engine-versions-reference-0003.html)）。一方で、Trino や Presto のコネクタはそのままでは使えず、Trino の障害耐性のある実行も未対応だと書いています。**Athena は Trino の機能を取り込んだ AWS のサービスで、Trino そのものではありません。**
 </Callout>
 
+ここで挙げたエンジンの系譜と一覧は<a href={`${import.meta.env.BASE_URL}reading/compute-map/`}>計算エンジンの地図</a>にまとめています。中身はそれぞれ、<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>、<a href={`${import.meta.env.BASE_URL}reading/compute-stream/`}>状態を持つストリーム処理</a>（Flink）、<a href={`${import.meta.env.BASE_URL}reading/compute-mpp-sql/`}>常駐ワーカーで SQL を分散実行する</a>（Trino）で扱います。
+
 ## 実験 3：Trino の「カタログ」を見る
 
 docker で Trino の公式イメージ（`trinodb/trino:latest`。起動ログの版は 483）を 1 つ立て、`SHOW CATALOGS` を実行しました。

@@ -268,6 +268,8 @@ pq.write_table(t, "orders/dt=2026-09-02/part-1.parquet")   # 書き直した版
 | <a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a> | Hive 形式の限界、Iceberg / Delta Lake / Hudi | ③。版の差し替えとタイムトラベル |
 | <a href={`${import.meta.env.BASE_URL}reading/lake-table-ops/`}>更新・削除と運用</a> | CoW と MoR、コンパクション、CDC、3 形式の選び方 | ③ の運用 |
 
+この 5 回のあとに続く連載「大量データの計算エンジン」では、5 層のうち計算エンジンの層を掘り下げます。入口は<a href={`${import.meta.env.BASE_URL}reading/compute-map/`}>計算エンジンの地図</a>です。
+
 ## この回の用語
 
 Delta のトランザクションログは [PROTOCOL.md](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)、Hudi のタイムラインは[公式ドキュメント](https://hudi.apache.org/docs/timeline)の定義によります。

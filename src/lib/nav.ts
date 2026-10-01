@@ -52,7 +52,7 @@ export const AREAS: Area[] = [
       {
         title: '仕組みを読む',
         path: 'reading/',
-        summary: '検索エンジン、分散合意、DB の索引、データレイクなど 19 本',
+        summary: '検索エンジン、分散合意、DB の索引、データレイク、分散処理エンジンなど 26 本',
       },
       { title: '用語索引', path: 'terms/', summary: '用語から、主に扱う回と言及している回を引く' },
     ],
