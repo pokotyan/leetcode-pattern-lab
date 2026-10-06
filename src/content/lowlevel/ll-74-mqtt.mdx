@@ -1,0 +1,511 @@
+---
+title: 細い回線の pub/sub（MQTT）
+description: 電池で動き、回線が細く、いつ切れるか分からない端末を、何千台もサーバにつなぎ続けるにはどうすればよいのか。ブローカを挟む pub/sub、2 バイトから始まるパケット、QoS 0/1/2 が区間ごとに保証するもの、retain、Will、セッションを、手元のブローカとパケットの記録で確かめ、MQTT 5 の追加点と Kafka や AMQP との違いを見る
+chapter: realtime
+order: 2
+status: published
+topics:
+  - MQTT
+  - ブローカ / pub/sub
+  - トピックフィルタ（+ / #）
+  - $SYS
+  - 残り長（Variable Byte Integer）
+  - QoS 0 / 1 / 2
+  - PUBACK / PUBREC / PUBREL / PUBCOMP
+  - retain
+  - Will（Last Will and Testament）
+  - keepalive
+  - Clean Start / Session Expiry
+  - 共有サブスクリプション
+  - トピックエイリアス
+  - MQTT over WebSocket
+requires:
+  - ll-73-server-push
+  - ll-53-socket-tcp
+  - ll-72-grpc-ops
+---
+
+import Callout from '../../components/Callout.astro'
+
+前回は、ブラウザに向けてサーバから押す手段として、ポーリング、ロングポーリング、SSE、WebSocket を見ました。どれも、**相手はブラウザで、つないでいるのは人が操作している間だけ**、という前提に立っていました。
+
+この回の相手は違います。屋外の温度計、工場の設備、配送車、スマートフォンのアプリです。電池で何年も動かしたい。回線は細く、月ごとの通信量で課金され、トンネルに入れば切れる。そして台数は数千から数百万です。この条件の下で「サーバから押す」「端末から報告する」を続けるために作られたのが **MQTT** です。
+
+この回では、MQTT の考え方を押さえたあと、手元にブローカを立て、パケットを 1 バイトずつ読み、QoS、retain、Will、セッションの挙動を記録から確かめます。
+
+## 細い回線を前提にした設計
+
+MQTT は、1999 年に IBM の Andy Stanford-Clark と Arcom（現 Eurotech）の Arlen Nipper が作りました（[mqtt.org FAQ](https://mqtt.org/faq/)）。最初の用途は、石油パイプラインの機器を衛星回線越しに遠隔で管理することだったと紹介されています（[Paessler, 2024](https://blog.paessler.com/a-brief-history-of-mqtt)）。現在の版は OASIS 標準の 3.1.1 と 5.0 で、3.1.1 は ISO/IEC 20922 にもなっています（[mqtt.org FAQ](https://mqtt.org/faq/)）。
+
+設計の前提は、次の 3 つにまとめられます。
+
+| 前提 | 設計に表れたもの |
+| --- | --- |
+| 回線が細い、従量課金 | ヘッダは最小 2 バイト。テキストではなくバイナリ。要求と応答の往復を前提にしない |
+| 回線が不安定、端末が消える | ブローカが端末の不在を検出して代わりに知らせる（Will）。最後の値を預かる（retain）。切れている間の配信を溜める（セッション） |
+| 端末が多い、互いを知らない | 送り手と受け手の間に必ずブローカを挟み、宛先ではなく**話題（トピック）**で配る |
+
+この性質はスマートフォンにも合います。Facebook は 2011 年、Messenger のアプリで MQTT の接続を張り続け、チャットの配信経路に流すことで、端末から端末への配信を数秒から数百ミリ秒に縮めたと書いています。理由として挙げているのは、帯域と電池を節約するよう作られていることです（[Facebook Engineering, 2011](https://engineering.fb.com/2011/08/12/android/building-facebook-messenger/)）。
+
+## ブローカを挟む pub/sub
+
+MQTT の登場人物は、**クライアント**と**ブローカ**（仕様の用語ではサーバ）だけです。端末もアプリのバックエンドも、すべてクライアントとしてブローカに TCP でつなぎます。
+
+```
+  温度計 A ──PUBLISH home/living/temp──┐
+                                        ▼
+  温度計 B ──PUBLISH home/kitchen/temp─→ ブローカ ──→ 画面アプリ（SUBSCRIBE home/+/temp）
+                                        │
+                                        └────────→ 記録係（SUBSCRIBE home/#）
+```
+
+- 送る側（**publisher**）は、トピック名を付けてブローカに **PUBLISH** するだけで、誰が受け取るかを知りません
+- 受ける側（**subscriber**）は、ブローカに **SUBSCRIBE** で「このトピックに合うものを送ってほしい」と登録します
+- ブローカが、届いたメッセージを、合う購読を持つ全クライアントに配ります
+
+接続はどちらもクライアントからブローカへの 1 本です。端末は NAT の内側にいても構いません。前回の WebSocket と同じく、**一度張った接続を逆向きに使って**ブローカから押します。違うのは、送り手と受け手が直接つながる場面が一切ないことです。gRPC のような要求と応答の組ではなく、**1 対多、多対 1 の配信**が基本の形です。
+
+## トピックとワイルドカード
+
+トピック名は `/` で区切られた階層を持つ UTF-8 の文字列です。購読するときは、**トピックフィルタ**にワイルドカードを書けます（[MQTT 5.0 4.7](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+| フィルタ | 合うもの | 合わないもの |
+| --- | --- | --- |
+| `home/+/temp` | `home/living/temp`、`home/kitchen/temp` | `home/temp`、`home/a/b/temp` |
+| `home/#` | `home`、`home/living/temp`、その下のすべて | `office/temp` |
+| `#` | `$` で始まらないすべて | `$SYS/broker/version` |
+
+`+` はちょうど 1 階層、`#` はその階層から下のすべて（親そのものも含む）に合い、`#` はフィルタの最後にしか置けません。トピックはあらかじめ作る必要がなく、PUBLISH した時点で存在します。
+
+`$` で始まるトピックはブローカの実装のために予約されていて、**先頭の階層のワイルドカードには合いません**。仕様は、`#` の購読は `$` で始まるトピックを受け取らず、両方欲しければ `#` と `$SYS/#` の両方を購読せよと書いています（[MQTT 5.0 4.7.2](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。`$SYS/` は、ブローカが自分の状態を出す場所として広く使われている慣習です。
+
+## 手元にブローカを立てる
+
+以下の実験は、Docker Desktop（Engine 29.2.1）の上で、公式イメージ `eclipse-mosquitto:2`（mosquitto 2.1.2）をブローカに、同じイメージに入っている `mosquitto_pub` / `mosquitto_sub` をクライアントに使いました。パケットは、ブローカのネットワーク名前空間に `nicolaka/netshoot` のコンテナを相乗りさせ、`tcpdump` で記録して TShark 4.6.6 で読んでいます。設定は次のとおりです。
+
+```
+listener 1883
+allow_anonymous true
+listener 9001
+protocol websockets
+persistence false
+```
+
+mosquitto 2 は既定で `allow_anonymous` が false なので、認証なしの実験のために明示しています（[mosquitto.conf(5)](https://mosquitto.org/man/mosquitto-conf-5.html)）。`persistence false` は既定値で、ブローカを再起動するとセッションも retain されたメッセージも消えます。
+
+まず `$SYS` を覗きます。
+
+```
+$ mosquitto_sub -h ll74-broker -t '$SYS/broker/version' -t '$SYS/broker/clients/connected' \
+    -t '$SYS/broker/uptime' -v
+$SYS/broker/version mosquitto version 2.1.2
+$SYS/broker/clients/connected 2
+$SYS/broker/uptime 116 seconds
+```
+
+同じ時点で `#` を購読すると、届いたのは `home/living/temp 23.4`（後で使う retain されたメッセージ）だけで、`$SYS` の値は 1 つも来ませんでした。
+
+## パケットを読む
+
+MQTT のパケットは、**固定ヘッダ**、**可変ヘッダ**、**ペイロード**の 3 つでできています。固定ヘッダは次の形です（[MQTT 5.0 2.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+```
+1 バイト目:  上位 4 ビット = パケットの種類   下位 4 ビット = フラグ
+2 バイト目〜: 残り長（このあとに続くバイト数。1〜4 バイトの可変長整数）
+```
+
+種類は 1 が CONNECT、2 が CONNACK、3 が PUBLISH、4 が PUBACK、5〜7 が PUBREC / PUBREL / PUBCOMP、8 が SUBSCRIBE、9 が SUBACK、12 / 13 が PINGREQ / PINGRESP、14 が DISCONNECT です。下位 4 ビットに意味があるのは主に PUBLISH で、**DUP（ビット 3）、QoS（ビット 2〜1）、RETAIN（ビット 0）** が入ります。
+
+**残り長**は、1 バイトに 7 ビットずつ値を入れ、最上位ビットを「まだ続く」の印にした可変長整数です（[MQTT 5.0 1.5.5](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。127 までは 1 バイト、16,383 までは 2 バイトで、最大 4 バイト、268,435,455 までです。Protocol Buffers の varint（第 67 回）と同じ考え方で、小さいパケットほど短く書けます。
+
+### CONNECT と CONNACK（MQTT 3.1.1）
+
+`mosquitto_pub -V mqttv311 -i pub0 -q 0 -t home/living/temp -m 20.5` を記録した、TCP のペイロードです。
+
+```
+クライアント → ブローカ  CONNECT（18 バイト）
+10                 種類 1（CONNECT）、フラグ 0
+10                 残り長 16
+00 04 4d 51 54 54  プロトコル名 "MQTT"（2 バイトの長さ + 文字列）
+04                 プロトコルレベル 4（= 3.1.1）
+02                 接続フラグ: Clean Session = 1
+00 3c              keepalive 60 秒
+00 04 70 75 62 30  クライアント ID "pub0"
+
+ブローカ → クライアント  CONNACK（4 バイト）
+20 02 00 00        種類 2、残り長 2、Session Present = 0、戻りコード 0（受け付けた）
+```
+
+文字列はすべて「2 バイトの長さ + 中身」で書かれます。
+
+### PUBLISH
+
+続く PUBLISH（QoS 0）です。
+
+```
+30                 種類 3、DUP 0、QoS 0、RETAIN 0
+16                 残り長 22
+00 10 68 6f 6d 65 2f 6c 69 76 69 6e 67 2f 74 65 6d 70   トピック "home/living/temp"
+32 30 2e 35        ペイロード "20.5"
+```
+
+**ペイロードに長さの欄はありません。**残り長から可変ヘッダの長さを引いた残りがペイロードです。中身の形式も決まっておらず、ブローカにとってはただのバイト列です。4 バイトの値を送るのに、パケット全体で 24 バイトでした。そのうち 18 バイトはトピック名で、トピック名を短くすればもっと縮みます。
+
+QoS 1 にすると、トピックの後ろに **2 バイトのパケット ID** が入ります。
+
+```
+32 18 00 10 …(home/living/temp)… 00 01 32 31 2e 35
+↑ QoS 1                           ↑ パケット ID 1
+```
+
+ペイロードを 200 バイトにすると、残り長が 2 バイトになりました（MQTT 5 で記録）。
+
+```
+30 d5 01 …      0xd5 の下位 7 ビット 0x55 = 85、続きの印あり → 0x01 × 128 = 128 → 合計 213
+                （トピック 2 + 10、プロパティ長 1、ペイロード 200）
+```
+
+### SUBSCRIBE と SUBACK（MQTT 5）
+
+MQTT 5 では、可変ヘッダの中に**プロパティ**の並びが入ります。プロパティは「1 バイトの識別子 + 値」の繰り返しで、先頭に可変長整数でその全長を書きます。`mosquitto_sub -V 5 -q 1 -t 'sensor/#'` の記録です。
+
+```
+ブローカ → クライアント  CONNACK
+20 0e 00 00        残り長 14、Session Present 0、理由コード 0x00（成功）
+0b                 プロパティ長 11
+22 00 0a           Topic Alias Maximum = 10
+27 00 1e 84 80     Maximum Packet Size = 2,000,000
+21 00 14           Receive Maximum = 20
+
+クライアント → ブローカ  SUBSCRIBE
+82 0e              種類 8、フラグ 0010（SUBSCRIBE では固定）、残り長 14
+00 01              パケット ID 1
+00                 プロパティ長 0
+00 08 73 65 6e 73 6f 72 2f 23   フィルタ "sensor/#"
+01                 購読オプション: 最大 QoS 1
+
+ブローカ → クライアント  SUBACK
+90 04 00 01 00 01  パケット ID 1、プロパティ長 0、理由コード 0x01（QoS 1 で受け付けた）
+```
+
+CONNACK のプロパティで、ブローカは自分の制約をクライアントに伝えています。SUBACK の最後の 1 バイトは、フィルタごとに「どの QoS で受け付けたか」、または失敗の理由を返します。
+
+## QoS 0 / 1 / 2
+
+MQTT の **QoS** は、PUBLISH を 1 回送るときの、送り手と受け手の間の約束です（[MQTT 5.0 4.3](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+| QoS | 仕様の名前 | やり取り | 受け手から見た結果 |
+| --- | --- | --- | --- |
+| 0 | At most once | PUBLISH だけ | 1 回届くか、届かない |
+| 1 | At least once | PUBLISH → PUBACK | 少なくとも 1 回。重複しうる |
+| 2 | Exactly once | PUBLISH → PUBREC → PUBREL → PUBCOMP | 1 回だけ |
+
+購読者を 1 つ（`home/+/temp` を QoS 2 で購読）置いた状態で、3 つの QoS で 1 回ずつ PUBLISH した記録を並べます。ブローカは 172.20.0.2、送り手は .4、購読者は .3 です。
+
+```
+QoS 0
+ 4  .4 → br  CONNECT
+ 8  .4 → br  PUBLISH
+11  br → .3  PUBLISH                    応答はどこにもない
+
+QoS 1
+22  .4 → br  PUBLISH  (id=1)
+23  br → .3  PUBLISH  (id=1)            ← 先に購読者へ転送
+25  br → .4  PUBACK   (id=1)            ← 送り手への受領通知
+29  .3 → br  PUBACK   (id=1)
+
+QoS 2
+38  .4 → br  PUBLISH  (id=1)
+39  br → .4  PUBREC   (id=1)            「受け取った。まだ配らない」
+40  .4 → br  PUBREL   (id=1)            「では確定する」
+41  br → .3  PUBLISH  (id=2)            ← 購読者向けには別の ID
+42  br → .4  PUBCOMP  (id=1)
+43  .3 → br  PUBREC   (id=2)
+46  br → .3  PUBREL   (id=2)
+49  .3 → br  PUBCOMP  (id=2)
+```
+
+### 保証は区間ごと
+
+この記録から読み取れる一番大事なことは、**QoS のやり取りが「送り手とブローカ」「ブローカと購読者」の 2 区間で別々に行われている**ことです。QoS 2 では、送り手側の ID が 1、購読者側の ID が 2 で、PUBREC / PUBREL / PUBCOMP もそれぞれの区間で閉じています。
+
+QoS 1 の記録では、ブローカは購読者に転送してから送り手に PUBACK を返していますが、送り手は購読者の PUBACK（29 番）を待っていません。**送り手が受け取る PUBACK は「ブローカが引き受けた」という意味でしかありません。**仕様の言葉では、受け手はメッセージの**所有権を引き受け**、引き受けたサーバは合う購読を持つクライアントのセッションにそれを加えます（[MQTT 5.0 4.5](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。その先で購読者に届いたかどうかを、送り手が MQTT の仕組みで知る方法はありません。
+
+<Callout type="warn" title="QoS 2 にしても「端から端まで 1 回」にはならない">
+  QoS は区間ごとの約束で、届け先の購読者が何人いても、オフラインでも、送り手の受領通知は変わりません。
+  さらに、購読者に届く QoS は**発行時の QoS と購読時に認められた最大 QoS の小さいほう**です（[MQTT 5.0 3.8.4](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。QoS 2 で送っても、QoS 1 で購読している相手には重複しうる形で届きます。
+  そして、購読者のアプリが受け取ったメッセージを処理し終えたかどうかは、MQTT の外の話です。「必ず 1 回だけ処理する」が必要なら、メッセージに ID を持たせて処理する側で重複を捨てる、という第 70 回の再試行と同じ考え方が要ります。
+</Callout>
+
+QoS 2 の 2 段階の確認が何のためにあるかは、受け手の義務を見ると分かります。受け手は PUBREL を受け取るまで、同じパケット ID の PUBLISH が再送されてきても PUBREC を返すだけで、**先へ重複して配ってはいけません**（[MQTT 5.0 4.3.3](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。PUBREL は「この ID はもう再送しないので、記録を消してよい」という合図です。3.1.1 の仕様の図には、PUBLISH の時点で先へ配る方式と、PUBREL を待って配る方式の 2 通りが書かれていて（[MQTT 3.1.1 4.3.3](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html)）、上の記録の mosquitto は PUBREL（40 番）の後に購読者へ送っていました。
+
+### QoS 1 の重複を起こしてみる
+
+「少なくとも 1 回」の重複は、どこで起きるのでしょうか。MQTT は TCP の上で動くので、**同じ接続の中では再送しません**。仕様は、未確認の PUBLISH を元のパケット ID で送り直すのは**セッションを引き継いで再接続したときだけ**で、それ以外の時に再送してはならないと定めています（[MQTT 5.0 4.4](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。TCP が届けたはずのものを、TCP の再送の上にさらに重ねる意味はないからです。
+
+そこで、Python（3.12）の素のソケットで MQTT 3.1.1 のバイト列を組み、「受け取ったのに PUBACK を返さずに切る」購読者を作りました。Clean Session = 0 で `alarm/door` を QoS 1 で購読し、切断している間に `open` を QoS 1 で送り、つなぎ直します。
+
+```
+--- 1 回目の接続: 受け取るが PUBACK を返さずに切る
+CONNACK 20 02 01 00                                                    Session Present = 1
+RECV    32 12 00 0a 61 6c 61 72 6d 2f 64 6f 6f 72 00 01 6f 70 65 6e   dup=0
+--- 2 回目の接続: もう一度届く。今度は PUBACK を返す
+CONNACK 20 02 01 00
+RECV    3a 12 00 0a 61 6c 61 72 6d 2f 64 6f 6f 72 00 01 6f 70 65 6e   dup=1
+SENT PUBACK 0001
+--- 3 回目の接続
+CONNACK 20 02 01 00                                                    もう何も来ない
+```
+
+2 回目の先頭のバイトが `0x32` から `0x3a` に変わり、**DUP ビット**（ビット 3）が立っています。パケット ID は同じ 1 です。1 回目でアプリがメッセージを処理し終え、PUBACK を返す直前に落ちた場合、アプリは同じメッセージを 2 回処理することになります。DUP は「再送かもしれない」という目印にすぎず、受け手がこれを見て捨ててよいとは限りません（1 回目が届いていなかった場合も DUP は立ちます）。
+
+## retain: 最後の値を預ける
+
+pub/sub には、**後から購読した人は、次に誰かが送るまで何も知らない**という弱点があります。温度計が 10 分おきに送るなら、画面を開いてから最大 10 分、温度が表示されません。
+
+PUBLISH の RETAIN ビットを立てると、ブローカはそのトピックの**最後の 1 件**を保存し、新しく購読したクライアントに即座に送ります（[MQTT 5.0 3.3.1.3](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+```
+$ mosquitto_pub -t home/living/temp  -m 23.0 -r
+$ mosquitto_pub -t home/kitchen/temp -m 25.5 -r
+$ mosquitto_pub -t home/living/temp  -m 23.4 -r       ← 同じトピックの 2 件目
+$ mosquitto_sub -t 'home/+/temp' -v -F '%r %t %p'     （%r は受け取った RETAIN ビット）
+1 home/living/temp 23.4
+1 home/kitchen/temp 25.5
+```
+
+保存されるのは**トピックごとに 1 件**で、23.0 は 23.4 に置き換えられています。履歴ではありません。消すときは、**空のペイロードを retain で送ります**。
+
+```
+$ mosquitto_pub -t home/kitchen/temp -n -r
+$ mosquitto_sub -t 'home/#' -v -F '%r %t %p'
+1 home/living/temp 23.4
+```
+
+retain は「現在の状態」を表すトピックには向いていますが、「ボタンが押された」のような出来事に付けると、後から購読した人が過去の出来事を今起きたものとして受け取ります。
+
+<Callout type="note" title="ブローカによって細部が違う">
+  AWS IoT Core は retain に対応していますが、**ワイルドカードを含むフィルタで購読したときは、retain されたメッセージを購読時に送りません**。購読時に受け取るには、トピック名と完全に一致するフィルタで購読する必要があります。また QoS 2 には対応していません（[AWS IoT Core Developer Guide](https://docs.aws.amazon.com/iot/latest/developerguide/mqtt.html)）。
+  クラウドのブローカは仕様の全部を実装しているとは限りません。使う前に、差分の一覧を確かめておく必要があります。
+</Callout>
+
+## Will と keepalive: 黙って消えた端末
+
+電池が切れた、圏外に出た、電源を抜かれた。こうした端末は、切断の挨拶（DISCONNECT）を送れません。
+
+**Will**（Last Will and Testament、遺言）は、接続のときに CONNECT の中で「自分が異常な形で切れたら、このトピックにこれを送ってほしい」とブローカに預けておくメッセージです。正常な DISCONNECT を受け取ったら、ブローカは Will を捨てます（[MQTT 5.0 3.1.2.5](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+では、ブローカは「黙って消えた」ことをどう知るのでしょうか。第 72 回で見たとおり、TCP は書き込みが無ければ相手の消滅を検出できません。MQTT は **keepalive** でこれを補います。CONNECT に書いた秒数の間に送るものが無ければ、クライアントは PINGREQ を送ります。ブローカは、**keepalive の 1.5 倍の時間**、クライアントから何も受け取らなければ接続を閉じなければなりません（[MQTT 5.0 3.1.2.10](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+これを確かめます。2 つの端末を用意し、どちらも接続時に「切れたら `dev/<名前>/status` に `offline` を retain で送る」という Will を預け、つないだ直後に `online` を retain で送ります。
+
+- `dev1` は普通に DISCONNECT して終わる
+- `dev2` は keepalive を 5 秒にしてつなぎ、つないだまま、コンテナの `iptables` で**ブローカへ向かうパケットをすべて捨てる**。接続を閉じる操作は何もしない
+
+`dev/+/status` を購読していた監視役の出力と、ブローカのログです（時刻はコンテナの UTC）。
+
+```
+07:24:26 dev/dev1/status online
+07:24:29 dev/dev2/status online
+07:24:35 dev/dev2/status offline
+
+1791271468: Received SUBSCRIBE from dev2
+1791271475: Client dev2 [172.20.0.5:56456] disconnected: exceeded timeout.
+1791271475: Sending PUBLISH to auto-EA0366FF-... (d0, q0, r0, m0, 'dev/dev2/status', ... (7 bytes))
+```
+
+`dev1` は正常に切断したので、Will は送られていません。`dev2` は、最後にブローカがパケットを受け取ってから 7 秒後（keepalive 5 秒の 1.5 倍）に切断と判定され、その場で Will の `offline` が配られました。
+
+<Callout type="warn" title="正常に切断するなら、自分で offline を送る">
+  上の実験で `dev1` の状態は `online` のまま残りました。正常な切断では Will が送られないので、retain した状態を正しく保つには、切断の前に自分で `offline` を送る必要があります。
+  MQTT 5 では、DISCONNECT の理由コードに 0x04（Disconnect with Will Message）を書くと、正常な切断でも Will を送らせられます（[MQTT 5.0 3.14.2.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。また、Will Delay Interval を付けると、その秒数が経つ前に同じセッションへつなぎ直した場合は Will が送られません（[MQTT 5.0 3.1.3.2.2](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。トンネルで一瞬切れるたびに `offline` が飛ぶのを防げます。
+</Callout>
+
+keepalive の間隔は、第 72 回の gRPC と同じく、途中の NAT やロードバランサのアイドルタイムアウトより短くしておく必要があります。一方で、PINGREQ を送るたびに端末は無線を起こすので、電池には響きます。モバイル回線の端末では、この 2 つの釣り合いで値を決めます。
+
+## セッション: 切れている間に届いたもの
+
+MQTT の**セッション**は、ブローカがクライアント ID ごとに持つ状態です。購読の一覧、配信途中の QoS 1 / 2 のメッセージ、そして**切断中に届いた QoS 1 / 2 のメッセージ**が入ります（[MQTT 5.0 4.1](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+3.1.1 では、CONNECT の Clean Session フラグ 1 つで「切断したらセッションを捨てる / 残す」を決めていました。MQTT 5 はこれを 2 つに分けました（[MQTT 5.0 3.1.2.4、3.1.2.11.2](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+| 欄 | 意味 |
+| --- | --- |
+| Clean Start | 1 なら、接続の時点で既存のセッションを捨てて新しく始める |
+| Session Expiry Interval | 切断の後、セッションを何秒残すか。0（または省略）なら切断と同時に消え、0xFFFFFFFF なら消えない |
+
+3.1.1 の Clean Session = 0 は、5 では「Clean Start = 0、期限なし」に当たります。期限が無いと、二度と戻ってこない端末のセッションがブローカに溜まり続けます。5 で期限を付けられるようになったのはこのためです。
+
+試します。スマートフォンのチャットアプリに見立てて、クライアント ID `phone1` が Session Expiry 300 秒で `chat/room1` を QoS 1 で購読し、切断します。切断中に 4 件送ります。
+
+```
+m1 qos0                       QoS 0
+m2 qos1                       QoS 1
+m3 qos1 expiry2s              QoS 1、Message Expiry Interval 2 秒
+m4 qos1 expiry60s             QoS 1、Message Expiry Interval 60 秒
+```
+
+4 秒待ってから、同じ ID、Clean Start = 0 でつなぎ直しました。
+
+```
+$ mosquitto_sub -V 5 -i phone1 -c -x 300 -q 1 -t chat/room1 -F '%q %t %p [expiry=%E]'
+1 chat/room1 m2 qos1 [expiry=]
+1 chat/room1 m4 qos1 expiry60s [expiry=53]
+```
+
+届いたのは 2 件でした。そのときの CONNECT と CONNACK です。
+
+```
+CONNECT  10 1b 00 04 4d 51 54 54 05 00 00 3c 08 11 00 00 01 2c 21 00 14 00 06 70 68 6f 6e 65 31
+                                    ↑  接続フラグ 0x00: Clean Start = 0
+                                             ↑ 0x11 Session Expiry Interval = 0x12c = 300
+CONNACK  20 0e 01 00 …                 Session Present = 1（前のセッションを使っている）
+```
+
+- **m1（QoS 0）は溜められていません。**mosquitto は既定で、切断中のクライアント向けの QoS 0 を捨てます（`queue_qos0_messages` が既定で false。QoS 1 / 2 は 1 クライアントあたり既定で 1000 件まで溜める）（[mosquitto.conf(5)](https://mosquitto.org/man/mosquitto-conf-5.html)）
+- **m3 は期限切れで捨てられました。**MQTT 5 の **Message Expiry Interval** は、メッセージがブローカに留まってよい秒数です
+- **m4 は残り 53 秒として届きました。**仕様は、ブローカが転送するときに「受け取った値から待たせた時間を引いた値」を書くよう定めています（[MQTT 5.0 3.3.2.3.3](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。記録の PUBLISH には `02 00 00 00 35`（識別子 0x02、値 53）が入っていました
+
+最後に、もう 1 件送ってから、同じ ID を **Clean Start = 1** でつなぐと、何も届きませんでした。セッションごと捨てられ、溜まっていた 1 件も消えています。
+
+<Callout type="warn" title="クライアント ID は 1 台に 1 つ">
+  セッションはクライアント ID に結び付いています。同じ ID で別の接続が来ると、ブローカは古い接続を切ります（MQTT 5 では理由コード 0x8E Session taken over）。2 台に同じ ID を焼き込むと、互いを追い出し合って接続と切断を繰り返します。
+  ID を空にしてつなぐとブローカが決めてくれますが（記録では CONNACK の Assigned Client Identifier に `auto-1595C0D1-…` が入っていました）、その ID を覚えておかない限り、セッションは引き継げません。
+</Callout>
+
+## MQTT 5 で増えたもの
+
+MQTT 5 は 2019 年に OASIS 標準になりました（[MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。ここまでに出てきたもの以外の主な追加点です（付録 C に一覧があります）。
+
+| 追加 | 何ができるようになったか |
+| --- | --- |
+| 理由コード | CONNACK、PUBACK、SUBACK、DISCONNECT などが失敗の理由を返す。たとえば PUBACK の 0x10 は「合う購読者がいなかった」、0x97 は「割り当て超過」 |
+| 共有サブスクリプション | 複数のクライアントで 1 つの購読を分け合う |
+| メッセージの有効期限 | 上で見た Message Expiry Interval |
+| トピックエイリアス | 長いトピック名を、接続ごとに決めた番号で置き換える |
+| ユーザプロパティ | HTTP のヘッダのように、任意の名前と値の組をパケットに付ける |
+| request/response | Response Topic と Correlation Data で、応答の宛先と対応付けを運ぶ |
+| フロー制御 | Receive Maximum で、同時に確認待ちにできる QoS 1 / 2 の数を伝える |
+| 拡張認証 | AUTH パケットで、チャレンジ・レスポンス型の認証を往復できる |
+
+3.1.1 では、ブローカが受け付けられない PUBLISH に出会うと、**接続を切ることでしか**伝えられませんでした。理由コードは運用の上で大きな違いです。
+
+### 共有サブスクリプション
+
+通常の購読では、同じトピックを購読する全員に同じメッセージが届きます。処理を複数の作業者に**分担**させたいときは、`$share/{グループ名}/{フィルタ}` の形で購読します。同じグループの中では、1 件のメッセージは 1 つのセッションにだけ届きます（[MQTT 5.0 4.8.2](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+```
+w1  （$share/workers/jobs）: job1 job3 job5
+w2  （$share/workers/jobs）: job2 job4 job6
+all （jobs）               : job1 job2 job3 job4 job5 job6
+```
+
+6 件を QoS 1 で送ると、`w1` と `w2` に交互に分かれ、普通に購読した `all` には全部が届きました。どう振り分けるかは仕様では決まっておらず、ブローカの実装次第です。
+
+### トピックエイリアス
+
+`factory/line-07/press-12/temperature` のような長いトピックに、1 文字の値を何度も送る場面を考えます。最初の PUBLISH でトピック名とエイリアス 1 を一緒に送れば、以後は**長さ 0 のトピック名とエイリアスだけ**で送れます（[MQTT 5.0 3.3.2.3.4](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。同じ接続で 3 件送った記録です。
+
+```
+送り手 → ブローカ
+30 2b 00 24 …(factory/line-07/press-12/temperature)… 03 23 00 01 31   45 バイト（エイリアス 1 を設定）
+30 07 00 00 03 23 00 01 32                                            9 バイト
+30 07 00 00 03 23 00 01 33                                            9 バイト
+
+ブローカ → 購読者
+30 28 00 24 …(factory/line-07/press-12/temperature)… 00 31            3 件とも 42 バイト
+```
+
+2 件目からは 45 バイトが 9 バイトになっています。ただし、**ブローカから購読者への区間では、3 件ともトピック名が丸ごと付いています。**エイリアスは**接続ごと**の対応表で、ブローカは受け取った区間で名前に戻し、送る区間では使うかどうかを自分で決めます。QoS と同じく、ここでも区間ごとの話です。使える番号の上限は、受け手が CONNECT / CONNACK の Topic Alias Maximum で伝えます。
+
+### request/response
+
+pub/sub の上で要求と応答をするには、応答をどこに送ればよいか、どの要求への応答かを運ぶ必要があります。MQTT 5 は、PUBLISH に **Response Topic**（応答を送ってほしいトピック）と **Correlation Data**（要求を識別するバイト列）を付けられるようにしました（[MQTT 5.0 4.10](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。応答する側は、受け取った Response Topic に、同じ Correlation Data を付けて PUBLISH します。3.1.1 では、これをペイロードの中に各自の形式で書いていました。
+
+## WebSocket の上の MQTT、TLS、認証
+
+### ブラウザから MQTT を話す
+
+ブラウザの JavaScript は生の TCP を開けません。前回見た WebSocket は、ブラウザから使える双方向の通り道でした。MQTT はこの上にそのまま載せられます。仕様は 3 つのことを決めています（[MQTT 5.0 6](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。
+
+- MQTT のパケットは WebSocket の**バイナリ**フレームで送る
+- 1 つのフレームにパケットが複数入っても、途中で切れていてもよい。受け手はフレームの境界をパケットの境界と仮定してはいけない
+- サブプロトコルの名前は `mqtt`
+
+mosquitto の WebSocket のリスナ（9001 番）に、Python の素のソケットでハンドシェイクを送り、3.1.1 の CONNECT を 1 フレームで送りました。
+
+```
+→ GET /mqtt HTTP/1.1
+  Upgrade: websocket
+  Sec-WebSocket-Protocol: mqtt
+  …
+← HTTP/1.1 101 Switching Protocols
+  Upgrade: WebSocket
+  Connection: Upgrade
+  Sec-WebSocket-Accept: a4k329ygeFTQEHyRm/b9mqhmg6I=
+  Sec-WebSocket-Protocol: mqtt
+
+→ 82 92 96 a9 a7 c9 86 b9 …    FIN + バイナリ、マスクあり、長さ 18（中身は CONNECT をマスクしたもの）
+← 82 04 20 02 00 00            バイナリ、長さ 4、中身は CONNACK 20 02 00 00
+```
+
+前回の WebSocket のフレームの中に、この回の CONNACK の 4 バイトがそのまま入っています。WebSocket は通り道を提供しているだけで、その上のやり取りは TCP 直結のときと同じです。前回は WebSocket の上のメッセージの形をアプリが自分で決める必要がありましたが、MQTT を載せれば、トピック、QoS、retain、セッションをそのまま使えます。ブラウザ用の MQTT クライアントのライブラリは、この形で動いています。443 番の HTTPS と同じ口を通せるので、MQTT の専用ポートを開けにくい社内ネットワークの内側の端末にも使えます。
+
+### TLS と認証
+
+IANA に登録されたポートは、平文の MQTT が 1883、TLS の上の MQTT が 8883 です（[MQTT 5.0 4.2](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。MQTT 自身には暗号化の仕組みがなく、TLS に任せます。
+
+認証の基本は CONNECT の**ユーザ名とパスワード**の欄です。平文のポートで `-u alice -P s3cret` を付けると、記録にはこう残っていました。
+
+```
+10 25 00 04 4d 51 54 54 05 c2 00 3c 03 21 00 14
+00 06 61 6c 69 61 73 31          クライアント ID "alias1"
+00 05 61 6c 69 63 65             ユーザ名 "alice"
+00 06 73 33 63 72 65 74          パスワード "s3cret"   ← そのまま読める
+```
+
+接続フラグ `0xc2` は、ユーザ名あり（ビット 7）、パスワードあり（ビット 6）、Clean Start（ビット 1）です。TLS を使わなければ、パスワードは途中の誰からでも読めます。仕様は、この欄にトークンを入れる使い方も想定しています（[MQTT 5.0 4.12](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。多数の端末を扱うクラウドのブローカでは、TLS のクライアント証明書（第 113 回の mTLS）で端末を識別する形もよく使われます。AWS IoT Core はその代表です（[AWS IoT Core: X.509 client certificates](https://docs.aws.amazon.com/iot/latest/developerguide/x509-client-certs.html)）。
+
+認証の次は**認可**です。どのクライアントがどのトピックに PUBLISH / SUBSCRIBE してよいかを、ブローカの ACL で決めます。ワイルドカードの `#` を誰でも購読できる設定は、全端末の通信を誰でも盗み見られる設定と同じです。
+
+## 他の選択肢と何が違うか
+
+最後に、似た場面で比べられる仕組みと並べます。
+
+| | MQTT | Kafka | AMQP（RabbitMQ など） | WebSocket 直結 |
+| --- | --- | --- | --- | --- |
+| 中心にあるもの | ブローカ。メッセージは配ったら消える（retain の 1 件とセッションの溜まり分を除く） | 分割されたログ。読んでも消えず、トピックごとの保存期間まで残る | ブローカのキューと、キューへの振り分けの規則 | アプリのサーバ |
+| 宛先の指定 | 階層のあるトピックとワイルドカード | トピックとパーティション | exchange と routing key（0-9-1）など | アプリが決める |
+| 想定する相手 | 多数の細い端末、ブラウザ | サーバ同士、データ基盤 | サーバ同士の業務処理 | ブラウザ |
+| 端末の不在 | keepalive、Will、セッション | 対象外 | 対象外（接続の切断は検出する） | アプリが作る |
+| 後から読み返す | できない | オフセットを戻して読み直せる | 取り出したら消える | アプリが作る |
+
+Kafka は、イベントを保存期間までトピックに保持し、パーティションの中では書かれた順に読めることを保証します（[Apache Kafka Introduction](https://kafka.apache.org/intro)）。読み手は自分の位置（オフセット）を持ち、過去に戻って読み直せます。MQTT のブローカは、retain の 1 件とセッションの溜まり分を除いて、配り終えたメッセージを持ちません。**「全部を残して後から何度でも処理する」なら Kafka、「今つながっている多数の端末に、今の値を細い回線で配る」なら MQTT**です。実際の構成では、端末側を MQTT のブローカで受け、その先を Kafka のようなログにつなぐ形がよく取られます。
+
+AMQP のブローカは、exchange からキューへの振り分けの規則や、消費者からの確認応答を細かく制御できます（[RabbitMQ: AMQP 0-9-1 Model Explained](https://www.rabbitmq.com/tutorials/amqp-concepts)）。業務のメッセージを確実に処理させる用途に向いています。RabbitMQ は、同梱のプラグインで MQTT 3.1、3.1.1、5.0 も受けられます（[RabbitMQ: MQTT Plugin](https://www.rabbitmq.com/docs/mqtt)）。1 つのブローカが両方の口を持つ形です。
+
+前回の WebSocket 直結との違いは、**何を自分で作るか**です。WebSocket は双方向の通り道しか提供しないので、誰に何を配るか、切れていた間の分をどうするか、相手が消えたらどうするかは、アプリが作ります。MQTT はそれをブローカに任せる代わりに、ブローカという部品を 1 つ運用することになります。
+
+MQTT を選ぶのは、次のような場面です。
+
+- **センサや設備、家電**: 端末が多く、回線と電池が限られ、状態の通知が中心
+- **モバイルアプリへの通知とチャット**: 上で見た Messenger の例のように、張り続ける接続を安く保ちたい
+- **車両**: 移動で回線が頻繁に切れ、切れている間の分をセッションで受け取りたい
+- **ブラウザの画面へのライブ更新**: WebSocket の上で、サーバ側の配信の仕組みをブローカに任せたい
+
+逆に、メッセージを長く保存して何度も処理し直すデータ基盤や、1 回の要求に 1 回の応答を返すのが中心の API には、それぞれ Kafka や gRPC（第 11 章）のほうが素直に合います。
+
+## まとめ
+
+- MQTT は、細く不安定な回線、電池で動く端末、多数の端末を前提に作られた pub/sub のプロトコル。送り手と受け手は互いを知らず、必ずブローカを挟んでトピックで配る
+- トピックは `/` で区切る階層で、購読では `+`（1 階層）と `#`（以下すべて）が使える。`$` で始まるトピックは先頭のワイルドカードに合わない
+- パケットは 1 バイトの種類とフラグ、1〜4 バイトの残り長から始まる。PUBLISH のフラグに DUP、QoS、RETAIN が入る
+- QoS 0 は 1 回以下、1 は 1 回以上、2 は 1 回だけ。どれも**送り手とブローカ、ブローカと購読者の区間ごと**の約束で、端から端までの処理を保証するものではない
+- 再送はセッションを引き継いだ再接続のときだけ行われ、DUP ビットが立つ。QoS 1 では、そこで重複が生まれる
+- retain はトピックごとに最後の 1 件を預ける。Will は黙って消えた端末の代わりにブローカが送り、その検出は keepalive の 1.5 倍で行われる
+- セッションは、切断中の QoS 1 / 2 のメッセージを溜める。MQTT 5 では Clean Start と Session Expiry に分かれ、メッセージにも有効期限が付けられる
+- MQTT 5 は理由コード、共有サブスクリプション、トピックエイリアス、ユーザプロパティ、request/response を加えた。エイリアスも区間ごとに働く
+- WebSocket のバイナリフレームに載せればブラウザから話せる。暗号化は TLS に任せ、認証は CONNECT のユーザ名とパスワード、またはクライアント証明書で行う
+- 配ったものを残さないのが MQTT、ログとして残して読み直せるのが Kafka。多数の細い端末とのやり取りに MQTT、その先の保存と処理に Kafka という分担がよく取られる
+
+ここまでの 2 回で見た仕組みは、どれも TCP の上にありました。TCP の上では、1 つのパケットの損失が後ろのすべてを止めますし、届くのが遅すぎて意味のなくなったデータまで律儀に再送されます。次回は、第 66 回で見た QUIC を HTTP 以外に使う話です。信頼性のないデータグラムを運ぶ DATAGRAM 拡張、ブラウザから使える WebTransport、QUIC の上に別の通信を通す MASQUE、DNS over QUIC、メディア配信のための MoQ、そしてゲームでの採用例を見ます。

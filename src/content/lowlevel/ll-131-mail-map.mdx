@@ -1,0 +1,347 @@
+---
+title: メールは誰から誰へ、何を運んでいるのか
+description: '受信箱に「差出人: 社長」と表示されたメールは、本当に社長が送ったものでしょうか。メールを運ぶ登場人物と、封筒（エンベロープ）と便箋（ヘッダ）の区別から、なぜ SMTP は誰でも名乗れるのか、その穴を 40 年かけてどう継ぎ足してきたのかを見ます'
+chapter: mail
+order: 1
+status: published
+topics:
+  - Internet Mail Architecture
+  - MUA / MSA / MTA / MDA
+  - エンベロープとヘッダ
+  - MAIL FROM / RCPT TO
+  - Return-Path
+  - Bcc
+  - なりすまし
+  - メール認証の年表
+requires:
+  - ll-130-failures
+  - ll-58-dns-records
+  - ll-53-socket-tcp
+---
+
+import Callout from '../../components/Callout.astro'
+
+## この章で見るもの
+
+ここまでの章で、TCP（第 53 回）、DNS（第 56〜64 回）、暗号と署名（第 102〜108 回）、証明書と TLS（第 109〜113 回）、認証と認可（第 116〜123 回）を 1 つずつ見てきました。
+
+メールは、**これらの部品を全部使う仕組み**です。しかも、そのどれよりも古い。SMTP の最初の仕様は 1982 年で、DNS の MX も、TLS も、署名も、あとから 1 枚ずつ継ぎ足されてきました。この章では、その継ぎ足しを 1 枚ずつはがしながら、**それぞれの部品が何を保証し、何を保証しないのか**を分けていきます。
+
+| 回 | 見るもの |
+| --- | --- |
+| 第 131 回（この回） | 登場人物、エンベロープとヘッダ、継ぎ足しの年表 |
+| 第 132 回 | @ の左側は誰が決めるのか（サブアドレス、別名、正規化） |
+| 第 133 回 | SMTP の会話を手で読む（応答コード、キュー、バウンス） |
+| 第 134 回 | MX と配送の経路、送信側の身元（HELO、逆引き） |
+| 第 135 回 | メッセージの形式（RFC 5322、MIME、日本語のヘッダ） |
+| 第 136 回 | 経路の暗号化（STARTTLS、MTA-STS、DANE） |
+| 第 137 回 | SPF: 送ってよいサーバの一覧 |
+| 第 138 回 | DKIM: ドメインによる署名 |
+| 第 139 回 | DMARC: 利用者が見る差出人と結びつける |
+| 第 140 回 | 中身の暗号化と署名（S/MIME、OpenPGP） |
+| 第 141 回 | 受け取ったメールを読む（IMAP、POP、JMAP、OAuth） |
+| 第 142 回 | アプリからメールを送り、届かせる |
+
+この回は章の地図です。**誰が誰にメールを渡しているのか**と、**そのとき何が運ばれているのか**を押さえます。
+
+## 「差出人: 社長」は誰が書いたのか
+
+次のようなメールが届いたとします。
+
+```
+差出人: 社長 <ceo@example.com>
+宛先:   全社員 <all@example.org>
+件名:   至急、この口座に振り込んでください
+```
+
+メールソフトが表示している「差出人」は、メッセージの中の `From:` という 1 行です。その 1 行は、**メッセージを作った人が好きに書いたテキスト**にすぎません。SMTP の仕様そのものが、この点をはっきり認めています。
+
+> SMTP mail is inherently insecure in that it is feasible for even fairly casual users to negotiate directly with receiving and relaying SMTP servers and create messages that will trick a naive recipient into believing that they came from somewhere else.
+> ——[RFC 5321 7.1](https://www.rfc-editor.org/rfc/rfc5321.html#section-7.1)
+
+なぜそうなっているのか。それを理解するには、メールが**封筒と便箋の 2 層**でできていることから見る必要があります。その前に、登場人物を揃えます。
+
+## 登場人物
+
+メールの世界の用語は、[RFC 5598](https://www.rfc-editor.org/rfc/rfc5598.html)（Internet Mail Architecture、2009 年、Informational）が整理しています。この章ではこの用語を使います。
+
+```
+  送信者の側                                            受信者の側
+ ┌──────┐  提出    ┌──────┐  中継    ┌──────┐  中継    ┌──────┐  配達   ┌─────┐  取り出し ┌──────┐
+ │ MUA  │ ───────→ │ MSA  │ ───────→ │ MTA  │ ───────→ │ MTA  │ ──────→ │ MDA │ ─→ MS ─→ │ MUA  │
+ └──────┘ 587/465  └──────┘   25     └──────┘   25     └──────┘         └─────┘  IMAP/POP └──────┘
+ メールソフト     提出を受ける      途中の中継         受信ドメインの       メールボックス    メールソフト
+                  （認証あり）                          入口（MX）          に入れる
+```
+
+| 名前 | 正式名 | 役割 |
+| --- | --- | --- |
+| **MUA** | Message User Agent | 利用者が使うメールソフト。Outlook、Thunderbird、Gmail の画面、アプリの送信処理 |
+| **MSA** | Mail Submission Agent | MUA からメッセージの**提出**を受け付ける。**利用者を認証**し、組織の方針を当てはめる |
+| **MTA** | Message Transfer Agent | サーバからサーバへ**中継**する。Postfix、Exim など |
+| **MDA** | Mail Delivery Agent | 最後の MTA から受け取り、利用者のメールボックスに入れる |
+| **MS** | Message Store | メールボックス。MUA は IMAP や POP でここから読み出す |
+
+RFC 5598 は MTA を「1 回のアプリケーション層の中継を担うもの」と定義し、**エンベロープや中身を変えず、経路の記録（トレース情報）だけを足す**としています。この「足すだけ」という性格が、あとで `Received:` の行として見えてきます。
+
+使うポートは経路の区間ごとに違います。
+
+| 区間 | プロトコル | ポート | 根拠 |
+| --- | --- | --- | --- |
+| MUA → MSA（提出） | SMTP（submission） | **587**（STARTTLS）、**465**（最初から TLS） | [RFC 6409](https://www.rfc-editor.org/rfc/rfc6409.html)、[RFC 8314](https://www.rfc-editor.org/rfc/rfc8314.html) |
+| MTA → MTA（中継） | SMTP | **25** | [RFC 5321](https://www.rfc-editor.org/rfc/rfc5321.html) |
+| MS → MUA（取り出し） | IMAP / POP3 | 993 / 995（最初から TLS） | RFC 8314 |
+
+**提出と中継を別のポートに分けた**のは、両者で相手に求めるものが違うからです。提出を受ける MSA は「自分の組織の利用者か」を確かめてから受け取ります。中継を受ける MTA は、世界中の知らないサーバから、自分宛てのメールを**認証なしで**受け取らなければなりません。25 番しかなかった時代は、この 2 つが同じ入口に混ざっていました（提出の仕様 [RFC 2476](https://www.rfc-editor.org/rfc/rfc2476.html) は 1998 年）。第 136 回で、TLS の事情もこの区間ごとに違うことを見ます。
+
+組織の境界も大事です。RFC 5598 は、管理者が異なる範囲を **ADMD**（Administrative Management Domain）と呼びます。上の図で言えば、送信者の MSA と MTA が 1 つの ADMD、受信側の MTA 以降が別の ADMD です。**ADMD の境界を越えるところで、相手の言うことを信じてよいかが問題になります**。SPF、DKIM、DMARC は、どれもこの境界で使う道具です。
+
+## 封筒と便箋: エンベロープとヘッダ
+
+SMTP で 1 通を送るとき、送る側は大きく 2 種類の情報を渡します（会話の詳細は第 133 回）。
+
+```
+MAIL FROM:<bounce-7f3a@mailer.example.net>     ← エンベロープ（封筒）
+RCPT TO:<bob@example.org>                      ← エンベロープ（封筒）
+RCPT TO:<carol@example.org>                    ← エンベロープ（封筒）
+DATA
+From: President <ceo@example.com>              ← ヘッダ（便箋の上のほう）
+To: All Staff <all@example.org>                ← ヘッダ
+Subject: envelope and header                   ← ヘッダ
+
+The envelope and the header are different things.   ← 本文
+.
+```
+
+- **エンベロープ**: SMTP のコマンドで渡す、配送のための情報。`MAIL FROM` は「届かなかったときに知らせる先」、`RCPT TO` は「実際に届ける先」。[RFC 5321](https://www.rfc-editor.org/rfc/rfc5321.html) が決める
+- **ヘッダと本文**: `DATA` のあとに送るメッセージそのもの。`From:`、`To:`、`Subject:` などは [RFC 5322](https://www.rfc-editor.org/rfc/rfc5322.html) が決める
+
+RFC 5598 は、両者を取り違えないように `RFC5321.MailFrom` と `RFC5322.From` のように仕様の番号を前に付けて書き分けています。この章でも、紛らわしいところではこの書き方をします。
+
+| | エンベロープ | ヘッダ |
+| --- | --- | --- |
+| 例 | `MAIL FROM`、`RCPT TO` | `From:`、`To:`、`Cc:`、`Subject:` |
+| 誰が使うか | MTA（配送の判断） | 利用者と MUA（表示） |
+| 利用者に見えるか | 普通は見えない（届いたあと `Return-Path:` に残る） | 見える |
+| 中継で変わるか | 変わりうる（転送、メーリングリスト） | 原則として変えない |
+| 確かめる仕組み | SPF（第 137 回） | DMARC（第 139 回）が DKIM か SPF と結びつけて |
+
+**MTA は封筒しか見ずに配送します**。便箋に `To: 全社員` と書いてあっても、MTA が届けるのは `RCPT TO` の相手だけです。そして、**封筒と便箋が一致している必要は、どこにもありません**。
+
+## 一致しなくてよい理由
+
+「一致しなくてよい」は手抜きではなく、メールの基本的な機能がそれに依存しています。3 つ挙げます。
+
+**1. Bcc。** 本人には届けたいが、ほかの受信者には見せたくない宛先です。これは「`RCPT TO` には入れるが、ヘッダには書かない」ことでしか実現できません。RFC 5322 の [3.6.3](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.3) は `Bcc:` の扱いを複数挙げており、代表的なのは**送る前に `Bcc:` の行を消す**やり方です。RFC 5321 の [7.2](https://www.rfc-editor.org/rfc/rfc5321.html#section-7.2) も、`RCPT` の宛先一覧をヘッダに写してはならない（SHOULD NOT）と書いています。
+
+**2. メーリングリストと転送。** `all@example.org` に送ったメールを、リストのサーバが 100 人の会員に配り直すとします。このとき RFC 5321 の [3.9](https://www.rfc-editor.org/rfc/rfc5321.html#section-3.9) は、**エンベロープの `MAIL FROM` はリストの管理者の宛先に変えなければならない（MUST）が、ヘッダは変えてはならない（MUST）、特に `From:` は変わらない**と決めています。
+
+```
+元のメール     MAIL FROM:<bounce-7f3a@mailer.example.net>   From: ceo@example.com   To: all@example.org
+リストが配る   MAIL FROM:<all-bounces@example.org>          From: ceo@example.com   To: all@example.org
+               RCPT TO:<erin@example.org>                   （ヘッダはそのまま）
+```
+
+会員のメールソフトには、差出人は社長、宛先はリストのアドレスと表示されます。これが正しい表示です。一方で、配送に失敗したという通知（バウンス）は、社長ではなく**リストの管理者に**返ってきます。100 人のうち 1 人のアドレスが無効になったことを知って対処できるのは、リストの管理者だからです。
+
+**3. 差出人と、エラーを受け取る先は別の人。** 配信サービスを使うアプリは、`From:` に `noreply@shop.example` と書き、`MAIL FROM` には配信サービスが用意したバウンス受付のアドレスを入れます。どの宛先が無効かを機械的に集計するためです（第 142 回）。上の例の `bounce-7f3a@mailer.example.net` のように、宛先ごとに文字列を変えておけば、戻ってきたバウンスがどの送信のものかが分かります。
+
+`MAIL FROM` の値は、最後に配達するサーバが **`Return-Path:` の行として**メッセージの先頭に書き残します。RFC 5321 の [4.4](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.4) はこれを必須とし、「`MAIL` コマンドの reverse-path の情報を保存する」ものだと説明しています。受信箱でメールの「ソースを表示」すると、`From:` とは違うアドレスが `Return-Path:` にあるのはこのためです。
+
+<Callout type="warn" title="よくある誤解: From: を見れば送り主が分かる">
+  `From:` は便箋に書かれた文字列で、SMTP はその中身を一切確かめません。封筒の `MAIL FROM` も、SMTP だけなら同じく自己申告です。
+  つまり、**SMTP という仕組みだけでは、差出人の表示は何も保証しません**。
+  これを補うのが第 137〜139 回の SPF、DKIM、DMARC で、それぞれが保証する範囲は違います。
+  SPF は封筒の `MAIL FROM` しか見ず、DKIM は「署名したドメインが責任を持つ」としか言いません。
+  利用者が見る `From:` と結びつけるのは DMARC が初めてです。それでも、表示名（`社長` の部分）や、よく似た別のドメインは防げません。
+</Callout>
+
+## なぜ誰でも名乗れる設計なのか
+
+SMTP の最初の仕様 [RFC 821](https://www.rfc-editor.org/rfc/rfc821.html) は 1982 年 8 月に出ました（同じ月にメッセージ形式の [RFC 822](https://www.rfc-editor.org/rfc/rfc822.html)）。インターネットの前身である ARPANET の時代で、つながっているホストは限られ、その管理者どうしがある程度互いを知っている世界でした。
+
+RFC 821 には、**相手を認証する手順も、名乗った名前を確かめる手順も、1 つもありません**（`VRFY` という「確認」のコマンドはありますが、これは宛先のメールボックスが存在するかを尋ねるものです）。「誰かが他人になりすます」ことは、守るべき脅威として設計の前提に入っていませんでした。むしろ RFC 821 は、別のネットワークのホストどうしの間を**中継できること**を重要な特徴として挙げています。
+
+この設計は、その後の 2 つの事情でそのまま残りました。
+
+- **互換性。** 世界中のメールサーバが 25 番で互いに話せることが、メールの価値そのものです。新しい決まりを「守らない相手とは話さない」にすると、守っていない大多数のサーバとメールがやり取りできなくなります。だから新しい仕組みは、**「対応している相手とだけ使う」という任意の拡張**として足すしかありませんでした
+- **中継という構造。** メールは送り手から受け手へ直接届くとは限らず、途中のサーバが預かって転送します。送り手と受け手が同時に接続している必要がない、という利点の裏返しで、**受け手は、最初に書いた人と直接話す機会がありません**
+
+結果として、なりすましへの対策は SMTP の中にではなく、**DNS に方針を書き、受け取った側がそれを引いて判定する**という形で、外側に積み上げられていきました。
+
+## 継ぎ足しの年表
+
+主な仕様の年を並べます（日付は rfc-editor.org の各 RFC の情報による）。
+
+| 年 | 仕様 | 何を足したか | この章 |
+| --- | --- | --- | --- |
+| 1982 | [RFC 821](https://www.rfc-editor.org/rfc/rfc821.html) SMTP、RFC 822 形式 | 始まり。認証なし | 第 133 回、第 135 回 |
+| 1986 | [RFC 974](https://www.rfc-editor.org/rfc/rfc974.html) | MX レコードによる配送先の決定 | 第 134 回 |
+| 1993 | [RFC 1425](https://www.rfc-editor.org/rfc/rfc1425.html) ESMTP | `EHLO` と拡張の仕組み。以後の継ぎ足しの土台 | 第 133 回 |
+| 1996 | RFC 2045〜2049 MIME | 日本語、添付ファイル | 第 135 回 |
+| 1998 | [RFC 2476](https://www.rfc-editor.org/rfc/rfc2476.html) | 提出（587 番）を中継から分離 | この回 |
+| 1999 | [RFC 2487](https://www.rfc-editor.org/rfc/rfc2487.html) STARTTLS、[RFC 2554](https://www.rfc-editor.org/rfc/rfc2554.html) SMTP AUTH | 経路の暗号化、提出の認証 | 第 136 回、第 133 回 |
+| 2006 | [RFC 4408](https://www.rfc-editor.org/rfc/rfc4408.html) SPF（実験的） | 送ってよい IP の宣言 | 第 137 回 |
+| 2007 | [RFC 4871](https://www.rfc-editor.org/rfc/rfc4871.html) DKIM | ドメインによる署名 | 第 138 回 |
+| 2008 | [RFC 5321](https://www.rfc-editor.org/rfc/rfc5321.html) / [RFC 5322](https://www.rfc-editor.org/rfc/rfc5322.html) | SMTP と形式の現行版 | 全体 |
+| 2014 | [RFC 7208](https://www.rfc-editor.org/rfc/rfc7208.html) | SPF が標準化の道へ | 第 137 回 |
+| 2015 | [RFC 7489](https://www.rfc-editor.org/rfc/rfc7489.html) DMARC（Informational） | `From:` との結びつけ、報告 | 第 139 回 |
+| 2015 | [RFC 7672](https://www.rfc-editor.org/rfc/rfc7672.html) DANE for SMTP | DNSSEC による証明書の固定 | 第 136 回 |
+| 2018 | [RFC 8461](https://www.rfc-editor.org/rfc/rfc8461.html) MTA-STS、[RFC 8460](https://www.rfc-editor.org/rfc/rfc8460.html) TLS-RPT | STARTTLS を強制する方針と、失敗の報告 | 第 136 回 |
+| 2018 | [RFC 8314](https://www.rfc-editor.org/rfc/rfc8314.html) | 提出と取り出しは最初から TLS を推奨 | 第 136 回 |
+| 2019 | [RFC 8617](https://www.rfc-editor.org/rfc/rfc8617.html) ARC（実験的） | 転送で壊れた認証結果の引き継ぎ | 第 138 回 |
+| 2024 | [Gmail の送信者ガイドライン](https://support.google.com/a/answer/81126) | 1 日 5,000 通を超える送信者に SPF・DKIM・DMARC を要求（2 月 1 日から） | 第 139 回 |
+| 2026 | [RFC 9989](https://www.rfc-editor.org/rfc/rfc9989.html)〜[9991](https://www.rfc-editor.org/rfc/rfc9991.html) | DMARC の改訂版（DMARCbis）が Proposed Standard に。RFC 7489 を置き換え | 第 139 回 |
+
+眺めると、2 つのことが読み取れます。
+
+1 つ目は、**SMTP の最初から最初の送信者認証（SPF）まで 24 年かかった**ことです。その間、なりすましへの対処は、受信側がそれぞれ独自に作るフィルタに頼るしかありませんでした。
+
+2 つ目は、**標準を作ることと、使わせることは別**だということです。SPF、DKIM、DMARC は 2015 年には揃っていましたが、仕様があるだけでは送信者に設定を強いることはできません。2024 年に Gmail が、1 日 5,000 通を超えて送る送信者に 3 つすべての設定を求めたのは、大手の受信側が要件として示すことで、任意の拡張を**事実上の必須**に変えた例です（詳しくは第 139 回）。
+
+<Callout type="warn" title="よくある誤解: TLS で送られてきたメールなら差出人は本物">
+  経路の TLS（STARTTLS）が守るのは、**その 1 区間の盗聴**です。相手のサーバが誰かを確かめるかどうかは設定次第で、中継では確かめないことが多いのが実情です（第 136 回）。
+  そしてどちらにしても、TLS が認証するのは**サーバ**で、便箋の `From:` に何が書かれているかとは無関係です。
+  なりすましたメールも、きちんと TLS で運ばれてきます。
+  さらに、TLS は区間ごとにほどかれるので、中継するサーバの中ではメールは平文です。中身を守るのは第 140 回の S/MIME や OpenPGP の仕事です。
+</Callout>
+
+## 部品の地図: 何を保証し、何を保証しないか
+
+この章で出てくる部品を、「何を保証するか」「何を保証しないか」で並べておきます。以降の回はこの表の 1 行ずつを掘り下げます。
+
+| 部品 | 保証すること | 保証しないこと | 使う下の部品 | 回 |
+| --- | --- | --- | --- | --- |
+| SMTP | 配送の手順（受け取った責任の受け渡し） | 誰が送ったか | TCP（第 53 回） | 第 133 回 |
+| MX | そのドメイン宛てをどこへ届けるか | 届け先が本物か（DNSSEC なしでは） | DNS（第 56〜60 回） | 第 134 回 |
+| STARTTLS | 1 区間の盗聴の防止（日和見） | 相手のサーバが本物か、中継先での秘匿 | TLS（第 112 回） | 第 136 回 |
+| MTA-STS / DANE | 相手の MX と証明書が正しいこと | 中身、差出人 | Web PKI（第 110 回）/ DNSSEC（第 61 回） | 第 136 回 |
+| SPF | 封筒の `MAIL FROM` のドメインが、その IP から送ってよいこと | `From:`、転送されたあと | DNS の TXT（第 58 回） | 第 137 回 |
+| DKIM | `d=` のドメインが、この中身に責任を持つこと | `From:` との関係 | 署名（第 106 回）、鍵の形式（第 107 回） | 第 138 回 |
+| DMARC | `From:` のドメインと SPF か DKIM が揃っていること | 表示名、似たドメイン、乗っ取られた正規アカウント | SPF、DKIM、DNS | 第 139 回 |
+| S/MIME / OpenPGP | 人による署名、中身の秘匿 | 件名や宛先などのヘッダ | 証明書（第 109 回）、公開鍵（第 105 回） | 第 140 回 |
+| IMAP + OAuth | メールボックスを読むのが本人であること | 届いたメールの真正さ | OAuth（第 120 回） | 第 141 回 |
+
+**どの 1 行も、単独ではメールを安全にしません**。たとえば DKIM の署名が正しくても、`d=` が差出人と無関係のドメインなら、利用者にとっての意味は薄い。DMARC はその隙間を埋めますが、DKIM と SPF がなければ判定する材料がありません。この章では、各回の終わりに「何と組み合わさって意味を持つか」を必ず確かめます。
+
+## 手元で確かめる
+
+テスト用の SMTP サーバ [Mailpit](https://mailpit.axllent.org/) を Docker で起動し、封筒と便箋を別々にしたメールを送って、受け取った生のメッセージを見比べます。Mailpit は受け取ったメールをどこにも配送せず、手元に溜めて Web の画面と API で見せてくれます。**外部のメールサーバには一切送りません**。
+
+```bash
+docker run -d --name ll113 -p 18113:1025 -p 18114:8025 axllent/mailpit
+```
+
+1025 番が SMTP、8025 番が Web の画面と API です（ここでは v1.31.3）。Python の `smtplib` で送ります。`send_message` に `from_addr` と `to_addrs` を渡すと、ヘッダとは別に封筒の値を指定できます。
+
+```python
+import smtplib
+from email.message import EmailMessage
+
+msg = EmailMessage()
+msg["From"] = "President <ceo@example.com>"
+msg["To"] = "All Staff <all@example.org>"
+msg["Subject"] = "envelope and header"
+msg.set_content("The envelope and the header are different things.\n")
+
+with smtplib.SMTP("127.0.0.1", 18113, local_hostname="client.example.net") as s:
+    s.set_debuglevel(1)
+    s.send_message(
+        msg,
+        from_addr="bounce-7f3a@mailer.example.net",
+        to_addrs=["bob@example.org", "carol@example.org"],
+    )
+```
+
+`set_debuglevel(1)` で、実際に流れたコマンドが見えます（抜粋）。
+
+```
+send: 'ehlo client.example.net\r\n'
+send: 'mail from:<bounce-7f3a@mailer.example.net> size=246\r\n'
+reply: b'250 2.1.0 Ok\r\n'
+send: 'rcpt to:<bob@example.org>\r\n'
+reply: b'250 2.1.5 Ok\r\n'
+send: 'rcpt to:<carol@example.org>\r\n'
+reply: b'250 2.1.5 Ok\r\n'
+send: 'data\r\n'
+reply: b'250 2.0.0 Ok: queued as 3RlkIfLZOEjW5rvbKHxLcT'
+```
+
+サーバは `ceo@example.com` について何も尋ねず、`bob` と `carol` への配送を引き受けました。受け取った側に残った生のメッセージを API で取り出します。
+
+```
+$ curl -s http://127.0.0.1:18114/api/v1/message/3RlkIfLZOEjW5rvbKHxLcT/raw
+Bcc: bob@example.org, carol@example.org
+Message-ID: <3fNuvEwNnEp2dCJRHGuipb@mailpit>
+Return-Path: <bounce-7f3a@mailer.example.net>
+Received: from client.example.net (unknown [192.168.65.1])
+        by b1d2dd8e916e (Mailpit) with SMTP
+        for <bob@example.org>; Mon, 28 Sep 2026 12:07:35 +0000 (UTC)
+From: President <ceo@example.com>
+To: All Staff <all@example.org>
+Subject: envelope and header
+...
+```
+
+読み取れることを並べます。
+
+- **`Return-Path:` に封筒の `MAIL FROM` が入り、`From:` は便箋に書いたまま**。両者は別の値で、サーバはそれを咎めない
+- **`To:` は `all@example.org` のまま**だが、実際に受け取ったのは `bob` と `carol`。MTA は封筒の `RCPT TO` だけを見て配送した
+- **`Received:` が 1 行足された**。`from client.example.net` は送り手が `EHLO` で名乗った名前で、括弧の中の `[192.168.65.1]` は TCP の接続元の IP。`unknown` は、その IP の逆引きができなかったという意味（第 134 回）
+- 先頭の `Bcc:` と `Message-ID:` は **Mailpit が付けたもの**。Mailpit は 1 通を全宛先の分まとめて保存するので、ヘッダに無い封筒の宛先を確認しやすいよう `Bcc:` として書き足しているようです（今回の実験で観察した挙動）。本物の配送では、`bob` と `carol` のメールボックスにそれぞれ別の 1 通が入り、このような行は付きません
+
+次に、ヘッダに `Bcc:` を書いたメッセージを、封筒を指定せずに送ります。`smtplib` は `To:`、`Cc:`、`Bcc:` から封筒の宛先を作り、**`Bcc:` の行は送らずに消します**（`send_message` のドキュメントに明記されています。[Python のドキュメント](https://docs.python.org/3/library/smtplib.html#smtplib.SMTP.send_message)）。
+
+```
+send: 'mail from:<alice@example.com> size=169\r\n'
+send: 'rcpt to:<bob@example.org>\r\n'
+send: 'rcpt to:<dave@example.org>\r\n'
+send: 'data\r\n'
+send: b'From: alice@example.com\r\nTo: bob@example.org\r\nSubject: bcc test\r\n...'
+```
+
+`dave` は封筒には入っていますが、`DATA` で送った便箋のどこにも出てきません。**Bcc は、封筒と便箋が一致しなくてよいことそのもの**です。封筒を指定しないとき、`MAIL FROM` は `From:` から取られていることも分かります。
+
+最後に、メーリングリストの配り直しをまねます。1 通目の生のメッセージから Mailpit が付けた行を除き、封筒だけを変えて再送します。
+
+```python
+with smtplib.SMTP("127.0.0.1", 18113, local_hostname="lists.example.org") as s:
+    s.sendmail("all-bounces@example.org", ["erin@example.org"], msg)
+```
+
+```
+Return-Path: <all-bounces@example.org>
+Received: from lists.example.org (unknown [192.168.65.1])
+        by b1d2dd8e916e (Mailpit) with SMTP
+        for <erin@example.org>; Mon, 28 Sep 2026 12:08:22 +0000 (UTC)
+Received: from client.example.net (unknown [192.168.65.1])
+        by b1d2dd8e916e (Mailpit) with SMTP
+        for <bob@example.org>; Mon, 28 Sep 2026 12:07:35 +0000 (UTC)
+From: President <ceo@example.com>
+To: All Staff <all@example.org>
+```
+
+`Return-Path:` はリストの管理者に変わり、`From:` と `To:` は元のままです。`Received:` は**上に 1 行ずつ積み重なって**いきます。下から読めば、メールがたどった経路の順になります（第 134 回、第 135 回）。
+
+終わったらコンテナを止めます。
+
+```bash
+docker stop ll113
+```
+
+<Callout type="note" title="この実験が示していないこと">
+  ここでは、`ceo@example.com` を名乗ったメールが手元の Mailpit に**受け取られた**ことを見ただけです。
+  実際の受信側の MTA は、受け取るかどうか、受け取ったあと受信箱に入れるか迷惑メールにするかを、SPF・DKIM・DMARC、送信元の IP の評判などを使って判定します。
+  「SMTP では名乗れる」ことと「名乗ったメールが相手の受信箱に届く」ことは別で、後者を難しくするのがこの章の後半の部品です。
+</Callout>
+
+## まとめ
+
+- メールの登場人物は MUA、MSA（提出、587 / 465）、MTA（中継、25）、MDA、MS（IMAP / POP で読む）。提出は利用者を認証し、中継は知らない相手から認証なしで受け取る
+- SMTP で運ばれるのは、配送のための**エンベロープ**（`MAIL FROM`、`RCPT TO`）と、利用者が見る**ヘッダと本文**（`From:`、`To:` など）の 2 層。MTA は封筒だけを見て配送する
+- 封筒と便箋は一致しなくてよい。Bcc、メーリングリスト、バウンスの受付先の分離は、すべてこの不一致に依存している
+- `MAIL FROM` は最後に配達するサーバが `Return-Path:` として残す。`Received:` は中継のたびに上へ積まれる
+- SMTP は 1982 年の信頼し合うホストの時代に作られ、名乗った名前を確かめる手順を持たない。互換性のために、対策は任意の拡張と DNS に書く方針として外側に継ぎ足されてきた
+- STARTTLS、SPF、DKIM、DMARC、MTA-STS はそれぞれ保証する範囲が違い、**単独ではメールを安全にしない**
+
+次の第 132 回では、この回で何度も書いた `user@example.com` の **@ の左側**を見ます。`user+shop@example.com` が同じ受信箱に届くのはなぜか、その左側を決めているのは誰なのか。続く第 133 回では、この回で `smtplib` に任せた SMTP の会話を、1 行ずつ自分の手で話します。応答コードの 4xx と 5xx の違いが、なぜメールを「数日遅れても最後には届く」仕組みにしているのかを見ます。

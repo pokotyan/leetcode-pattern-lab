@@ -193,7 +193,7 @@ gmail.com.  3600  IN  MX  20 alt2.gmail-smtp-in.l.google.com.
 
 Web サーバとメールサーバを別の場所に置けるのは、この分離のおかげです。`example.com` の A は Web のホスティング先、MX はメールの事業者、と向け先を型ごとに変えられます。apex に CNAME を置けない理由の 1 つがここにもあって、CNAME を置くと MX も一緒に読み替えられてしまいます。
 
-MX を引いた後、送信側がどの順で相手を選び、何を確かめて渡すのかは第 126 回で見ます。
+MX を引いた後、送信側がどの順で相手を選び、何を確かめて渡すのかは第 134 回で見ます。
 
 ## 何でも書ける: TXT
 
@@ -208,7 +208,7 @@ MX を引いた後、送信側がどの順で相手を選び、何を確かめ�
 | `_dmarc.example.com` | `v=DMARC1; p=reject; rua=mailto:...` | **DMARC**: SPF と DKIM に失敗したメールをどう扱うかの方針（[RFC 7489](https://datatracker.ietf.org/doc/html/rfc7489)） |
 | `example.com` | `google-site-verification=...` など | **所有確認**: 外部サービスに、このドメインの管理者であると示す |
 
-メールの 3 つ（SPF、DKIM、DMARC）が何を確かめ、どう組み合わさるのかは、第 19 章（第 129〜131 回）で詳しく見ます。
+メールの 3 つ（SPF、DKIM、DMARC）が何を確かめ、どう組み合わさるのかは、第 20 章（第 137〜139 回）で詳しく見ます。
 
 最後の所有確認は、仕組みとしては単純です。サービスがランダムな文字列を発行し、「これを TXT に書いてください」と頼みます。書けたということは、**そのゾーンを編集できる**ということで、つまりドメインの管理者だと分かります。`github.com` の TXT を引くと、`apple-domain-verification=...` や `stripe-verification=...` が並んでいるのが見えます。Let's Encrypt が使う ACME の DNS-01 チャレンジも同じ考え方です。
 
@@ -233,7 +233,7 @@ _xmpp-server._tcp.jabber.org.  60  IN  SRV  30 30 5269 scarlet.jabber.org.
 
 A レコードでは分からない**ポート番号**まで書けるのが特徴です。優先度は MX と同じく小さいほうから試し、同じ優先度の中では重みに比例して振り分けます。
 
-Web ブラウザは SRV を使いませんが、XMPP や SIP、LDAP、Active Directory、Kubernetes のクラスタ内 DNS（第 156 回）などで使われています。HTTPS / SVCB は、SRV の考え方を発展させて、ポート以外の接続条件も載せられるようにしたものと見ることができます。
+Web ブラウザは SRV を使いませんが、XMPP や SIP、LDAP、Active Directory、Kubernetes のクラスタ内 DNS（第 164 回）などで使われています。HTTPS / SVCB は、SRV の考え方を発展させて、ポート以外の接続条件も載せられるようにしたものと見ることができます。
 
 ## 逆引き: PTR
 

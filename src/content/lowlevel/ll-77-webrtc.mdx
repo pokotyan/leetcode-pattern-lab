@@ -1,0 +1,510 @@
+---
+title: WebRTC
+description: ICE で開けた UDP の通り道の上で、WebRTC は何をしているのか。SDP の offer と answer を 1 行ずつ読み、DTLS で決めた鍵を SDP の fingerprint で確かめる仕組み、1 つのポートに STUN・DTLS・RTP・RTCP を同居させる見分け方、RTP と RTCP による音声と映像の運び方、遅延を見る輻輳制御、多人数の通話の形、SCTP の上の DataChannel を、手元の 2 つのコンテナで損失を入れて確かめる
+chapter: realtime
+order: 5
+status: published
+topics:
+  - WebRTC
+  - シグナリング
+  - SDP / offer・answer（JSEP）
+  - BUNDLE / rtcp-mux
+  - a=fingerprint / a=setup
+  - DTLS-SRTP
+  - 先頭バイトによる多重化（RFC 7983）
+  - RTP / RTCP
+  - SSRC
+  - ジッタバッファ
+  - NACK / RTX / FEC
+  - GCC / transport-cc / REMB
+  - メッシュ / MCU / SFU
+  - サイマルキャスト / SVC
+  - DataChannel
+  - SCTP over DTLS
+  - DCEP
+  - 部分信頼性（PR-SCTP）
+  - I-DATA
+requires:
+  - ll-54-tcp-flow
+  - ll-66-http3-quic
+  - ll-76-nat-traversal
+---
+
+import Callout from '../../components/Callout.astro'
+
+前回は、NAT の内側にいる 2 台の端末の間に、STUN、TURN、ICE を使って UDP の通り道を開けました。ICE は候補のペアを STUN で確かめ、通ったペアを 1 つ選びます。手に入ったのは「互いに UDP のパケットを送り合える 2 つのアドレスとポート」だけです。
+
+この回では、その通り道の上に載る **WebRTC** を見ます。ブラウザ同士でビデオ通話をするとき、ICE で選んだ 1 つの UDP ポートの上を、鍵の交換、暗号化された音声と映像、その受信状況の報告、任意のデータが同時に流れています。それぞれを担う部品を順に取り出し、手元の 2 つのコンテナの間で実際に流して確かめます。
+
+## 部品の全体図
+
+WebRTC は 1 つのプロトコルではなく、既存の部品を組み合わせたものです（[RFC 8825](https://www.rfc-editor.org/rfc/rfc8825.html)）。
+
+| 仕事 | 部品 | 仕様 |
+| --- | --- | --- |
+| 相手と設定を交換する | シグナリング（規格の外）で SDP を運ぶ | SDP は [RFC 8866](https://www.rfc-editor.org/rfc/rfc8866.html)、手順は JSEP（[RFC 9429](https://www.rfc-editor.org/rfc/rfc9429.html)） |
+| 通り道を見つける | ICE（STUN / TURN） | [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html)（第 76 回） |
+| 鍵を決め、相手を確かめる | DTLS | [RFC 5763](https://www.rfc-editor.org/rfc/rfc5763.html)、[RFC 5764](https://www.rfc-editor.org/rfc/rfc5764.html) |
+| 音声と映像を運ぶ | RTP / RTCP を SRTP で暗号化 | [RFC 3550](https://www.rfc-editor.org/rfc/rfc3550.html)、[RFC 3711](https://www.rfc-editor.org/rfc/rfc3711.html) |
+| 任意のデータを運ぶ | SCTP を DTLS の中に入れる | [RFC 8831](https://www.rfc-editor.org/rfc/rfc8831.html)、[RFC 8832](https://www.rfc-editor.org/rfc/rfc8832.html) |
+
+積み方を図にすると次のようになります。音声と映像は DTLS の**外**を通り、データは DTLS の**中**を通ることに注意してください。
+
+```
+   音声・映像                 DataChannel
+  ┌───────────┐            ┌────────────┐
+  │ RTP/RTCP  │            │ SCTP       │
+  ├───────────┤            ├────────────┤
+  │ SRTP      │←─ 鍵 ──────│ DTLS       │
+  └───────────┘            └────────────┘
+  ┌──────────────────────────────────────┐
+  │ ICE（STUN で確かめた 1 つの UDP の 5 つ組）│
+  └──────────────────────────────────────┘
+```
+
+**シグナリングは規格に含まれていません。**SDP をどうやって相手に届けるかは決められておらず、WebSocket でも HTTP の POST でも、紙に書いて手渡しでもかまいません。JSEP は、ブラウザが SDP を作って受け取る API の振る舞いだけを決め、運び方はアプリケーションに任せています（[RFC 9429 3.1](https://www.rfc-editor.org/rfc/rfc9429.html#section-3.1)）。電話のように呼び出しの仕組みまで決めてしまうと、既存のサービスの認証や部屋の管理と噛み合わないためです。ただし、後で見るとおり、**暗号化の安全性はこの「規格の外」の経路に依存します**。
+
+## 手元で 2 者をつなぐ
+
+2 つのコンテナを Docker のブリッジネットワークに置き、片方（offer 側）から SDP を HTTP の POST で送り、もう片方（answer 側）が answer を返すだけの最小のシグナリングを書きました。これが「規格の外」の部分です。実装は 2 つ使いました。
+
+- **aiortc 1.15.0**（Python 3.12.14。aioice 0.10.2、pylibsrtp 1.0.0、pyOpenSSL 26.4.0）。合成した音声（無音）と映像（黒い画面を VP8 で符号化）のトラックと、DataChannel を 2 本張る
+- **pion/webrtc v4.2.22**（Go 1.24.6。pion/sctp v1.11.3、pion/dtls v3.1.9）。DataChannel の比較と、DTLS の検証の実験に使う
+
+パケットは answer 側のコンテナで `tcpdump` で記録し、tshark 4.4.19 で読みました。DTLS の鍵は、aiortc では pyOpenSSL の keylog コールバックで、pion では `SettingEngine.SetDTLSKeyLogWriter` で書き出し、DataChannel の中身を復号しています。損失と遅延は、offer 側のコンテナの送信側に `tc qdisc add dev eth0 root netem delay 50ms loss 5%` で入れました。
+
+<Callout type="warn" title="実験した環境の負荷">
+  実験は Docker Desktop（macOS、arm64、Docker 29.2.1）の上で、同じ機械で他の実験も並行して動いている状態で行いました。ロードアベレージは 20〜60 です。
+  コンテナの中で 20ms の `sleep` を 20 秒繰り返すと、最大で 848ms 遅れて戻ることがありました。以下の遅延の数字の裾には、この止まりが混ざっている可能性があります。
+</Callout>
+
+## SDP を 1 つ読む
+
+aiortc の offer 側が作った SDP です（音声の部分と、DataChannel の部分の抜粋。`a=fingerprint` の sha-384 と sha-512 の行は省略）。
+
+```
+v=0
+o=- 4000260267 4000260267 IN IP4 0.0.0.0
+s=-
+t=0 0
+a=group:BUNDLE 0 1 2
+m=audio 58156 UDP/TLS/RTP/SAVPF 96 9 0 8
+c=IN IP4 172.21.0.3
+a=sendrecv
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid
+a=mid:0
+a=rtcp:9 IN IP4 0.0.0.0
+a=rtcp-mux
+a=ssrc:889567089 cname:378123a2-c063-429a-94ea-f57805bd9502
+a=rtpmap:96 opus/48000/2
+a=rtpmap:9 G722/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=candidate:461573564b34ea161d3793846aacf055 1 udp 2130706431 172.21.0.3 58156 typ host
+a=end-of-candidates
+a=ice-ufrag:n0DW
+a=ice-pwd:b5OuHruaOPvPrNU3fhA0Wq
+a=fingerprint:sha-256 35:29:4E:F5:22:21:76:8E:00:7B:3E:A9:5B:4E:40:54:46:42:CC:C8:9F:5E:0D:27:BE:7D:1C:82:37:10:8A:C6
+a=setup:actpass
+m=video 48624 UDP/TLS/RTP/SAVPF 97 98 99 100 101 102
+...
+m=application 43273 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 172.21.0.3
+a=mid:2
+a=sctp-port:5000
+a=max-message-size:65536
+...
+```
+
+行ごとに読んでいきます。
+
+**`m=` 行。** 1 本のメディアの記述の始まりで、`m=<種類> <ポート> <プロトコル> <形式の一覧>` の形です（[RFC 8866 5.14](https://www.rfc-editor.org/rfc/rfc8866.html#section-5.14)）。音声の `UDP/TLS/RTP/SAVPF` は「UDP の上の、DTLS で鍵を決めた、RTCP のフィードバック付きの暗号化された RTP」という意味で、続く `96 9 0 8` は使えるペイロード種別（PT）の番号を好みの順に並べたものです。番号の意味は `a=rtpmap` が決めます。96 は Opus（48kHz、2 チャネル）で、0 と 8 は G.711 の静的に割り当てられた番号です。WebRTC の実装は、音声では Opus と G.711、映像では VP8 と H.264 を必ず実装することになっています（[RFC 7874](https://www.rfc-editor.org/rfc/rfc7874.html)、[RFC 7742](https://www.rfc-editor.org/rfc/rfc7742.html)）。DataChannel の `m=application` は `UDP/DTLS/SCTP` で、`a=sctp-port` は DTLS の中の SCTP のポート番号です（[RFC 8841](https://www.rfc-editor.org/rfc/rfc8841.html)）。
+
+**`a=ice-ufrag` と `a=ice-pwd`。** ICE の確認に使う STUN の短期の認証情報です。前回見たとおり、Binding Request の USERNAME は `相手の ufrag:自分の ufrag` になります。記録の最初のパケットは `Binding Request user: n0DW:NDxR` で、`n0DW` がこの offer の ufrag、`NDxR` が answer の ufrag でした。ufrag は 4 文字以上、pwd は 22 文字以上と決められていて（[RFC 8839 5.4](https://www.rfc-editor.org/rfc/rfc8839.html#section-5.4)）、aiortc はちょうど下限の長さを使っています。
+
+**`a=group:BUNDLE 0 1 2` と `a=rtcp-mux`。** offer では音声、映像、データに別々のポート（58156、48624、43273）が書かれています。BUNDLE は、`a=mid` で名前を付けた複数の `m=` 行を、**1 つの 5 つ組にまとめる**指定です（[RFC 9143](https://www.rfc-editor.org/rfc/rfc9143.html)）。answer は次のように、3 つとも同じポートを返しました。
+
+```
+m=audio 53670 UDP/TLS/RTP/SAVPF 96 9 0 8
+m=video 53670 UDP/TLS/RTP/SAVPF 97 98 99 100 101 102
+m=application 53670 UDP/DTLS/SCTP webrtc-datachannel
+```
+
+実際に流れたのは、offer の先頭（mid 0）のポート 58156 と answer の 53670 の間の 1 本だけでした。`tshark -z conv,udp` で数えると、約 9 秒の間に 1601 個のパケットがこの 1 本に流れ、他のポートには何も流れていません。rtcp-mux は、RTP と RTCP を同じポートに載せる指定です（[RFC 5761](https://www.rfc-editor.org/rfc/rfc5761.html)）。元の RTP は RTCP に「RTP のポート + 1」を使っていました。ICE の確認は 5 つ組ごとに要るので、まとめるほど確認の数も、NAT の行も減ります。どの `m=` 行のパケットかは、RTP のヘッダ拡張の `sdes:mid`（`a=extmap:1`）や SSRC で見分けます。
+
+pion の SDP は、ポートに 9（discard）、アドレスに `0.0.0.0` を書き、実際のアドレスは `a=candidate` にだけ書く形でした。候補を後から少しずつ送る Trickle ICE（前回）を前提にした書き方です。
+
+**`a=fingerprint` と `a=setup`。** 次の節で扱います。
+
+<Callout type="note" title="候補の種類を数える">
+  最初の試行では、aiortc が既定で Google の公開 STUN サーバに問い合わせ、`typ srflx` の候補に手元の回線のグローバルアドレスを書き込みました。SDP をそのまま貼ると、自宅のアドレスが漏れます。以降は `iceServers` を空にして、host 候補だけで実験しています。
+  前回、TURN を経由する通話の割合は自分のサービスで測るしかないと書きました。ブラウザでは `getStats()` の `candidate-pair` で選ばれたペアを探し、その `localCandidateId` が指す `local-candidate` の `candidateType`（host、srflx、prflx、relay）を数えれば分かります（[W3C webrtc-stats](https://www.w3.org/TR/webrtc-stats/)）。
+</Callout>
+
+## DTLS-SRTP: 鍵は DTLS で、本人確認は SDP で
+
+### 誰が DTLS のクライアントになるか
+
+DTLS は UDP の上の TLS です（第 112 回の TLS 1.3 と基本は同じで、パケットの損失と順序の入れ替わりに耐える仕組みが足されています）。TLS と同じく、クライアントとサーバの役割を決める必要があります。それを決めるのが `a=setup` です。
+
+offer は **`actpass`**（どちらにもなれる）を書かなければなりません。answer は `active` か `passive` を選び、`active` を選んだ側が ClientHello を送ります（[RFC 8842 5.2、5.3](https://www.rfc-editor.org/rfc/rfc8842.html#section-5.2)）。offer 側は、answer を受け取る前に相手の ClientHello が届くことに備えておく必要があります。
+
+aiortc も pion も、answer に `a=setup:active` を書きました。記録でも、answer 側（172.21.0.2）が ClientHello を送っています。
+
+```
+1  0.000000  172.21.0.2  STUN   Binding Request user: n0DW:NDxR
+2  0.000453  172.21.0.3  STUN   Binding Success Response XOR-MAPPED-ADDRESS: 172.21.0.2:53670
+3  0.001363  172.21.0.3  STUN   Binding Request user: NDxR:n0DW
+4  0.001646  172.21.0.2  STUN   Binding Success Response XOR-MAPPED-ADDRESS: 172.21.0.3:58156
+5  0.025416  172.21.0.2  DTLS   Client Hello
+6  0.027011  172.21.0.3  DTLSv1.2  Server Hello, Certificate, Server Key Exchange, Certificate Request, Server Hello Done
+7  0.028323  172.21.0.2  DTLSv1.2  Certificate, Client Key Exchange, Certificate Verify, Change Cipher Spec, Finished
+8  0.028818  172.21.0.3  DTLSv1.2  New Session Ticket, Change Cipher Spec, Finished
+9  0.029229  172.21.0.3  SCTP   INIT
+```
+
+ICE の確認が 2 往復で済み、その直後に DTLS 1.2 のハンドシェイクが始まっています。サーバが **Certificate Request** を送っていることに注意してください。Web の TLS と違い、**両側が証明書を出します**。
+
+### 自己署名の証明書を、SDP で確かめる
+
+記録から両側の証明書を取り出すと、どちらも**自己署名**でした。発行者と主体が同じ、乱数の CN を持つ証明書で、有効期間は 1 か月です。
+
+```
+172.21.0.3（offer 側）: subject=CN=3ec785c8b34638474a2bfa5ad1485e5e  issuer=同じ
+172.21.0.2（answer 側）: subject=CN=78133e19ea88c403c67c7d756a741a5d  issuer=同じ
+```
+
+CA の署名がないので、証明書そのものからは相手が誰かは分かりません。代わりに、**SDP の `a=fingerprint` に書かれたハッシュと、DTLS で受け取った証明書のハッシュが一致するか**を確かめます（[RFC 8122](https://www.rfc-editor.org/rfc/rfc8122.html)、[RFC 5763 5](https://www.rfc-editor.org/rfc/rfc5763.html#section-5)）。offer 側の証明書の DER を SHA-256 にかけると、先頭は `35294ef52221768e` で、offer の SDP の `a=fingerprint:sha-256 35:29:4E:F5:22:21:76:8E:…` と一致しました。
+
+一致しなければどうなるか。pion で、受け取った answer の fingerprint の先頭の 1 文字だけを書き換えてから `SetRemoteDescription` に渡しました。
+
+```
+tampered: a=fingerprint:sha-256 1F:66:AF:28:8C:0F:23:F7:92:44:D9:BB:…
+ice state: connected
+dtls state: failed
+pc state: closed
+
+0.0013  172.21.0.2  DTLS      Client Hello
+0.0016  172.21.0.3  DTLSv1.2  Hello Verify Request
+0.0017  172.21.0.2  DTLSv1.2  Client Hello
+0.0021  172.21.0.3  DTLSv1.2  Server Hello, Certificate, Server Key Exchange, Certificate Request, Server Hello Done
+0.0028  172.21.0.2  DTLSv1.2  Certificate, Client Key Exchange, Certificate Verify, Change Cipher Spec, Finished
+0.0034  172.21.0.3  DTLSv1.2  Alert (Level: Fatal, Description: Bad Certificate)
+```
+
+ICE は通り、DTLS のハンドシェイクも最後まで進みますが、offer 側は相手の証明書が SDP と合わないと判断して **Bad Certificate** の警告を返し、接続を閉じました。RFC 8842 は、一致しなければ直ちにセッションを壊さなければならないとしています（[RFC 8842 5.1](https://www.rfc-editor.org/rfc/rfc8842.html#section-5.1)）。
+
+### シグナリングを握る者は、間に入れる
+
+この仕組みが守ってくれるのは、**SDP が改ざんされずに届いた場合だけ**です。シグナリングの経路を握った者は、両側の fingerprint を自分の証明書のものに差し替え、両側とそれぞれ DTLS を張って中継できます。RFC 5763 も、SDP の完全性が確かめられる限り DTLS は乗っ取られないが、シグナリングの経路を支配する攻撃者は fingerprint を書き換えて間に入れると書いています（[RFC 5763 8](https://www.rfc-editor.org/rfc/rfc5763.html#section-8)）。
+
+つまり、WebRTC の通話の秘匿は、**シグナリングサーバを運営する者を信頼する**ことの上に立っています。ブラウザの WebRTC は、シグナリングを HTTPS や WSS で運ぶことで経路上の攻撃者は防げますが、サーバそのものが書き換える場合は防げません。
+
+### SRTP の鍵は DTLS から取り出す
+
+DTLS のハンドシェイクには **use_srtp** 拡張が付き、SRTP の保護方式を交渉します（[RFC 5764 4.1](https://www.rfc-editor.org/rfc/rfc5764.html#section-4.1)）。手元の記録では、ServerHello で `SRTP_AEAD_AES_256_GCM` が選ばれていました。ハンドシェイクが終わると、両側は TLS の鍵導出（エクスポータ）から SRTP の鍵を取り出し、**音声と映像は DTLS のレコードに入れずに**、SRTP で直接暗号化して送ります（[RFC 5764 4.2](https://www.rfc-editor.org/rfc/rfc5764.html#section-4.2)）。DTLS は鍵を決めるためだけに使われ、メディアは RTP のパケットの形のまま流れます。
+
+SRTP は RTP の**ペイロードだけ**を暗号化し、ヘッダは平文のまま認証だけします（[RFC 3711 3.1](https://www.rfc-editor.org/rfc/rfc3711.html#section-3.1)）。そのため、鍵を持たない tshark でも、次の節で見るシーケンス番号や SSRC は読めます。音量のレベルのようなヘッダ拡張まで隠すには、pion の SDP に出ていた `a=cryptex` の拡張が要ります（[RFC 9335](https://www.rfc-editor.org/rfc/rfc9335.html)）。
+
+## 1 つのポートに 4 つを流す
+
+BUNDLE と rtcp-mux の結果、1 つの UDP の 5 つ組に、STUN（ICE の確認と、その後も続く同意の確認）、DTLS（ハンドシェイクと、SCTP を入れたレコード）、SRTP、SRTCP が同居します。受け取った側は、**UDP のペイロードの先頭の 1 バイト**で振り分けます（[RFC 7983](https://www.rfc-editor.org/rfc/rfc7983.html)。QUIC を加えた更新が [RFC 9443](https://www.rfc-editor.org/rfc/rfc9443.html)）。
+
+| 先頭バイト | 行き先 | 理由 |
+| --- | --- | --- |
+| 0〜3 | STUN | STUN のメッセージ種別の上位 2 ビットは必ず 0 |
+| 16〜19 | ZRTP | |
+| 20〜63 | DTLS | TLS のレコードの content type（20〜23 など） |
+| 64〜79 | TURN の ChannelData（TURN サーバから届いたもの） | チャネル番号が 0x4000 から始まる |
+| 128〜191 | RTP / RTCP | 先頭の 2 ビットが RTP のバージョン 2 |
+
+RFC 9443 は、残りの 80〜127 と 192〜255、および TURN サーバ以外から届いた 64〜79 を QUIC に割り当てています。QUIC の先頭のビットの使い方が、この表の空いているところに収まるように選ばれているためです。
+
+RTP と RTCP は同じ範囲に入ります。これを分けるのは**2 バイト目**で、RTCP のパケット種別（200〜206 など）と重ならないよう、多重化するときは RTP のペイロード種別を 64〜95 に使わないことになっています（[RFC 5761 4](https://www.rfc-editor.org/rfc/rfc5761.html#section-4)）。
+
+aiortc の約 9 秒の記録を、この規則どおりに先頭バイトで数える小さなスクリプトを書いて分類しました。
+
+```
+   8  0-3     STUN                     例 0001 0044 2112a442…   （Binding Request とマジッククッキー）
+   4  20-63   DTLS（content type 22）   例 16 feff …              （ハンドシェイク）
+   1  20-63   DTLS（content type 21）   例 15 fefd …              （Alert。終了時）
+ 813  20-63   DTLS（content type 23）   例 17 fefd …              （アプリケーションデータ = SCTP）
+ 725  128-191 RTP                      例 90 e1 1f4d …
+  18  128-191 RTCP（PT 200 = SR）      例 80 c8 …
+  18  128-191 RTCP（PT 201 = RR）      例 81 c9 …
+  12  128-191 RTCP（PT 206 = PSFB）    例 8f ce …
+   2  128-191 RTCP（PT 203 = BYE）     例 81 cb …
+```
+
+STUN は最初の確認の 4 つの後も流れています。前回触れた、相手がまだ受け取る意思を持っているかの確認（[RFC 7675](https://www.rfc-editor.org/rfc/rfc7675.html)）です。
+
+## RTP と RTCP
+
+### RTP のヘッダが持つもの
+
+RTP は UDP の上に 12 バイトのヘッダを足しただけのプロトコルです（[RFC 3550 5.1](https://www.rfc-editor.org/rfc/rfc3550.html#section-5.1)）。再送も順序の保証もしません。ヘッダが持つのは、受け取った側が**自分で**並べ直し、時間どおりに再生するための材料です。
+
+| 欄 | 長さ | 用途 |
+| --- | --- | --- |
+| シーケンス番号 | 16 ビット | パケットごとに 1 増える。抜けと順序の入れ替わりを見つける |
+| タイムスタンプ | 32 ビット | 中身の**サンプリングの時刻**。クロックの周波数は `a=rtpmap` の値 |
+| SSRC | 32 ビット | 送信元の流れを識別する乱数 |
+| M ビット、PT | 1 + 7 ビット | 映像ではフレームの最後のパケットの印。PT は `m=` 行の番号 |
+
+記録から抜き出すと次のとおりです。
+
+```
+PT  SSRC        Seq    Timestamp     間隔
+96  0x3505B771  13389  2066054865          音声（Opus 48kHz）
+96  0x3505B771  13390  2066055825    +960   = 20ms ぶん
+97  0x07B072EE  8013   3150500157          映像（VP8 90kHz）
+97  0x07B072EE  8014   3150503156    +2999  ≒ 1/30 秒ぶん
+```
+
+シーケンス番号とタイムスタンプの初期値は乱数です。タイムスタンプは時計の時刻ではなく、**メディアの中の時刻**です。Opus はクロック 48kHz で 20ms ごとに 1 パケットなので 960 ずつ、映像はクロック 90kHz で毎秒 30 フレームなので 3000 ずつ増えています。映像の 1 フレームが複数のパケットに分かれると、それらは同じタイムスタンプを持ちます。
+
+### ジッタバッファ
+
+パケットは一定の間隔で送られても、網の待ち行列のせいで到着の間隔はばらつきます（ジッタ）。受け取った側は、届いたパケットをすぐ再生せず、**少し溜めてから**タイムスタンプの順に一定の速さで取り出します。これがジッタバッファです。
+
+溜める量が少ないと、遅れて届いたパケットは再生の時刻に間に合わず、失われたのと同じになります。多いと、会話の遅延が増えます。aiortc の受信側は、音声では 16 パケットまで溜めて 4 パケット溜まってから取り出し、映像では 128 パケットまで溜める固定の設定でした（ソースの `JitterBuffer(capacity=16, prefetch=4)`）。ブラウザの実装は、測ったジッタに応じて溜める量を変えます。
+
+### RTCP: 受け取った側の報告
+
+RTP の流れに並行して、RTCP が受信状況を報告します（[RFC 3550 6.4](https://www.rfc-editor.org/rfc/rfc3550.html#section-6.4)）。
+
+- **SR（Sender Report、PT 200）**: 送った側が、送ったパケット数とバイト数、そして**壁時計の時刻とその瞬間の RTP タイムスタンプの対応**を知らせる。音声と映像は別の SSRC でクロックも違うので、受け取った側はこの対応を使って口の動きと声を合わせる（リップシンク）
+- **RR（Receiver Report、PT 201）**: 受け取った側が、SSRC ごとに、**直前の報告からの損失率**（8 ビットの固定小数点）、累積の損失数、受け取った最大のシーケンス番号、**到着間隔のジッタ**、最後に受け取った SR の時刻と、それから経過した時間を返す。送った側はこの最後の 2 つから RTT を計算できる
+
+SRTCP は先頭の 8 バイトより後ろを暗号化するので（[RFC 3711 3.4](https://www.rfc-editor.org/rfc/rfc3711.html#section-3.4)）、RR の中身は記録からは読めません。そこで、損失を入れた実験で、送った側の aiortc が RR から組み立てた統計を取り出しました。
+
+```
+remote-inbound-rtp audio packetsLost= 41 fractionLost= 19 jitter= 111 rtt= 0.0525
+remote-inbound-rtp video packetsLost= 21 fractionLost= 13 jitter= 189 rtt= 0.0526
+```
+
+aiortc は RR の損失率の 8 ビットの値をそのまま返していて、19 は 19/256 ≒ 7.4% です。ジッタは RTP タイムスタンプの単位なので、音声の 111 は 48kHz で約 2.3ms です。RTT の 52ms は、netem で片道に入れた 50ms とほぼ合っています。
+
+### 失われたパケットをどうするか
+
+RTP は自分では再送しません。何をするかは、失われたものの性質で決まります。
+
+**NACK と RTX。** 映像の `a=rtcp-fb:97 nack` は、受け取った側が抜けたシーケンス番号を **NACK**（RTCP の PT 205、FMT 1）で知らせ、送った側が送り直す仕組みです（[RFC 4585 6.2.1](https://www.rfc-editor.org/rfc/rfc4585.html#section-6.2.1)）。送り直しは元の流れに混ぜず、`a=ssrc-group:FID` で組にした**別の SSRC** と、`a=rtpmap:98 rtx/90000` の別の PT で送ります（[RFC 4588](https://www.rfc-editor.org/rfc/rfc4588.html)）。元のシーケンス番号は、そのペイロードの先頭 2 バイトに入ります。損失を入れた実験の記録です。
+
+```
+0.9717  172.21.0.3  PT 97  SSRC 0x36693fff  Seq 3189  TS 3992111170    （3188 が届いていない）
+0.9720  172.21.0.2  RTCP PT 205（NACK）
+1.0061  172.21.0.3  PT 97  SSRC 0x36693fff  Seq 3190  TS 3992114169
+1.0228  172.21.0.3  PT 98  SSRC 0xe723096e  Seq 23215 TS 3992108170    （RTX。TS は 3188 のもの）
+```
+
+3189 が届いた瞬間に 3188 の抜けに気付いて NACK を送り、約 51ms 後に RTX が届いています。約 15 秒の記録で、NACK が 20 個、RTX が 23 個流れていました。
+
+**音声は送り直さない。** 同じ実験で、音声は約 760 パケット中 44 個（約 5.8%）が失われたままでした。音声の `m=` 行には `nack` がありません。20ms の音声を 1 往復かけて取り戻しても、ジッタバッファの再生の時刻には間に合わないことが多いからです。失われた部分は、復号器が前後から推測して埋めます（パケット損失の隠蔽）。
+
+**FEC。** 再送を待てないなら、最初から冗長なデータを送っておく手があります。pion の SDP の `a=fmtp:111 minptime=10;useinbandfec=1` は、Opus のパケットに直前のフレームの低品質な複製を入れる、Opus 自身の FEC を使うという指定です。他に、同じ音声を前のパケットに重ねて入れる RED や、映像のパケットの XOR を送る FlexFEC があり、WebRTC での要件は [RFC 8854](https://www.rfc-editor.org/rfc/rfc8854.html) が決めています。FEC は損失がなくても帯域を使い、NACK は損失があったときだけ 1 往復の遅れで使います。
+
+**PLI。** 映像のフレームは前のフレームとの差分で符号化されるので、取り戻せない損失があると、以降のフレームが正しく復号できません。受け取った側は **PLI**（PT 206、FMT 1）で、前のフレームに依存しないキーフレームを要求します。
+
+## 輻輳制御: 遅延を見る
+
+### なぜ損失を待たないのか
+
+第 54 回の TCP の輻輳制御（Reno や CUBIC）は、**パケットが失われるまで**送る速さを上げ、失われたら下げます。経路上のルータに大きな待ち行列があると、それが溢れるまで損失は起きません。待ち行列が満ちた状態では、パケットは何百ミリ秒も待たされます（バッファブロート）。ファイルの転送なら速さが出ていれば困りませんが、会話では待ち時間がそのまま遅延になります。RFC 8836 は、対話的なメディアの輻輳制御には、待ち行列の遅延をできるだけ小さく保つことを求めています（[RFC 8836](https://www.rfc-editor.org/rfc/rfc8836.html)）。
+
+そこで、WebRTC で広く使われている **GCC**（Google Congestion Control）は、損失より先に**遅延の変化**を見ます（[draft-ietf-rmcat-gcc-02](https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02)。2016 年のドラフトで、RFC にはならず失効しています）。
+
+- **遅延に基づく部分**: 連続して送ったパケットの群の、**送信の間隔と到着の間隔の差**を求める。差が増え続けていれば、どこかの待ち行列が伸びている。これをフィルタで平滑化し、適応的に変わるしきい値と比べて「使いすぎ」「使い足りない」「普通」を判定し、使いすぎなら受信できている速さの 0.85 倍程度まで下げる（5 節）
+- **損失に基づく部分**: 損失率が 2% 未満なら 5% 上げ、10% を超えたら損失率に応じて下げ、その間は変えない（6 節）
+
+2 つの推定の小さい方を、送る速さにします。損失が 2〜10% あっても下げないのは、無線の網などで起きる、混雑と関係のない損失に過剰に反応しないためです。
+
+### どちらの側で推定するか
+
+遅延の変化を測るには、各パケットの到着時刻が要ります。その計算をどこでするかで 2 つの方式があり、手元の 2 つの実装は別の方式を使っていました。
+
+| 方式 | 推定する場所 | SDP の印 | 送り返すもの |
+| --- | --- | --- | --- |
+| REMB | 受け取った側 | `a=rtcp-fb:97 goog-remb`（aiortc） | 推定した上限のビットレート（RTCP PT 206、FMT 15） |
+| transport-cc | 送った側 | `a=rtcp-fb:111 transport-cc`、`a=extmap:4 …transport-wide-cc-extensions-01`（pion） | 各パケットの到着時刻の差分（RTCP PT 205、FMT 15） |
+
+transport-cc では、送る側がすべての RTP パケットに、**音声も映像も通した 1 本の 16 ビットの番号**をヘッダ拡張で付けます。受け取った側は、その番号ごとに届いたかどうかと到着時刻の差（250 マイクロ秒単位）を返すだけで、推定の計算はすべて送った側で行います（[draft-holmer-rmcat-transport-wide-cc-extensions-01](https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01)）。アルゴリズムを改良しても、受け取る側を更新する必要がありません。先ほどの先頭バイトの分類で見えた PT 206（先頭が 0x8f = FMT 15）は、aiortc の受信側が送った REMB です。同じ目的の報告形式は、IETF で RTCP の汎用の形として標準化もされています（[RFC 8888](https://www.rfc-editor.org/rfc/rfc8888.html)）。
+
+推定した速さは、映像の符号化器の目標のビットレートに渡されます。帯域が足りなくなったとき、TCP のように同じデータを待たせて送るのではなく、**解像度やフレームレートを落として、送るデータそのものを小さくする**のが、メディアの輻輳制御の特徴です。
+
+## 多人数: メッシュ、MCU、SFU
+
+ここまでは 2 者でした。参加者が N 人になると、つなぎ方が 3 通りに分かれます（[RFC 7667](https://www.rfc-editor.org/rfc/rfc7667.html) が RTP の構成を分類しています）。
+
+| 形 | 各端末の送信 | 各端末の受信 | サーバの仕事 |
+| --- | --- | --- | --- |
+| メッシュ | N−1 本（全員に同じ映像を別々に符号化して送る） | N−1 本 | シグナリングだけ |
+| MCU | 1 本 | 1 本（合成済み） | 全員の映像を復号し、1 枚に合成して再び符号化する |
+| SFU | 1 本（または数本） | N−1 本 | 復号せずに、パケットを選んで転送する |
+
+**メッシュ**はサーバの費用がかかりませんが、上りの帯域が人数に比例します。1 本 1.5Mbps の映像なら、5 人で上りに 6Mbps 要ります。家庭の回線の上りは下りより細いことが多く、数人が限度です。
+
+**MCU** は端末の負担が最も軽い代わりに、サーバで全員分の復号と符号化をするので CPU を多く使い、その処理の分だけ遅延も増えます。
+
+**SFU** は今の多人数の通話の主流の形です。SFU は WebRTC の相手として各端末と ICE、DTLS をつなぎ、受け取った RTP を復号も再符号化もせずに他の参加者へ転送します。公開アドレスで待つので、前回触れた ICE-lite で済みます。困るのは、**受け取る側ごとに回線の太さが違う**ことです。1 本しか送らなければ、最も細い回線の参加者に合わせるしかありません。そこで、次の 2 つを使います。
+
+- **サイマルキャスト**: 送る側が、同じ映像を**解像度の違う複数の符号化**（例えば 1080p、540p、270p）で同時に送る。SDP では `a=rid` と `a=simulcast` で表す（[RFC 8853](https://www.rfc-editor.org/rfc/rfc8853.html)、[RFC 8851](https://www.rfc-editor.org/rfc/rfc8851.html)）。SFU は受け取る側ごとに 1 つを選んで転送する
+- **SVC**（スケーラブル符号化）: 1 本の符号化の中を**層**に分ける。例えば時間方向の層なら、基本の層だけで 7.5fps、次の層を足すと 15fps、全部で 30fps になるように作る。SFU は上の層のパケットを捨てるだけで、細い回線向けの流れが作れる。VP9 や AV1 が対応し、ブラウザでは `scalabilityMode`（`L1T3` など）で指定する（[W3C webrtc-svc](https://www.w3.org/TR/webrtc-svc/)）
+
+<Callout type="warn" title="SFU は中身を見られる">
+  DTLS-SRTP の暗号化は**ホップごと**です。SFU は各端末と別々に DTLS を張るので、転送する前に SRTP を一度復号しています。
+  SFU の運営者からも中身を隠すには、符号化したフレームをアプリケーションの側でもう一度暗号化する必要があります。その形式が SFrame（[RFC 9605](https://www.rfc-editor.org/rfc/rfc9605.html)）で、ブラウザでは符号化の後のフレームに手を入れる API を使って実装します。
+</Callout>
+
+## DataChannel: DTLS の中の SCTP
+
+### なぜ SCTP なのか
+
+任意のデータを運ぶ部品には、**SCTP** が選ばれました（[RFC 8831](https://www.rfc-editor.org/rfc/rfc8831.html)）。SCTP は、もともと電話網の信号を IP で運ぶために作られた、TCP と並ぶトランスポートです。DataChannel に必要な性質を、最初から持っていました。
+
+- 1 つの関係（association）の中に**複数のストリーム**を持ち、ストリームの間で順序を待たせない
+- メッセージの境界を保つ（TCP のようなバイト列ではない）
+- ストリームの中で、順序を守るか守らないかを**メッセージごとに**選べる
+- **部分信頼性**（PR-SCTP）の拡張で、一定回数または一定時間で再送を諦められる（[RFC 3758](https://www.rfc-editor.org/rfc/rfc3758.html)、回数の方式は [RFC 7496](https://www.rfc-editor.org/rfc/rfc7496.html)）
+- TCP と同等の輻輳制御を持つ
+
+ただし、SCTP を IP の上に直接載せると、NAT もファイアウォールも通りません。そこで、**SCTP のパケットをそのまま DTLS のレコードに入れて**、ICE で開けた UDP の上を通します（[RFC 8261](https://www.rfc-editor.org/rfc/rfc8261.html)）。暗号化は DTLS が担い、SCTP はユーザ空間のライブラリとして動きます。
+
+### チャネルを開く
+
+DataChannel を開く手順は DCEP（[RFC 8832](https://www.rfc-editor.org/rfc/rfc8832.html)）が決めています。aiortc の記録を、DTLS の鍵で復号して SCTP として読みました（tshark の `-d dtls.port==<ポート>,sctp`）。
+
+```
+ 9  172.21.0.3  SCTP   INIT
+10  172.21.0.2  SCTP   INIT_ACK
+11  172.21.0.3  SCTP   COOKIE_ECHO
+12  172.21.0.2  SCTP   COOKIE_ACK
+13  172.21.0.3  RTCDC  DATA_CHANNEL_OPEN_REQUEST
+14  172.21.0.3  RTCDC  DATA_CHANNEL_OPEN_REQUEST
+15  172.21.0.2  RTCDC  DATA_CHANNEL_ACK
+17  172.21.0.2  RTCDC  DATA_CHANNEL_ACK
+```
+
+SCTP の 4 ウェイハンドシェイクの後、チャネルごとに OPEN を送り、ACK を受け取ります。2 つの OPEN の中身はこうでした。
+
+```
+DATA chunk (ordered, TSN: 0, SID: 1, SSN: 0, PPID: 50)
+  Channel type: DATA_CHANNEL_RELIABLE (0)
+  Reliability parameter: 0
+  Label: reliable
+
+DATA chunk (ordered, TSN: 1, SID: 3, SSN: 0, PPID: 50)
+  Channel type: DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED (129)
+  Reliability parameter: 0
+  Label: unreliable
+```
+
+**1 つの DataChannel は、SCTP の 1 本のストリーム**です。ストリーム番号（SID）が 1 と 3 の奇数なのは、両側が同時にチャネルを開いても番号が衝突しないよう、**DTLS のクライアントは偶数、サーバは奇数**を使う決まりだからです（[RFC 8832 4](https://www.rfc-editor.org/rfc/rfc8832.html#section-4)）。この接続では answer 側が `a=setup:active` で DTLS のクライアントになったので、offer 側は奇数を使っています。
+
+PPID（ペイロードの種類）の 50 は DCEP の制御メッセージで、アプリケーションのデータは文字列なら 51、バイナリなら 53 です（[RFC 8831 8](https://www.rfc-editor.org/rfc/rfc8831.html#section-8)）。
+
+チャネルの種類は、上位のビットが「順序を守らない」、下位が信頼性の方式を表します（[RFC 8832 5.1](https://www.rfc-editor.org/rfc/rfc8832.html#section-5.1)）。
+
+| 値 | 種類 | Reliability parameter の意味 |
+| --- | --- | --- |
+| 0x00 / 0x80 | 確実に届ける（順序あり / なし） | 使わない |
+| 0x01 / 0x81 | 再送の回数を制限する | 再送の最大回数 |
+| 0x02 / 0x82 | 時間を制限する | 再送を試みる最大の時間（ミリ秒） |
+
+JavaScript の API では、`createDataChannel(label, { ordered, maxRetransmits, maxPacketLifeTime })` がこれに対応します。`ordered` の既定は `true` で、`maxRetransmits` と `maxPacketLifeTime` は片方しか指定できません（[MDN](https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/createDataChannel)）。`maxRetransmits: 0` は「一度だけ送り、失われたら諦める」で、UDP に近い届け方になります。
+
+### 諦めたことを伝える
+
+再送しないと決めても、SCTP の受け取った側は、抜けた TSN（全ストリームを通した通し番号）が埋まるのを待ち続けます。送った側は、諦めた分を **FORWARD-TSN** で「ここまでは届いたことにしてよい」と知らせます（[RFC 3758 3.2](https://www.rfc-editor.org/rfc/rfc3758.html#section-3.2)）。
+
+pion の記録では、SCTP の INIT で両側が `RE_CONFIG`、`FORWARD_TSN`、`I_DATA`、`I_FORWARD_TSN` に対応していると伝え合い、実際のデータは **I-DATA**（種類 64）で、諦めの通知は **I-FORWARD-TSN**（種類 194）で送っていました。
+
+```
+I_FORWARD_TSN chunk
+  New cumulative TSN: 1968870721
+  Stream identifier: 3
+  Flags: U-Bit: Unordered messages
+  Message identifier: 15
+```
+
+I-DATA は、大きなメッセージを分割して送るときに、**別のストリームのメッセージを間に挟めるようにした**データの形式です（[RFC 8260](https://www.rfc-editor.org/rfc/rfc8260.html)）。従来の DATA では、1 つのメッセージの断片はすべて連続して送る必要があり、大きなファイルを 1 本のチャネルで送っている間は、他のチャネルの小さなメッセージが待たされました。RFC 8831 は I-DATA を使うべきだとし、使えない場合はメッセージを 16KB 程度に抑えるよう勧めています（[RFC 8831 6.6](https://www.rfc-editor.org/rfc/rfc8831.html#section-6.6)）。
+
+## 損失を入れて ordered と unordered を比べる
+
+pion で 2 本のチャネルを同時に開きました。
+
+- `reliable`: 既定の設定。順序あり、確実に届ける
+- `unreliable`: `Ordered: false`、`MaxRetransmits: 0`
+
+offer 側から、送った時刻を入れた約 200 バイトのメッセージを、毎秒 50 個、両方のチャネルに同じ番号で 1000 個ずつ送り、answer 側で受け取った時刻との差を測りました。2 つのコンテナは同じカーネルの時計を使うので、そのまま引き算できます。
+
+まず `delay 50ms` だけを入れた場合です。両チャネルとも 1000 個すべてが届き、中央値 51.4ms、p99 は 62ms 前後でした。
+
+次に `delay 50ms loss 5%` です。6 回繰り返した範囲を並べます（100ms を超えた数は、数え始めた後の 3 回分）。
+
+| | reliable（順序あり・確実） | unreliable（順序なし・再送 0 回） |
+| --- | --- | --- |
+| 届いた数 | 1000（6 回とも） | 942〜957 |
+| 中央値 | 52.4〜55.4ms | 51.5〜51.8ms |
+| p90 | 437〜664ms | 55.1〜78.9ms |
+| p99 | 1036〜1136ms | 76.2〜1112ms |
+| 100ms を超えた数 | 268〜318 | 14〜75 |
+
+**unreliable は、失われた約 5% がそのまま失われ、残りは片道の遅延どおりに届いています。**reliable はすべて届く代わりに、**3 割近くのメッセージが 100ms 以上遅れました**。失われたのは 5% なのに、遅れたのはその 6 倍です。
+
+遅れたメッセージの番号を並べると、理由が分かります。
+
+```
+reliable:   58:144  59:124  60:104  61:135  62:112  100:144 101:123 102:104 …
+            （番号:遅延 ms）
+```
+
+58 番が失われ、再送が届くまでの約 90ms の間、後から届いた 59、60 番も**58 番を待って**渡されません。20ms ずつ後に送られたので、待ち時間が 20ms ずつ短くなっています。順序を守るストリームの中で起きる HOL ブロッキングで、第 66 回の TCP と同じことが SCTP のストリームの中でも起きています。さらに、再送そのものが失われた場合などは、SCTP の再送タイマ（RTO の下限は 1 秒、[RFC 9260 16](https://www.rfc-editor.org/rfc/rfc9260.html#section-16)）を待つことになり、その間に送った 50 個前後がまとめて 1 秒以上遅れます。p99 が 1 秒を少し超えているのは、この形だと考えています（再送のパケットを 1 つずつ追跡してはいません）。
+
+unreliable の p99 が 1 秒を超えた回が 1 回ありました。この回は、231 番から 242 番までの十数個が続けて 1.1〜1.2 秒遅れています。unreliable のメッセージも、**同じ SCTP の関係の輻輳ウィンドウを共有**していて（[RFC 8831 5](https://www.rfc-editor.org/rfc/rfc8831.html#section-5)）、reliable の側で再送のタイムアウトが起きてウィンドウが縮むと、送り出し自体が待たされます。この遅れはそれで説明できますが、冒頭の環境の止まりと区別はできていません。
+
+<Callout type="warn" title="実装によって挙動が違う">
+  最初は aiortc で同じ比較をしました。損失を入れて 2 本のチャネルを同時に流すと、reliable は 38 個届いた後に止まり、送信側のバッファが増え続けました。reliable の 1 本だけなら、同じ条件で 1000 個すべて届きました。
+  順序なし・再送なしのチャネルを混ぜたときの処理に原因がありそうですが、突き止めてはいません。DataChannel の部分信頼性は、**使う実装で実際に損失を入れて試す**価値があります。
+</Callout>
+
+### どう使い分けるか
+
+- **ゲームの位置や入力**: 新しい値が来れば古い値は要らない。`ordered: false, maxRetransmits: 0` のチャネルで送る。次回のゲームの状態同期は、この「届かなくてよい」経路を前提にする
+- **チャットや操作の確定**: 失われては困り、順序も要る。既定のチャネルで送る
+- **ファイル転送**: 確実に届ける必要はあるが、遅延は気にならない。既定のチャネルで、`bufferedAmount` を見ながら送り、送信側のバッファを溢れさせない。小さな制御メッセージとは**別のチャネル**にすると、I-DATA に対応していれば、ファイルの断片の間に制御メッセージを挟める
+
+## QUIC、WebTransport と比べる
+
+第 75 回の QUIC も、確実に届けるストリームと再送しない DATAGRAM を 1 本の暗号化された接続に同居させていました。WebRTC の DataChannel と、やっていることはよく似ています。違いは積み方と、相手が誰かです。
+
+| | WebRTC DataChannel | WebTransport（QUIC） |
+| --- | --- | --- |
+| 積み方 | SCTP / DTLS / ICE / UDP | HTTP/3 / QUIC / UDP |
+| 相手 | 端末同士（サーバでもよい） | サーバだけ |
+| 接続の前に要るもの | シグナリングの経路、STUN、TURN | HTTP/3 を話すサーバと、その証明書 |
+| 相手の確かめ方 | SDP の fingerprint（シグナリングを信頼する） | Web の PKI（証明書の検証） |
+| 確実でないデータ | チャネルごとに回数か時間で諦める | DATAGRAM（一度だけ送る） |
+| 音声・映像 | RTP で運び、ジッタバッファ、輻輳制御、エコー除去までブラウザが持つ | 自分で WebCodecs などと組み合わせる |
+| ブラウザの対応 | 主要なブラウザすべて | Chrome、Firefox、そして Safari 26.4 から（[WebKit](https://webkit.org/blog/17862/webkit-features-for-safari-26-4/)） |
+| 仕様の状態（2026 年 10 月） | RFC と W3C 勧告（[W3C](https://www.w3.org/TR/webrtc/)、2025 年 3 月） | W3C は勧告候補、IETF はドラフト（[draft-ietf-webtrans-http3](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/)） |
+
+選び方は、まず**相手がサーバか端末か**で分かれます。
+
+- **ブラウザとサーバの間**で、確実なデータと捨ててよいデータを混ぜたいなら、WebTransport が素直です。シグナリングも ICE も要らず、サーバの側は普通の HTTP/3 のサーバとして作れます。WebTransport が使えなかった頃は、サーバの側に WebRTC の実装を置き、DataChannel を使っていました。今もその構成で動いているゲームはありますが、新しく作るなら WebTransport が第一の候補です
+- **端末同士**を直接つなぐなら、ブラウザで使えるのは今のところ WebRTC だけです。WebTransport の仕様は、端末同士の接続を扱っていません
+- **音声と映像の通話**なら、相手がサーバ（SFU）でも WebRTC です。ジッタバッファ、損失の隠蔽、遅延に基づく輻輳制御、エコー除去を自分で作る必要がありません。逆に、1 対多の配信で数秒の遅延を許せるなら、第 75 回の MoQ のように QUIC の上に組む方式も検討されています
+
+## まとめ
+
+- WebRTC は、SDP、ICE、DTLS、SRTP、SCTP を組み合わせたもの。SDP をどう運ぶか（シグナリング）は規格に含まれず、アプリケーションに任される
+- SDP の `m=` 行が 1 本のメディアを表す。BUNDLE と rtcp-mux で、音声、映像、データ、RTCP を 1 つの UDP の 5 つ組にまとめ、ICE の確認を 1 回で済ませる
+- `a=setup` で DTLS の役割を決め、両側が自己署名の証明書を出す。証明書は SDP の `a=fingerprint` と照らし合わせて確かめるので、安全性はシグナリングの経路の完全性に依存する。fingerprint を 1 文字変えると Bad Certificate で切れた
+- SRTP の鍵は DTLS から取り出し、メディアは DTLS に入れずに SRTP で送る。1 つのポートに流れる STUN、DTLS、RTP/RTCP は、先頭の 1 バイトで振り分ける
+- RTP はシーケンス番号、メディアの時刻のタイムスタンプ、SSRC だけを持ち、再送しない。受け取った側がジッタバッファで並べ、RTCP の RR で損失率やジッタを返す。映像は NACK と RTX で取り戻し、音声は隠蔽や FEC で埋め、取り戻せなければ PLI でキーフレームを求める
+- 輻輳制御は、待ち行列が満ちる前に遅延の変化で検知する。推定は受信側（REMB）でも送信側（transport-cc）でもでき、帯域が足りなければ送るデータそのものを小さくする
+- 多人数では SFU が主流。サイマルキャストや SVC で、受け取る側ごとに違う品質を転送する。SFU は SRTP を復号するので、運営者から隠すには SFrame が要る
+- DataChannel は DTLS の中の SCTP で、1 チャネルが 1 ストリーム。5% の損失で、順序あり・確実なチャネルは 3 割近くが 100ms 以上遅れ、順序なし・再送なしのチャネルは 5% を失う代わりに遅れなかった。どちらも 1 つの関係の輻輳ウィンドウを共有する
+- サーバとブラウザなら WebTransport、端末同士や通話なら WebRTC
+
+ここまでの 3 回で、データを**どう運ぶか**を見てきました。確実に届けるか、遅れたら捨てるか、端末同士か中継を挟むかです。次回は、その上で**何を送るか**を考えます。遅延も損失もある回線の向こうで、複数の参加者が同じゲームの世界を見ているように見せるために、ロックステップ、スナップショットの補間、予測と巻き戻し、ラグ補償、ロールバックを比べます。
