@@ -1,0 +1,511 @@
+---
+title: 証跡に残す
+description: 守りが効いていたことを、後から第三者に示すにはどうするか。監査ログの書き方、改ざんに気づける形、SIEM と Sigma、継続的統制モニタリング、SOC 2 までを、ハッシュ連鎖のログを手元で作って確かめる
+chapter: assure
+order: 8
+status: published
+topics:
+  - 監査ログ
+  - ハッシュ連鎖
+  - WORM / オブジェクトロック
+  - CloudTrail のログファイル検証
+  - SIEM
+  - Sigma
+  - 継続的統制モニタリング
+  - SOC 2 / Trust Services Criteria
+  - Type I / Type II
+  - ISO/IEC 27001
+requires:
+  - ll-174-sec-map
+  - ll-176-dast-iac-cspm
+  - ll-103-hash-mac
+  - ll-171-opentelemetry
+---
+
+import Callout from '../../components/Callout.astro'
+
+第 174 回で、この章を**設計・実装・検査・証跡**の 4 段に分けました。脅威モデリングでリスクを洗い出し（設計）、OWASP や CIS の基準に沿って作り（実装）、SAST・SCA・DAST・IaC 検査・CSPM・SLSA で効き続けているかを機械で確かめる（検査）ところまでを、第 175〜180 回で見てきました。
+
+この回は最後の段です。検査で「問題なし」と出ても、それが**手元の画面に一瞬表示されただけ**なら、後から誰にも示せません。半年後に顧客や監査人から「この期間、管理者権限の付与は承認を経ていましたか」と聞かれたとき、答えになるのは記憶ではなく**記録**です。ここでは、記録を残し、改ざんされていないと言える形にし、集めて見張り、最後に第三者の評価（SOC 2）につなげるまでを見ます。第 26 章の、そして低レイヤの読み物全体の最後の回です。
+
+## ログと証跡は何が違うのか
+
+第 171 回で見たログやトレースは、主に**運用のため**のものです。障害の原因を探す、遅い処理を見つける。古いものは捨ててよく、多少欠けても困りません。
+
+**証跡（audit trail）**は目的が違います。「誰が、いつ、何をしたか」を**後から主張するため**の記録です。そのため、次の性質が求められます。
+
+| 性質 | 運用のログ | 証跡 |
+| --- | --- | --- |
+| 読む人 | 開発者・運用者 | 監査人、調査担当、ときに裁判 |
+| 欠けたとき | 不便 | 「やっていない」と見なされうる |
+| 書き換え | 気にしない | **書き換えられていないと言えること**が価値の大半 |
+| 保存期間 | 数日〜数週間 | 規程で決めた期間（年単位のことが多い） |
+| 書き込める人 | アプリ自身 | 記録される本人とは別の経路で守る |
+
+最後の行が重要です。管理者が自分の操作を記録したログを、同じ管理者が消せるなら、そのログは管理者の不正の証拠になりません。
+
+そしてもう 1 つ。証跡は監査ログだけではありません。第 175〜178 回の検査の結果も、**「この期間、このリポジトリの変更はすべて SAST を通っていた」「この期間、公開バケットは 0 だった」**という証拠になります。検査を自動化した時点で、証拠の大半はすでに生まれています。足りないのは、それを**残し、統制と結び付け、示せる形にする**部分です。
+
+## 監査ログに何を書くか
+
+監査ログの 1 行には、少なくとも次の 5 つが要ります。OWASP の Logging Cheat Sheet も、イベントの属性を **when・where・who・what** に分けて挙げています（[OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)）。
+
+| 項目 | 例 | 注意 |
+| --- | --- | --- |
+| 誰が | `actor: alice`、サービスアカウント名 | 共有アカウントでは個人を特定できない。第 128 回のワークロード ID なら機械の主体も区別できる |
+| いつ | `2026-10-07T09:02:14Z` | UTC と ISO 8601 で揃える。時刻同期が崩れると相関できない |
+| 何を | `action: role.grant`、`target: user:bob role:admin` | 操作の種類と対象を、後で検索できる固定の語彙で |
+| どこから | 送信元 IP、端末、API かコンソールか | プロキシの後ろでは、`X-Forwarded-For` のような利用者が偽れるヘッダをそのまま信じない |
+| 結果 | `success` / `denied` / `error` | **失敗も書く**。拒否の連続は攻撃の兆候 |
+
+何を記録するかについて、同じ資料は、認証の成功と失敗、認可の失敗、管理者の操作のような高リスクの機能の使用などを挙げています。逆に、セッション ID、アクセストークン、パスワード、接続文字列、鍵などは**書かない**か、マスクするよう求めています（[OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)）。第 177 回で見たとおり、ログはシークレットが漏れる主要な経路の 1 つです。
+
+もう 1 つ見落とされやすいのが**ログへの注入**です。利用者の入力に改行が含まれていると、偽の 1 行を差し込めてしまいます。OWASP Top 10 の 2025 年版の A09 は、ログのデータを正しくエンコードして、ログや監視の仕組みへの注入を防ぐよう求めています（[OWASP Top 10:2025 A09](https://top10.owasp.org/2025/A09_2025-Security_Logging_and_Alerting_Failures)）。1 行を 1 つの JSON にして、文字列はシリアライザに任せれば、改行はエスケープされます。
+
+<Callout type="note" title="Monitoring から Alerting へ">
+  OWASP Top 10 の 2021 年版で「Security Logging and Monitoring Failures」だった A09 は、2025 年版で「Security Logging and Alerting Failures」に名前が変わりました。
+  理由は、**記録したイベントに対して行動を起こさせる通知の役割**を強調するためだと説明されています（[OWASP Top 10:2025 A09](https://top10.owasp.org/2025/A09_2025-Security_Logging_and_Alerting_Failures)）。
+  記録しただけで誰も見ないログは、事故の後に読まれるだけです。
+</Callout>
+
+## 実験の環境
+
+| 項目 | バージョン |
+| --- | --- |
+| OS | macOS 26.2 |
+| Python | 3.14.0（すべて `python3 -I` で実行） |
+| SQLite（Python に組み込み） | 3.51.0 |
+| sigma-cli | 3.1.0 |
+| pySigma | 1.5.1 |
+| pySigma-backend-splunk | 2.1.0 |
+| pySigma-backend-elasticsearch | 2.1.1 |
+| pySigma-backend-sqlite | 2.0.0 |
+
+sigma-cli は Python の仮想環境に `pip install sigma-cli` で入れ、バックエンドは `sigma plugin install splunk` のように追加しました。Docker は使っていません。
+
+## 改ざんに気づける形: ハッシュ連鎖
+
+ファイルに追記するだけのログは、ファイルを書き換えられる人なら誰でも書き換えられます。書き換え自体を防ぐのは保存先の仕事（後で見ます）ですが、その前に、**書き換えられたら気づける**形にしておくことはできます。
+
+方法は単純です。各行に、**直前の行のハッシュ**と、**直前のハッシュとこの行の中身をつないだもののハッシュ**を書きます。第 103 回で見た SHA-256 を使います。
+
+```
+行 1: { 中身1, prev: 000…0, hash: H(000…0 ‖ 中身1) = h1 }
+行 2: { 中身2, prev: h1,     hash: H(h1 ‖ 中身2)     = h2 }
+行 3: { 中身3, prev: h2,     hash: H(h2 ‖ 中身3)     = h3 }
+```
+
+行 2 の中身を 1 文字変えると h2 が変わり、行 3 の `prev` と合わなくなります。行を 1 つ抜いても、つなぎ目が合わなくなります。Git のコミットが親のハッシュを含むのと同じ考え方です。
+
+これを Python で書きました。
+
+```python
+import hashlib, json, sys
+
+GENESIS = "0" * 64
+
+def entry_hash(prev, body):
+    data = prev + json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(data.encode()).hexdigest()
+
+def append(path, body):
+    prev = GENESIS
+    try:
+        with open(path) as f:
+            for line in f:
+                prev = json.loads(line)["hash"]
+    except FileNotFoundError:
+        pass
+    rec = dict(body, prev=prev, hash=entry_hash(prev, body))
+    with open(path, "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec["hash"]
+
+def verify(path):
+    prev = GENESIS
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            rec = json.loads(line)
+            body = {k: v for k, v in rec.items() if k not in ("prev", "hash")}
+            if rec["prev"] != prev:
+                return f"NG: {n} 行目の prev が直前の hash と一致しない"
+            if rec["hash"] != entry_hash(prev, body):
+                return f"NG: {n} 行目の内容が hash と一致しない"
+            prev = rec["hash"]
+    return f"OK: {n} 行、末尾の hash = {prev[:16]}..."
+```
+
+ハッシュを取る前に、JSON をキーの順に並べ、空白を除いた形（`sort_keys=True` と `separators`）にしているのが要点です。同じ中身でもキーの順や空白が違えば別のバイト列になり、別のハッシュになります。**ハッシュを取る前の正規化**を決めておかないと、検証する側が同じ値を再現できません。
+
+ログインし、管理者権限を付けて、データを書き出して、権限を外す、という 4 件のイベントを、`append` を 4 回呼ぶだけの小さなスクリプト（`demo.py`）で書き込みました。
+
+```bash
+python3 -I demo.py audit.jsonl
+python3 -I auditlog.py verify audit.jsonl
+```
+
+```
+db0d8a7df650d8b9
+c19cdd88c5fc01c3
+0248b9382ce289a7
+baf2ac006cd1e4ed
+OK: 4 行、末尾の hash = baf2ac006cd1e4ed...
+```
+
+できたファイルの 2 行目と 3 行目はこうなっています（実際は 1 行ずつ）。
+
+```json
+{"ts": "2026-10-07T09:02:14Z", "actor": "alice", "action": "role.grant", "target": "user:bob role:admin", "src_ip": "203.0.113.10", "result": "success", "prev": "db0d8a7df650d8b967835aa453cdb9e6e1714aa16fd14f8ad63359ed69d879a9", "hash": "c19cdd88c5fc01c38b30831d8a59d0d6d0821ba695ddeda78d733dd9c798220e"}
+{"ts": "2026-10-07T09:05:40Z", "actor": "bob", "action": "export", "target": "table:customers", "src_ip": "198.51.100.7", "result": "success", "prev": "c19cdd88c5fc01c38b30831d8a59d0d6d0821ba695ddeda78d733dd9c798220e", "hash": "0248b9382ce289a7b92f9c831926e7b828c03d829e9d19dbcaa6a2b60cf6b39a"}
+```
+
+3 行目は、bob が権限を得てすぐに顧客テーブルを書き出した記録です。bob がこれを隠したいとします。
+
+**書き換える。** 3 行目の `actor` を `carol` に変えます。
+
+```bash
+cp audit.jsonl t1.jsonl
+sed -i '' '3s/"actor": "bob"/"actor": "carol"/' t1.jsonl
+python3 -I auditlog.py verify t1.jsonl
+```
+
+```
+NG: 3 行目の内容が hash と一致しない
+```
+
+**消す。** 3 行目を丸ごと削除します。
+
+```bash
+sed '3d' audit.jsonl > t2.jsonl
+python3 -I auditlog.py verify t2.jsonl
+```
+
+```
+NG: 3 行目の prev が直前の hash と一致しない
+```
+
+削除した行の次の行（元の 4 行目）が、新しい 3 行目として「自分の前は 0248… のはず」と主張し、それが合わないので気づけます。ここまでは期待どおりです。
+
+## 連鎖だけでは足りない
+
+ところが、次の 2 つは検出できません。
+
+**末尾を切る。**
+
+```bash
+head -2 audit.jsonl > t3.jsonl
+python3 -I auditlog.py verify t3.jsonl
+```
+
+```
+OK: 2 行、末尾の hash = c19cdd88c5fc01c3...
+```
+
+連鎖は「前とのつながり」しか見ていないので、後ろを丸ごと落としても、残った部分は正しい連鎖のままです。
+
+**作り直す。** 3 行目を抜いて、以降のハッシュをすべて計算し直し、ついでに無害な 1 行を足して行数も 4 に揃えます。ハッシュには鍵がないので、ファイルを書ける人なら誰でも計算できます。
+
+```python
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from auditlog import append
+src, dst = sys.argv[1], sys.argv[2]
+for n, line in enumerate(open(src), 1):
+    if n == 3:
+        continue
+    rec = json.loads(line)
+    append(dst, {k: v for k, v in rec.items() if k not in ("prev", "hash")})
+append(dst, {"ts": "2026-10-07T09:07:00Z", "actor": "bob", "action": "logout",
+             "target": "console", "src_ip": "198.51.100.7", "result": "success"})
+```
+
+```bash
+python3 -I forge.py audit.jsonl forged.jsonl
+python3 -I auditlog.py verify forged.jsonl
+```
+
+```
+OK: 4 行、末尾の hash = f4b8726a348a2d48...
+```
+
+完全に正しい連鎖になりました。**ハッシュ連鎖は、ファイルだけを見ている限り、作り直しに対して無力です。**
+
+対策は、**連鎖の先頭（最新のハッシュ）を、ログとは別の場所に控えておく**ことです。4 行書いた時点で `baf2ac…` を外に控えておけば、作り直した版はそこで食い違います。控えた値と照合する関数を足しました。
+
+```python
+def anchor_check(path, expected, count):
+    lines = open(path).read().splitlines()
+    if len(lines) < count:
+        return f"NG: 外に控えた時点では {count} 行あったが、今は {len(lines)} 行"
+    got = json.loads(lines[count - 1])["hash"]
+    if got != expected:
+        return f"NG: {count} 行目の hash が控えと違う ({got[:16]}... != {expected[:16]}...)"
+    return f"OK: {count} 行目までは控えと一致"
+```
+
+```bash
+H=baf2ac006cd1e4ed3a4c5480bda015509d49f24b446fd00a31f9bbfa723519e5
+python3 -I auditlog.py anchor audit.jsonl  $H 4
+python3 -I auditlog.py anchor t3.jsonl     $H 4
+python3 -I auditlog.py anchor forged.jsonl $H 4
+```
+
+```
+OK: 4 行目までは控えと一致
+NG: 外に控えた時点では 4 行あったが、今は 2 行
+NG: 4 行目の hash が控えと違う (f4b8726a348a2d48... != baf2ac006cd1e4ed...)
+```
+
+末尾の切り落としも作り直しも、控えと比べれば分かります。つまり、ハッシュ連鎖の役割は**ログ全体の状態を 32 バイトに縮めること**です。守るべきものが大きなファイルから 1 つの値に変わり、その値を、ログを書き換えられる人の手が届かない場所（別のアカウント、別の組織、紙でもよい）へ定期的に送ればよくなります。
+
+控える代わりに、第 103 回の HMAC を使う方法もあります。ハッシュの計算に鍵を混ぜれば、鍵を持たない人は作り直せません。ただしその場合は、**鍵をログの書き手から隔離する**問題に置き換わるだけです。どちらにしても、どこかに「書き換える人が触れないもの」が要ります。
+
+<Callout type="warn" title="改ざん検知は、改ざん防止ではない">
+  ハッシュ連鎖で分かるのは「書き換えられた」ことだけで、元の内容は戻りません。
+  検知した時点で、その区間の証跡は失われています。
+  書き換え自体を防ぐのは、次に見る保存先の仕組みです。両方を重ねて使います。
+</Callout>
+
+## 外に控える仕組み: WORM とダイジェスト
+
+実際のクラウドには、ここまで手で作ったものがそのまま用意されています。
+
+**書き換えられない保存先（WORM）。** Amazon S3 の Object Lock は、オブジェクトを一定期間、削除も上書きもできなくする仕組みで、書き込みは 1 回、読み出しは何度でもという **WORM（write-once-read-many）**のモデルを取ります。保持の方式は 2 つあり、**governance モード**では特別な権限を持つ利用者なら設定を外せますが、**compliance モード**ではアカウントの root ユーザーを含め誰も、保持期間が終わるまで上書きも削除もできません（[Amazon S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)）。証跡の置き場所としては、管理者自身が消せないことに意味があります。
+
+**ダイジェストによる検証。** AWS CloudTrail のログファイル整合性の検証は、SHA-256 でハッシュを取り、SHA-256 with RSA で署名します。CloudTrail は 1 時間ごとに、その 1 時間に届けたログファイルとそれぞれのハッシュを並べた**ダイジェストファイル**を作り、秘密鍵で署名します。各ダイジェストファイルには**直前のダイジェストファイルの署名**も含まれます（[CloudTrail のログファイル整合性の検証](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-log-file-validation-intro.html)）。
+
+これは実験で作ったものとほぼ同じ構造です。
+
+| 実験 | CloudTrail |
+| --- | --- |
+| 各行のハッシュ | 各ログファイルのハッシュ |
+| `prev` で前の行とつなぐ | ダイジェストが前のダイジェストの署名を含む |
+| 先頭のハッシュを外に控える | ダイジェストを AWS の鍵で署名する |
+
+署名が控えの役割を果たします。利用者は秘密鍵を持っていないので、ログを書き換えても正しい署名のダイジェストは作れません。同じページは、この仕組みでログファイルが**削除または変更されたこと**や、ある期間に**ログが 1 つも届いていないこと**まで主張できると説明しています。後者は、実験の「末尾を切る」攻撃への答えです。
+
+第 111 回で見た Certificate Transparency も同じ系統です。CT のログは**追記だけの Merkle 木**で、誰でも CA の発行とログ自身を監査できるように設計されています（[RFC 9162](https://www.rfc-editor.org/rfc/rfc9162)）。第 80 回の Merkle 木を、改ざんに気づくための構造として使っている例です。
+
+<Callout type="tip" title="証跡は別のアカウントへ">
+  監査ログは、記録される側のアカウントとは別の、ログ保管専用のアカウントやプロジェクトへ送るのが定石です。
+  本番のアカウントの管理者権限を奪われても、ログの保管先には書き込みしかできない、という形にしておけば、侵入者は自分の足跡を消せません。
+  第 160 回で見た「権限を分ける」考え方を、ログに当てはめたものです。
+</Callout>
+
+## SIEM: 集めて、揃えて、つなげる
+
+1 つのアプリの監査ログだけを見ていても、攻撃の全体は見えません。IdP のログイン、クラウドの API 呼び出し（CloudTrail）、アプリの監査ログ、エンドポイントの記録を**同じ場所で同時に**見る必要があります。それをする仕組みが **SIEM（Security Information and Event Management）**です。やっていることは 4 つに分けられます。
+
+1. **集約** — 各所のログを 1 か所に集める。第 171 回の OpenTelemetry のコレクタと同じく、送り手と受け手の間に中継を置くことが多い
+2. **正規化** — フィールド名を揃える。IdP は `user.email`、クラウドは `userIdentity.arn`、アプリは `actor` と、同じ「誰が」が別の名前で届く
+3. **相関** — 別々のログを、人・時刻・IP でつなぐ。「普段と違う国からのログイン」の 5 分後に「管理者権限の付与」があった、のように
+4. **検知ルール** — 条件に合ったら通知する
+
+ログの管理全般については、NIST の SP 800-92 が組織のログ管理の進め方を指針としてまとめています（[NIST SP 800-92](https://csrc.nist.gov/pubs/sp/800/92/final)）。
+
+### Sigma: 検知ルールを製品から切り離す
+
+検知ルールは、SIEM の製品ごとにクエリ言語が違います。Splunk なら SPL、Elasticsearch なら Lucene や ES|QL です。製品を替えるとルールを全部書き直すことになり、他の組織とルールを共有することもできません。
+
+**Sigma** は、この問題を解くための SIEM 向けの汎用のルール形式です。ルールは YAML で書き、仕様には検知ルール、相関ルール、フィルタの 3 種類が定められています（[Sigma specification](https://github.com/SigmaHQ/sigma-specification)）。書いたルールは **sigma-cli** で各製品のクエリへ変換します（[sigma-cli](https://github.com/SigmaHQ/sigma-cli)）。
+
+実験の監査ログに対して、「admin ロールの付与が成功した」を検知するルールを書きました。
+
+```yaml
+title: 管理者権限の付与
+id: 5b0f6a3e-2d7c-4c8e-9a51-7c1f0d9e4a21
+status: experimental
+description: 誰かに admin ロールが付与されたことを検知する
+logsource:
+  product: myapp
+  service: audit
+detection:
+  selection:
+    action: role.grant
+    target|contains: 'role:admin'
+    result: success
+  condition: selection
+fields:
+  - actor
+  - target
+  - src_ip
+level: high
+```
+
+`detection` の `selection` に並べた条件は AND で結ばれ、`condition` でそれらの組み合わせを指定します。`target|contains` の `|contains` は**修飾子**で、完全一致ではなく部分一致を意味します。
+
+これを 3 つの製品向けに変換しました。
+
+```bash
+sigma convert -t splunk --without-pipeline rule.yml
+sigma convert -t lucene --without-pipeline rule.yml
+sigma convert -t esql   --without-pipeline rule.yml
+sigma convert -t sqlite --without-pipeline rule.yml
+```
+
+```
+action="role.grant" target="*role:admin*" result="success" | table actor,target,src_ip
+action:role.grant AND target:*role\:admin* AND result:success
+from * metadata _id, _index, _version | where action=="role.grant" and target like "*role:admin*" and result=="success"
+SELECT * FROM logs WHERE `action`='role.grant' AND target LIKE '%role:admin%' ESCAPE '\' AND result='success'
+```
+
+`contains` が、Splunk と Lucene では `*…*` のワイルドカードに、SQL では `LIKE '%…%'` に置き換わっているのが分かります。Lucene では `:` がフィールドの区切りと衝突するので `\:` とエスケープされています。こうした方言の違いを、ルールを書く側は気にしなくて済みます。
+
+最後の SQL は、実際に流せます。監査ログを SQLite のメモリ上の表 `logs` に読み込み、変換結果をそのまま実行しました。
+
+```python
+import json, sqlite3, sys
+db = sqlite3.connect(":memory:")
+cols = ("ts", "actor", "action", "target", "src_ip", "result")
+db.execute(f"CREATE TABLE logs ({', '.join(cols)})")
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    db.execute("INSERT INTO logs VALUES (?,?,?,?,?,?)", [r[c] for c in cols])
+for row in db.execute(sys.stdin.read()):
+    print(row)
+```
+
+```bash
+sigma convert -t sqlite --without-pipeline rule.yml 2>/dev/null | python3 -I query.py audit.jsonl
+```
+
+```
+('2026-10-07T09:02:14Z', 'alice', 'role.grant', 'user:bob role:admin', '203.0.113.10', 'success')
+```
+
+4 行のうち、alice が bob に admin を付けた 1 行だけが引っかかりました。
+
+ここでは `--without-pipeline` を付けて、ルールのフィールド名をそのまま使いました。実際には、ルールの `action` が SIEM の側では `event.action` だったりします。この対応付けをするのが**処理パイプライン**で、Sigma のルール中のフィールド名を実際のログで使われているフィールド名に写します（[Sigma: Processing Pipelines](https://sigmahq.io/docs/digging-deeper/pipelines.html)）。SIEM の 2 番目の仕事である正規化を、ルールの変換時に済ませる仕組みです。
+
+<Callout type="note" title="1 行のルールと、つながりのルール">
+  このルールは 1 行だけを見ています。
+  「権限を付けた後、10 分以内に大量の書き出しがあった」のように複数のイベントをつなぐには、Sigma の相関ルールを使います。
+  ただし相関は SIEM 側の機能に強く依存し、すべてのバックエンドで同じように変換できるわけではありません。
+  まず単体のルールで確実に拾い、相関はその上に重ねる順に作るのが無難です。
+</Callout>
+
+## 継続的統制モニタリング: 証拠を自動で集める
+
+ここまでで、監査ログを残し、守り、見張ることができました。しかし監査で求められるのは、監査ログだけではありません。
+
+- 全員に MFA が有効になっていたか
+- 退職者のアカウントは期限内に止められたか
+- 本番への変更はレビューを経ていたか
+- 公開されたストレージはなかったか
+- 依存の脆弱性は期限内に直されていたか
+
+これらを年に 1 度、スクリーンショットを集めて示すやり方では、**撮った瞬間の状態**しか分かりません。第 174 回で見たドリフトの問題そのものです。
+
+**継続的統制モニタリング（continuous control monitoring）**は、これを機械に任せる考え方です。代表的な製品に Vanta や Drata があります。仕組みはどれも似ていて、
+
+1. クラウド、IdP、HR システム、Git ホスティング、チケット管理などに **API で接続**する
+2. 設定や状態を定期的に取得し、「MFA が全員に有効」のような**テスト**を走らせる
+3. テストの結果を、**統制**と**フレームワークの要求**に結び付けて保存する
+
+という流れです。Vanta の文書は、クラウド環境や IdP、HR システムを接続すると、インフラを継続的に監視し、証拠を自動で集め、準拠から外れたときに通知できると説明し、テストを「特定のセキュリティ設定（例えば MFA が有効か）の自動チェックで、合格すると監査に使える証拠を生む」ものと定義しています（[Vanta: Integration Journey](https://help.vanta.com/en/articles/15878233-integration-journey-what-to-connect-first-in-vanta)）。Drata の文書も、接続によって元のシステムから直接情報を取得し、ある時点だけでなく継続的に要件を確かめると説明し、標準の接続がない社内システムについては、構造化した証拠を JSON で送り込む独自の接続やテストを作れるとしています（[Drata: Understanding Connections](https://help.drata.com/en/articles/13273728-understanding-connections-in-drata)）。
+
+製品の名前を外せば、やっていることは第 176 回の CSPM と同じです。**API で現在の状態を集め、基準と比べる。**違いは、比べる相手が CIS Benchmarks のような技術的な基準ではなく、**監査のフレームワークの要求**であることと、結果を**期間にわたって残す**ことにあります。
+
+### 統制と証拠の対応表
+
+この仕組みの中心にあるのは、次のような**対応表**です。
+
+| 統制（自社が決めた約束） | 証拠 | 集め方 | この章の回 |
+| --- | --- | --- | --- |
+| 本番の変更はレビューを経る | ブランチ保護の設定、PR の承認記録 | Git ホスティングの API | 第 178 回 |
+| 依存の重大な脆弱性は 30 日以内に直す | SCA の検出と解消の日時 | SCA ツールの API | 第 175 回 |
+| 公開ストレージを作らない | CSPM の結果の履歴 | クラウドの API | 第 176 回 |
+| シークレットをリポジトリに置かない | secret scanning の検出と対応の記録 | Git ホスティングの API | 第 177 回 |
+| 管理者権限の付与は記録し、検知する | 監査ログ、SIEM の通知と対応の記録 | ログ保管先・SIEM | この回 |
+| 退職者のアカウントを当日中に止める | HR の退職日と IdP の無効化日時の突き合わせ | HR・IdP の API | 第 125 回 |
+
+左の列は、組織が自分で決める約束です。右の列が、その約束を守っていたことを示す材料です。**検査を自動化していれば、その実行記録がそのまま証拠になる**、というのがこの章の 4 段がつながる場所です。逆に、検査を自動化していない統制は、毎回人が証拠を作ることになります。
+
+<Callout type="warn" title="テストが緑でも、統制が効いているとは限らない">
+  自動のテストが見ているのは、接続した範囲の、テストが定義した項目だけです。
+  接続していないシステムは監視されず、Drata の文書も、接続していないシステムでは証拠を手で上げる必要がありうるとしています（[Drata: Understanding Connections](https://help.drata.com/en/articles/13273728-understanding-connections-in-drata)）。
+  「全員 MFA 有効」のテストが緑でも、IdP を通らない管理用のアカウントが別にあれば、そこは見えていません。
+  ダッシュボードの緑は、**どこまでを見ているかを把握したうえで**信じるものです。
+</Callout>
+
+## SOC 2: 第三者に示す
+
+集めた証拠を、最終的に誰に見せるのか。B2B の SaaS では、多くの場合、顧客のセキュリティ審査です。顧客ごとに何百もの質問票に答える代わりに、**独立した監査人の報告書**を渡して答えに代える。その代表が **SOC 2** です。
+
+SOC 2 は、米国公認会計士協会（AICPA）の枠組みに基づく、サービス提供組織の統制についての監査報告書です。評価の基準は **Trust Services Criteria（TSC）**で、**セキュリティ、可用性、処理のインテグリティ、機密性、プライバシー**の 5 つの区分があります（[AICPA: 2017 Trust Services Criteria (With Revised Points of Focus — 2022)](https://www.aicpa-cima.com/resources/download/2017-trust-services-criteria-with-revised-points-of-focus-2022)）。どの区分を報告の範囲に含めるかは、サービスの性質に応じて選びます。
+
+注意したいのは、TSC が**「何をすべきか」の具体的な設定項目ではない**ことです。「論理的なアクセスを制限している」「システムの異常を監視している」のような**達成すべき状態**が書かれていて、それを**どういう統制で満たすかは組織が決めます**。前の節の対応表の左の列を書くのは自社で、監査人はそれが TSC を満たすか、実際に守られていたかを評価します。
+
+### Type I と Type II
+
+SOC 2 の報告書には 2 種類あります。
+
+| | Type I | Type II |
+| --- | --- | --- |
+| 評価の時点 | **特定の日付の時点** | **一定の期間** |
+| 評価すること | 統制が適切に設計されているか | 設計に加えて、期間を通じて**実際に運用されていたか** |
+| 監査人がすること | 統制の存在と設計を確かめる | 期間内の記録からサンプルを取って、統制が毎回効いていたかを試す |
+
+AICPA の解説でも、Type I では監査人が**特定の日付の時点で**統制を評価すると説明されています（[AICPA: Maintaining high standards for SOC engagements](https://www.aicpa-cima.com/professional-insights/video/maintaining-high-standards-for-soc-engagements)）。
+
+Type I は、統制を作った直後に取れます。一方 Type II は、「この期間に入社した人の中から何人かを選び、その全員が初日に MFA を設定していたか」「この期間の本番変更から何件かを選び、すべてにレビューがあったか」を記録で確かめます。**期間の途中で記録が欠けていれば、その統制は運用されていなかったと評価されえます。**
+
+ここで、この回の前半とつながります。Type II が求めているのは、**期間を通じて効き続けていたことの証拠**です。年に 1 度スクリーンショットを撮る運用では答えられず、検査の自動化、改ざんに気づける監査ログ、継続的統制モニタリングの記録が、そのまま答えになります。この章の題名「守りが効き続けているか」の問いに、第三者の言葉で答えたものが Type II の報告書です。
+
+<Callout type="note" title="報告書の受け渡し">
+  SOC 2 の報告書には、システムの構成や統制の詳細が書かれます。そのため利用者を限った報告書として扱われ、秘密保持契約を結んだ顧客などに渡すのが一般的です。
+  自由に配布してよいものとしては SOC 3 があります。SOC 2 と同じ区分を扱いますが、SOC 2 ほどの詳細は含みません（[AICPA: SOC 3](https://www.aicpa-cima.com/topic/audit-assurance/audit-and-assurance-greater-than-soc-3)）。
+</Callout>
+
+## ISO/IEC 27001 との違い
+
+SOC 2 と並んでよく求められるのが **ISO/IEC 27001** です。これは**情報セキュリティマネジメントシステム（ISMS）**の要求事項を定めた国際規格で、現行は 2022 年 10 月に出た第 3 版です。リスク管理の過程を通じて情報の機密性・完全性・可用性を保つ**仕組み**を、組織が作り、運用し、改善し続けることを求めています（[ISO/IEC 27001:2022](https://www.iso.org/standard/27001)）。
+
+違いを大まかに並べると、次のようになります。
+
+| | SOC 2 | ISO/IEC 27001 |
+| --- | --- | --- |
+| 何か | 監査人による**報告書** | 規格への適合の**認証** |
+| 主に見るもの | 個々の統制が設計どおり効いていたか | リスクを管理する仕組み（ISMS）が回っているか |
+| 結果の形 | 統制とテスト結果を記した詳細な報告書 | 認証書（合否） |
+| よく求められる場面 | 北米の顧客 | 欧州・アジアを含む国際的な取引 |
+
+両方が求める証拠はかなり重なります。アクセス管理、変更管理、ログと監視、脆弱性管理。統制を 1 つの表にまとめ、それぞれを複数のフレームワークの要求に結び付けておけば、同じ証拠を使い回せます。継続的統制モニタリングの製品が複数のフレームワークを扱うのは、この重なりがあるからです。
+
+## この章を終えて
+
+第 26 章では、守りを 4 段で見てきました。
+
+1. **設計** — 脅威モデリングでリスクを洗い出し、どこに統制を置くかを決める（第 174 回）
+2. **実装** — OWASP の ASVS や CIS Benchmarks の基準に沿って作る。シークレット、テナントの境界、ファイルの取扱いのように、事故が起きやすい場所は個別に固める（第 177・179・180 回）
+3. **検査** — SAST と SCA でコードと依存を、DAST・IaC 検査・CSPM で動いているものと設定を、SLSA・SBOM・署名で作ってから配るまでを、機械で確かめ続ける（第 175・176・178 回）
+4. **証跡** — その結果と監査ログを、改ざんに気づける形で残し、統制と結び付け、第三者に示す（この回）
+
+1 段目から 3 段目までは「守る」ための仕事で、4 段目は「守っていたと示す」ための仕事です。後者は前者の副産物として作れます。検査が自動化されていれば、証拠は勝手に積み上がります。
+
+そして、ここまでで低レイヤの読み物は終わりです。
+
+第 1 章で 0 と 1 から始め、CPU が命令を実行する仕組み、メモリの階層、アドレスの変換、プログラムが実行可能になるまで、複数の流れが同時に走る仕組み、カーネルとの境界、データを残す仕組み、ネットワーク、名前を引く仕組み、サービス同士の通信とリアルタイムの配信、データベースの中身を見ました。続いて、ブラウザの中身とその境界、暗号の道具、TLS、認証と認可、シングルサインオン、メールが届くまでを通り、言語の壁を越える方法、全体の起動、コンテナで本番に届けて大量に動かし続ける仕組み、本番で動いているものを観測し測る方法を経て、最後に、その守りが効き続けていることを確かめ、証跡として示すところまで来ました。
+
+ここから先は、**実際に作る番**です。
+
+1. **論理回路からコンピュータへ** — NAND から CPU を組み、機械語を走らせる
+2. **アセンブラからコンパイラへ** — 自作言語を自作 CPU まで落とす
+3. **NES エミュレータ** — 実在するハードウェアを再現する
+
+<a href={`${import.meta.env.BASE_URL}build/`}>「作る」へ進む →</a>
+
+読んで分かった気になっていたことが、作ってみると分かっていなかったと気づきます。それが目的です。
+
+## まとめ
+
+- 証跡は、運用のログと違い、**後から主張するための記録**。書き換えられていないと言えることに価値がある
+- 監査ログの 1 行には、誰が・いつ・何を・どこから・結果を書く。失敗も書き、シークレットは書かない。1 行 1 JSON にして注入を防ぐ
+- ハッシュ連鎖は書き換えと途中の削除に気づけるが、**末尾の切り落としと作り直しには気づけない**。最新のハッシュを外に控えて初めて効く
+- 書き換えを防ぐのは WORM（S3 Object Lock の compliance モードなど）。CloudTrail のダイジェストは、ハッシュ連鎖と署名を組み合わせた同じ構造
+- SIEM は集約・正規化・相関・検知ルール。Sigma はルールを YAML で書き、sigma-cli で各製品のクエリに変換する
+- 継続的統制モニタリングは、API で状態を集めてテストし、統制と証拠の対応表に結び付けて期間にわたって残す。見ている範囲の外は見えない
+- SOC 2 は TSC の 5 区分に基づく監査報告書。Type I は時点の設計、Type II は**期間を通じた運用**を評価する
+- ISO/IEC 27001 は ISMS の認証。証拠は SOC 2 と大きく重なる
+- 設計・実装・検査を自動化しておけば、証跡はその副産物として積み上がる

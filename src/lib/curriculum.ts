@@ -331,6 +331,11 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
     title: '第25章　観測する',
     summary: '本番で動いているものを、止めずに外から見る。カーネルに小さなプログラムを差し込む eBPF、アプリケーションの中から見る OpenTelemetry、コードを書き換えずに計装を差し込む仕組み、そして手元で測る道具',
   },
+  {
+    id: 'assure',
+    title: '第26章　守りが効き続けているか',
+    summary: '守りは作った時点で正しくても、動かしている間にずれていく。脅威モデリングと OWASP・CIS の基準、コードを読んで見つける SAST と SCA、動いているものと設定を確かめる DAST・IaC 検査・CSPM、シークレットの漏れ道、作ってから配るまでの改ざんを防ぐ SLSA・SBOM・署名、テナントの境界、ファイルの受け取りと返却に潜む攻撃、そして監査ログ・SIEM・継続的統制モニタリング・SOC 2 で証跡に残すまで',
+  },
 ]
 
 export const chapterById = new Map(LOWLEVEL_CHAPTERS.map((c) => [c.id, c]))

