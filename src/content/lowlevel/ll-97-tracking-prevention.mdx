@@ -17,7 +17,7 @@ topics:
 requires:
   - ll-96-third-party-cookie
   - ll-93-origin-site
-  - ll-118-session-cookie
+  - ll-126-session-cookie
   - ll-58-dns-records
 ---
 
@@ -265,7 +265,7 @@ Chromium は `ThirdPartyStoragePartitioning` を外した `--disable-features` �
 
 読み取れることを並べます。
 
-- **Chromium** は、`SameSite=None` の `srv_none` を iframe にも画像にも付けた。SameSite を書いていない `srv_default` と `js_long` は Lax として扱われ（第 118 回）、付かなかった。`Partitioned` 付きの `part` は `127.0.0.1` を分割のキーとして保存された（第 96 回の CHIPS）。localStorage は分割され、トップレベルで書いた値は見えない
+- **Chromium** は、`SameSite=None` の `srv_none` を iframe にも画像にも付けた。SameSite を書いていない `srv_default` と `js_long` は Lax として扱われ（第 126 回）、付かなかった。`Partitioned` 付きの `part` は `127.0.0.1` を分割のキーとして保存された（第 96 回の CHIPS）。localStorage は分割され、トップレベルで書いた値は見えない
 - **Firefox**（TCP）は、トップレベルで設定された Cookie を**どれも**送らなかった。iframe に見えるのは、iframe の中で設定された `part` だけで、これは「ニュースのサイト用の瓶」に入っている。localStorage も分割されている
 - **WebKit** は、何も送らず、iframe に Cookie も見せなかった。`document.hasStorageAccess()` は `false` で、使うには Storage Access API で許可を求める必要がある
 
@@ -285,8 +285,8 @@ ITP の分類（どのドメインを追跡者とみなすか）は、利用者�
 | アクセス解析 | JavaScript で書いた訪問者 ID が Safari では 7 日で消え、再訪した人が新しい訪問者に数えられる | サーバが HTTP の応答で Cookie を設定する（ファーストパーティ化）。ただし CNAME や別の IP アドレスの計測サーバ経由だと、これも 7 日に縮む |
 | 広告の効果測定 | クリック ID をリンクに載せて着地先で保存する方式が、Safari の 24 時間の上限やプライベートブラウズのパラメータ除去に当たる | サーバ側での計測、ブラウザが用意する集計の仕組み（ただし Chrome の Attribution Reporting は廃止予定） |
 | 埋め込みのウィジェット | チャットや動画の iframe が、利用者のログイン状態を読めない | CHIPS で分割した Cookie を使う、Storage Access API で許可を求める（第 96 回） |
-| 埋め込み型の SSO | 隠した iframe で IdP のセッションを確かめる方式が、Safari と Firefox で動かない | トップレベルのリダイレクトに切り替える、FedCM（第 124 回） |
-| ログインの維持 | ログインを localStorage のトークンで保つと、Safari で 7 日使わなければ消える | HttpOnly の Cookie をサーバが設定する（第 118 回、第 119 回） |
+| 埋め込み型の SSO | 隠した iframe で IdP のセッションを確かめる方式が、Safari と Firefox で動かない | トップレベルのリダイレクトに切り替える、FedCM（第 132 回） |
+| ログインの維持 | ログインを localStorage のトークンで保つと、Safari で 7 日使わなければ消える | HttpOnly の Cookie をサーバが設定する（第 126 回、第 127 回） |
 
 表の 1 行目の「ファーストパーティ化」は、Safari の側から見ると**まさに ITP が 2020 年以降に塞いできた回り道**と同じ形になりえます。自社のサーバが自社のドメインと近い IP アドレスで HTTP の応答から Cookie を設定するのと、計測業者のサーバを CNAME で自社のサブドメインに見せかけるのとでは、扱いが違います。
 
@@ -304,10 +304,10 @@ ITP の分類（どのドメインを追跡者とみなすか）は、利用者�
 | --- | --- | --- |
 | サイトの定義 × 第三者 Cookie の遮断 | 「第三者」はトップレベルのサイトとの比較で決まる。サブドメインは同じサイト | 第 93 回、第 96 回 |
 | CNAME × ITP | 名前は同じサイトでも、CNAME の行き先が第三者なら寿命を縛る | 第 58 回 |
-| SameSite × 各ブラウザの制限 | `SameSite=None` を付けても、Safari と Firefox の第三者の文脈では届かないか分割される | 第 118 回 |
+| SameSite × 各ブラウザの制限 | `SameSite=None` を付けても、Safari と Firefox の第三者の文脈では届かないか分割される | 第 126 回 |
 | CHIPS / Storage Access API × 各ブラウザ | 制限の下で、埋め込みが正当に Cookie を使う手段。遮断するブラウザほど必要になる | 第 96 回 |
 | Referrer-Policy × リンクの装飾 | ITP は装飾付きの移動の後、`document.referrer` を登録可能ドメインまで縮める | 第 98 回 |
-| 第三者 Cookie の制限 × SSO | 隠した iframe でのセッション確認が壊れ、FedCM やトップレベルの移動へ | 第 124 回 |
+| 第三者 Cookie の制限 × SSO | 隠した iframe でのセッション確認が壊れ、FedCM やトップレベルの移動へ | 第 132 回 |
 | 構成の型 × ブラウザの違い | 別サイトの API と Cookie は、Safari と Firefox では第三者の扱いになる | 第 101 回 |
 
 ## まとめ

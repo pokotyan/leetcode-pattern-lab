@@ -118,7 +118,7 @@ ndots:5 のとき
   "example.com" ドット 1 個 → example.com.corp.example → example.com.svc.example → example.com
 ```
 
-`ndots` を大きくすると、外部の名前を 1 回引くだけで、存在しない名前の問い合わせが何回も先に走ります。第 164 回で見た Kubernetes の `ndots:5` がまさにこれで、その影響は第 63 回で詳しく見ます。
+`ndots` を大きくすると、外部の名前を 1 回引くだけで、存在しない名前の問い合わせが何回も先に走ります。第 172 回で見た Kubernetes の `ndots:5` がまさにこれで、その影響は第 63 回で詳しく見ます。
 
 末尾にドットを付けた `example.com.` は「これで完結した名前」という意味になり、search の補完は行われません。
 

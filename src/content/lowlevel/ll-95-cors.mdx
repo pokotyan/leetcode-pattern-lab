@@ -17,7 +17,7 @@ topics:
 requires:
   - ll-94-cross-origin
   - ll-93-origin-site
-  - ll-118-session-cookie
+  - ll-126-session-cookie
   - ll-85-navigation
 ---
 
@@ -41,7 +41,7 @@ on the requested resource.
 | --- | --- |
 | 別のオリジンのページに、応答を読ませてよいかをサーバが答える | サーバへのリクエストを止める（単純なリクエストはそのまま届く） |
 | 単純でないリクエストの前に、サーバが CORS を理解しているかを確かめる（プリフライト） | サーバを攻撃から守る。curl やサーバ間の通信を制限する |
-| 資格情報（Cookie など）つきの応答を読ませるかを、別に確かめる | Cookie を付けるかどうかを決める（それは SameSite と第三者 Cookie の制限。第 118 回、第 96 回） |
+| 資格情報（Cookie など）つきの応答を読ませるかを、別に確かめる | Cookie を付けるかどうかを決める（それは SameSite と第三者 Cookie の制限。第 126 回、第 96 回） |
 
 ## CORS は、ブラウザとサーバの間の約束
 
@@ -188,7 +188,7 @@ transfers: ['to=mallory&amount=100', ...]
 
 <Callout type="warn" title="よくある誤解: 「CORS はサーバを攻撃から守る」">
   CORS は**ブラウザの中の読み出しの制限を、サーバが緩める仕組み**です。サーバに対する防御は何も足しません。
-  状態を変える API を守るのは、CSRF の対策（同期トークン、SameSite、Fetch Metadata。第 118 回、第 98 回）と、認証と認可です。
+  状態を変える API を守るのは、CSRF の対策（同期トークン、SameSite、Fetch Metadata。第 126 回、第 98 回）と、認証と認可です。
   「`Content-Type: application/json` しか受け付けないので、プリフライトが必ず起きて安全」という考え方もありますが、サーバが `text/plain` で届いた JSON も受け付けてしまう実装だと、この前提は崩れます。**受け付ける `Content-Type` を厳密に確かめて初めて**、プリフライトは防御の一段になります。
 </Callout>
 
@@ -213,7 +213,7 @@ the wildcard '*' when the request's credentials mode is 'include'.
 which must be 'true' when the request's credentials mode is 'include'.
 ```
 
-表の右の列に注目してください。**読めなかった 3 つでも、Cookie はサーバに届いています。** Cookie を付けるかどうかは、SameSite と第三者 Cookie の扱い（第 118 回、第 96 回）が決めることで、CORS は付けた後の応答を読ませるかどうかしか決めません。ここではページと API が同じサイトなので、`SameSite=Lax` でも Cookie は届きます。
+表の右の列に注目してください。**読めなかった 3 つでも、Cookie はサーバに届いています。** Cookie を付けるかどうかは、SameSite と第三者 Cookie の扱い（第 126 回、第 96 回）が決めることで、CORS は付けた後の応答を読ませるかどうかしか決めません。ここではページと API が同じサイトなので、`SameSite=Lax` でも Cookie は届きます。
 
 `Access-Control-Expose-Headers` も確かめました。API は毎回 `X-Request-Id` を返していますが、`response.headers.get('x-request-id')` は `Expose-Headers: X-Request-Id` を付けた応答でだけ `req-11` を返し、付けない応答では `null` でした。
 
@@ -339,8 +339,8 @@ CORS 単独では、守れるものがほとんどありません。どの部品
 | 組み合わせる部品 | 役割の分担 | 回 |
 | --- | --- | --- |
 | 同一オリジンポリシー | 既定で読み出しを禁じる。CORS はその例外を作る | 第 93 回、第 94 回 |
-| SameSite と第三者 Cookie の制限 | Cookie を**付けるか**を決める。CORS は付けた後に**読ませるか**を決める | 第 118 回、第 96 回、第 97 回 |
-| CSRF トークン、Fetch Metadata | 単純なリクエストで**届いてしまう**書き込みを、サーバの側で拒む | 第 118 回、第 98 回 |
+| SameSite と第三者 Cookie の制限 | Cookie を**付けるか**を決める。CORS は付けた後に**読ませるか**を決める | 第 126 回、第 96 回、第 97 回 |
+| CSRF トークン、Fetch Metadata | 単純なリクエストで**届いてしまう**書き込みを、サーバの側で拒む | 第 126 回、第 98 回 |
 | CSP の `connect-src` | 自分のページが**どこへ** fetch してよいかを、ページの側で絞る | 第 99 回 |
 | CORP、ORB、COEP | `img` や `script` の埋め込みのように、CORS を通らない読み込みがプロセスのメモリに載るのを制限する | 第 100 回 |
 | HTTP キャッシュと CDN | `Vary: Origin` を付けないと、正しい CORS の設定がキャッシュで壊れる | 第 85 回 |

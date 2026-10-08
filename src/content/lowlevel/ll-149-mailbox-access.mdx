@@ -1,0 +1,429 @@
+---
+title: 受け取ったメールを読む
+description: 届いたメールは、どこに置かれ、手元の端末はどうやって読みにいくのか。POP3 と IMAP と JMAP の違い、IMAP の状態を持つ会話、サーバの中の保存形式、パスワードから OAuth へ移ったクライアントの認証、そしてメールアカウントが他のすべてのアカウントの合鍵になっている構造を見ます
+chapter: mail
+order: 11
+status: published
+topics:
+  - POP3
+  - IMAP（IMAP4rev2）
+  - UID / UIDVALIDITY
+  - IDLE
+  - JMAP
+  - mbox / Maildir
+  - SASL XOAUTH2 / OAUTHBEARER
+  - アプリパスワード
+  - アカウントの回復
+requires:
+  - ll-148-mail-e2e
+  - ll-128-oauth
+  - ll-125-password-mfa
+  - ll-50-durability
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 届いたメールは、どこにあるのか
+
+ここまでの回で、メールは MTA から MTA へ中継され、最後に受信者のドメインの MTA が受け取るところまで来ました（第 139〜142 回）。第 139 回の登場人物でいえば、その後 **MDA**（配送エージェント）がメールを利用者のメールボックスに書き込みます。
+
+では、利用者のスマートフォンやパソコンのメールアプリ（MUA）は、そのメールボックスをどうやって読むのでしょうか。SMTP は「送り届ける」ための取り決めで、「置いてあるものを読む」ための取り決めではありません。**読む側には、まったく別のプロトコルがあります。**
+
+この回では、受け取ったメールを読む 3 つのプロトコル（POP3、IMAP、JMAP）の考え方の違いを見たあと、手元のサーバで IMAP を 1 行ずつ話します。後半では、メールアプリの認証がパスワードから OAuth へ移った流れと、**メールアカウントが他のすべてのアカウントの合鍵になっている**という、この章でいちばん実務に効く話をします。
+
+```
+ 送信者 ──SMTP──▶ MTA ──SMTP──▶ MTA ──▶ MDA ──▶ [メールボックス]
+                                                      ▲
+                                                      │ POP3 / IMAP / JMAP
+                                                      │ （この回）
+                                               利用者の MUA（複数の端末）
+```
+
+## 3 つの取り出し方
+
+| | POP3 | IMAP | JMAP |
+| --- | --- | --- | --- |
+| 仕様 | [RFC 1939](https://www.rfc-editor.org/rfc/rfc1939.html)（1996 年） | [RFC 9051](https://www.rfc-editor.org/rfc/rfc9051.html)（IMAP4rev2、2021 年） | [RFC 8620](https://www.rfc-editor.org/rfc/rfc8620.html)（2019 年）、[RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html)（メール部分、2019 年） |
+| 運ぶもの | テキストの行（TCP） | テキストの行（TCP） | JSON（HTTP） |
+| メールの正本 | **端末**（取ってきて、サーバからは消すのが基本） | **サーバ** | **サーバ** |
+| フォルダ | 受信箱 1 つだけ | 複数（階層あり） | 複数 |
+| 既読などの状態 | 持たない | サーバが持ち、端末間で共有 | サーバが持ち、端末間で共有 |
+| 新着の通知 | 無い（定期的に取りにいく） | IDLE で押し出してもらう | EventSource や WebSocket で押し出してもらう |
+| 待ち受けのポート | 110 / 995（TLS） | 143 / 993（TLS） | HTTPS の 443 |
+
+いちばん大きな違いは **「メールの正本がどこにあるか」** です。POP3 は、ダイヤルアップで短時間だけつなぎ、メールを手元にまとめて落として切る、という使い方のために作られました。IMAP は、メールはサーバに置いたまま、端末はその**見え方を同期する**ための仕組みです。1 人が複数の端末を持つ今の使い方には、IMAP か JMAP が合っています。
+
+ポートについては、第 144 回で見た [RFC 8314](https://www.rfc-editor.org/rfc/rfc8314.html)（2018 年）が、提出と同じく IMAP と POP3 にも**最初から TLS で話すポート（993、995）を使う**ことを勧めています。143 と 110 では平文で始め、STARTTLS（POP3 では `STLS`、[RFC 2595](https://www.rfc-editor.org/rfc/rfc2595.html)）で切り替えます。
+
+## POP3: 取ってきて、消す
+
+POP3 の会話は、SMTP に似た短いコマンドの往復です。
+
+```
+S: +OK Dovecot ready.
+C: USER carol
+C: PASS ...
+C: STAT            ← 何通、合計何バイトか
+C: LIST            ← 1 通ずつの大きさ
+C: UIDL            ← 1 通ずつの一意な ID
+C: RETR 1          ← 1 通目を丸ごと取る
+C: DELE 1          ← 1 通目に削除の印を付ける
+C: QUIT            ← ここで初めて、印を付けたものが消える
+```
+
+POP3 には状態がほとんどありません。フォルダも既読も無く、あるのは「今この受信箱にある n 通」だけです。番号は接続ごとに 1 から振り直されるので、**前回どこまで取ったか**を覚えるには `UIDL` の一意な ID を端末側で記録しておくしかありません（`UIDL` は RFC 1939 では任意のコマンドです）。
+
+`DELE` は即座に消すのではなく印を付けるだけで、`QUIT` の後の UPDATE 状態で初めて削除されます（RFC 1939 の 6 節）。途中で接続が切れれば何も消えません。取り出しの途中で失敗しても、メールを失わないための設計です。
+
+<Callout type="warn" title="よくある誤解: POP3 は古いので使われていない">
+  POP3 は今も多くのメールサービスが提供しています。そして、**端末に落としてサーバから消す**という性質は、今でも意味を持つことがあります。サーバに何年分ものメールを置いておかないので、サーバ側のアカウントが破られたときに読まれる量が減ります。
+  ただし、複数の端末で同じ受信箱を見たい、送信済みや下書きを共有したい、という今の普通の使い方には向きません。「サーバにも残す」設定にすると、今度は端末ごとに既読の状態がばらばらになります。
+</Callout>
+
+## IMAP: サーバが状態を持つ会話
+
+IMAP は、POP3 とは考え方がまったく違います。**サーバがメールボックスの状態（どのメールがあり、どれが既読か）を持ち、端末はその状態を問い合わせたり変えたりする**プロトコルです。
+
+会話にはいくつかの特徴があります。
+
+- **タグ**: クライアントはコマンドの先頭に `a1`、`a2` のような好きな文字列を付けます。サーバはそのコマンドの完了を同じタグで返します。応答を待たずに複数のコマンドを送れるようにするためです
+- **タグなしの応答**: `*` で始まる行は、タグ付きの完了とは別に、サーバが「今こうなっている」と知らせるものです。**自分が頼んでいないことも**知らせてきます（別の端末でメールが消された、新着が来た、など）
+- **状態**: 接続は「未認証」「認証済み」「メールボックスを選択中」「終了」の 4 つの状態を移ります（RFC 9051 の 3 節）。`FETCH` や `STORE` は `SELECT` でメールボックスを選んだ後でしか使えません
+
+```
+   未認証 ──LOGIN / AUTHENTICATE──▶ 認証済み ──SELECT──▶ 選択中
+                                       ▲                    │
+                                       └──── CLOSE / UNSELECT┘
+```
+
+現行の仕様は 2021 年の IMAP4rev2（RFC 9051）で、それまでの IMAP4rev1（[RFC 3501](https://www.rfc-editor.org/rfc/rfc3501.html)、2003 年）を置き換えました。rev2 は rev1 の時代に拡張として別の RFC になっていた機能（`IDLE`、`UIDPLUS`、`MOVE` など）を本体に取り込んでいます。実際のサーバは両方を話すことが多く、後で見る Dovecot も `IMAP4rev1 IMAP4rev2` の両方を名乗ります。
+
+## 番号が 2 種類ある: シーケンス番号と UID
+
+IMAP でいちばんつまずきやすいのが、メールを指す番号が 2 種類あることです。
+
+| | シーケンス番号 | UID |
+| --- | --- | --- |
+| 何の番号か | 今このメールボックスで何番目か（1 から連番） | このメールボックスでこのメールに振られた固有の番号 |
+| 削除されると | **後ろのメールの番号が 1 つずつ繰り上がる** | 変わらない。消えた番号は二度と使われない |
+| 新しいメールには | 末尾の番号 | それまでのどれよりも大きい番号 |
+| 使うコマンド | `FETCH 3`、`STORE 3` | `UID FETCH 42`、`UID STORE 42` |
+
+RFC 9051 は UID について「セッションの間に変わってはならず（MUST NOT）、セッションをまたいでも変わるべきでない（SHOULD NOT）」とし、「厳密に増える順に割り当てる」と定めています（[2.3.1.1 節](https://www.rfc-editor.org/rfc/rfc9051.html#section-2.3.1.1)）。シーケンス番号のほうは、削除（EXPUNGE）されると「それ以降のすべてのメールの番号が 1 つ減る」と書かれています（[2.3.1.2 節](https://www.rfc-editor.org/rfc/rfc9051.html#section-2.3.1.2)）。
+
+ただし UID にも前提があります。サーバがメールボックスを作り直すなどして、UID を振り直さざるを得ないことがあります。そのときサーバは **UIDVALIDITY** という値を変えます。クライアントは `SELECT` の応答に含まれる UIDVALIDITY を覚えておき、**値が変わっていたら、手元に覚えた UID をすべて捨てて取り直します**。メールを一意に指すのは「メールボックス名 + UIDVALIDITY + UID」の組です。
+
+<Callout type="warn" title="よくある誤解: メールの番号を覚えておけば、次回も同じメールを指せる">
+  シーケンス番号は、自分か他の端末が 1 通消しただけでずれます。「3 番を削除」のつもりで、前の接続で覚えた番号を送ると、**別のメールを消します**。
+  端末をまたいで何かを覚えるときは UID を使い、UIDVALIDITY も一緒に覚えます。手元で実際にずれるところを、次の節で確かめます。
+</Callout>
+
+## フラグと既読
+
+IMAP では、メールごとに**フラグ**を付けられます。仕様で決まっているのは `\Seen`（既読）、`\Answered`（返信済み）、`\Flagged`（重要の印）、`\Deleted`（削除の印）、`\Draft`（下書き）です。rev1 にあった `\Recent` は rev2 で非推奨になりました（[2.3.2 節](https://www.rfc-editor.org/rfc/rfc9051.html#section-2.3.2)）。
+
+IMAP の削除は 2 段階です。`STORE` で `\Deleted` を付けても、まだ消えていません。`EXPUNGE` で初めて、印の付いたメールが消えます。POP3 の `DELE` と `QUIT` の関係に似ています。多くのメールアプリの「ゴミ箱へ」は、実際には「Trash というメールボックスへ移す」（`MOVE`）操作です。
+
+既読の印は、**本文を取っただけで付く**ことがあります。`FETCH` で `BODY[...]` を取ると、サーバは自動で `\Seen` を付けます。付けずに読みたいときは `BODY.PEEK[...]` を使います（[6.4.5 節](https://www.rfc-editor.org/rfc/rfc9051.html#section-6.4.5)）。一覧を表示するために件名だけ取るたびに既読になっては困るので、メールアプリは普通 `PEEK` を使います。
+
+## IDLE: 新着を押し出してもらう
+
+POP3 には新着を知らせる手段がなく、端末は数分おきに接続して確かめるしかありませんでした。IMAP の **IDLE**（もとは [RFC 2177](https://www.rfc-editor.org/rfc/rfc2177.html)、1997 年。rev2 では本体の [6.3.13 節](https://www.rfc-editor.org/rfc/rfc9051.html#section-6.3.13)）を使うと、クライアントは「何か起きたら知らせて」と言って接続を開いたまま待ちます。新着があると、サーバがタグなしの `* 5 EXISTS` を送ってきます。クライアントは `DONE` を送って待ちを終えます。
+
+これは第 45 回の I/O 多重化の話そのものです。IMAP サーバは、IDLE で待っている何万もの接続を抱えることになります。1 接続に 1 つのスレッドやプロセスを割り当てていては持ちません。Dovecot には、IDLE で待っている接続の処理を別のプロセスに預けて資源を節約する `imap_hibernate_timeout` という設定があり、手元のコンテナの既定値は 5 秒でした（`doveconf` の出力）。
+
+ただし IDLE は **1 つの接続で 1 つのメールボックス**しか見張れません。受信箱と別のフォルダを両方見張るには接続を 2 本張ります。また、スマートフォンのアプリが裏で TCP 接続を持ち続けるのは電池と OS の制約から難しく、スマートフォンでは、メール事業者独自の通知の仕組みや OS の通知サービスを併用することがあります。
+
+## JMAP: HTTP と JSON で
+
+IMAP は 1980 年代から継ぎ足されてきたため、拡張が多く、行単位の独特の文法を持ち、実装が難しいプロトコルです。**JMAP**（JSON Meta Application Protocol）は、同じ「サーバが状態を持ち、端末が同期する」という考え方を、**HTTP と JSON で作り直したもの**です。RFC 8621 の著者の 1 人は、メール事業者 Fastmail の技術者です。
+
+JMAP のリクエストは、**メソッド呼び出しの配列**を 1 回の HTTP POST で送ります。前の呼び出しの結果を次の呼び出しの引数に使える（`#` で始まる引数）ので、「受信箱の新しい順に 10 通の ID を探し、その件名と差出人を取る」を 1 往復で済ませられます。RFC 8620 の書き方に沿った例を示します。
+
+```json
+{ "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+  "methodCalls": [
+    ["Email/query", { "accountId": "A1",
+                      "filter": { "inMailbox": "INBOX-ID" },
+                      "sort": [{ "property": "receivedAt", "isAscending": false }],
+                      "limit": 10 }, "q"],
+    ["Email/get",   { "accountId": "A1",
+                      "#ids": { "resultOf": "q", "name": "Email/query", "path": "/ids" },
+                      "properties": ["subject", "from", "receivedAt"] }, "g"]
+  ] }
+```
+
+同期は「前回の状態の番号（state）から何が変わったか」を `Email/changes` で聞く形です。IMAP の UIDVALIDITY や CONDSTORE（変更番号）の拡張が担っていたことを、最初から仕様に組み込んでいます。新着の通知は、HTTP の EventSource か、WebSocket（[RFC 8887](https://www.rfc-editor.org/rfc/rfc8887.html)、2020 年）で受け取ります。認証も普通の HTTP の `Authorization` ヘッダなので、OAuth（第 128 回）のアクセストークンをそのまま載せられます。
+
+JMAP は仕様としては完成していますが、執筆時点（2026 年 9 月）で、提供している大手のメール事業者は多くありません。**IMAP が当面の標準であることは変わりません。**
+
+## 手元で確かめる: Dovecot と話す
+
+広く使われている IMAP / POP3 サーバの Dovecot（公式のコンテナイメージ `dovecot/dovecot`、版は 2.4.5）を手元で動かします。イメージは IMAP を 31143 番、POP3 を 31110 番で待つので、ホストの 18116 番と 18117 番につなぎます。POP3 は既定で無効なので、設定ファイルを 1 つ足して有効にしました。パスワードは環境変数で渡す、どの利用者名でも同じパスワードで入れる試験用の設定です。
+
+```bash
+docker run -d --name ll122 -e USER_PASSWORD=secret \
+  -p 127.0.0.1:18116:31143 -p 127.0.0.1:18117:31110 \
+  -v "$PWD/conf.d:/etc/dovecot/conf.d:ro" dovecot/dovecot:latest
+```
+
+### TLS の前にはパスワードを受け付けない
+
+まず、平文のまま挨拶だけ聞きます。
+
+```
+$ printf 'a CAPABILITY\r\nb LOGOUT\r\n' | nc 127.0.0.1 18116
+* OK [CAPABILITY IMAP4rev1 IMAP4rev2 LOGIN-REFERRALS ID ENABLE IDLE SASL-IR LITERAL+ STARTTLS LOGINDISABLED] Dovecot ready.
+```
+
+`STARTTLS` と並んで **`LOGINDISABLED`** があります。「この状態では LOGIN を受け付けない」という宣言です。RFC 9051 は、平文のポートでは STARTTLS と LOGINDISABLED の両方を実装しなければならないとしています（[6.1.1 節](https://www.rfc-editor.org/rfc/rfc9051.html#section-6.1.1)）。それでも Python の imaplib で TLS の前に LOGIN を送ってみると、こう返ってきました。
+
+```
+> b'LJPF1 LOGIN alice "secret"'
+< b'* BAD [ALERT] cleartext authentication not allowed without SSL/TLS, but your client did it anyway. If anyone was listening, the password was exposed.'
+< b'LJPF1 NO [PRIVACYREQUIRED] Cleartext authentication disallowed on non-secure (SSL/TLS) connections.'
+```
+
+サーバは断りましたが、**パスワードはもう平文で経路に流れています**。サーバの拒否は、流れた後では何も守りません。守れるのは、TLS の前に送らないクライアントだけです。STARTTLS を使うクライアントは、TLS への切り替えに失敗したら認証に進まずに止まる必要があります（第 144 回の STARTTLS を消す攻撃）。
+
+以下の実験では、コンテナの自己署名証明書を取り出して信頼の起点として渡し、名前 `localhost` と照合して**検証したうえで** TLS を張っています（第 110 回）。
+
+```python
+ctx = ssl.create_default_context(cafile="ll122-server.pem")
+M = imaplib.IMAP4("localhost", 18116); M.starttls(ssl_context=ctx)
+```
+
+```
+verified TLS: TLSv1.3 ((('commonName', 'localhost'),),)
+```
+
+### シーケンス番号がずれるのを見る
+
+`APPEND` で、利用者 carol の受信箱に 3 通（件名「請求書のお知らせ」「会議の議事録」「パスワード再設定」）を入れておき、`openssl s_client -starttls imap` で 1 行ずつ話します。応答を抜粋します。
+
+```
+a2 SELECT INBOX
+* 3 EXISTS
+* OK [UIDVALIDITY 1790597316] UIDs valid
+* OK [UIDNEXT 4] Predicted next UID
+a2 OK [READ-WRITE] Select completed
+
+a3 FETCH 1:* (UID FLAGS RFC822.SIZE)
+* 1 FETCH (UID 1 FLAGS () RFC822.SIZE 314)
+* 2 FETCH (UID 2 FLAGS () RFC822.SIZE 304)
+* 3 FETCH (UID 3 FLAGS () RFC822.SIZE 313)
+
+a4 UID FETCH 2 (BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])
+* 2 FETCH (UID 2 BODY[HEADER.FIELDS (SUBJECT FROM)] {72}
+From: bob@example.net
+Subject: =?utf-8?b?5Lya6K2w44Gu6K2w5LqL6Yyy?=
+```
+
+`SELECT` の応答に UIDVALIDITY と、次に振る UID（UIDNEXT）が含まれています。件名は第 143 回で見た encoded-word のままで、日本語に直すのはクライアントの仕事です。`{72}` は「この後に 72 バイトが続く」という**リテラル**の書き方で、IMAP はこれで改行を含む任意のバイト列を 1 行の文法の中に埋め込みます。
+
+1 通目を消します。
+
+```
+a5 STORE 1 +FLAGS (\Deleted)
+* 1 FETCH (FLAGS (\Deleted))
+a6 EXPUNGE
+* 1 EXPUNGE
+a7 FETCH 1:* (UID FLAGS)
+* 1 FETCH (UID 2 FLAGS ())
+* 2 FETCH (UID 3 FLAGS ())
+```
+
+消す前に 2 番だった UID 2 のメールが **1 番に**、3 番だった UID 3 が **2 番に**繰り上がりました。UID は変わっていません。
+
+続けて、`PEEK` を付けずに本文を取ります。
+
+```
+a9 FETCH 2 (BODY[TEXT])
+* 2 FETCH (FLAGS (\Seen) BODY[TEXT] {10}
+本文 3
+)
+a10 FETCH 2 (FLAGS)
+* 2 FETCH (FLAGS (\Seen))
+```
+
+本文を取っただけで、頼んでいない `\Seen` が付き、サーバがそれを知らせてきました。この既読の状態は**サーバに**残るので、同じアカウントを見る他の端末でも既読になります。
+
+### IDLE で新着を受け取る
+
+Python 3.14 の imaplib には `idle()` が入りました。1 本目の接続で IDLE に入り、2 秒後に別の接続から 1 通 `APPEND` します。
+
+```
+21:10:20 IDLE 開始
+21:10:22 別の接続で APPEND: [APPENDUID 1790597316 5] Append completed
+21:10:22 サーバから届いた: EXISTS [b'4']
+('OK', [b'2 3 4 5'])
+```
+
+別の接続で起きた追加が、同じ秒のうちに `* 4 EXISTS` として押し出されてきました。最後の行は `UID SEARCH ALL` の結果で、消した UID 1 は欠番のまま、新しいメールには UID 5 が振られています。
+
+### 同じ受信箱を POP3 で見る
+
+同じ carol の受信箱に、POP3 でつなぎます。
+
+```
+*cmd* 'STLS'
+*cmd* 'STAT'   → (4, 953)
+*cmd* 'LIST'   → [b'1 304', b'2 313', b'3 168', b'4 168']
+*cmd* 'UIDL'   → [b'1 000000026aba58c4', b'2 000000036aba58c4', b'3 000000046aba58c4', b'4 000000056aba58c4']
+```
+
+POP3 からは 4 通が 1〜4 番として見えるだけで、フォルダも既読の印もありません。`UIDL` の値を読むと、Dovecot は IMAP の UID（`00000002`〜`00000005`）と UIDVALIDITY（`6aba58c4` は 10 進で 1790597316）を 16 進でつないで、POP3 の一意な ID にしていることが分かります。同じメールボックスを 2 つのプロトコルで見せるための工夫です。
+
+## サーバの中の保存形式: mbox と Maildir
+
+最後に、サーバがメールをディスクにどう置いているかを見ます。形式は大きく 2 つです。
+
+**mbox** は、1 つのメールボックスを **1 つのファイル**にし、メールを `From ` で始まる区切りの行でつないでいく形式です。本文中の `From ` で始まる行を区切りと取り違えないよう `>From ` に書き換える慣習がありますが、実装によって扱いがまちまちです（[RFC 4155](https://www.rfc-editor.org/rfc/rfc4155.html)、Informational）。1 つのファイルに配送と削除が同時に書き込むので、**ロックが欠かせません**。途中まで書いたところで落ちると、ファイルの末尾に壊れたメールが残ります。
+
+**Maildir** は、D. J. Bernstein が qmail のために考えた形式で、**1 通を 1 つのファイル**にします。ディレクトリは `tmp`、`new`、`cur` の 3 つです（[Bernstein の説明](https://cr.yp.to/proto/maildir.html)）。
+
+```
+配送:  tmp/ に一意な名前で書く → fsync → new/ へ rename（または link）
+読む:  new/ から cur/ へ移し、名前の末尾に ":2,フラグ" を付ける
+```
+
+Bernstein は利点を「一言で言えば、ロックが要らない（no locks）」と書いています。各メールが一意な名前の別のファイルなので、配送と読み出しが互いに邪魔しません。そして、**書きかけのメールは `tmp` にしかない**ので、読む側が途中までのメールを見ることがありません。これは第 49 回の「同じファイルシステムの中の rename は原子的」と、第 50 回の「rename の前に fsync しないと、名前だけあって中身が空のファイルが残りうる」の応用です。MTA が SMTP で `250` を返す前にキューを永続化するのと同じ責任を（第 141 回）、MDA は受信者のメールボックスに対して負っています。
+
+手元の Dovecot の Maildir を、`docker cp` でホストに取り出して見ました（ファイル名の途中は省略）。
+
+```
+mail/48f7be29.../cur/1790597316.M719245P20.83d344004f67,S=294,W=304:2,
+mail/48f7be29.../cur/1790597316.M724500P20.83d344004f67,S=303,W=313:2,S
+mail/48f7be29.../cur/1790597348.M137168P26.83d344004f67,S=160,W=168:2,
+mail/48f7be29.../dovecot-uidlist
+mail/48f7be29.../dovecot.index.cache
+mail/48f7be29.../dovecot.index.log
+```
+
+名前は「時刻.配送の識別子.ホスト名」で、`M` はマイクロ秒、`P` はプロセス ID です。`S=` と `W=` はサイズを書いておく Dovecot の拡張です。2 行目の末尾の **`:2,S` が既読**を表しています。先ほど `BODY[TEXT]` で取った「パスワード再設定」のメールです。**フラグはファイル名に書かれる**ので、既読にするとは、ファイルを rename することです。
+
+では UID はどこにあるのか。Maildir の仕様には UID がありません。Dovecot は `dovecot-uidlist` という別のファイルに対応表を持っています。
+
+```
+3 V1790597316 N5 G48f7be29c458ba6a1400000006fed7e8
+2 :1790597316.M719245P20.83d344004f67,S=294,W=304
+3 :1790597316.M724500P20.83d344004f67,S=303,W=313
+4 :1790597348.M137168P26.83d344004f67,S=160,W=168
+```
+
+`V` が UIDVALIDITY、`N` が次に振る UID で、各行が「UID とファイル名」の対応です。Maildir 自体はロックが要らなくても、**この対応表を更新するときにはロックが要ります**。Dovecot はそのためにロックファイルを使います。
+
+実は最初、メールボックスを macOS のホストのディレクトリに置いて（コンテナと共有して）試したところ、`Our dotlock file .../dovecot-uidlist.lock was overridden` と `UIDVALIDITY changed` という警告が出ました。共有されたファイルシステムの上でロックが期待どおりに働かなかったと考えられます。**UIDVALIDITY は、こういう事故の後にクライアントへ「覚えた UID を捨てよ」と伝える仕組み**でもあります。メールボックスをコンテナの中に置き直すと、警告は出なくなりました。
+
+## クライアントの認証: パスワードから OAuth へ
+
+長いあいだ、メールアプリは IMAP の `LOGIN` や SMTP の `AUTH PLAIN` に、**利用者のアカウントのパスワードそのもの**を渡してきました（第 141 回）。これには第 125 回で見た問題がすべて当てはまります。
+
+- メールアプリがパスワードを端末に保存する。流出すれば、メールだけでなくアカウント全体に入られる
+- **多要素認証を掛けられない**。IMAP の `LOGIN` には、ワンタイムコードやパスキーを差し込む場所がない
+- パスワードを総当たりや使い回しで試す攻撃の入口が、Web のログイン画面の外に開いたままになる
+
+そこで大手の事業者は、パスワードでの接続（Microsoft は **基本認証**、Google は **安全性の低いアプリ**と呼びます）を止めてきました。
+
+| 事業者 | 何を止めたか | 時期 |
+| --- | --- | --- |
+| Microsoft（Exchange Online） | POP、IMAP、EWS、ActiveSync などの基本認証 | 使われていないテナントから 2021 年に無効化を始め、2022 年 10 月 1 日を期日とした。現在は全テナントで無効で、再び有効にはできない（[Microsoft Learn](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online)） |
+| Microsoft（Exchange Online） | 送信（SMTP AUTH）の基本認証 | 延期が重なり、2026 年 1 月 27 日の告知では、2026 年 12 月末に既存テナントで既定で無効、最終的な廃止日は 2027 年後半に発表（[Microsoft の告知](https://techcommunity.microsoft.com/blog/exchange/updated-exchange-online-smtp-auth-basic-authentication-deprecation-timeline/4489835)） |
+| Google（Workspace） | パスワードだけで入る IMAP、POP、CalDAV、CardDAV など | 当初は 2024 年 9 月 30 日の予定が延期され、最終的に 2025 年 5 月 1 日で終了（[Google Workspace Updates](https://workspaceupdates.googleblog.com/2023/09/winding-down-google-sync-and-less-secure-apps-support.html)） |
+
+代わりに使うのが OAuth 2.0 です（第 128 回）。メールアプリは OAuth のクライアントとして、ブラウザで利用者に事業者のログイン画面（多要素認証やパスキーを含む）を通ってもらい、**メールへのアクセスに限った、期限つきのアクセストークン**を受け取ります。パスワードはメールアプリに渡りません。
+
+### IMAP にトークンを載せる: SASL
+
+IMAP と SMTP の `AUTHENTICATE` / `AUTH` は、**SASL**（Simple Authentication and Security Layer）という共通の枠組みに沿っていて、方式（メカニズム）の名前を付けて認証の中身を送ります。`PLAIN` はその 1 つで、利用者名とパスワードを送る方式です。OAuth のトークンを送る方式は 2 つあります。
+
+| 方式 | 仕様 | 使っているところ |
+| --- | --- | --- |
+| `XOAUTH2` | Google 独自（[Google のドキュメント](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol)） | Gmail、Microsoft 365（[Microsoft Learn](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)） |
+| `OAUTHBEARER` | [RFC 7628](https://www.rfc-editor.org/rfc/rfc7628.html)（2015 年、標準化の過程にある仕様） | IETF の標準の方式。GS2 ヘッダに続けて `host` と `port` も送れる |
+
+`XOAUTH2` の中身は、区切りに 0x01（`^A`）を使った短い文字列を Base64 にしただけです。手元で組み立てるとこうなります（トークンはもちろん偽物です）。
+
+```
+'user=carol@example.com\x01auth=Bearer ya29.EXAMPLE-ACCESS-TOKEN\x01\x01'
+dXNlcj1jYXJvbEBleGFtcGxlLmNvbQFhdXRoPUJlYXJlciB5YTI5LkVYQU1QTEUtQUNDRVNTLVRPS0VOAQE=
+```
+
+これを `AUTHENTICATE XOAUTH2 <この文字列>` で送ります。`auth=Bearer ...` の部分は HTTP の `Authorization` ヘッダと同じ書き方で、**中身は第 128 回のベアラトークン**です。Gmail の場合、IMAP、POP、SMTP に使うトークンには `https://mail.google.com/` というスコープが要ります。Microsoft 365 では IMAP 用に `https://outlook.office.com/IMAP.AccessAsUser.All` のように、プロトコルごとにスコープが分かれています。失敗したときは、理由を書いた JSON を Base64 にして返してきます。
+
+手元の Dovecot は OAuth の設定をしていないので、TLS の後の CAPABILITY に `AUTH=PLAIN` しかなく、試すと断られます。
+
+```
+XOAUTH2 -> [ALERT] Unsupported authentication mechanism.
+OAUTHBEARER -> [ALERT] Unsupported authentication mechanism.
+```
+
+Dovecot を OAuth に対応させるには、受け取ったトークンを認可サーバに問い合わせて確かめる（第 130 回のイントロスペクション、または JWT の検証）設定を足します。**メールサーバは OAuth のリソースサーバになる**わけです。
+
+<Callout type="warn" title="よくある誤解: アプリパスワードを使えば安全">
+  OAuth に対応していない古いメールアプリのために、多くの事業者は**アプリパスワード**（Google では 16 桁）を用意しています。多要素認証を有効にしたアカウントで、アプリごとに別のパスワードを発行する仕組みです。
+  しかし、アプリパスワードは**多要素認証を素通りする長期の合言葉**です。スコープも期限もなく、盗まれればそのまま使えます。Google 自身が「アプリパスワードは推奨されず、ほとんどの場合は不要」と書いています（[Google アカウント ヘルプ](https://support.google.com/accounts/answer/185833)）。Google はアカウントのパスワードを変えるとアプリパスワードを失効させますが、逆に言えば、変えるまでは使え続けます。
+  Microsoft は、基本認証の廃止によって、2 段階認証に対応しないアプリでのアプリパスワードも使えなくなったと書いています（上の Microsoft Learn の記事）。
+</Callout>
+
+## メールは合鍵になっている
+
+ここまでメールを「読む」話をしてきましたが、この回で最も伝えたいのは次のことです。
+
+**多くのサービスは、メールアドレスを「本人に連絡がつく経路」として、アカウントの回復に使っています。**
+
+- パスワードを忘れたら、**再設定のリンク**がメールで届く
+- パスワードを使わない**マジックリンク**のログインは、メールのリンクを踏むことがそのままログインになる
+- ログインの確認に、**メールでワンタイムコード**が届く
+- 新しいサービスへの登録は「このアドレスに届いたメールを確かめた」ことで本人確認とする。第 129 回の `email_verified` も、第 133 回のドメインの所有確認の一部も、この上に立っています
+
+したがって、**メールボックスを読める人は、そこに紐づいたほぼすべてのアカウントを奪える**ことになります。
+
+```
+            ┌──▶ ショッピングサイト（再設定のリンク）
+メール      ├──▶ SNS（マジックリンク）
+アカウント ─┼──▶ クラウドの管理画面（メールのワンタイムコード）
+            ├──▶ 別のメールアカウント（予備のアドレスとして）
+            └──▶ 仕事のサービス（招待と所有確認）
+```
+
+第 125 回で「アカウントの強さは、いちばん弱い入口で決まる」と書きました。メールはその**入口がすべて集まった場所**です。だから次のことが効いてきます。
+
+- メールアカウント自体に、最も強い認証（パスキーや、フィッシングに強い多要素認証）を掛ける
+- メールアプリの接続を OAuth にし、アプリパスワードや基本認証を残さない。**IMAP の入口が、Web のログインよりも弱い状態を作らない**
+- 攻撃者はメールボックスに入ると、転送の設定や受信のルールを足して、再設定のメールを利用者に気づかせずに抜き取ることがある。見覚えのない転送やルールは、乗っ取りの痕跡として確かめる
+- サービスを作る側は、メールでの回復を**最も弱い経路**として扱い、重要な操作（連絡先のメールアドレスの変更、多要素の解除）の前には、別の要素での確認を挟む
+
+<Callout type="warn" title="よくある誤解: メールのワンタイムコードは「第二の要素」になる">
+  パスワードに加えてメールにコードを送る方式は、多要素認証のように見えます。しかし、**パスワードを忘れたときの再設定もメールで行う**サービスでは、メールボックスさえ読めれば、パスワードを再設定してコードも受け取れます。2 つの要素が、実は 1 つのメールアカウントに頼っています。
+  また、メールのコードは利用者がフィッシングのページに打ち込めてしまう点でも、第 125 回で見た SMS のコードと同じ弱さを持ちます。
+</Callout>
+
+## どの部品と組み合わさっているか
+
+| 守りたいこと | 担う部品 |
+| --- | --- |
+| 端末とサーバの間でパスワードやメールを盗み見られない | TLS（第 112 回）。IMAP と POP3 は 993 / 995 の暗黙の TLS を勧められている（RFC 8314、第 144 回） |
+| つないだ先が本物のメールサーバである | 証明書の検証と信頼の連鎖（第 109、110 回） |
+| パスワードを端末に置かない、多要素を効かせる | OAuth 2.0（第 128 回）と SASL の `XOAUTH2` / `OAUTHBEARER` |
+| サーバがトークンを確かめる | イントロスペクションや JWT の検証（第 127、130 回） |
+| 「受け取りました」の後にメールが消えない | tmp への書き込み、fsync、rename（第 49、50 回） |
+| 大量の IDLE の接続を抱える | I/O 多重化（第 45 回） |
+| 読んだ中身が本当にその差出人からのものか | **読むプロトコルは何も保証しない**。DKIM と DMARC（第 146、147 回）、S/MIME と OpenPGP（第 148 回） |
+| 経路上のサーバに中身を読まれない | **経路の TLS では守れない**。サーバの中では平文で保存される。守るのはエンドツーエンドの暗号化（第 148 回） |
+
+最後の 2 行は見落としやすい点です。IMAP を TLS で守っても、守られるのは**端末とサーバの間**だけです。メールボックスの中のメールは、サーバの管理者や、サーバに入り込んだ攻撃者からは読めます。そして、メールボックスにあるメールが本物かどうかは、届いた時点で受信側の MTA が判定した結果（第 150 回で読む `Authentication-Results`）に頼っています。
+
+## まとめ
+
+- 届いたメールを読むのは SMTP ではなく、**POP3、IMAP、JMAP** という別のプロトコル
+- POP3 は「取ってきて消す」。状態はほぼ無く、フォルダも既読も持たない。`DELE` は `QUIT` の後に効く
+- IMAP は**サーバが状態を持ち**、端末がそれを同期する。現行は IMAP4rev2（RFC 9051、2021 年）。タグ付きのコマンドと、頼んでいなくても届くタグなしの応答で会話する
+- メールを指す番号は 2 種類。**シーケンス番号は削除でずれ、UID はずれない**。UID は UIDVALIDITY と組にして覚える
+- `BODY[]` を取ると既読になる。一覧を作るときは `BODY.PEEK[]` を使う
+- IDLE で新着を押し出してもらえるが、1 接続で 1 メールボックス。JMAP は同じ考え方を HTTP と JSON で作り直したもの
+- 保存形式は、1 ファイルにつなぐ mbox と、1 通 1 ファイルの Maildir。Maildir は tmp に書いて rename することで、ロックなしで書きかけを見せない
+- メールアプリの認証は、パスワード（基本認証）から **OAuth と SASL の `XOAUTH2` / `OAUTHBEARER`** へ移った。アプリパスワードは多要素を素通りする長期の合言葉
+- メールアカウントは、パスワードの再設定やマジックリンクを通じて**他のアカウントの合鍵**になっている。メールの入口は、最も強く守る
+
+次の第 150 回は章の最後です。ここまでの部品をすべて使って、アプリからメールを送り、**迷惑メールに入らずに届かせる**ための運用を見ます。

@@ -1,0 +1,443 @@
+---
+title: SMTP の会話を手で読む
+description: メールソフトが「送信しました」と表示したとき、相手のサーバとの間では何が約束されたのでしょうか。SMTP の会話を 1 行ずつ自分で話し、応答コードの 4xx と 5xx の違い、キューとバウンス、250 を返す側の責任、そして誰にでも中継させてはいけない理由を見ます
+chapter: mail
+order: 3
+status: published
+topics:
+  - SMTP（RFC 5321）
+  - EHLO と拡張
+  - MAIL / RCPT / DATA
+  - ドット詰め
+  - 応答コードと拡張ステータスコード
+  - 再送のキュー
+  - バウンス（DSN）
+  - null の送信者
+  - SMTP AUTH（SASL）
+  - オープンリレー
+requires:
+  - ll-139-mail-map
+  - ll-53-socket-tcp
+  - ll-50-durability
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 「送信しました」は何を約束したのか
+
+メールソフトの送信ボタンを押すと、すぐに「送信しました」と表示されます。しかし、その時点でメールは相手の受信箱に入っていません。まだ自分の組織のサーバが受け取っただけかもしれませんし、相手のサーバが一時的に止まっていれば、数時間後、数日後に届くこともあります。届かなかったと知らせるメールが、2 日後に返ってくることもあります。
+
+この回では、前回 `smtplib` に任せた SMTP の会話を、**1 行ずつ自分で話して**読みます。見たいのは次の 3 つです。
+
+- サーバが返す 3 桁の数字は、何を区別しているのか
+- なぜメールは「すぐには届かなくても、最後には届く（または届かなかったと分かる）」仕組みになっているのか
+- 「受け取りました」と答えたサーバは、何に責任を持つのか
+
+SMTP の現行の仕様は [RFC 5321](https://www.rfc-editor.org/rfc/rfc5321.html)（2008 年）です。後継の改訂版は IETF の emailcore 作業部会で作られており、執筆時点（2026 年 9 月）では [RFC Editor の待ち行列に入った草案](https://datatracker.ietf.org/doc/draft-ietf-emailcore-rfc5321bis/)で、まだ RFC にはなっていません。この回は RFC 5321 に沿って読みます。
+
+## 会話の形
+
+SMTP は、第 53 回で見た TCP の接続の上で、**人が読める文字の行**をやり取りする仕組みです。行の終わりは必ず CR LF（`\r\n`）です。基本の形は **1 つのコマンドに 1 つの応答**で、応答は 3 桁の数字で始まります。
+
+```
+クライアント                        サーバ（25 番で待つ）
+    |  ---- TCP 接続 ------------------> |
+    |  <--- 220 挨拶 -------------------- |
+    |  ---- EHLO 自分の名前 ------------> |
+    |  <--- 250 拡張の一覧 -------------- |
+    |  ---- MAIL FROM:<送信者> ---------> |  ここから 1 通の取引
+    |  <--- 250 -------------------------- |
+    |  ---- RCPT TO:<宛先> -------------> |  宛先の数だけ繰り返す
+    |  <--- 250 か 4xx / 5xx ------------ |
+    |  ---- DATA ------------------------> |
+    |  <--- 354 本文をどうぞ ------------ |
+    |  ---- ヘッダ、空行、本文、"." -----> |
+    |  <--- 250 受け取った -------------- |  ここで責任が移る
+    |  ---- QUIT ------------------------> |
+    |  <--- 221 -------------------------- |
+```
+
+応答が複数行にわたるときは、最後の行以外は数字の直後が `-` になり、最後の行だけが空白になります。クライアントは「数字の次が空白の行」が来るまで読み続けます。
+
+待ち時間も決まっています。RFC 5321 は、挨拶や `MAIL`、`RCPT` の応答を 5 分、本文の終わりへの応答を 10 分待つよう求めています（[4.5.3.2](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.5.3.2)）。Web の感覚では異様に長いですが、これは相手のサーバが本文を検査したり保存したりする時間を見込んだものです。
+
+## 手元で話す準備
+
+Docker で Postfix を立て、手元の Python から 1 行ずつ話します。実在のメールサーバへは送らず、宛先はすべて存在しない `example.test` のドメインにします。
+
+```bash
+docker run -d --name ll114 -p 18115:25 debian:stable-slim sleep infinity
+docker exec -it ll114 bash
+# コンテナの中で
+apt-get update && apt-get install -y postfix sasl2-bin libsasl2-modules
+postconf -e myhostname=mx.example.test mydestination="example.test, localhost" \
+            mynetworks=127.0.0.0/8 maillog_file=/var/log/postfix.log
+postconf -e default_transport="error:5.7.1 lab: no external delivery"   # 外へは絶対に送らない
+useradd -m bob
+postfix start
+```
+
+`mydestination` に書いたドメイン宛ては自分で受け取り、それ以外は中継になります。`mynetworks` はコンテナ自身だけにしたので、ホストの Mac から来る接続は「知らない相手」として扱われます。
+
+クライアントは、行を送って応答を最後の行まで読むだけの小さなものです。
+
+```python
+import socket
+s = socket.create_connection(("127.0.0.1", 18115))
+f = s.makefile("rb")
+
+def reply():
+    while True:
+        line = f.readline().decode().rstrip("\r\n"); print("S: " + line)
+        if line[3:4] != "-":        # 数字の次が空白なら最後の行
+            return line
+
+def cmd(c):
+    print("C: " + c); s.sendall(c.encode() + b"\r\n"); return reply()
+
+reply()                             # 接続しただけで 220 が来る
+cmd("EHLO client.example.test")
+```
+
+`nc -C 127.0.0.1 18115` でも同じことができます。ここでは、行の終わりの `\r\n` を自分で付けていることが見えるように Python で書きます。
+
+## 挨拶と EHLO: 何が話せるかを確かめる
+
+接続すると、クライアントが何も言わないうちにサーバが名乗ります。続けて `EHLO` で自分の名前を伝えると、サーバは**使える拡張の一覧**を返します。
+
+```
+S: 220 mx.example.test ESMTP Postfix (Debian)
+C: EHLO client.example.test
+S: 250-mx.example.test
+S: 250-PIPELINING
+S: 250-SIZE 10240000
+S: 250-VRFY
+S: 250-ETRN
+S: 250-STARTTLS
+S: 250-ENHANCEDSTATUSCODES
+S: 250-8BITMIME
+S: 250-DSN
+S: 250-SMTPUTF8
+S: 250 CHUNKING
+```
+
+1982 年の [RFC 821](https://www.rfc-editor.org/rfc/rfc821.html) には拡張の仕組みがなく、挨拶は `HELO` でした。`EHLO`（Extended HELO）は「拡張を知っているので一覧をください」という意味で、古い相手なら `HELO` に戻ります（[RFC 5321 3.2](https://www.rfc-editor.org/rfc/rfc5321.html#section-3.2)）。**SMTP の機能のほとんどは、この一覧で相手が名乗ったときだけ使える任意の拡張**です。
+
+| 拡張 | 意味 | 仕様 |
+| --- | --- | --- |
+| `SIZE 10240000` | 受け取れる最大の大きさ（バイト）。`MAIL FROM` で先に大きさを申告できる | [RFC 1870](https://www.rfc-editor.org/rfc/rfc1870.html) |
+| `8BITMIME` | 最上位ビットが立ったバイト（8 ビット）を本文に含めてよい | [RFC 6152](https://www.rfc-editor.org/rfc/rfc6152.html) |
+| `PIPELINING` | 応答を待たずに複数のコマンドをまとめて送ってよい | [RFC 2920](https://www.rfc-editor.org/rfc/rfc2920.html) |
+| `STARTTLS` | この接続を TLS に切り替えられる（第 144 回） | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html) |
+| `AUTH PLAIN LOGIN` | SASL で利用者を認証できる。方式の一覧が続く | [RFC 4954](https://www.rfc-editor.org/rfc/rfc4954.html) |
+| `SMTPUTF8` | アドレスやヘッダに UTF-8 を使える（第 143 回） | [RFC 6531](https://www.rfc-editor.org/rfc/rfc6531.html) |
+| `CHUNKING` | `DATA` の代わりに `BDAT` で長さを先に示して送れる（本文の終わりの印が要らない） | [RFC 3030](https://www.rfc-editor.org/rfc/rfc3030.html) |
+| `ENHANCEDSTATUSCODES` | 応答に `5.1.1` のような詳しいコードを付ける | [RFC 2034](https://www.rfc-editor.org/rfc/rfc2034.html) |
+| `DSN` | 配送の結果を知らせてほしい条件を指定できる | [RFC 3461](https://www.rfc-editor.org/rfc/rfc3461.html) |
+
+この一覧に `AUTH` が**ない**ことに注目してください。後で見るとおり、TLS に切り替えた後の `EHLO` にだけ現れます。一覧は固定ではなく、**その時点の接続の状態でサーバが決める**ものです。同じ手順を別の実装であるテスト用サーバ mailpit に対して行うと、返ってきたのは `SIZE`、`ENHANCEDSTATUSCODES`、`8BITMIME`、`SMTPUTF8` の 4 つだけでした。クライアントは相手が名乗ったものだけを使い、名乗らなければ使わずに済ませます。
+
+## 1 通の取引: MAIL、RCPT、DATA
+
+では 1 通送ります。宛先には、存在する利用者、存在しない利用者、よそのドメインの 3 つを並べます。
+
+```
+C: MAIL FROM:<alice@client.example.test> SIZE=300
+S: 250 2.1.0 Ok
+C: RCPT TO:<bob@example.test>
+S: 250 2.1.5 Ok
+C: RCPT TO:<nosuchuser@example.test>
+S: 550 5.1.1 <nosuchuser@example.test>: Recipient address rejected: User unknown in local recipient table
+C: RCPT TO:<carol@elsewhere.example>
+S: 454 4.7.1 <carol@elsewhere.example>: Relay access denied
+C: DATA
+S: 354 End data with <CR><LF>.<CR><LF>
+C: From: Alice <alice@client.example.test>
+C: To: bob@example.test
+C: Subject: hello
+C:
+C: line 1
+C: ..starts with a dot
+C: .
+S: 250 2.0.0 Ok: queued as 51B49A0088
+C: QUIT
+S: 221 2.0.0 Bye
+```
+
+読みどころは 3 つあります。
+
+**1. 宛先は 1 つずつ判定される。** 3 つの `RCPT` はそれぞれ別の応答を受けました。`DATA` に進めたのは、受け入れられた宛先が 1 つ以上残ったからです。本文は 1 回送るだけで、受け入れられた `bob` の分だけ配達されます。サーバは 1 通あたり少なくとも 100 個の宛先を受け付けられなければならず、それ以上は断ってよいとされています（[RFC 5321 4.5.3.1.8](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.5.3.1.8)）。
+
+**2. 順番は決まっている。** `MAIL` の前に `RCPT` を送ると、mailpit は `503 5.5.1 Bad sequence of commands (MAIL required before RCPT)` と答えました。SMTP の会話には状態があり、取引は `MAIL` で始まって本文の終わりで閉じます。
+
+**3. `DATA` の後の行はコマンドではない。** `354` を受けてから本文の終わりを示す行までは、`From:` も `Subject:` もサーバにとっては**ただの文字列**です。前回見た封筒（エンベロープ）と便箋（ヘッダ）の区別は、この会話の形そのものから来ています。
+
+受け取ったメールボックスでは、サーバが先頭に `Received: from client.example.test (unknown [192.168.65.1]) by mx.example.test ...` という 1 行を足していました。`EHLO` でこちらが名乗った名前と、サーバが実際に見た接続元の IP アドレス（逆引きは引けなかったので `unknown`）を並べて書くのは、名乗りが確かめられていないからです。送信側の身元の話は第 142 回で続けます。
+
+## 本文の終わりと「ドット詰め」
+
+本文の終わりは、**`.` だけの行**、つまりバイト列の `\r\n.\r\n` です。では、本文の中に `.` だけの行や `.` で始まる行があったらどうするのか。
+
+RFC 5321 は、送る側が**行頭の `.` の前にもう 1 つ `.` を足し**、受ける側は行頭の `.` を 1 つ取り除く、と決めています（[4.5.2](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.5.2)）。これを **ドット詰め**（dot-stuffing）と呼びます。
+
+```
+書いた本文            送る行               受け取った側が保存する行
+.starts with a dot → ..starts with a dot → .starts with a dot
+.                  → ..                  → .          （本文の終わりと区別できる）
+```
+
+上の会話では `..starts with a dot` を送り、メールボックスには `.starts with a dot` が残りました。ドット詰めは `smtplib` のようなライブラリが自動でやってくれますが、手で話すときは自分でやらなければなりません。
+
+<Callout type="warn" title="よくある誤解: 行の終わりは LF でも CR LF でも同じ">
+  Unix のプログラムは行の終わりを LF（`\n`）だけで書くことが多く、昔から多くの SMTP サーバがそれを大目に見てきました。
+  ところが「本文の終わりを何と見なすか」がサーバごとに違うと、中継する側には本文の一部に見える `\n.\n` を、
+  受ける側が本文の終わりと解釈し、その後ろに続く文字列を **2 通目のメールのコマンド**として実行してしまいます。
+  2023 年 12 月に SEC Consult が公表した **SMTP smuggling** がこれで、Postfix、Sendmail、Exim に CVE が割り当てられました
+  （[SEC Consult](https://sec-consult.com/blog/detail/smtp-smuggling-spoofing-e-mails-worldwide/)、[Postfix の解説](https://www.postfix.org/smtp-smuggling.html)）。
+  Postfix 3.9 以降は既定で、本文の終わりとして正しい `\r\n.\r\n` だけを認めます（[smtpd_forbid_bare_newline](https://www.postfix.org/postconf.5.html#smtpd_forbid_bare_newline)）。
+</Callout>
+
+手元の Postfix 3.10 に、本文の途中へ `line\n.\nMAIL FROM:<x@y>\r\n` を混ぜて送ってみました。サーバは `\n.\n` で取引を閉じず、正しい終わりの行まで待って `250` を返し、`MAIL FROM:<x@y>` は 1 通目の本文の 1 行としてメールボックスに残りました。2 通目のメールは生まれていません。
+
+## 応答コードを読む
+
+3 桁の数字は、**1 桁目だけで、クライアントが次に何をすべきかが決まる**ように作られています（[RFC 5321 4.2.1](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.2.1)）。
+
+| 1 桁目 | 意味 | クライアントがすること |
+| --- | --- | --- |
+| 2 | 成功 | 次へ進む |
+| 3 | 途中。続きの情報を待っている | 続きを送る（`354` の後の本文、`334` の後の認証情報） |
+| 4 | 一時的な失敗。今回は受け付けなかった | **後でもう一度、同じ要求を送る** |
+| 5 | 恒久的な失敗 | **同じ要求を繰り返さない** |
+
+2 桁目は大まかな分類で、`x0z` は構文、`x1z` は情報、`x2z` は接続、`x5z` はメールの処理系、を表します。
+
+しかし 3 桁では情報が足りません。`550` は「宛先がいない」ときにも「方針により拒否」のときにも使われます。そこで、応答の本文の先頭に **拡張ステータスコード**を付ける仕組みが作られました（[RFC 3463](https://www.rfc-editor.org/rfc/rfc3463.html)、SMTP で付けることを宣言するのが `ENHANCEDSTATUSCODES`）。形は `分類.主題.詳細` です。
+
+| 主題 | 意味 | 例（今回の会話で見たもの） |
+| --- | --- | --- |
+| X.1 | 宛先のアドレス | `550 5.1.1` 宛先の利用者がいない |
+| X.2 | メールボックス | `X.2.2` メールボックスが満杯 |
+| X.3 | メールの処理系 | `552 5.3.4` 大きすぎる（`SIZE=99999999` を申告した） |
+| X.4 | ネットワークと経路 | `4.4.1` 相手が応答しない（後のキューの例） |
+| X.5 | プロトコル | `503 5.5.1` 順番の誤り、`500 5.5.2` 知らないコマンド |
+| X.6 | 内容や形式 | 変換できない形式など |
+| X.7 | 安全性や方針 | `454 4.7.1` 中継を拒否、`535 5.7.8` 認証の失敗 |
+
+1 桁目の分類（2、4、5）は 3 桁の応答コードと揃えます。**プログラムで扱うなら、応答の文言ではなくこの 2 つの数字を見る**のが基本です。文言は実装ごとに違い、同じ `5.1.1` でも Postfix は `User unknown in local recipient table`、別のサーバは別の言い回しで返します。
+
+## 4xx は再送、5xx は諦め
+
+1 桁目の 4 と 5 の違いは、メールという仕組み全体の性格を決めています。RFC 5321 は、どちらにすべきか迷ったときの目安をこう書いています。**同じコマンドをそのまま繰り返して、いずれ成功しうるなら 4xx**、送る側か受ける側が何かを変えない限り成功しないなら 5xx です（[4.2.1](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.2.1)）。
+
+| 状況 | 返すべき応答 | 送る側の動き |
+| --- | --- | --- |
+| 受信側のディスクが一時的に足りない | 4xx（`452 4.3.1` など） | キューに残し、後で再送 |
+| 受信側が再起動中で接続できない | 応答なし（接続失敗） | 4xx と同じく再送 |
+| 宛先の利用者がいない | 5xx（`550 5.1.1`） | 諦めて、送信者に知らせる |
+| メールが大きすぎる | 5xx（`552 5.3.4`） | 諦めて、送信者に知らせる |
+
+この取り決めのおかげで、受信側は**止まっていても、断ってもよい**ことになります。受信側が数時間止まっても、送る側がメールを抱えて待ってくれるからです。逆に言えば、**4xx と 5xx を取り違えると、メールは黙って失われるか、無駄に何日も待たされます**。恒久的な問題に 4xx を返せば送る側は 5 日間再送し続け、一時的な問題に 5xx を返せば、届けられたはずのメールが送信者に突き返されます。
+
+上の会話で、よそのドメイン宛ての `RCPT` に Postfix が返したのは `550` ではなく `454 4.7.1`、つまり一時的な失敗でした。これは手元の Postfix の設定 `smtpd_relay_restrictions = permit_mynetworks permit_sasl_authenticated defer_unauth_destination` によるもので、`defer_unauth_destination` は中継の拒否を「一時的な失敗として」返す指定です（[postconf(5)](https://www.postfix.org/postconf.5.html#defer_unauth_destination)）。設定を誤って自分宛てのドメインを書き忘れても、送る側のキューに残って再送されるので、直せば届きます。
+
+<Callout type="warn" title="よくある誤解: エラーが出なかったのだから、届いた">
+  メールソフトやアプリが受け取る `250` は、**最初の 1 台のサーバが受け取った**という意味でしかありません。
+  その先の中継で 4xx が続けば数日キューに留まり、最後に 5xx で断られれば、そのときに送信者宛ての知らせ（バウンス）が作られます。
+  送信の API が成功を返した後に届かなかったことを知る手段は、このバウンス（と第 150 回で見る配信サービスの通知）しかありません。
+  アプリで「送った」と「届いた」を同じ状態として記録していると、ここで食い違います。
+</Callout>
+
+## MTA のキュー: 数日かけて届ける
+
+送る側の MTA は、すぐに渡せないメールを**キュー**に入れて、間隔を空けて再送します。RFC 5321 は、失敗した宛先への再送は少なくとも 30 分空けること、諦めるまでの期間は少なくとも 4〜5 日が一般に必要であること、そして再送の設定は変更できなければならないことを求めています（[4.5.4.1](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.5.4.1)）。
+
+Postfix の既定値は次のとおりです（[postconf(5)](https://www.postfix.org/postconf.5.html)。手元の 3.10 の `postconf -d` でも同じ値でした）。
+
+| パラメータ | 既定値 | 意味 |
+| --- | --- | --- |
+| `queue_run_delay` | 300s | 保留中のキューを見直す間隔 |
+| `minimal_backoff_time` | 300s | 再送の間隔の下限 |
+| `maximal_backoff_time` | 4000s | 再送の間隔の上限（約 67 分） |
+| `maximal_queue_lifetime` | 5d | 一時的な失敗が続いたとき、諦めるまでの期間 |
+| `bounce_queue_lifetime` | 5d | バウンス自体が届かないとき、諦めるまでの期間 |
+
+RFC の「30 分」より短い間隔で始めて、上限まで間隔を延ばしていく作りです。
+
+手元で確かめます。`slow.example.test` 宛てを、誰も待っていないポート（コンテナの中の `127.0.0.1:2525`）へ送るよう `transport_maps` に書き、認証してから 1 通送りました（認証は後の節で見ます）。サーバは `250 2.0.0 Ok: queued as 8C8B3A01F7` と答え、その直後に次の状態になりました。
+
+```
+$ postqueue -p
+-Queue ID-  --Size-- ----Arrival Time---- -Sender/Recipient-------
+8C8B3A01F7      213 Mon Sep 28 12:08:09  alice@example.test
+                    (connect to 127.0.0.1[127.0.0.1]:2525: Connection refused)
+                                         dave@slow.example.test
+```
+
+ログには `dsn=4.4.1, status=deferred` と残っています。接続できないのは「そのうち直るかもしれない」失敗なので、4 として扱い、キューの `deferred` のディレクトリに置いて待ちます。`postcat -q 8C8B3A01F7` で開くと、本文と一緒に `sender: alice@example.test` や `log_helo_name=client.example.test` といった**封筒の情報**が保存されています。RFC 5321 も、キューの 1 件には封筒の情報が入ると書いています（4.5.4.1）。再送するときに要るのは `MAIL FROM` と `RCPT TO` であって、本文の `From:` や `To:` ではないからです。
+
+## 250 を返す側の責任
+
+本文の終わりに `250` を返すことには、重い意味があります。
+
+> When the receiver-SMTP accepts a piece of mail (by sending a "250 OK" message in response to DATA), it is accepting responsibility for delivering or relaying the message. ... It MUST NOT lose the message for frivolous reasons, such as because the host later crashes ...
+> （[RFC 5321 6.1](https://www.rfc-editor.org/rfc/rfc5321.html#section-6.1)）
+
+`250` を返した瞬間に、**そのメールを届ける（または届かなかったと知らせる）責任が、送った側から受けた側へ移ります**。送った側は、`250` を見たらキューからそのメールを消してよいのです。だから受けた側は、`250` を返した直後に電源が落ちてもメールを失ってはいけません。
+
+これは第 50 回で見た durability の問題そのものです。`write` しただけではデータは OS のページキャッシュにあり、電源が落ちれば消えます。Postfix の文書は、メールを取り込む `cleanup` が**成功を返す前に、メールを安定した記憶装置に書き込み終えなければならない**ため、Postfix の性能はディスクの I/O で決まる、と説明しています（[QSHAPE_README](https://www.postfix.org/QSHAPE_README.html)）。メールサーバのディスクが遅いと受け取りが遅くなるのは、この約束を守っているからです。
+
+逆の向きの失敗もあります。サーバが保存を終えた後、`250` がクライアントに届く前に接続が切れると、クライアントは「受け取られなかった」と判断して後で再送します。受けた側には同じメールが 2 通残ります。RFC 5321 は、この重複を減らすために、受信側は本文の終わりへの応答をできるだけ早く返すよう求めています（6.1、[RFC 1047](https://www.rfc-editor.org/rfc/rfc1047.html)）。**「失わない」と「重複させない」を両立させる方法はなく、SMTP は失わないほうを選んでいます**。
+
+## バウンス: 届かなかったことを知らせる
+
+`250` で責任を引き受けた後に届けられないと分かったら、受けた側は送信者に知らせるメールを作らなければなりません（RFC 5321 6.1）。これが **バウンス**（配送状態の通知、DSN）です。送信者の宛先には、本文の `From:` ではなく**封筒の `MAIL FROM`**（`Return-Path:`）を使います。
+
+手元で、存在しない利用者宛てにコンテナの中から送り、`bob` に返ってきたバウンスを見ます。
+
+```
+Return-Path: <>
+From: Mail Delivery System <MAILER-DAEMON@mx.example.test>
+Subject: Undelivered Mail Returned to Sender
+To: bob@example.test
+Auto-Submitted: auto-replied
+Content-Type: multipart/report; report-type=delivery-status; ...
+
+--8C703A0240.1790597299/mx.example.test
+Content-Description: Notification               ← 人が読む説明（省略）
+--8C703A0240.1790597299/mx.example.test
+Content-Description: Delivery report
+Content-Type: message/delivery-status            ← プログラムが読む部分
+
+Reporting-MTA: dns; mx.example.test
+Final-Recipient: rfc822; nosuchuser@example.test
+Action: failed
+Status: 5.1.1
+Diagnostic-Code: X-Postfix; unknown user: "nosuchuser"
+
+--8C703A0240.1790597299/mx.example.test
+Content-Description: Undelivered Message
+Content-Type: message/rfc822                     ← 元のメール
+```
+
+3 つの部分を束ねる `multipart/report` の形は [RFC 6522](https://www.rfc-editor.org/rfc/rfc6522.html) が、2 つ目の `message/delivery-status` の中身は [RFC 3464](https://www.rfc-editor.org/rfc/rfc3464.html) が決めています。2 つ目の `message/delivery-status` に、さきほどの拡張ステータスコードが `Status: 5.1.1` として入ります。バウンスを自動で処理するプログラムは、ここを読みます。
+
+### null の送信者 `MAIL FROM:<>`
+
+このバウンスの `Return-Path:` は `<>`、つまり**送信者なし**です。RFC 5321 は、バウンスを `MAIL FROM:<>` で送らなければならないと決めています（6.1、[4.5.5](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.5.5)）。
+
+理由は無限の往復を防ぐためです。バウンスに送信者を書くと、そのバウンスも届かなかったときに、バウンスのバウンスが作られ、それも届かなければ……と続きます。送信者が空なら、**バウンスが届かなくても、それ以上は誰にも知らせない**ことになります。不在通知のような自動応答も、送信者が `<>` のメールには返してはいけません（[RFC 3834](https://www.rfc-editor.org/rfc/rfc3834.html) 2）。
+
+<Callout type="warn" title="よくある誤解: いったん受け取ってから、後でバウンスすればよい">
+  存在しない宛先のメールを `250` で受け取ってから後でバウンスすると、そのバウンスは `MAIL FROM` 宛てに送られます。
+  しかし前回見たとおり、`MAIL FROM` は誰でも好きに書けます。スパムの送信者が他人のアドレスを `MAIL FROM` に書けば、
+  **無関係な人のところに大量のバウンスが届きます**。これを backscatter と呼びます（[Postfix の解説](https://www.postfix.org/BACKSCATTER_README.html)）。
+  だから受信側は、分かることはできるだけ会話の中、`RCPT` の段階で 5xx を返して断ります。断られた側のバウンスは、
+  送信者を確かめられた自分の組織の送信サーバが、自分の利用者に向けて作ることになります。
+</Callout>
+
+## PIPELINING: 往復を減らす
+
+1 コマンドごとに応答を待つと、相手が遠いほど往復の時間がかさみます。`PIPELINING` を名乗ったサーバには、応答を待たずにコマンドをまとめて送れます。
+
+```
+C: MAIL FROM:<>
+C: RCPT TO:<bob@example.test>
+C: RCPT TO:<nosuchuser@example.test>
+C: DATA
+S: 250 2.1.0 Ok
+S: 250 2.1.5 Ok
+S: 550 5.1.1 <nosuchuser@example.test>: Recipient address rejected: ...
+S: 354 End data with <CR><LF>.<CR><LF>
+```
+
+4 行を 1 回で送り、応答は**送った順に 1 つずつ**返ってきました。途中の `550` があっても、受け入れられた宛先が 1 つでもあれば本文へ進めます。ただし、どこでも区切れるわけではありません。`RSET`、`MAIL FROM`、`RCPT TO` はまとめてよい一方、`EHLO`、`DATA`、`QUIT`、`NOOP` などは**まとまりの最後にしか置けない**と決まっています（[RFC 2920 3.1](https://www.rfc-editor.org/rfc/rfc2920.html#section-3.1)）。これらは会話の状態を変えるので、応答を見てから次を決める必要があるからです。
+
+## 提出の認証とオープンリレー
+
+ここまでで、よそのドメイン宛ての `RCPT` は `Relay access denied` で断られました。では、自分の組織の利用者が外部へ送りたいときはどうするのか。**認証して、自分が誰かを示します**。
+
+`AUTH` は、TLS に切り替える前は使えませんでした。
+
+```
+C: AUTH LOGIN
+S: 503 5.5.1 Error: authentication not enabled
+C: STARTTLS
+S: 220 2.0.0 Ready to start TLS
+   （TLS 1.3 のハンドシェイク。第 112 回）
+C: EHLO client.example.test
+S: 250-mx.example.test
+...
+S: 250-AUTH PLAIN LOGIN          ← STARTTLS の代わりに現れた
+...
+```
+
+これは、Postfix で SASL の認証（利用者 `alice@example.test` を `saslpasswd2` で登録）を有効にし、`smtpd_tls_auth_only = yes` を設定した結果です。TLS の後で `EHLO` をやり直すのは、TLS の前に聞いた一覧が改ざんされていたかもしれないので、捨てて聞き直すためです（[RFC 3207 4.2](https://www.rfc-editor.org/rfc/rfc3207.html#section-4.2)）。
+
+`AUTH` の中身は **SASL**（Simple Authentication and Security Layer）という、プロトコルから切り離された認証の枠組みで、SMTP はそのやり取りを `334` の途中応答で運びます（[RFC 4954](https://www.rfc-editor.org/rfc/rfc4954.html)）。よく使われる 2 つの方式を見ます。
+
+**PLAIN**（[RFC 4616](https://www.rfc-editor.org/rfc/rfc4616.html)）は、`認可の名前 NUL 利用者名 NUL パスワード` を Base64 にして 1 行で送ります。
+
+```
+C: AUTH PLAIN AGFsaWNlQGV4YW1wbGUudGVzdABzZWNyZXQ=
+S: 235 2.7.0 Authentication successful
+                     ↑ base64 -d すると "\0alice@example.test\0secret"
+```
+
+**LOGIN** は、サーバが Base64 の `Username:` と `Password:` を 1 つずつ尋ねる方式です。
+
+```
+C: AUTH LOGIN
+S: 334 VXNlcm5hbWU6          ← "Username:"
+C: YWxpY2VAZXhhbXBsZS50ZXN0  ← "alice@example.test"
+S: 334 UGFzc3dvcmQ6          ← "Password:"
+C: d3Jvbmc=                  ← "wrong"
+S: 535 5.7.8 Error: authentication failed: authentication failure
+```
+
+LOGIN は広く実装されていますが、RFC にはならず、草案の中でも「廃止された方式で、PLAIN を使うべき」とされています（[draft-murchison-sasl-login](https://datatracker.ietf.org/doc/draft-murchison-sasl-login/)）。
+
+<Callout type="warn" title="よくある誤解: Base64 にしてあるから、パスワードは隠れている">
+  Base64 は第 127 回で見たとおり符号化であって、鍵を使いません。上のとおり `base64 -d` で誰でも元に戻せます。
+  PLAIN も LOGIN も、**パスワードをそのまま送る方式**です。守っているのは下の TLS だけなので、TLS なしで `AUTH` を許してはいけません。
+  `smtpd_tls_auth_only` のような設定は、そのための安全装置です。パスワードそのものを送らない方法として、
+  OAuth 2.0 のトークンを SASL で送る方式があり、第 149 回で見ます。
+</Callout>
+
+本来、提出は 25 番ではなく 587 番（[RFC 6409](https://www.rfc-editor.org/rfc/rfc6409.html)）か 465 番（[RFC 8314](https://www.rfc-editor.org/rfc/rfc8314.html)）で受けます。今回の実験は、見やすさのために 1 つのポートで中継と提出の両方の役を兼ねさせています。ポートごとの TLS の違いは第 144 回で比べます。
+
+### オープンリレー
+
+認証も送信元の確認もせずに、**誰の、どこ宛てのメールでも中継するサーバ**を、オープンリレーと呼びます。RFC 821 の時代には、中継は互いに助け合う当たり前の機能でした。しかしスパムの送信者にとっては、自分の送信元を隠し、他人の回線と評判で大量に送れる便利な踏み台になります。
+
+RFC 5321 も、任意のサイトを通した中継が送信元を隠すために悪用されてきたこと、そのため中継を知っている相手に限る絞り込みを実装が提供すべきことを書いています（[7.9](https://www.rfc-editor.org/rfc/rfc5321.html#section-7.9)）。今の MTA は、宛先が自分のドメインである（これは中継ではなく受け取り）か、送信元が信頼するネットワークにある（`permit_mynetworks`）か、認証に成功した（`permit_sasl_authenticated`）ときだけ中継し、それ以外は断ります。
+
+手元でも、ホストから認証なしで送った `carol@elsewhere.example` 宛ては断られ、認証した後の `dave@slow.example.test` 宛ては受け付けられてキューに入りました。**中継してよいかどうかは、封筒の宛先と、相手が誰かを確かめられたかで決まります**。本文の `From:` はここでも見ていません。
+
+## SMTP は何と組み合わさって意味を持つか
+
+SMTP の会話そのものは、誰が送ったかも、途中で読まれていないかも保証しません。保証しているのは「受け取ったら責任を持って届けるか、届かなかったと知らせる」ことだけです。ほかの性質は、ここまでの部品と組み合わさって初めて得られます。
+
+| 欲しい性質 | SMTP 単体 | 組み合わせる部品 | 見た回 |
+| --- | --- | --- | --- |
+| 確実に届く（失わない） | 250 の責任とキュー | fsync で記憶装置まで書く | 第 50 回 |
+| 相手のサーバに届く | TCP の接続 | 接続の一生、再送 | 第 53 回 |
+| どのサーバへ送るか | 決めない | DNS の MX | 第 58 回、第 142 回 |
+| 途中で読まれない | 平文 | STARTTLS と証明書 | 第 109〜113 回、第 144 回 |
+| 提出してきたのが本人 | 名乗るだけ | SASL と TLS、OAuth | 第 124 回、第 128 回、第 149 回 |
+| 送信元のサーバが正当 | 名乗るだけ | SPF | 第 145 回 |
+| 内容が改ざんされていない | 何もしない | DKIM（署名） | 第 106 回、第 146 回 |
+| 利用者が見る差出人が正しい | 何もしない | DMARC | 第 147 回 |
+
+## まとめ
+
+- SMTP は CR LF で区切った行を 1 コマンド 1 応答でやり取りする。応答の 1 桁目で、クライアントの次の動き（進む、続きを送る、後で再送する、諦める）が決まる
+- `EHLO` への応答が使える拡張の一覧で、**その接続の状態でサーバが決める**。`AUTH` は TLS の後にだけ現れる、といった変化がある
+- 1 通の取引は `MAIL`、`RCPT`（宛先ごとに判定）、`DATA` の順。`DATA` の後はヘッダも本文もサーバにとってはただの文字列で、終わりは `\r\n.\r\n`。本文の行頭の `.` はドット詰めで 2 つにする。行の終わりの解釈の違いは SMTP smuggling を生んだ
+- 拡張ステータスコード `分類.主題.詳細`（`5.1.1` など）は、文言より確かな判定材料になる
+- **4xx は再送、5xx は諦め**。送る側はキューに封筒ごとメールを抱え、Postfix の既定では 5 日間、間隔を延ばしながら再送する。これが「受信側は止まっても断ってもよい」という性格を支えている
+- 本文の終わりに `250` を返したら、届ける責任が移る。だから受けた側は記憶装置に書き終えてから答える。失わない代わりに、重複はありうる
+- 届かなかったときのバウンスは `MAIL FROM:<>` で送る。受け取ってから断ると、偽の `MAIL FROM` に向けた backscatter になるので、できるだけ `RCPT` の段階で断る
+- 中継してよいのは、自分宛て、信頼するネットワーク、認証済みの相手だけ。PLAIN と LOGIN はパスワードを Base64 にしただけなので、TLS の上でしか使わない
+
+次の第 142 回では、この会話を始める前の段階、つまり送る側の MTA が「どのサーバに接続すればよいか」を DNS の MX からどう決めるのかを見ます。あわせて、受ける側が接続してきた相手の身元を、名乗った名前と逆引きでどう疑うのかを見ます。

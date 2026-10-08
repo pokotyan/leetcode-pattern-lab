@@ -61,7 +61,7 @@ import Callout from '../../components/Callout.astro'
 <Callout type="note" title="Pebble に移った理由の 1 つは FFI">
   CockroachDB は Go で書かれていて、RocksDB は C++ です。
   RocksDB を呼ぶたびに cgo の境界を越えることになり、
-  第 143 回で見た「境界をまたぐ呼び出しのコスト」と「言語をまたいだデバッグの難しさ」を抱えていました。
+  第 151 回で見た「境界をまたぐ呼び出しのコスト」と「言語をまたいだデバッグの難しさ」を抱えていました。
   Cockroach Labs は Pebble の利点として、この cgo の境界を越えずに済むことを挙げています（[Cockroach Labs](https://www.cockroachlabs.com/blog/pebble-rocksdb-kv-store/)）。
 </Callout>
 
@@ -159,7 +159,7 @@ TiDB が採用している **Percolator**（Google が 2010 年に発表した�
 
 **CockroachDB** は特殊なハードウェアを仮定せず、NTP で揃えた普通の時計を使います。その代わり、ノード間の時計のずれに上限（既定で 500 ミリ秒）を仮定します。読み取りの時刻より少しだけ新しい版を見つけたとき、それが本当に未来の書き込みなのか、時計のずれでそう見えているだけなのか区別できません。この **不確実な区間** に入った場合は、読み取りの時刻を進めてやり直します。そして、あるノードの時計のずれが上限の 80% を超えたと判断すると、そのノードは自ら停止します（[Cockroach Labs](https://www.cockroachlabs.com/blog/clock-management-cockroachdb/)）。**仮定が破れたまま動き続けるより、止まるほうを選ぶ**設計です。
 
-時計そのものの話（NTP による補正や、時刻が巻き戻る問題）は、第 149 回で扱います。
+時計そのものの話（NTP による補正や、時刻が巻き戻る問題）は、第 157 回で扱います。
 
 ## 何を払っているのか
 

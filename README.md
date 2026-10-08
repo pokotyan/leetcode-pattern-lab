@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | アルゴリズム | `/algorithms/` | LeetCode を「型」で落とす。ステップ実行つき |
 | システム設計 | `/system-design/` | 大きな仕組みを中身まで降りて読む（`/reading/`） |
-| 低レイヤ | `/lowlevel/` | CPU からシステムコール、ストレージ、ネットワーク、DNS、サービス間通信（HTTP/2・HTTP/3・gRPC）、リアルタイム通信（WebSocket・MQTT・QUIC・NAT 越え・WebRTC・ゲームの同期・CRDT・差分同期）、DB、ブラウザ、ブラウザの境界（Cookie・CORS・ヘッダ）、暗号・TLS・SSH・認証認可・SSO、メール、FFI と Wasm、コンテナ、クラウドネイティブ、観測、守りの継続的な検証（SAST・SCA・CSPM・サプライチェーン・テナント分離・証跡）まで 26 章（181 回） |
+| 低レイヤ | `/lowlevel/` | CPU からシステムコール、ストレージ、ネットワーク、DNS、サービス間通信（HTTP/2・HTTP/3・gRPC）、リアルタイム通信（WebSocket・MQTT・QUIC・NAT 越え・WebRTC・ゲームの同期・CRDT・差分同期）、DB、ブラウザ、ブラウザの境界（Cookie・CORS・ヘッダ）、暗号・TLS・SSH・その上に載るプロトコル（SFTP・FTPS・SSH のトンネル・DB の TLS・TLS の VPN・EAP-TLS・NTS）・認証認可・SSO、メール、FFI と Wasm、コンテナ、クラウドネイティブ、観測、守りの継続的な検証（SAST・SCA・CSPM・サプライチェーン・テナント分離・証跡）まで 27 章（189 回） |
 | 作る | `/build/` | NAND から CPU、言語、NES エミュレータまで 3 トラック |
 
 トップ (`/`) はポータルで、区画の一覧と目的別の入口を出す。

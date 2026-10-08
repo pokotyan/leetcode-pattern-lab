@@ -1,0 +1,612 @@
+---
+title: 裏方を守る TLS
+description: Wi-Fi に参加する前の端末は、まだ IP アドレスすら持っていません。それでも TLS のハンドシェイクは行われています。802.1X と EAP-TLS、MD5 で守られてきた RADIUS と RadSec、時刻の問い合わせを守る NTS、ログを運ぶ syslog over TLS を、手元の FreeRADIUS と chrony と rsyslog で確かめます
+chapter: atop
+order: 7
+status: published
+topics:
+  - 802.1X
+  - EAP
+  - EAP-TLS
+  - PEAP / EAP-TTLS
+  - MSK / PMK
+  - RADIUS
+  - Message-Authenticator
+  - Blast-RADIUS
+  - RadSec（RADIUS/TLS）
+  - NTS
+  - NTS-KE
+  - syslog over TLS
+  - LDAPS / StartTLS
+requires:
+  - ll-121-tls-vpn
+  - ll-113-tls-ops
+  - ll-112-tls13-handshake
+  - ll-110-pki-chain
+  - ll-103-hash-mac
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 利用者の目に触れない TLS
+
+前回の第 121 回では、stunnel や OpenVPN のように、TLS で接続や網そのものを包む方法を見ました。そこで使われた TLS は、どれも**IP アドレスを持った端末が、相手につながった後に**始めるものでした。
+
+ところが、ネットワークの裏方にはその前提が成り立たない場面があります。社内の Wi-Fi に参加しようとしている端末は、まだ IP アドレスを持っていません。アクセスポイントは、端末を網に入れてよいかを、自分では判断せずに裏の認証サーバに尋ねます。その問い合わせは 1990 年代の設計のまま、MD5 で守られています。サーバの時計を合わせる NTP の応答や、各サーバから集めるログは、多くの場合、誰が送ったものか確かめられないまま受け取られています。
+
+この回では、こうした**利用者が直接は見ない場所で働く TLS** を 5 つ取り上げます。
+
+| 対象 | TLS の使われ方 | 何を守るか |
+| --- | --- | --- |
+| 802.1X と EAP-TLS / PEAP / EAP-TTLS | IP より下で、EAP のパケットに TLS のハンドシェイクを入れて運ぶ | 網に参加してよい端末かの判断と、無線の暗号鍵の元 |
+| RadSec（RADIUS/TLS） | RADIUS のパケットを TLS の接続に入れる | アクセスポイントと認証サーバの間の問い合わせ |
+| NTS | TLS は鍵を決めるだけ。時刻の問い合わせは NTP のまま | 時刻の応答が本物で、書き換えられていないこと |
+| syslog over TLS | ログの行を TLS の接続で運ぶ | ログの盗み見、書き換え、なりすまし |
+| LDAPS / StartTLS | 第 116 回の型 1 と型 2 | ディレクトリへの問い合わせとパスワード |
+
+第 116 回で、TLS の上に載る型からはみ出すものとして「TLS を部品として使う」ものを挙げました。EAP-TLS と NTS はその代表です。
+
+## 実験の環境
+
+すべての実験は、Docker の中に作った専用のネットワーク（`ll122-net`、172.30.122.0/24）で行いました。
+
+| 項目 | 版 |
+| --- | --- |
+| Docker Engine | 29.2.1（macOS の Docker Desktop、aarch64） |
+| コンテナの OS | Debian 13（trixie）13.7 |
+| FreeRADIUS | 3.2.7（Debian の `3.2.7+dfsg-1+deb13u2`） |
+| eapol_test | v2.10（wpa_supplicant の試験用ツール、Debian の `eapoltest`） |
+| radsecproxy | 1.11.2 |
+| chrony | 4.6.1 |
+| rsyslog | 8.2504.0（`rsyslog-openssl`） |
+| OpenSSL（コンテナ内） | 3.5.7 |
+| OpenSSL（証明書の作成） | 3.6.2 |
+| tcpdump | 4.99.5 |
+| Python | 3.14.0 |
+
+証明書は、手元で作った CA（`CN=ll122 Lab CA`）で、RADIUS サーバ用（`radius.example.com`）、NTS サーバ用（`ntp.example.com`）、syslog の受け手用（`syslog.example.com`）、利用者のクライアント証明書（`alice@example.com`）、syslog の送り手用（`web1.example.com`）を、すべて P-256 の鍵で発行しました。偽のサーバ用に、別の CA（`CN=Evil CA`）で `radius.example.com` の証明書も作っています。
+
+## 802.1X: IP アドレスより先に認証する
+
+### 3 人の登場人物
+
+802.1X は、IEEE が定めた「ポートを開ける前に認証する」仕組みです。有線のスイッチのポートでも、Wi-Fi の WPA2/WPA3-Enterprise でも、登場人物は同じ 3 人です。
+
+```
+  端末（サプリカント）      アクセスポイント／スイッチ        認証サーバ（RADIUS）
+ ┌──────────────┐  EAPOL   ┌─────────────────┐  RADIUS   ┌──────────────────┐
+ │ wpa_supplicant │ ───────▶ │  オーセンティケータ │ ────────▶ │ FreeRADIUS など   │
+ │ IP アドレスなし │ ◀─────── │  EAP を中継するだけ │ ◀──────── │ EAP の相手役      │
+ └──────────────┘ (L2 の枠) └─────────────────┘ (UDP 1812) └──────────────────┘
+        └────────────── EAP の会話（この中に TLS のハンドシェイクが入る）──────────────┘
+```
+
+端末とアクセスポイントの間は、イーサネットや 802.11 のフレームに EAP を直接載せた EAPOL（EAP over LAN）です。アクセスポイントは、受け取った EAP のパケットを RADIUS の属性に入れて認証サーバに転送するだけで、中身は解釈しません。
+
+EAP（Extensible Authentication Protocol）の仕様は、この形をはっきり書いています。EAP は「IP を必要とせずに、PPP や IEEE 802 のようなデータリンク層の上で直接動く」もので、認証の方式は裏の認証サーバが実装し、間の機器は通過させるだけでよい、という作りです（[RFC 3748 1](https://www.rfc-editor.org/rfc/rfc3748.html#section-1)）。さらに EAP は**一度に 1 パケットしか送らない交互の会話**で、**EAP 自体は分割（フラグメント）を持たず、必要なら方式ごとに持つ**とされています（[RFC 3748 1.3](https://www.rfc-editor.org/rfc/rfc3748.html#section-1.3)）。
+
+この 2 つの性質が、EAP の中に TLS を入れるときの姿を決めます。TCP がないので、TLS のレコードを順番どおり届ける役目は EAP の交互の会話が担います。証明書を含む数 KB のハンドシェイクは、方式の側で小さく切って、1 切れずつ確認を取りながら送ります。
+
+### TLS を使う EAP の方式
+
+| 方式 | 外側の TLS | 利用者の確かめ方 | 仕様 |
+| --- | --- | --- | --- |
+| EAP-TLS | 相互認証（クライアント証明書が必須） | 端末の証明書 | [RFC 5216](https://www.rfc-editor.org/rfc/rfc5216.html)、TLS 1.3 は [RFC 9190](https://www.rfc-editor.org/rfc/rfc9190.html) |
+| PEAP | サーバ証明書だけ | トンネルの中の EAP（多くは EAP-MSCHAPv2 のパスワード） | Microsoft の [MS-PEAP](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-peap/5308642b-90c9-4cc4-beec-fb367325c0f9) |
+| EAP-TTLS | サーバ証明書だけ | トンネルの中で PAP、CHAP、MS-CHAP、MS-CHAP-V2、EAP | [RFC 5281](https://www.rfc-editor.org/rfc/rfc5281.html) |
+
+PEAP と EAP-TTLS は、**まず TLS のトンネルを作り、その中で昔ながらのパスワード認証をする**二段構えです。EAP-TTLS ではトンネルの中の属性を Diameter と互換の AVP の形で運び、外側で名乗る利用者名には実名ではなく `anonymous` のような仮の名前を使うべきだとしています（[RFC 5281](https://www.rfc-editor.org/rfc/rfc5281.html)）。TLS 1.3 で使うときの鍵の導出などは、PEAP、EAP-TTLS、EAP-FAST、TEAP をまとめて [RFC 9427](https://www.rfc-editor.org/rfc/rfc9427.html) が定めています。
+
+## 手元で EAP-TLS を通す
+
+FreeRADIUS を認証サーバとし、`eapol_test` を端末とアクセスポイントの両方の代わりに使います。`eapol_test` は、サプリカントとして EAP を話しつつ、そのパケットを自分で RADIUS に詰めて認証サーバに送るツールです。
+
+FreeRADIUS の側では、`mods-available/eap` の証明書の場所を手元の CA で発行したものに差し替え、既定の EAP の方式を `tls` にしました。端末の側の設定は次のとおりです。
+
+```
+network={
+	key_mgmt=WPA-EAP
+	eap=TLS
+	identity="alice"
+	ca_cert="/pki/ca.pem"
+	domain_match="radius.example.com"
+	client_cert="/pki/client.pem"
+	private_key="/pki/client.key"
+}
+```
+
+`ca_cert` と `domain_match` が、**サーバの証明書をどの CA で、どの名前で確かめるか**の指定です。第 110 回でブラウザが URL のホスト名を使っていたところを、ここでは設定で与えています。Wi-Fi には URL がないので、**照合する名前は誰かが端末に設定しない限り存在しません**。
+
+```
+$ eapol_test -c /sup/eap-tls.conf -a 172.30.122.10 -s lab-shared-secret
+...
+MPPE keys OK: 1  mismatch: 0
+SUCCESS
+```
+
+<Callout type="note" title="利用者名に @example.com を付けたら、別のサーバに飛んだ">
+  最初は `identity="alice@example.com"` で試し、拒否されました。FreeRADIUS の既定の `proxy.conf` には `realm example.com` の定義があり、
+  `@` の後ろの領域名を見て、別の RADIUS サーバ（既定では自分自身の別の口）へ要求を転送していたためです。
+  EAP の外側の利用者名は、このように**どのサーバに回すかを決める宛先**としても使われます。大学の相互利用の eduroam は、この転送を世界規模で行っている例です。
+</Callout>
+
+### 出力を読む: EAP の中の TLS
+
+`eapol_test` は、EAP のパケットとそれを包んだ RADIUS のパケットの両方を表示します。最初の 2 往復を抜き出します。
+
+```
+EAP: Received EAP-Request id=128 method=1 vendor=0 vendorMethod=0      ← 1 = Identity「名乗れ」
+TX EAP -> RADIUS - hexdump(len=10): 02 80 00 0a 01 61 6c 69 63 65      ← Response, "alice"
+RADIUS message: code=1 (Access-Request) identifier=0 length=124
+   Attribute 1 (User-Name) length=7
+      Value: 'alice'
+   Attribute 79 (EAP-Message) length=12
+      Value: 0280000a01616c696365
+   Attribute 80 (Message-Authenticator) length=18
+RADIUS message: code=11 (Access-Challenge) identifier=0 length=64
+   Attribute 79 (EAP-Message) length=8
+      Value: 018100060d20                                                ← EAP-TLS の Start
+```
+
+EAP のパケットは `コード（1 = 要求、2 = 応答）、番号、長さ（2 バイト）、方式` の順です。最初の `alice` はまだ TLS の前なので、**平文で流れています**。RFC 3748 も、Identity の要求と応答は平文で送られると書いています（[RFC 3748 5.1](https://www.rfc-editor.org/rfc/rfc3748.html#section-5.1)）。
+
+認証サーバからの返事 `01 81 00 06 0d 20` は、方式 13（`0d`、EAP-TLS）で、フラグが `0x20` です。EAP-TLS のフラグは先頭から L（長さ付き）、M（続きあり）、S（開始）の 3 ビットで、S が立った空の要求が「TLS を始めよ」という合図です（[RFC 5216 3.1](https://www.rfc-editor.org/rfc/rfc5216.html#section-3.1)）。サーバから始めの合図を出し、**ClientHello はクライアントが送る**という第 112 回の順番は変わりません。
+
+この先、ハンドシェイクのメッセージが EAP に入って行き来します。
+
+```
+RADIUS message: code=1 (Access-Request) identifier=1 length=337
+   Attribute 79 (EAP-Message) length=207                                ← ClientHello
+RADIUS message: code=11 (Access-Challenge) identifier=1 length=1064
+   Attribute 79 (EAP-Message) length=255
+   Attribute 79 (EAP-Message) length=255
+   Attribute 79 (EAP-Message) length=255
+   Attribute 79 (EAP-Message) length=243                                ← ServerHello と証明書（前半）
+RADIUS message: code=1 (Access-Request) identifier=2 length=138
+   Attribute 79 (EAP-Message) length=8                                  ← 中身のない応答 = 「受け取った、続きを」
+RADIUS message: code=11 (Access-Challenge) identifier=2 length=197
+   Attribute 79 (EAP-Message) length=141                                ← 後半
+```
+
+ここに 2 段の分割が見えます。
+
+- **RADIUS の属性は値が最大 253 バイト**なので（[RFC 2865 5](https://www.rfc-editor.org/rfc/rfc2865.html#section-5)）、1 つの EAP パケットを複数の EAP-Message 属性に分けて入れ、受け手が連結します（[RFC 3579 3.1](https://www.rfc-editor.org/rfc/rfc3579.html#section-3.1)）。長さ 255 は、種類と長さの 2 バイトを含んだ値です
+- **EAP-TLS 自身も TLS のデータを分割します**。M フラグ付きの断片を受け取った側は、データのない応答を返して続きを促します（[RFC 5216 2.1.5](https://www.rfc-editor.org/rfc/rfc5216.html#section-2.1.5)）。長さ 8 の EAP-Message がその確認です。FreeRADIUS の設定ファイルは、多くのアクセスポイントが扱えるパケットの大きさが 1500〜1600 バイト程度なので、断片の大きさは 1024 バイト以下がよいと説明しています（`mods-available/eap` の `fragment_size` のコメント）。上の 4 つの属性の合計がおよそ 1000 バイトなのはこのためです
+
+EAP が一度に 1 パケットしか送らないので、**証明書が大きいほど往復が増え、接続が遅くなります**。EAP-TLS で証明書の鎖を短く、鍵を小さく（RSA より ECDSA）するのは、このためでもあります。
+
+続いて、端末がサーバの証明書を確かめた記録です。
+
+```
+CTRL-EVENT-EAP-PEER-CERT depth=1 subject='/CN=ll122 Lab CA' hash=a417c234...
+TLS: tls_verify_cb - preverify_ok=1 err=0 (ok) ca_cert_verify=1 depth=1 buf='/CN=ll122 Lab CA'
+CTRL-EVENT-EAP-PEER-CERT depth=0 subject='/CN=radius.example.com' hash=e2bc9998...
+CTRL-EVENT-EAP-PEER-ALT depth=0 DNS:radius.example.com
+TLS: Match domain against radius.example.com
+TLS: Match in dNSName found
+EAP: Status notification: remote certificate verification (param=success)
+SSL: SSL_connect:SSLv3/TLS read server certificate request
+SSL: SSL_connect:SSLv3/TLS write client certificate
+SSL: SSL_connect:SSLv3/TLS write certificate verify
+```
+
+第 110 回の鎖の検証と、SAN の dNSName との照合がそのまま行われています。サーバは CertificateRequest を送り、端末はクライアント証明書と CertificateVerify を返しました。第 113 回の mTLS と同じ形です。
+
+### TLS 1.2 で話していた
+
+サーバのログを見ると、端末は TLS 1.3 を提示したのに、サーバは TLS 1.2 で答えていました。
+
+```
+(3) eap_tls: (TLS) TLS - recv TLS 1.3 Handshake, ClientHello
+(3) eap_tls: (TLS) TLS - send TLS 1.2 Handshake, ServerHello
+(3) eap_tls: (TLS) TLS - send TLS 1.2 Handshake, Certificate
+(3) eap_tls: (TLS) TLS - send TLS 1.2 Handshake, ServerKeyExchange
+(3) eap_tls: (TLS) TLS - send TLS 1.2 Handshake, CertificateRequest
+```
+
+FreeRADIUS 3.2 の設定ファイルは `tls_max_version = "1.2"` を既定にしており、コメントで「ほとんどの EAP のサプリカントは TLS 1.3 を正しく扱えない」と、大文字で書いています（[raddb/mods-available/eap](https://github.com/FreeRADIUS/freeradius-server/blob/v3.2.x/raddb/mods-available/eap)）。Web では TLS 1.3 が当たり前になりましたが、端末の OS や組み込み機器のサプリカントを一斉に入れ替えられない 802.1X では、移行が遅れています。
+
+TLS 1.3 の EAP-TLS（[RFC 9190](https://www.rfc-editor.org/rfc/rfc9190.html)、2022 年）には、TLS 1.2 にはなかった決まりがあります。
+
+- **利用者名を平文で送ってはならない**。TLS 1.3 に対応する端末は、Identity の応答に利用者名などの恒久的な識別子を平文で入れてはならず、`@realm` のような匿名の名前を使う（[RFC 9190 2.1.8](https://www.rfc-editor.org/rfc/rfc9190.html#section-2.1.8)）。上の出力の平文の `alice` は、TLS 1.2 だから許されていた形です
+- **成功の合図を暗号化して送る**。サーバはハンドシェイクの後、アプリケーションデータとして 1 バイトの `0x00` を送り、それを「認証の完了」の印にする（[RFC 9190 2.5](https://www.rfc-editor.org/rfc/rfc9190.html#section-2.5)）。EAP の Success は暗号化されないので、それだけでは偽物と区別できないためです
+
+### 鍵はどこへ行くか
+
+EAP-TLS の目的は、認証だけではありません。**無線を暗号化する鍵の元**を、端末と認証サーバの間で作ることでもあります。
+
+```
+EAP-TLS: Derived key - hexdump(len=64): 67 f2 0a 24 94 de 6d ac ... 92 6f 84 72 fa b2 0b 32 ...
+...
+RADIUS message: code=2 (Access-Accept) identifier=4 length=173
+   Attribute 26 (Vendor-Specific) length=58
+      Value: 000001371134834569f8cd49fffeec90...
+   Attribute 26 (Vendor-Specific) length=58
+      Value: 0000013710348da91b2859c3671646c1...
+MS-MPPE-Send-Key (sign) - hexdump(len=32): 92 6f 84 72 fa b2 0b 32 ...
+MS-MPPE-Recv-Key (crypt) - hexdump(len=32): 67 f2 0a 24 94 de 6d ac ...
+PMK from EAPOL - hexdump(len=32): 67 f2 0a 24 94 de 6d ac ...
+```
+
+順に読みます。
+
+1. 端末と認証サーバは、TLS の主秘密から 64 バイトの **MSK**（Master Session Key）を導きます。TLS 1.2 では TLS の PRF にラベル `client EAP encryption` を与え（[RFC 5216 2.3](https://www.rfc-editor.org/rfc/rfc5216.html#section-2.3)）、TLS 1.3 では TLS-Exporter にラベル `EXPORTER_EAP_TLS_Key_Material` を与えます（[RFC 9190 2.3](https://www.rfc-editor.org/rfc/rfc9190.html#section-2.3)）。第 112 回で見た「ハンドシェイクの結果から用途ごとに鍵を切り出す」仕組みの応用です
+2. 認証サーバは MSK を 32 バイトずつに分け、Access-Accept の中の Microsoft 社の属性（`00000137` は企業番号 311、続く `11` と `10` は種類 17 の MS-MPPE-Recv-Key と 16 の MS-MPPE-Send-Key）に入れて、**アクセスポイントへ渡します**（[RFC 2548 2.4.2](https://www.rfc-editor.org/rfc/rfc2548.html#section-2.4.2)）
+3. アクセスポイントと端末は、その鍵（MSK の先頭 32 バイト）を **PMK** として、4 ウェイハンドシェイクで実際の無線の鍵を作ります。出力の PMK が MS-MPPE-Recv-Key と一致しているのが見えます
+
+アクセスポイントは TLS の中身を一度も見ていませんが、最後に**無線の鍵の元だけを RADIUS で受け取ります**。ということは、その RADIUS のパケットの守りが弱ければ、鍵の元がそこから漏れます。RFC 2548 によれば、この属性は**共有の秘密と MD5 で作った値との XOR**で隠されているだけです（同上）。この話は、後の「RADIUS は MD5 で守られている」の節につながります。
+
+## サーバの証明書を確かめないと何が起きるか
+
+PEAP と EAP-TTLS は、外側の TLS でサーバだけを確かめ、その中でパスワードを送ります。ここで端末がサーバの証明書を確かめなかったらどうなるかを、手元で再現します。
+
+偽の認証サーバとして、別の CA（`Evil CA`）で `radius.example.com` の証明書を発行した FreeRADIUS を、もう 1 台立てました。利用者 `bob` のパスワードは `hunter2` です。端末の設定は、EAP-TTLS の中で PAP（パスワードをそのまま送る方式）を使うものを 2 通り用意しました。
+
+```
+# 確かめない設定（ca_cert も domain_match もない）
+network={
+	key_mgmt=WPA-EAP
+	eap=TTLS
+	identity="bob"
+	anonymous_identity="anonymous"
+	password="hunter2"
+	phase2="auth=PAP"
+}
+# 確かめる設定では、次の 2 行を足す
+	ca_cert="/pki/ca.pem"
+	domain_match="radius.example.com"
+```
+
+| 接続先 | 端末の設定 | 結果 |
+| --- | --- | --- |
+| 本物（172.30.122.10） | 確かめる | `SUCCESS` |
+| 偽物（172.30.122.11） | 確かめない | `SUCCESS` |
+| 偽物（172.30.122.11） | 確かめる | `FAILURE` |
+
+2 行目の「成功」のとき、偽のサーバのログには次の行が残っていました。
+
+```
+(5) eap_ttls: Session established.  Proceeding to decode tunneled attributes
+(5) eap_ttls: Got tunneled request
+(5) eap_ttls:   User-Name = "bob"
+(5) eap_ttls:   User-Password = "hunter2"
+```
+
+外側の名前は `anonymous` で、`bob` とパスワードは TLS のトンネルの中にありました。経路の途中からは見えません。しかし、**トンネルの終点が偽物なので、偽物は平文でパスワードを受け取ります**。端末の側には、証明書を確かめなかった記録だけが残ります。
+
+```
+CTRL-EVENT-EAP-PEER-CERT depth=1 subject='/CN=Evil CA' hash=4cf0f560...
+TLS: tls_verify_cb - preverify_ok=1 err=19 (self-signed certificate in certificate chain) ca_cert_verify=0 depth=1 buf='/CN=Evil CA'
+```
+
+`err=19` という誤りを検出しているのに、`ca_cert_verify=0` なので `preverify_ok=1`（通してよい）になっています。確かめる設定にすると、同じ証明書でハンドシェイクが止まり、パスワードは送られませんでした。
+
+```
+CTRL-EVENT-EAP-TLS-CERT-ERROR reason=1 depth=1 subject='/CN=Evil CA' err='self-signed certificate in certificate chain'
+SSL: SSL3 alert: write (local SSL3 detected an error):fatal:unknown CA
+```
+
+<Callout type="warn" title="よくある誤解: パスワードは TLS のトンネルの中だから安全">
+  トンネルが守るのは**経路**であり、**終点が本物かどうかは守りません**。これは第 114 回で見た、SSH でホスト鍵を確かめずに偽のサーバにつないだときと同じ構図です。
+  Wi-Fi では、攻撃者が同じ SSID の電波を出せば、端末は自分から偽のアクセスポイントに接続しに行きます。その裏に偽の RADIUS サーバを置けば、上の 2 行目がそのまま起きます。
+  PEAP の多くが使う MS-CHAPv2 は、PAP と違って平文のパスワードを送りませんが、Microsoft は MS-CHAPv2 のやり取りを手に入れた攻撃者が**利用者の認証情報を得られる**暗号上の弱点を認めています（[Microsoft Security Advisory 2743314](https://learn.microsoft.com/en-us/security-updates/securityadvisories/2012/2743314)）。
+  つまり PEAP-MSCHAPv2 でも、**サーバの証明書を確かめることだけが、パスワードを守っています**。
+</Callout>
+
+この問題は長く「利用者が『検証しない』を選べてしまう」形で残っていました。Android は 12 で、企業向けのネットワークにサーバ証明書の検証を必須とし、13 では最初の接続で見た鍵を覚えて以後はそれと照合する TOFU を加えました（[Android Open Source Project: Wi-Fi TOFU](https://source.android.com/docs/core/connect/wifi-tofu)）。第 114 回の SSH の `known_hosts` と同じ考え方を、Wi-Fi に持ち込んだものです。
+
+確実なのは、**端末の設定を管理者が配ること**です。CA の証明書と照合するサーバ名（上の `domain_match`）を構成プロファイルで配れば、利用者は判断を求められません。そして、パスワードではなく端末ごとの証明書で認証する EAP-TLS にすれば、偽のサーバに渡るのは使い回しのきかない署名だけになります。第 114 回で見た、SSH の公開鍵認証の署名がその接続でしか通用しないのと同じ理由です。
+
+## RADIUS は MD5 で守られている
+
+ここまで見たように、アクセスポイントと認証サーバの間は RADIUS（[RFC 2865](https://www.rfc-editor.org/rfc/rfc2865.html)、UDP の 1812 番）です。RADIUS には TLS のような通信路の暗号化がなく、アクセスポイントと認証サーバが事前に共有した**秘密の文字列**と MD5 を組み合わせて、パケットの一部を守っています。
+
+### 手元で確かめる: MD5 の組み立てを再計算する
+
+`radclient` で、EAP を使わない素朴なパスワード認証（PAP）の要求を送り、tcpdump で取ったパケットを Python で読みました。共有の秘密は `lab-shared-secret` です。
+
+```
+$ printf "User-Name = bob\nUser-Password = hunter2\n" | radclient -x 172.30.122.10 auth lab-shared-secret
+Sent Access-Request Id 85 from 0.0.0.0:36029 to 172.30.122.10:1812 length 61
+	Message-Authenticator = 0x
+	User-Name = "bob"
+	User-Password = "hunter2"
+Received Access-Accept Id 85 from 172.30.122.10:1812 to 172.30.122.20:36029 length 38
+	Message-Authenticator = 0x70c67111a6e9cb6833c7fdd11afa2faf
+```
+
+RADIUS のパケットは、`コード（1 バイト）、番号（1）、長さ（2）、Authenticator（16）、属性の並び` です。RFC 2865 が定める計算を、取ったパケットに当てはめます。
+
+```python
+ra = req[4:20]                                   # 要求の Authenticator（乱数）
+# User-Password: MD5(秘密 + 要求の Authenticator) と XOR したもの（RFC 2865 5.2）
+p = bytes(x ^ y for x, y in zip(c, hashlib.md5(secret + ra).digest())).rstrip(b"\0")
+# 応答の Authenticator: MD5(コード + 番号 + 長さ + 要求の Authenticator + 属性 + 秘密)（RFC 2865 3）
+calc = hashlib.md5(resp[:4] + ra + resp[20:] + secret).digest()
+# Message-Authenticator: HMAC-MD5（RFC 3579 3.2）
+mac = hmac.new(secret, bytes(z), hashlib.md5).digest()
+```
+
+```
+$ python3 radius_md5.py pap.pcap
+Request Authenticator   : 7d5ed38a613e45577020fd0628196b8b
+User-Password（回線上） : 4bf59189cfc1c0254f3ea70460e7dd56
+MD5(secret+RA) と XOR   : b'hunter2'
+Response Authenticator  : 6c82c68a2a323e6de37e0f19eb6495fe
+MD5(応答+RA+secret)     : 6c82c68a2a323e6de37e0f19eb6495fe 一致
+Message-Authenticator   : 70c67111a6e9cb6833c7fdd11afa2faf
+HMAC-MD5(secret, 応答)  : 70c67111a6e9cb6833c7fdd11afa2faf 一致
+```
+
+3 つとも、仕様どおりに再計算できました（[RFC 2865 3](https://www.rfc-editor.org/rfc/rfc2865.html#section-3)、[5.2](https://www.rfc-editor.org/rfc/rfc2865.html#section-5.2)、[RFC 3579 3.2](https://www.rfc-editor.org/rfc/rfc3579.html#section-3.2)）。読み取れることは次のとおりです。
+
+- **パスワードを隠しているのは、共有の秘密を知っていれば誰でも戻せる XOR です**。共有の秘密が漏れれば、過去に記録したパケットのパスワードもすべて読めます。第 105 回の前方秘匿性はありません
+- **応答の正しさを示す Response Authenticator は `MD5(... + 秘密)` という自作の組み立てです**。第 103 回で、`ハッシュ(鍵 || 本文)` が MAC にならないことを見ました。こちらは秘密を後ろに置いた形ですが、MD5 の衝突をそのまま突かれる弱点を持っています
+- それとは別に、後から足された **Message-Authenticator は HMAC-MD5** です。第 103 回の Callout のとおり、HMAC-MD5 は MD5 の衝突が作れても MAC としては破られていません
+
+### Blast-RADIUS（2024 年）
+
+2024 年 7 月に公表された **Blast-RADIUS**（[CVE-2024-3596](https://nvd.nist.gov/vuln/detail/CVE-2024-3596)）は、この Response Authenticator を、MD5 の**選択プレフィックス衝突**（第 103 回）で破る攻撃です（[blastradius.fail](https://www.blastradius.fail/)）。経路の途中にいる攻撃者は、共有の秘密も利用者のパスワードも知らないまま、**Access-Reject を Access-Accept に書き換え**、任意の属性を足せます。
+
+おおまかな流れはこうです。攻撃者は、要求に意味のない属性（Proxy-State）を足して、「本物の Reject」と「攻撃者が作った Accept」の MD5 の入力が衝突するように細工します。Response Authenticator の計算では秘密が入力の**最後**に来るので、秘密の手前までが同じハッシュの内部状態になれば、秘密を知らなくても両者の値が一致します。サーバが Reject に付けて返した Response Authenticator を、偽の Accept にそのまま貼り替えれば通ります。公表した研究者たちの実装も、衝突用のブロックを Proxy-State に入れており、乱数のような Proxy-State を含む Access-Accept を攻撃の兆候として挙げています。
+
+ただし、攻撃者はクライアントが応答を待つ間に衝突を計算し終えなければなりません。研究者たちの実証では計算に数分かかり、実際の RADIUS でよく使われる 30〜60 秒の待ち時間より長かったと書かれています（[blastradius.fail](https://www.blastradius.fail/)）。今すぐどこでも成立する攻撃ではありませんが、MD5 の衝突の計算は速くなる一方で、仕組みの側の欠陥は残ります。
+
+CERT/CC の整理では、**EAP だけを処理するサーバは影響を受けません**。EAP のパケットには Message-Authenticator（HMAC-MD5）が必須で、そちらは衝突では偽造できないからです（[CERT/CC VU#456537](https://kb.cert.org/vuls/id/456537)、[RFC 3579 3.2](https://www.rfc-editor.org/rfc/rfc3579.html#section-3.2)）。上の EAP-TLS の出力で、すべての Access-Request と Access-Challenge に `Message-Authenticator` が付いていたのはこのためです。対策は次の 2 段階とされています（同上）。
+
+- **短期**: PAP なども含めて、すべての要求と応答に Message-Authenticator を付け、受け手はそれがないパケットを捨てる
+- **長期**: RADIUS を TLS や DTLS の中で運ぶ
+
+手元の FreeRADIUS 3.2.7 は、この短期の対策を既に持っていました。`radclient` が PAP の要求にも `Message-Authenticator = 0x`（送信時に計算される）を付けていたのはその表れです。サーバの `radiusd.conf` では、`require_message_authenticator` と `limit_proxy_state` が既定で `auto`（相手から最初に届いたパケットを見て決める）になっています。最初の失敗（`@example.com` で自分自身へ転送されたとき）には、ログに次の警告が出ていました。
+
+```
+(0) ERROR: BlastRADIUS check: Received response to Access-Request with Message-Authenticator.
+(0) ERROR: Setting "require_message_authenticator = true" for home_server localhost
+(0) ERROR: It looks like the home server has been updated to protect from the BlastRADIUS attack.
+(0) ERROR: Please set "require_message_authenticator = true" for home_server localhost
+```
+
+転送先が Message-Authenticator を付けて返してきたので、「相手は対策済みだ」と判断して必須に切り替え、恒久的に設定するよう促しています。設定ファイルのコメントは、`auto` は再起動すると元に戻ることと、1 つの IP アドレスの裏に複数の機器がいる構成では最も弱い機器に合わせざるを得ないことを警告しています。**古いアクセスポイントが 1 台でも残っていれば、全体を必須に切り替えられない**のが、運用上の難しさです。
+
+## RadSec: RADIUS を TLS に入れる
+
+長期の対策として挙げられた「TLS の中で運ぶ」が **RadSec**（RADIUS/TLS）です。現行の仕様は [RFC 6614](https://www.rfc-editor.org/rfc/rfc6614.html)（2012 年、Experimental）で、要点は次のとおりです。
+
+- TCP の 2083 番で TLS を張り、その中に RADIUS のパケットを流す（[RFC 6614 2.1](https://www.rfc-editor.org/rfc/rfc6614.html#section-2.1)）
+- **相互認証が必須**。クライアントもサーバも証明書を出す（[RFC 6614 2.3](https://www.rfc-editor.org/rfc/rfc6614.html#section-2.3)）
+- RADIUS の中の MD5 の計算は残るが、そこで使う共有の秘密は**固定の文字列 `radsec`** にする（同上）。守りは TLS が担い、MD5 の組み立ては互換性のためだけに残る
+
+### 手元で確かめる: radsecproxy から FreeRADIUS へ
+
+FreeRADIUS に付属の `sites-available/tls`（2083 番で TLS を待ち受ける設定）を有効にし、端末の側には **radsecproxy** を置きました。radsecproxy は、手元で UDP の RADIUS を受け取り、TLS の接続に詰め替えて転送する中継です。古いアクセスポイントを変えずに、認証サーバまでの区間だけを TLS にするときの典型的な置き方です。
+
+```
+radclient ──UDP 1812（秘密 local-secret）──▶ radsecproxy ══TLS 2083（秘密 radsec）══▶ FreeRADIUS
+```
+
+```
+tls default {
+    CACertificateFile /pki/ca.pem
+    CertificateFile /pki/client.pem
+    CertificateKeyFile /pki/client.key
+}
+server radius.example.com {
+    type tls
+    secret radsec
+}
+```
+
+`server` の名前を `radius.example.com` にしておくと、radsecproxy はその名前で接続し、サーバの証明書をその名前と照合します。要求は通り、FreeRADIUS のログには次の行が残りました。
+
+```
+Listening on auth+acct proto tcp address * port 2083 (TLS) bound to server default
+(0) (TLS) RADIUS/TLS - recv TLS 1.3 Handshake, ClientHello
+(0) (TLS) RADIUS/TLS - send TLS 1.3 Handshake, ServerHello
+(0) (TLS) RADIUS/TLS - send TLS 1.3 Handshake, CertificateRequest
+(0) (TLS) RADIUS/TLS - send TLS 1.3 Handshake, Certificate
+(0)   TLS-Client-Cert-Common-Name := "alice@example.com"
+(0) (TLS) RADIUS/TLS - recv TLS 1.3 Handshake, CertificateVerify
+(0)   TLS-Session-Version = "TLS 1.3"
+(0) Received Access-Request Id 0 from 172.30.122.20:43441 to 0.0.0.0:2083 length 61
+```
+
+EAP の中では TLS 1.2 止まりだった同じ FreeRADIUS が、RadSec では TLS 1.3 で話しています。相手がサプリカントではなく、radsecproxy という更新しやすいソフトウェアだからです。サーバの側で 2083 番を tcpdump で見ると、TCP の 3 ウェイハンドシェイクの後は TLS のレコードだけが流れ、PAP のパスワードを含む RADIUS のパケットは見えません。
+
+<Callout type="note" title="RadSec の仕様は、2026 年 10 月時点で改訂の途中">
+  RFC 6614 と、DTLS の上で運ぶ [RFC 7360](https://www.rfc-editor.org/rfc/rfc7360.html) はどちらも Experimental です。
+  両者を置き換えて標準化の道に乗せる**ドラフト** draft-ietf-radext-radiusdtls-bis は、執筆時点の最新が 2026 年 9 月 30 日の第 18 版で、IETF の作業部会を終えて IESG の審査中です。承認されれば RFC 6614 と 7360 を廃止するとしています（[IETF Datatracker](https://datatracker.ietf.org/doc/draft-ietf-radext-radiusdtls-bis/)）。
+  別に、TLS の中では MD5 そのものを使わない **RADIUS/1.1**（[RFC 9765](https://www.rfc-editor.org/rfc/rfc9765.html)、2025 年 4 月、Experimental）があります。ALPN で `radius/1.1` を合意したときだけ、共有の秘密と MD5 の計算をやめ、TLS 1.3 以上を必須にします。第 116 回の ALPN の一覧に `radius/1.1` があったのはこのためです。
+</Callout>
+
+## NTS: 時刻の問い合わせを守る
+
+第 157 回で、時計は NTP で合わせ直すことを見ました。時刻は、第 111 回の証明書の有効期限、第 19 章で扱うトークンの期限、ログの順序など、多くの守りの前提になっています。にもかかわらず、NTP の応答は、既定では誰が送ったものか確かめられません。NTP には事前に共有した鍵で MAC を付ける方式もあります（RFC 8915 も、他の動作モードの守りとしてこれを挙げています。[RFC 8915 8.1](https://www.rfc-editor.org/rfc/rfc8915.html#section-8.1)）。しかし、鍵を利用者ごとに配って管理する必要があり、不特定多数に公開する時刻サーバには向きません。
+
+**NTS**（Network Time Security、[RFC 8915](https://www.rfc-editor.org/rfc/rfc8915.html)、2020 年）は、ここに TLS を部品として持ち込みました。
+
+```
+1. NTS-KE（鍵の確立）              TCP 4460、TLS 1.3、ALPN "ntske/1"
+   クライアント ══TLS══▶ NTS-KE サーバ
+      ← 使う AEAD、NTP サーバの場所、クッキー 8 個
+      双方が TLS-Exporter で同じ鍵を導く。ここで TLS は閉じる
+2. 時刻の問い合わせ                UDP 123、NTPv4 のまま
+   クライアント ──NTP + 拡張フィールド（クッキー、AEAD の認証タグ）──▶ NTP サーバ
+```
+
+要点を仕様から拾います。
+
+- NTS-KE は TCP の 4460 番で行い、**TLS 1.3 より前の版を交渉してはならない**（[RFC 8915 4](https://www.rfc-editor.org/rfc/rfc8915.html#section-4)）
+- 鍵は TLS の**鍵の書き出し**（TLS-Exporter）で双方が導く。鍵そのものは送られない（同上）
+- サーバは最初にクッキーを少なくとも 1 個、推奨では 8 個渡す（[RFC 8915 4](https://www.rfc-editor.org/rfc/rfc8915.html#section-4)）。RFC が推奨するクッキーの形式では、**中身はサーバだけが復号できる形で暗号化した鍵**で、サーバは利用者ごとの状態を持たずに済む（[RFC 8915 6](https://www.rfc-editor.org/rfc/rfc8915.html#section-6)）
+- NTP のパケットには、Unique Identifier、NTS Cookie、NTS Cookie Placeholder、NTS Authenticator and Encrypted Extension Fields の 4 種類の拡張フィールドを付ける（[RFC 8915 5](https://www.rfc-editor.org/rfc/rfc8915.html#section-5)）
+- 1 回の問い合わせごとに使い捨てのクッキーを使い、応答で新しいクッキーを受け取る。**クッキーを使い回さないので、端末がネットワークを移っても同じ端末だと追跡されにくい**（RFC 8915 はこれを unlinkability と呼ぶ。[RFC 8915 9.1](https://www.rfc-editor.org/rfc/rfc8915.html#section-9.1)）
+
+**時刻の問い合わせ自体は UDP の NTP のまま**というのが大事な点です。TCP と TLS の往復を毎回挟むと、往復の時間が揺れて時刻の精度が落ちます。TLS には一度だけ鍵を決めてもらい、精度が要る部分には手を出させない設計です。
+
+### 手元で確かめる: chrony の NTS サーバとクライアント
+
+chrony をサーバとクライアントの 2 つのコンテナで動かしました。どちらも時計を実際には動かさない `-x` を付けています。
+
+```
+# サーバ
+local stratum 1
+allow 172.30.122.0/24
+ntsserverkey /pki/ntp.key
+ntsservercert /pki/ntp.pem
+
+# クライアント
+server ntp.example.com iburst nts
+ntstrustedcerts /pki/ca.pem
+```
+
+```
+$ chronyc -N sources
+MS Name/IP address         Stratum Poll Reach LastRx Last sample
+===============================================================================
+^* ntp.example.com               1   6    17     3  -6102ns[  -23us] +/-   51us
+
+$ chronyc -N authdata
+Name/IP address             Mode KeyID Type KLen Last Atmp  NAK Cook CLen
+=========================================================================
+ntp.example.com              NTS     1   30  128    9    0    0    8   64
+
+$ chronyc -N ntpdata | grep Authenticated
+Authenticated   : Yes
+```
+
+`authdata` の列は chrony の説明書に定義があります（[chronyc: authdata](https://chrony-project.org/doc/4.6.1/chronyc.html)）。
+
+- `Mode NTS`: NTS で認証している。`KeyID 1` は NTS-KE に成功した回数
+- `Type 30`、`KLen 128`: AEAD の種類。chrony が使えるのは 15（AES-SIV-CMAC-256）と 30（AES-128-GCM-SIV）で、既定では鍵が短くクッキーも短くなる 30 を優先する（[chrony.conf: ntsaeads](https://chrony-project.org/doc/4.6.1/chrony.conf.html)）。RFC 8915 がサーバに必須としているのは 15 のほう（[RFC 8915 4.1.5](https://www.rfc-editor.org/rfc/rfc8915.html#section-4.1.5)）
+- `Cook 8`: 手持ちのクッキーが 8 個。使うたびに応答で補充されるので 8 のままになる
+- `CLen 64`: 次に使うクッキーの長さ（バイト）
+
+クライアントの側で取ったパケットを並べると、2 段の仕組みがそのまま見えます。
+
+```
+IP 172.30.122.31.49822 > 172.30.122.30.4460: Flags [S], ...
+...                                                        TLS 1.3 のハンドシェイクと NTS-KE の要求・応答
+IP 172.30.122.30.4460 > 172.30.122.31.49822: Flags [P.], seq 852:1438, ... length 586
+IP 172.30.122.30.4460 > 172.30.122.31.49822: Flags [F.], ...    ← サーバが TLS の接続を閉じる
+IP 172.30.122.31.42808 > 172.30.122.30.123: NTPv4, Client, length 188
+IP 172.30.122.30.123 > 172.30.122.31.42808: NTPv4, Server, length 188
+```
+
+同じサーバに `nts` を付けずに問い合わせると、NTP のパケットは 48 バイトで、`Authenticated : No` でした。
+
+```
+IP 172.30.122.2.42065 > 172.30.122.30.123: NTPv4, Client, length 48
+IP 172.30.122.30.123 > 172.30.122.2.42065: NTPv4, Server, length 48
+```
+
+48 バイトは NTP の本体だけで、NTS では拡張フィールドの分だけ 188 バイトに増えています。NTS-KE の最後の 586 バイトの中に、8 個のクッキーが入っていたことになります。
+
+`ntstrustedcerts` を外し、OS に入っている公開の CA だけで確かめさせると、NTS-KE の段階で失敗し、時刻を合わせる相手がいなくなりました。
+
+```
+TLS handshake with 172.30.122.30:4460 (ntp.example.com) failed : Error in the certificate verification. The certificate is NOT trusted. The certificate issuer is unknown.
+Can't synchronise: no selectable sources
+```
+
+`chronyc -N authdata` の `Atmp` は 1、`Cook` は 0 のままです。**NTS は、検証に失敗したときに認証なしの NTP へ黙って落ちません**。第 116 回で見た STARTTLS の「断られたら平文で続ける」とは逆の振る舞いです。
+
+<Callout type="warn" title="時刻を確かめるための証明書を、時刻で確かめる">
+  証明書の検証には「今が有効期間の中か」の判断が要ります。ところが NTS を使いたい端末は、**まさに時計が正しいかどうか分からない**状態です。
+  RFC 8915 もこの循環を認め、正しく合っていない時計しか持たないクライアントでは、運用上、期限の確認が難しい証明書を受け入れざるを得ない場合があるとしています（[RFC 8915 8.5](https://www.rfc-editor.org/rfc/rfc8915.html#section-8.5)）。
+  chrony には、証明書の有効期間の確認を止める `nocerttimecheck` があり、時計が狂った状態で起動する機器でも NTS を使えるようにするためのものと説明されています（[chrony.conf](https://chrony-project.org/doc/4.6.1/chrony.conf.html)）。
+  第 156 回の起動の直後や、電池の切れた RTC（第 157 回）を持つ機器ほど、この問題に当たります。複数の時刻源を使って 1 つの偽物に引きずられないようにすることが、併せて勧められています。
+</Callout>
+
+## syslog over TLS: ログを運ぶ
+
+各サーバのログを 1 か所に集める syslog も、長く平文で運ばれてきました。ログには利用者名や失敗したログインの記録が含まれ、攻撃者にとっては**書き換えたい・消したい**ものでもあります。
+
+[RFC 5425](https://www.rfc-editor.org/rfc/rfc5425.html)（2009 年）は、syslog を TLS で運ぶ方法を定めています。
+
+- 既定のポートは TCP の 6514 番（[RFC 5425 4.1](https://www.rfc-editor.org/rfc/rfc5425.html#section-4.1)）
+- **送り手も受け手も、証明書による認証を実装しなければならない**（[RFC 5425 4.2.1](https://www.rfc-editor.org/rfc/rfc5425.html#section-4.2.1)）。相手の確かめ方として、証明書の指紋による照合と、SAN の dNSName による照合を定める（[5.1、5.2](https://www.rfc-editor.org/rfc/rfc5425.html#section-5.1)）
+- TCP はバイト列なので、ログの区切りを示す必要がある。**各メッセージの前に、そのバイト数を 10 進数で書く**（[RFC 5425 4.3](https://www.rfc-editor.org/rfc/rfc5425.html#section-4.3)）
+
+暗号の方式については、[RFC 9662](https://www.rfc-editor.org/rfc/rfc9662.html)（2024 年）が更新し、TLS 1.2 を必須、TLS 1.3 を推奨としています。
+
+### 手元で確かめる: rsyslog から openssl s_server へ
+
+受け手には、届いた平文をそのまま画面に出してくれる `openssl s_server` を使い、クライアント証明書を必須にしました。送り手は rsyslog です。
+
+```
+# 受け手
+openssl s_server -accept 6514 -cert /pki/syslog.pem -key /pki/syslog.key \
+    -CAfile /pki/ca.pem -Verify 1 -verify_return_error
+
+# 送り手（rsyslog）
+*.* action(type="omfwd" target="syslog.example.com" port="6514" protocol="tcp"
+           StreamDriver="ossl" StreamDriverMode="1"
+           StreamDriverAuthMode="x509/name"
+           StreamDriverPermittedPeers="syslog.example.com"
+           template="RSYSLOG_SyslogProtocol23Format"
+           TCP_Framing="octet-counted")
+```
+
+`StreamDriverAuthMode="x509/name"` と `StreamDriverPermittedPeers` が、受け手の証明書を名前で確かめる指定です。送り手のコンテナで `logger` を実行すると、受け手には次のように届きました。
+
+```
+$ logger -t app -p auth.notice 'login failed for user alice'
+```
+
+```
+subject=CN=web1.example.com
+issuer=CN=ll122 Lab CA
+CIPHER is TLS_AES_256_GCM_SHA384
+...
+91 <37>1 2026-10-08T05:23:42.335900+00:00 84358621f876 app - - -  login failed for user alice
+```
+
+受け手は送り手の証明書（`web1.example.com`）を確かめ、TLS 1.3 で受け取っています。行頭の `91` がメッセージのバイト数で、その後ろが [RFC 5424](https://www.rfc-editor.org/rfc/rfc5424.html) の形式の syslog です。`<37>` は優先度で、ファシリティの auth（4）× 8 + 重大度の notice（5）= 37 です。
+
+<Callout type="warn" title="よくある誤解: TLS で送ればログは失われない">
+  RFC 5425 が対象にしている脅威は、なりすまし、書き換え、盗み見です。**届かなかったログ**は対象外で、
+  この方式はアプリケーションの層で受領の確認を返さないため、送り手はどのメッセージが確実に届いたかを常に知ることはできない、と書かれています（[RFC 5425 6.3](https://www.rfc-editor.org/rfc/rfc5425.html#section-6.3)）。
+  実際、上の実験では、受け手より先に起動した rsyslog は、最初の接続に失敗した後、受け手を立ててから出したログも受け手に届けず、送り手を起動し直すまで何も現れませんでした。送り手の画面にエラーは出ていましたが、受け手の側からは、ログが来ないのか、何も起きていないのかを区別できません。
+  ログの欠けを検出したいなら、送り手の側のキュー（ディスクに溜める設定）や、連番を付けて欠番を調べる仕組みを、TLS とは別に用意する必要があります。
+</Callout>
+
+## LDAPS と StartTLS
+
+社内の利用者の情報を引く LDAP にも、第 116 回の型 1 と型 2 の両方があります。セルフホストの IdP が LDAP を裏の利用者の保存先として使う話は、第 135 回で触れました。ここでは TLS の載せ方だけを短く見ます。
+
+- **StartTLS（型 2）**: 平文の LDAP の接続の中で StartTLS の拡張操作（OID `1.3.6.1.4.1.1466.20037`）を送り、そこから TLS に切り替える。LDAP の認証とセキュリティの仕様である [RFC 4513](https://www.rfc-editor.org/rfc/rfc4513.html) が定める TLS の始め方はこちら
+- **LDAPS（型 1）**: 636 番で、接続の直後から TLS を始める。広く使われているが、RFC 4513 には出てこない
+
+どちらでも、RFC 4513 は**中間者を防ぐために、クライアントはサーバの身元を確かめなければならない**とし、SAN との照合を基本に、CN での照合は非推奨としています（[RFC 4513 3.1.3](https://www.rfc-editor.org/rfc/rfc4513.html#section-3.1.3)）。また、利用者名とパスワードによる単純な認証（simple bind）は、**機密性の守りがない環境での認証には向かない**としています（[RFC 4513 5.1.3](https://www.rfc-editor.org/rfc/rfc4513.html#section-5.1.3)）。
+
+StartTLS を選ぶなら、第 116 回で見た「切り替えの合図を消される」ダウングレードと「切り替えの前に送ったバイトが後ろに混ざる」問題が、そのまま当てはまります。**StartTLS が失敗したら bind に進まない**設定になっているかどうかを、ライブラリごとに確かめる必要があります。
+
+## 並べてみる
+
+| | 802.1X の EAP-TLS | RadSec | NTS | syslog over TLS |
+| --- | --- | --- | --- | --- |
+| TLS が運ばれる場所 | EAP のパケットの中（IP の前） | TCP 2083 | TCP 4460（鍵の確立だけ） | TCP 6514 |
+| TLS の後ろで流れるもの | 何も流れない。MSK を導いて終わる | RADIUS のパケット | NTP（UDP 123、TLS の外） | syslog の行 |
+| 相互認証 | EAP-TLS では必須。PEAP / TTLS はサーバだけ | 必須 | サーバだけ | 必須 |
+| 照合する名前を決めるのは | 端末の設定（`domain_match` など） | 中継の設定 | `server` に書いた名前 | 送り手の設定 |
+| TLS の版の実情 | 1.2 が多い（FreeRADIUS 3.2 の既定） | 1.3 も使える | 1.3 だけ | 1.2 必須、1.3 推奨 |
+| TLS が守らないもの | 証明書を確かめない端末 | 証明書の配布と更新 | 証明書の期限を確かめるための時刻 | 届かなかったログ |
+
+4 つに共通するのは、**照合する名前が URL から自動で決まらない**ことです。ブラウザは利用者が打った URL のホスト名を証明書と照合できました。裏方の TLS では、誰かがその名前を設定ファイルに書かない限り、照合は行われません。上の実験で失敗させた箇所は、どれもそこでした。
+
+## 次回へ
+
+この章では、TLS と SSH の上に、ファイル転送、データベース、VPN、そしてこの回の裏方のプロトコルまで、多くのものが載っている様子を見てきました。載っているものが多いということは、**同じ証明書を、別のプロトコルのサーバが共有している**ことも多いということです。次の第 123 回では、HTTPS のつもりで送った要求が FTP やメールのサーバに届いてしまう混線（ALPACA）と、ライブラリが証明書を確かめない既定の怖さを見て、用途ごとにどの載せ方を選ぶかをまとめ、この章を締めます。
+
+## まとめ
+
+- 802.1X では、IP アドレスを持たない端末とアクセスポイントの間を EAPOL、アクセスポイントと認証サーバの間を RADIUS が運ぶ。EAP は交互の会話で、TLS のハンドシェイクは EAP-TLS の断片と RADIUS の 253 バイトの属性に二重に切られて運ばれる
+- EAP-TLS は TLS の結果から MSK を導き、認証サーバはそれを MS-MPPE の属性でアクセスポイントに渡す。その先頭 32 バイトが無線の PMK になる
+- FreeRADIUS 3.2 の EAP は既定で TLS 1.2 まで。TLS 1.3 の EAP-TLS（RFC 9190）では、利用者名を平文で送らず、成功の合図を暗号化して送る
+- PEAP や EAP-TTLS でサーバの証明書を確かめないと、偽のサーバがトンネルの終点になり、パスワードを受け取る。照合する CA と名前を端末に配ることが守りの本体
+- RADIUS は共有の秘密と MD5 でパスワードを隠し、応答を認証する。Blast-RADIUS（CVE-2024-3596）は Response Authenticator を MD5 の選択プレフィックス衝突で破る。短期の対策は Message-Authenticator（HMAC-MD5）の必須化
+- RadSec（RFC 6614）は RADIUS を相互認証の TLS（2083 番）に入れる。標準化の改訂はドラフトで IESG の審査中。RADIUS/1.1（RFC 9765）は TLS の中で MD5 をやめる
+- NTS は TLS 1.3 を鍵の確立（NTS-KE、4460 番）にだけ使い、時刻の問い合わせは NTP のまま、クッキーと AEAD の拡張フィールドで守る。証明書を確かめるために時刻が要るという循環を抱える
+- syslog over TLS（RFC 5425）は 6514 番で、メッセージの前にバイト数を書いて区切る。なりすましと書き換えは防ぐが、届かなかったログは検出しない
+- LDAP には StartTLS（RFC 4513）と LDAPS（636 番）があり、StartTLS には第 116 回の切り替えの弱点がそのまま当てはまる
+- 裏方の TLS では、照合する名前が URL から決まらない。誰かが設定に書かない限り、相手は確かめられない

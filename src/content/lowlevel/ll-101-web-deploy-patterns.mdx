@@ -20,7 +20,7 @@ requires:
   - ll-95-cors
   - ll-96-third-party-cookie
   - ll-98-request-headers
-  - ll-118-session-cookie
+  - ll-126-session-cookie
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -44,7 +44,7 @@ import Callout from '../../components/Callout.astro'
 | 問い | 何が決まるか | 回 |
 | --- | --- | --- |
 | 画面と API は**同じオリジン**か | CORS が要るか。`fetch` の既定で Cookie が付くか | 第 93、95 回 |
-| 画面と API は**同じサイト**か | `SameSite=Lax` / `Strict` の Cookie が付くか。`Sec-Fetch-Site` の値 | 第 93、98、118 回 |
+| 画面と API は**同じサイト**か | `SameSite=Lax` / `Strict` の Cookie が付くか。`Sec-Fetch-Site` の値 | 第 93、98、126 回 |
 | API の Cookie は、今の**トップレベルのサイト**から見て第一者か | 第三者 Cookie の制限（遮断、分割）の対象になるか | 第 96、97 回 |
 
 3 つ目の問いの「トップレベル」は、アドレスバーに出ているページのことです。第 96 回で見たとおり、**同じ Cookie でも、どのページの中で使われるかによって第一者（ファーストパーティ）にも第三者（サードパーティ）にもなります**。
@@ -63,8 +63,8 @@ import Callout from '../../components/Callout.astro'
 | 部品 | この型での効き方 |
 | --- | --- |
 | CORS | 不要。プリフライトも起きない |
-| Cookie | `__Host-sid; Secure; HttpOnly; SameSite=Lax; Path=/` がそのまま使える（第 118 回） |
-| CSRF | 別のサイトからの POST には Lax の Cookie が付かない。それでも同期トークンか `Sec-Fetch-Site` の確認を重ねる（第 98、118 回） |
+| Cookie | `__Host-sid; Secure; HttpOnly; SameSite=Lax; Path=/` がそのまま使える（第 126 回） |
+| CSRF | 別のサイトからの POST には Lax の Cookie が付かない。それでも同期トークンか `Sec-Fetch-Site` の確認を重ねる（第 98、126 回） |
 | 第三者 Cookie の制限 | 無関係。Cookie は常に第一者 |
 | XSS | 画面と API が同じオリジンなので、XSS が起きれば API も呼ばれる（第 99 回の CSP で抑える） |
 
@@ -136,8 +136,8 @@ API を別の登録可能なドメインに置く型です。買収したサー�
 取れる道は 3 つです。
 
 1. **型 1 か型 2 に寄せる**。画面のドメインの下に `api.app.example` を作ってプロキシする。多くの場合これが最も確実
-2. Cookie をやめ、**トークンを `Authorization` ヘッダで送る**。第三者 Cookie の制限は受けないが、トークンをブラウザのどこに置くかという第 119 回の問題が戻ってくる
-3. 画面と同じサイトに **BFF** を置き、BFF から API を呼ぶ（第 122 回、第 129 回の型 2）
+2. Cookie をやめ、**トークンを `Authorization` ヘッダで送る**。第三者 Cookie の制限は受けないが、トークンをブラウザのどこに置くかという第 127 回の問題が戻ってくる
+3. 画面と同じサイトに **BFF** を置き、BFF から API を呼ぶ（第 130 回、第 137 回の型 2）
 
 ## 手元で確かめる: 3 つの型を同じブラウザで比べる
 
@@ -210,7 +210,7 @@ api.other-cdn.test GET     /me         Origin=https://app.example.test:18195  Se
 <Callout type="warn" title="よくある誤解: 「第三者 Cookie が遮断されるなら、CSRF は起きない」">
   第三者 Cookie の制限が止めるのは、**別のサイトのページの中に埋め込まれた要求**（iframe、画像、`fetch`）に付く Cookie です。
   攻撃者のページからのフォーム送信やリンクは**トップレベルの移動**で、移動先の Cookie は第一者として扱われます。上の実験では、遮断した Chrome でも `SameSite=None` の Cookie が CSRF の POST に付きました。
-  CSRF を止めるのは SameSite（`Lax` 以上）と、同期トークンや Fetch Metadata による確認です（第 98 回、第 118 回）。
+  CSRF を止めるのは SameSite（`Lax` 以上）と、同期トークンや Fetch Metadata による確認です（第 98 回、第 126 回）。
 </Callout>
 
 <Callout type="warn" title="よくある誤解: 「CORS を正しく書けば、別サイトの API でも Cookie のセッションで動く」">
@@ -249,11 +249,11 @@ brand-a.example ──リダイレクト（トップレベル）──→ id.exa
 brand-a.example が自分の Cookie でセッションを作る
 ```
 
-- **IdP へのトップレベルのリダイレクト**（OIDC、SAML）。`id.example` の Cookie はトップレベルの移動では第一者なので、第三者 Cookie の制限を受けない（第 120、121、124 回）
-- **隠した iframe で IdP のセッションを確かめる方式は避ける**。iframe の中の IdP の Cookie は第三者 Cookie で、Safari や Firefox では動かない（第 124 回）
-- ブラウザにログインを仲介させる **FedCM**。Chrome 108 で提供が始まり、W3C で標準化が進んでいる（第 124 回）
+- **IdP へのトップレベルのリダイレクト**（OIDC、SAML）。`id.example` の Cookie はトップレベルの移動では第一者なので、第三者 Cookie の制限を受けない（第 128、129、132 回）
+- **隠した iframe で IdP のセッションを確かめる方式は避ける**。iframe の中の IdP の Cookie は第三者 Cookie で、Safari や Firefox では動かない（第 132 回）
+- ブラウザにログインを仲介させる **FedCM**。Chrome 108 で提供が始まり、W3C で標準化が進んでいる（第 132 回）
 
-この型の中身は SSO そのものなので、第 124 回と第 129 回の型 10 で詳しく見ます。ここで押さえるのは、**ブラウザの境界の面では、別のサイトどうしは「リダイレクトで第一者として往復する」以外に確実な道がない**ことです。
+この型の中身は SSO そのものなので、第 132 回と第 137 回の型 10 で詳しく見ます。ここで押さえるのは、**ブラウザの境界の面では、別のサイトどうしは「リダイレクトで第一者として往復する」以外に確実な道がない**ことです。
 
 ## 型 6: 開発環境（localhost）
 
@@ -320,7 +320,7 @@ GitHub は 2013 年、GitHub Pages を `github.com` のサブドメインから 
 | 2 サブドメインの API | 別 | 同じ | 必要（資格情報つき） | `Lax` が届く。`include` が必要 | 兄弟のサブドメインは `same-site` | 基本は無関係（CNAME の向け先に注意） |
 | 3 別サイトの API | 別 | 別 | 必要（資格情報つき） | `None; Secure` が必要 | `None` にした時点で素通り | **直撃**。CHIPS か型 1・2 に寄せる |
 | 4 埋め込みウィジェット | 別 | 別 | 場合による | `None; Secure; Partitioned` | `frame-ancestors`、`postMessage` の確認 | **直撃**。CHIPS と Storage Access API |
-| 5 複数ブランドの SSO | 別 | 別 | 不要（リダイレクト） | 各サイトで第一者の Cookie | リダイレクト先の検証（第 120 回） | iframe に頼らなければ回避できる。FedCM |
+| 5 複数ブランドの SSO | 別 | 別 | 不要（リダイレクト） | 各サイトで第一者の Cookie | リダイレクト先の検証（第 128 回） | iframe に頼らなければ回避できる。FedCM |
 | 6 開発環境 | 別（ポート） | 同じ（`localhost`） | プロキシなら不要 | `localhost` は `Secure` を受け付ける | 本番と違う | 本番と違う |
 
 表を縦に見ると、**型の番号が大きくなるほど、ブラウザが代わりに守ってくれる範囲が狭くなり、サーバが自分で確かめることが増えます**。迷ったら、型 1 か型 2 に寄せられないかを最初に考えます。
@@ -330,7 +330,7 @@ GitHub は 2013 年、GitHub Pages を `github.com` のサブドメインから 
 | やりたいこと | 組み合わせる部品 |
 | --- | --- |
 | 画面と API を分けても Cookie のセッションを保つ | 型 2 の配置＋ host-only の `__Host-` Cookie ＋資格情報つき CORS と `Vary: Origin`（第 95 回）＋ `credentials: 'include'` |
-| CSRF を止める | `SameSite=Lax` 以上（第 118 回）＋同期トークン、または `Sec-Fetch-Site` の確認（第 98 回）。第三者 Cookie の制限には頼らない |
+| CSRF を止める | `SameSite=Lax` 以上（第 126 回）＋同期トークン、または `Sec-Fetch-Site` の確認（第 98 回）。第三者 Cookie の制限には頼らない |
 | 埋め込まれても動く | CHIPS ＋ Storage Access API（第 96 回）＋ `frame-ancestors`（第 99 回）＋ `postMessage` の origin の確認（第 94 回） |
 | 利用者のコンテンツで本体を汚さない | 別の登録可能なドメイン＋ Public Suffix List（第 93 回）＋サイト分離（第 86 回）＋ CSP（第 99 回） |
 | 強い機能（`SharedArrayBuffer`）を使う | COOP と COEP、外部の資源には CORP か CORS（第 100 回）。型 3・4 の資源は許可を得る必要がある |

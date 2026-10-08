@@ -120,7 +120,7 @@ CORS（第 95 回）との違いは、**向き**にあります。CORS は「読
   curl やサーバ間の通信には何の効果もありません。
   CORP が守るのは、「利用者のブラウザが、利用者の Cookie を付けて取ってきた応答が、
   攻撃者のページのプロセスに入ること」だけです。
-  他人に見せてはいけない資源は、第 116 回の認可で守ります。
+  他人に見せてはいけない資源は、第 124 回の認可で守ります。
 </Callout>
 
 ## ページの側が約束する: COEP
@@ -166,7 +166,7 @@ Cross-Origin-Opener-Policy: same-origin
 グループが別になれば、互いを同じプロセスに置く理由が無くなります。`same-origin` にすると、他オリジンから開かれたとき `window.opener` は `null` になり、開いた側からは窓が閉じたように見えます。
 
 <Callout type="warn" title="COOP: same-origin は、ポップアップを使う連携を壊す">
-  OAuth（第 120 回）には、リダイレクトではなくポップアップで認可サーバの画面を開き、
+  OAuth（第 128 回）には、リダイレクトではなくポップアップで認可サーバの画面を開き、
   結果を `window.opener.postMessage` で返す実装がよくあります。決済の画面も同じ形を取りがちです。
   `same-origin` にすると `window.opener` が `null` になるので、**この受け渡しが黙って届かなくなります**。
   web.dev の手引きも、`same-origin` が OAuth や決済のような窓をまたぐ連携を壊すと明記しています
@@ -283,7 +283,7 @@ B /data.json?from=credentialless                Cookie=-
   `isolated` のページで `error` になった画像の要求は、**Cookie 付きでサーバに届いています**。
   COEP と CORP は、**戻ってきた応答をページのプロセスに渡さない**仕組みで、送ること自体は止めません。
   第 95 回の CORS と同じく、判定は応答を受け取った後にブラウザが行います。
-  副作用のある GET を作ってはいけない理由（第 118 回の CSRF）は、ここでもそのまま残ります。
+  副作用のある GET を作ってはいけない理由（第 126 回の CSRF）は、ここでもそのまま残ります。
 </Callout>
 
 `credentialless` のページからの要求には **Cookie が付いていません**。CORP の無い画像が読み込めたのは、この「資格情報を外して取る」と引き換えです。利用者ごとに違う画像は、この方式では利用者のものとしては取れず、公開の中身しか返ってきません。
@@ -329,11 +329,11 @@ Document-Isolation-Policy: isolate-and-require-corp
 | やりたいこと | 組み合わせる部品 |
 | --- | --- |
 | 他のサイトのデータを、自分のメモリに載せない | サイト分離（第 86 回）＋ ORB ＋正しい `Content-Type` と `nosniff`（第 99 回） |
-| 利用者ごとの画像を、他サイトに埋め込ませない | CORP（`same-origin` か `same-site`）＋サイトの定義（第 93 回）＋認可（第 116 回） |
+| 利用者ごとの画像を、他サイトに埋め込ませない | CORP（`same-origin` か `same-site`）＋サイトの定義（第 93 回）＋認可（第 124 回） |
 | `SharedArrayBuffer` と細かい時計を使う | COOP `same-origin` ＋ COEP ＋埋め込む資源側の CORP か CORS（第 95 回）＋ iframe の `allow` 属性 |
 | 分離しても、公開の埋め込みを残す | COEP `credentialless`（資格情報を外す）、または Document-Isolation-Policy |
 | ポップアップを悪用されにくくする | COOP 単独 ＋ `rel=noopener`（第 94 回） |
-| OAuth や決済のポップアップを残す | COOP `same-origin-allow-popups`、またはリダイレクト型のフロー（第 120 回） |
+| OAuth や決済のポップアップを残す | COOP `same-origin-allow-popups`、またはリダイレクト型のフロー（第 128 回） |
 | 壊れる箇所を先に知る | `-Report-Only` のヘッダ ＋報告の受け口（第 99 回の CSP と同じ運用） |
 
 ## まとめ

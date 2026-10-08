@@ -289,7 +289,7 @@ $ sed '1d;$d' id_ed25519 | base64 -d | xxd | head -3
 
 ## JWK と PKCS#12
 
-**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 119 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
+**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 127 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
 
 ```
 $ node -e 'const c=require("crypto"),fs=require("fs");
@@ -478,7 +478,7 @@ error:05800074:x509 certificate routines:ossl_x509_check_private_key:key values 
 | 証明書の SPKI | CA の署名 | 第 109〜111 回 |
 | TLS のサーバの秘密鍵 | 証明書 + CertificateVerify の署名 | 第 112 回 |
 | SSH のホスト鍵・ユーザ鍵 | known_hosts / authorized_keys（fingerprint） | 第 114〜115 回 |
-| JWKS の公開鍵 | TLS で守られた IdP の URL と `kid` | 第 119、121 回 |
+| JWKS の公開鍵 | TLS で守られた IdP の URL と `kid` | 第 127、129 回 |
 
 どの場合も、確かめているのは第 106 回で見たとおり「**この鍵**で署名された」ことだけです。その鍵が本物かどうかは、ペアの確認とは別に、それぞれの仕組みが引き受けています。
 
