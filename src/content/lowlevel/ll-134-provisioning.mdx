@@ -1,0 +1,350 @@
+---
+title: アカウントを配り、つなぐ
+description: SSO でログインがまとまれば、退職した人は全部のアプリから消えるのか。最初のログインで作る JIT と、IdP から押し込む SCIM、複数の IdP をつなぐフェデレーション、そして「同じ人だ」と判断する突き合わせの落とし穴を見ます
+chapter: sso
+order: 2
+status: published
+topics:
+  - プロビジョニング
+  - JIT プロビジョニング
+  - SCIM 2.0
+  - デプロビジョニング
+  - フェデレーション
+  - IdP ブローカー
+  - アカウントの突き合わせ
+  - nOAuth
+  - グループとロールの対応づけ
+  - ドメインの所有確認
+requires:
+  - ll-133-saml-sso
+  - ll-130-oidc
+  - ll-127-session-cookie
+  - ll-58-dns-records
+---
+
+import Callout from '../../components/Callout.astro'
+
+## ログインをまとめても、アカウントはまとまらない
+
+第 133 回で、SSO は「IdP とのセッション」と「各アプリとのセッション」の 2 段で成り立つと見ました。利用者は IdP に 1 回ログインすれば、各アプリに入れます。
+
+では、入社した日と退職した日を考えてみます。
+
+- 入社した日、経費精算のアプリに入ると、**自分の部署と承認者がもう設定されている**べきです
+- 退職した日、IdP のアカウントを止めたら、**すべてのアプリで何もできなくなる**べきです
+
+SSO が運ぶのは「今ログインしたのは誰か」という**その場の主張**だけです。アプリの中には、その人の**アカウント**があります。権限、所属、作ったデータ、発行した API トークン、ログイン中のセッション。これらはアプリのデータベースに住んでいて、IdP は直接触れません。
+
+```
+  IdP                               アプリ
+  ┌───────────────┐   ログインの主張   ┌──────────────────────────┐
+  │ 利用者の台帳  │ ─────────────────→ │ アカウント（権限・所属）  │
+  │ グループ      │   （SAML / OIDC）   │ セッション（第 127 回）   │
+  └───────────────┘                    │ API トークン、ローカルの  │
+          │                            │ パスワード、作ったデータ  │
+          └── アカウントを作る・直す・消す ──→ （ここがこの回の主題）
+```
+
+IdP の台帳とアプリのアカウントを揃える仕事を**プロビジョニング**（作る・直す）と**デプロビジョニング**（止める・消す）と呼びます。この回は、その 2 つのやり方と、「IdP の誰とアプリの誰が同じ人か」を決める**突き合わせ**を見ます。
+
+## JIT: 最初のログインで作る
+
+いちばん簡単なのは、**初めてログインしてきたときに、アカウントをその場で作る**方法です。ジャストインタイム（JIT）プロビジョニングと呼びます。SAML のアサーションや OIDC の ID トークンには、名前、メールアドレス、所属グループなどの属性が入っているので、それを使って行を 1 つ作れば済みます。
+
+JIT は IdP 側に特別な仕組みが要らず、SSO を入れた瞬間から動きます。しかし、**情報がアプリに届くのは、本人がログインしてきたときだけ**です。ここから弱点が 3 つ出てきます。
+
+| 場面 | JIT で起きること |
+| --- | --- |
+| 入社前 | 一度もログインしていない人はアプリに存在しない。事前にチームへ入れたり、ファイルを共有したりできない |
+| 異動 | 所属や役職が変わっても、次にログインするまでアプリの中は古いまま |
+| 退職 | **本人はもうログインしてこないので、アプリには何も届かない**。アカウントは残り続ける |
+
+3 つめが決定的です。JIT は「作る」ことはできても、**「消す」ことが原理的にできません**。消すべき人ほど、アプリに来ないからです。
+
+## SCIM: IdP から押し込む
+
+そこで、IdP の側から、変化があったときにアプリへ**知らせに行く**仕組みが要ります。その標準が **SCIM 2.0**（System for Cross-domain Identity Management）です。3 つの RFC に分かれています。
+
+- [RFC 7642](https://www.rfc-editor.org/rfc/rfc7642.html): 用語と想定する場面
+- [RFC 7643](https://www.rfc-editor.org/rfc/rfc7643.html): 利用者とグループをどう JSON で表すか（スキーマ）
+- [RFC 7644](https://www.rfc-editor.org/rfc/rfc7644.html): それを HTTP でどう作り・読み・直し・消すか（プロトコル）
+
+中身は、**利用者とグループを資源として持つ、素直な REST の API** です。アプリが次のエンドポイントを用意し、IdP がそこを呼びます（[RFC 7644 3.2](https://www.rfc-editor.org/rfc/rfc7644.html#section-3.2)）。
+
+| エンドポイント | 使い方 |
+| --- | --- |
+| `/Users` | POST で作る、GET で取得・検索、PUT で置き換え、PATCH で一部を直す、DELETE で消す |
+| `/Groups` | 同じ操作をグループに対して行う。メンバーの出入りは PATCH で |
+| `/ServiceProviderConfig` | PATCH や一括操作に対応しているかなど、アプリの対応範囲 |
+| `/ResourceTypes`、`/Schemas` | どんな資源と属性を扱えるか |
+
+<Callout type="note" title="SCIM では呼び名が逆になる">
+  SCIM の仕様では、**呼ぶ側の IdP を「クライアント」、呼ばれる側のアプリを「サービスプロバイダ」**と呼びます。
+  SAML の SP（サービスプロバイダ）と同じ言葉ですが、SCIM の文脈では「API を提供する側」という意味です。
+  アプリは SSO では IdP に頼る側、SCIM では API を提供する側になります。
+</Callout>
+
+### 3 つの識別子
+
+SCIM の利用者には、似た役割の識別子が 3 つあります（[RFC 7643 3.1](https://www.rfc-editor.org/rfc/rfc7643.html#section-3.1)、[4.1.1](https://www.rfc-editor.org/rfc/rfc7643.html#section-4.1.1)）。この区別が、後で見る突き合わせの話の伏線になります。
+
+| 属性 | 誰が決めるか | 性質 |
+| --- | --- | --- |
+| `id` | アプリ | アプリ全体で一意で、変わらず、使い回さない。クライアントが指定してはいけない |
+| `externalId` | IdP | IdP 側の識別子。IdP の名前空間の中でだけ意味を持つ |
+| `userName` | 両者で合意 | 利用者がログインに使う名前。一意で、大文字小文字を区別しない |
+
+IdP は作成時にアプリが返した `id` を覚えておき、以後の変更はその `id` に対して送ります。`externalId` は、その対応表を失ったときに `filter=externalId eq "..."` で引き直すための鍵です。メールアドレスを `userName` にすることが多いですが、**メールアドレスは変わりうる**ので、変更を追う鍵には使いません。
+
+### 止めるのは active、消すのは DELETE
+
+退職や異動でアプリを使えなくするとき、多くの IdP はまず **`active` を false にする PATCH** を送ります。`active` は「管理上の状態」を表す真偽値で、RFC は典型例として「true ならログインでき、false ならアカウントが停止されている」と説明しています（[RFC 7643 4.1.1](https://www.rfc-editor.org/rfc/rfc7643.html#section-4.1.1)）。ただし、**具体的に何を止めるかはアプリが決める**、とも書いています。
+
+Microsoft Entra ID の場合、割り当てから外された利用者や、IdP 側で無効化・論理削除された利用者は、`active` を false にする更新で無効化し、物理削除されたときに DELETE を送ります。Entra ID では論理削除から 30 日で物理削除になります（[Microsoft Learn: How provisioning works](https://learn.microsoft.com/en-us/entra/identity/app-provisioning/how-provisioning-works)）。DELETE を受けたアプリは、その後その資源について 404 を返さなければなりませんが、実際にデータを消すかどうかは選べます（[RFC 7644 3.6](https://www.rfc-editor.org/rfc/rfc7644.html#section-3.6)）。
+
+<Callout type="warn" title="SCIM の入口は、管理者を作れる入口でもある">
+  SCIM は認証の方式を自分では決めず、TLS と標準の HTTP 認証に任せています。例として挙がっているのは TLS のクライアント認証とベアラトークンです（[RFC 7644 2](https://www.rfc-editor.org/rfc/rfc7644.html#section-2)）。
+  実際には、アプリの管理画面で発行した**長期のベアラトークン**を IdP に貼る形が多く見られます。
+  このトークンを持つ者は、利用者を作り、グループに入れ、`active` を書き換えられます。
+  グループがアプリの管理者ロールに対応していれば（後述）、**管理者を好きに作れる鍵**です。第 109 回で見た秘密情報と同じ扱いが要ります。
+</Callout>
+
+SCIM は、IdP で何かが変わった瞬間に届くとは限りません。Entra ID のプロビジョニングは、差分を拾う周期的な処理を繰り返す作りで、その間隔はアプリごとに決まります（同じ Microsoft Learn の文書）。「退職処理をしたのに、まだ使えた」という数十分の隙間は、ここから生まれます。
+
+## 手元で確かめる: SCIM を受ける側を作る
+
+SCIM の `/Users` を受けるだけの小さなアプリを、Python の標準ライブラリで書いてみます。認証は、SSO の代わりに `userName` を受け取ってセッションと API トークンを発行するだけの `/login` で済ませます。要点の部分だけ抜き出します。
+
+```python
+users = {}      # id -> SCIM User
+sessions = {}   # セッション ID -> 利用者の id（第 127 回のサーバ側セッション）
+api_tokens = {} # 個人用の API トークン -> 利用者の id
+
+# POST /scim/v2/Users
+u = {"schemas": b["schemas"], "id": str(uuid.uuid4()), "externalId": b.get("externalId"),
+     "userName": b["userName"], "active": b.get("active", True)}
+
+# POST /login?user=...  … active でなければ 403
+# GET /me               … Cookie のセッションか Bearer の API トークンで利用者を引く
+
+# PATCH /scim/v2/Users/{id}
+for op in body["Operations"]:
+    if op["op"] == "replace" and op.get("path") == "active":
+        users[uid]["active"] = op["value"]
+if REVOKE_ON_DEACTIVATE and not users[uid]["active"]:
+    ...  # その利用者のセッションと API トークンを消す
+```
+
+IdP の役は curl が務めます。作成、`externalId` での検索、同じ `userName` での二重作成、ログイン、そして退職の PATCH を順に送ります。
+
+```
+$ curl -s -X POST $B/scim/v2/Users -H "Authorization: Bearer scim-secret" \
+    -H 'Content-Type: application/scim+json' \
+    -d '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],
+         "externalId":"00u1a2b3","userName":"hanako@example.com","active":true}'
+{"schemas": [...], "id": "33e05fce-4071-44c7-af77-1ac9e2fc532a", "externalId": "00u1a2b3",
+ "userName": "hanako@example.com", "active": true, "meta": {...}}
+
+$ curl -s -G $B/scim/v2/Users -H "Authorization: Bearer scim-secret" \
+    --data-urlencode 'filter=externalId eq "00u1a2b3"'
+{"schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"], "totalResults": 1, ...}
+
+--- 同じ userName（大文字違い）でもう一度作る
+409
+
+$ curl -s -X PATCH $B/scim/v2/Users/33e05fce-... -H "Authorization: Bearer scim-secret" \
+    -H 'Content-Type: application/scim+json' \
+    -d '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+         "Operations":[{"op":"replace","path":"active","value":false}]}'
+{... "userName": "hanako@example.com", "active": false, ...}
+```
+
+二重作成が 409 になるのは、`userName` が大文字小文字を区別せず一意だからです（[RFC 7644 3.3](https://www.rfc-editor.org/rfc/rfc7644.html#section-3.3)）。PATCH の本文は JSON Patch に似た形で、`schemas` に `PatchOp` を書き、`Operations` に操作を並べます（[RFC 7644 3.5.2](https://www.rfc-editor.org/rfc/rfc7644.html#section-3.5.2)）。
+
+肝心なのは PATCH の**後**です。退職の前にログインして得たセッションと API トークンで、`/me` を呼んでみます。アプリを 2 通りの設定で起動して比べました。
+
+```
+===== active=false のとき、フラグを書き換えるだけのアプリ
+--- 新しいログイン
+{"error": "inactive"}
+--- 既存のセッションと API トークン
+{"userName": "hanako@example.com"}
+{"userName": "hanako@example.com"}
+
+===== active=false のとき、セッションと API トークンも消すアプリ（--revoke）
+--- 新しいログイン
+{"error": "inactive"}
+--- 既存のセッションと API トークン
+{"error": "no session"}
+{"error": "no session"}
+```
+
+前者では、**新しいログインは止まったのに、すでに持っているセッションと API トークンは生きています**。SCIM は「この人はもう active ではない」と伝えるところまでで、その知らせを受けて何を消すかは、アプリの実装しだいです。
+
+## 退職者の削除は SSO だけでは終わらない
+
+実験の前者の状態は、珍しくありません。IdP で利用者を止めたとき、アプリの側に残りうるものを並べてみます。
+
+| 残るもの | なぜ残るか |
+| --- | --- |
+| アプリとのセッション | SSO の 2 段目。IdP のセッションとは独立に、Cookie の寿命まで生きる（第 127 回、第 133 回） |
+| リフレッシュトークン | アクセストークンを取り直せる。取り消さない限り長く生きる（第 129 回） |
+| 自己完結型のアクセストークン | 署名で検証するだけのリソースサーバは、期限まで受け付ける（第 128 回） |
+| 個人用 API トークン、SSH 鍵 | SSO を通らずに使える。IdP から見えない |
+| ローカルのパスワード | SSO を入れる前に作ったアカウントや、緊急用に残したアカウント |
+| 共有・所有しているもの | 本人が持っていた共有リンク、所有者になっているリソース、外部に張った連携 |
+
+IdP を止めて防げるのは、**これから IdP を通って入ってくる**ことだけです。すでに内側にいる状態を片づけるには、アプリが「止められた」ことを知り、自分で消す必要があります。その知らせの経路が SCIM であり、第 133 回で見た OIDC のバックチャネルログアウトです。
+
+さらに、アプリ同士でセッションの取り消しや危険の兆候をその場で伝え合う仕組みとして、OpenID Foundation は 2025 年 9 月に **Shared Signals Framework 1.0** と **CAEP 1.0** を最終仕様として承認しました（[OpenID Foundation](https://openid.net/three-shared-signals-final-specifications-approved/)）。CAEP には「セッションが取り消された（session-revoked）」「認証情報が変わった（credential-change）」などのイベントが定義されています（[CAEP 1.0](https://openid.net/specs/openid-caep-1_0-final.html)）。どれも、**受け取ったアプリが消す**ことで初めて効きます。
+
+<Callout type="warn" title="誤解: IdP でアカウントを止めれば、全アプリから締め出せる">
+  IdP が止められるのは「IdP への新しいログイン」と「IdP が新しく発行する主張」だけです。
+  各アプリのセッション、発行済みのトークン、SSO を通らない入口は、IdP の外にあります。
+  退職の手順には、IdP での無効化に加えて、**アプリごとに何が消えるか**（SCIM を受けてセッションとトークンを取り消すか、
+  取り消さないなら何時間で自然に切れるか）を確かめる項目が要ります。
+  「SSO を入れたから退職処理は IdP だけでよい」は、セッションの 2 段構造を忘れた考え方です。
+</Callout>
+
+## フェデレーション: IdP が 1 つではないとき
+
+ここまでは、IdP が 1 つの会社の中の話でした。実際には、1 つのアプリが**複数の IdP** を受け入れることがよくあります。
+
+- 企業向けの SaaS が、顧客企業ごとにその会社の IdP（Entra ID、Okta、Google Workspace）とつなぐ
+- 一般向けのサービスが、Google、Apple、GitHub などのアカウントでのログイン（ソーシャルログイン）を受け付ける
+- 合併した 2 つの会社の IdP を、しばらく並べて使う
+
+このように、自分の外の IdP が出した主張を信頼して受け入れることを**フェデレーション**と呼びます。IdP が増えるたびに各アプリが SAML と OIDC の実装を増やすのは大変なので、間に**IdP ブローカー**を置く構成がよく使われます。Keycloak の identity brokering はその典型です（[Keycloak Server Administration: Identity Brokering](https://www.keycloak.org/docs/latest/server_admin/index.html#_identity_broker)）。
+
+```
+  顧客 A の IdP (SAML) ──┐
+  顧客 B の IdP (OIDC) ──┼──→ ブローカー（Keycloak など）──OIDC──→ アプリ 1, 2, 3
+  Google (OIDC) ─────────┘      外の IdP の主張を検証し、
+                                自分の名前で ID トークンを出し直す
+```
+
+アプリから見れば、IdP はブローカー 1 つだけです。その代わり、**「外の IdP の誰が、ブローカーの誰か」を決める仕事**が、すべてブローカーに集まります。それが次の突き合わせです。
+
+## アカウントの突き合わせ: 「同じ人」をどう決めるか
+
+新しい IdP の主張が届いたとき、アプリ（またはブローカー）は、それを**既存のどのアカウントに結びつけるか**を決めなければなりません。いちばん手軽に見えるのは、メールアドレスで引くことです。「同じメールアドレスなら同じ人」。これが、この分野で最も多い事故の入口です。
+
+### 仕様が保証する識別子は iss と sub の組だけ
+
+OpenID Connect の仕様は、この点をはっきり書いています。ID トークンの `sub` と `iss` の組み合わせが、利用者の安定した識別子として RP が頼れる**唯一の**クレームです。`sub` は発行者の中で一意で、使い回されないからです。一方、他のクレームは時間がたっても変わらないことも、利用者ごとに一意であることも保証されません。発行者は同じ email の値を時期を変えて別の利用者に使ってよく、利用者の email も変わりえます。そのため **`email`、`phone_number`、`preferred_username`、`name` を一意の識別子として使ってはならない**、とされています（[OpenID Connect Core 5.7](https://openid.net/specs/openid-connect-core-1_0.html#ClaimStability)）。
+
+Google も、ID トークンの `email` を利用者の一意の識別子に使わず、常に `sub` を使うよう警告しています（[Google: OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect)）。
+
+```
+  accounts                         identities（外部の身元）
+  id | 表示用の email               iss                           | sub      | account_id
+  ---+-------------------           ------------------------------+----------+-----------
+  1  | hanako@example.com           https://idp.a.example         | a1b2c3   | 1
+                                    https://accounts.google.com   | 1076...  | 1
+                                    ↑ 突き合わせは (iss, sub) で引く。1 人に複数の身元を結べる
+```
+
+1 人のアカウントに、複数の（`iss`, `sub`）を結びつける表を持つのが基本の形です。第 130 回で、`iss` と `sub` の組が識別子で email ではないと述べたのは、この表のためです。
+
+### nOAuth: email で結びつけた結果
+
+2023 年 6 月、Descope は、Microsoft Azure AD（現 Entra ID）の「Microsoft でログイン」を使うマルチテナントのアプリで、アカウントを乗っ取れる問題を公表し、**nOAuth** と名付けました（[Descope](https://www.descope.com/blog/post/noauth)）。仕組みは単純です。
+
+1. 攻撃者は、自分が管理する Azure AD のテナントで、自分のアカウントの Email 属性を**被害者のメールアドレスに書き換える**。この変更には確認が要らない
+2. 攻撃者が、被害者も使っているアプリに「Microsoft でログイン」する
+3. アプリは ID トークンの `email` を見て、**同じメールアドレスの既存アカウント（被害者のもの）に結びつける**
+
+Descope の説明では、Azure AD の `email` クレームは**書き換えられ、検証もされていない**ので、識別子として信頼してはいけないものでした。Microsoft も同じ日に、email クレームを認可に使うアプリは権限昇格を受けうると注意を出しています（[MSRC, 2023-06-20](https://www.microsoft.com/en-us/msrc/blog/2023/06/potential-risk-of-privilege-escalation-in-azure-ad-applications)）。
+
+問題は IdP 単独にも、アプリ単独にもありません。**「どのテナントでも誰でも名乗れる email」を出す IdP** と、**「email が同じなら同じ人」とみなすアプリ**が組み合わさったときに起きます。Microsoft は現在、`email`、`preferred_username`、`unique_name` はテナントの管理者や、ときに利用者自身が書き換えられるので表示にしか使うなと書き、代わりに**変わらない `tid`（テナント）と `oid`（利用者）の組**をアプリのデータの鍵に使うよう勧めています（[Microsoft Learn: Secure applications and APIs by validating claims](https://learn.microsoft.com/en-us/entra/identity-platform/claims-validation)）。メールアドレスのドメインをそのテナントが所有確認済みかを示す任意のクレーム `xms_edov` も追加されました（[Microsoft Learn: Optional claims reference](https://learn.microsoft.com/en-us/entra/identity-platform/optional-claims-reference)）。
+
+公表から 2 年たった 2025 年 6 月にも、Semperis が Entra ID と連携する SaaS 104 個を試し、9 個がまだ nOAuth の形で乗っ取れたと報告しています（[Semperis](https://www.semperis.com/blog/noauth-abuse-alert-full-account-takeover/)）。
+
+### 手元で確かめる: 2 つの突き合わせ方
+
+nOAuth の形を、10 行ほどで再現してみます。被害者 hanako は、自社の IdP でログインする管理者です。攻撃者は、自分のテナントで email を hanako のものに書き換えた ID トークンを持ってきます。
+
+```python
+accounts = {1: {"name": "hanako", "email": "hanako@example.com", "role": "admin"}}
+links = {("https://login.example-corp.com", "a1b2c3"): 1}
+
+def by_email(claims):
+    for aid, a in accounts.items():
+        if a["email"] == claims.get("email"):
+            return aid
+
+def by_iss_sub(claims):
+    return links.get((claims["iss"], claims["sub"]))
+
+attacker = {"iss": "https://login.attacker-tenant.example", "sub": "zz9",
+            "email": "hanako@example.com"}
+```
+
+```
+$ python3 link.py
+by_email   -> {'name': 'hanako', 'email': 'hanako@example.com', 'role': 'admin'}
+by_iss_sub -> 一致なし（新規か拒否）
+```
+
+email で引くと、攻撃者は hanako の管理者アカウントに入れます。（`iss`, `sub`）で引くと、知らない発行者の知らない利用者なので、新しいアカウントを作るか拒否するかの判断に回ります。
+
+<Callout type="warn" title="誤解: email_verified が true なら、email で結びつけてよい">
+  `email_verified` は「その **OP が**、検証した**時点で**、利用者がそのアドレスを支配していることを確かめた」という意味です（[OpenID Connect Core 5.1](https://openid.net/specs/openid-connect-core-1_0.html#StandardClaims)）。
+  これには 2 つの限界があります。1 つは、**どの IdP の検証か**です。自分が権威を持たないドメインのアドレスを「確認済み」と言う IdP もありえますし、
+  検証の方法は IdP ごとの取り決めしだいです。もう 1 つは、**時点**です。アドレスは後で持ち主が変わりえます。
+  2025 年 1 月、Truffle Security は、廃業したスタートアップのドメインを買い取って Google Workspace を作り直すと、
+  元社員のメールアドレスで、そのドメインの人向けに「Google でログイン」を受け付けていた外部サービスに入れる場合があると報告しました（[Truffle Security](https://trufflesecurity.com/blog/millions-at-risk-due-to-google-s-oauth-flaw)）。
+  メールアドレスは**連絡先**であって、**身元の鍵**ではありません。
+</Callout>
+
+### 既存のアカウントに結びつけるなら、本人に証明させる
+
+ソーシャルログインを後から足したときなど、既存のアカウントに新しい身元を結びつけたい場面はあります。安全な形は、**既存のアカウントで一度ログインしてもらい、その状態で新しい IdP の身元を結ぶ**ことです。「email が同じだから」という推測ではなく、両方の鍵を持っていることを本人に示させます。
+
+Keycloak のブローカーも、初回ログインで同じメールアドレスやユーザ名の既存アカウントが見つかった場合、既定では結びつけてよいか確認し、メールでの確認か**既存アカウントでの再認証**を求めます。確認なしに結びつける AutoLink という部品もありますが、ドキュメントは「利用者が任意のユーザ名やメールアドレスで自分を登録できる環境では危険」と明記しています（[Keycloak: Automatically link existing first login flow](https://www.keycloak.org/docs/latest/server_admin/index.html#automatically-link-existing-first-login-flow)）。「外の IdP のメールアドレスを信頼する」という Trust Email の設定も、IdP ごとに選ぶ形になっています（同じ文書）。
+
+## グループとロールの対応づけ
+
+アカウントの次は権限です。IdP は「経理部」「管理者」のようなグループを持ち、SAML の属性や OIDC のクレーム、SCIM の `/Groups` でアプリに伝えます。しかし SCIM のスキーマは、グループは RBAC などを表しやすくするためのものだが、**明示的な認可のモデルは定めていない**、グループに属することの意味は**サービスプロバイダ（アプリ）が決める**と書いています（[RFC 7643 4.1.2](https://www.rfc-editor.org/rfc/rfc7643.html#section-4.1.2)）。
+
+つまり、「IdP のグループ X はアプリのロール Y」という**対応表はアプリの側に要ります**。第 132 回で見た RBAC のロールを、外から来たグループに結びつける作業です。ここにも落とし穴があります。
+
+- **名前ではなく ID で対応づける**: グループ名は変わりますし、別の顧客の IdP にも同じ名前のグループがありえます。Entra ID の groups クレームは、既定でグループのオブジェクト ID を運びます（[Microsoft Learn: Access token claims reference](https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference)）
+- **トークンに全部は載らない**: 同じ文書によれば、Entra ID は所属グループが SAML で 150、JWT で 200 を超えると、groups クレームそのものを出さず、Microsoft Graph で問い合わせるよう示す印だけを入れます。「groups が空だから権限なし」と読むと、大きな組織の人ほど権限を失います
+- **グループを編集できる人は、アプリの権限を配れる人**: アプリの管理者ロールを IdP のグループに結びつけた瞬間、そのグループのメンバーを変更できる IdP の管理者は、アプリの管理者を作れるようになります
+- **対応づけはテナントごとに**: 顧客 A の IdP の「Admins」は、顧客 A の範囲の管理者にしか結びつけません。第 132 回のマルチテナントの境界です
+
+## ドメインの所有確認
+
+企業向けの SaaS では、「@example.com の人は、example.com 社の IdP へ送る」という振り分けや、「この会社のドメインの人は、この会社の組織に自動で入れる」という設定がよくあります。このとき、**そのドメインを本当にその会社が持っているか**を確かめないと、別の会社が他人のドメインを自分の IdP に向けられます。そうなれば、そのドメインの社員のログインを横取りできてしまいます。
+
+確かめ方は、第 58 回で見た **TXT レコードによるドメインの所有確認**です。サービスが発行したランダムな値を、そのドメインの DNS に TXT レコードとして置いてもらいます。DNS を書き換えられるのはドメインの持ち主だけ、という前提に乗る方法です。Entra ID も、独自ドメインを追加するときは TXT（または MX）レコードで所有を確かめます（[Microsoft Learn: Add your custom domain name](https://learn.microsoft.com/en-us/entra/fundamentals/add-custom-domain)）。先の `xms_edov` は、この確認を済ませたドメインのアドレスかどうかをアプリに伝えるクレームでした。
+
+ただし、この確認も**その時点の所有**を示すだけです。Truffle Security の事例のように、ドメインが手放されて別の持ち主に渡れば、確認済みという事実は過去のものになります。
+
+## どの部品と組み合わさっているか
+
+| やりたいこと | 使う部品 | 前の回 |
+| --- | --- | --- |
+| ログインした人を知る | SAML / OIDC の ID トークン（署名、JWKS、TLS） | 第 128、130、133 回 |
+| アカウントを前もって作る・直す・止める | SCIM（HTTP + JSON + ベアラトークンか mTLS） | 第 114、129 回 |
+| 止めた人の状態を片づける | サーバ側セッションの削除、トークンの取り消し、バックチャネルログアウト、CAEP | 第 127、129、133 回 |
+| 外の IdP の人を自分の人に結ぶ | （`iss`, `sub`）の対応表、再認証による結びつけ | 第 130 回 |
+| グループを権限にする | アプリ側の対応表、RBAC、テナントの境界 | 第 132 回 |
+| ドメインがその会社のものか確かめる | DNS の TXT レコード | 第 58 回 |
+
+どれか 1 つでは足りません。SSO だけでは退職者が残り、SCIM だけではセッションが残り、突き合わせを誤れば正しく作ったアカウントを他人に渡します。
+
+## まとめ
+
+- SSO が運ぶのは「今ログインしたのは誰か」だけ。アプリの中のアカウント、権限、セッション、トークンは別に管理が要る
+- JIT プロビジョニングは初回ログインで作る。手軽だが、ログインしてこない人の変化は届かず、退職者を消せない
+- SCIM 2.0（RFC 7643 / 7644）は IdP がアプリの `/Users` と `/Groups` を呼んで押し込む。識別子は `id`（アプリ）、`externalId`（IdP）、`userName` の 3 つ
+- 退職は多くの場合 `active=false` の PATCH で届く。**それを受けてセッションやトークンを消すのはアプリの仕事**で、消さなければ既存の入口は生き続ける
+- 複数の IdP を受け入れるのがフェデレーション。IdP ブローカーを挟むと、突き合わせの責任がブローカーに集まる
+- 利用者の識別子は（`iss`, `sub`）。email は書き換えられ、使い回され、持ち主が変わる。email で結びつけた結果が nOAuth（2023）
+- 既存アカウントへの結びつけは、既存アカウントでの再認証で本人に証明させる
+- グループの意味はアプリが決める。ID で対応づけ、トークンに載りきらない場合と、グループの編集権が権限の配布権になることに注意する
+- ドメインによる振り分けには TXT での所有確認が要る。所有も、メールアドレスの確認も、その時点のものにすぎない
+
+ここまでは、IdP は Entra ID や Google のように誰かが運営しているものとして話してきました。次の第 135 回では、その IdP にどんな種類があり、何を基準に選ぶのかを見ます。誰かが運営するマネージドや SaaS の IdP から、自分で動かすセルフホストまでを並べ、続く第 136 回でセルフホストが何を引き受けるのかを実際に動かして確かめます。

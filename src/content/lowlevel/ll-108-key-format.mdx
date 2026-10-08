@@ -1,0 +1,496 @@
+---
+title: 鍵ファイルを読む
+description: 手元にある server.key は、どのアルゴリズムの、どの形式の鍵なのか。この証明書と組になっているのか。PEM、DER、PKCS#1、PKCS#8、OpenSSH、JWK、PKCS#12 の層を分け、秘密鍵から公開鍵を導いてペアかどうかを確かめます
+chapter: crypto
+order: 6
+status: published
+topics:
+  - PEM / DER
+  - ASN.1
+  - PKCS#1 / PKCS#8 / SEC1
+  - SubjectPublicKeyInfo
+  - OpenSSH の鍵形式
+  - JWK / JWK Thumbprint
+  - PKCS#12
+  - fingerprint
+  - 鍵のペアの確認
+requires:
+  - ll-107-signature
+  - ll-106-public-key
+---
+
+import Callout from '../../components/Callout.astro'
+
+## その鍵は何なのか
+
+障害対応で、こんなファイルを渡されたとします。
+
+```
+server.key   server.crt   bundle.pem   id_deploy   id_deploy.pub   jwks.json
+```
+
+`server.key` は RSA なのか EC なのか。`bundle.pem` の 1 つ目は本当にサーバの証明書なのか。`id_deploy.pub` はこの秘密鍵と組なのか。拡張子を見ても、どれも分かりません。
+
+第 106 回と第 107 回では、鍵を「数」として扱いました。この回は、その数が**ファイルとしてどう書かれているか**を見ます。形式の層を分けて読めるようになれば、「このファイルは何か」と「この 2 つはペアか」は、どちらも数行のコマンドで確かめられます。
+
+## 鍵の種類: アルゴリズムと用途
+
+まず、中に入っている鍵の種類です。実務で出会うのはほぼ次の 4 つです。
+
+| アルゴリズム | 用途 | 公開鍵の大きさ | 強度の目安 |
+| --- | --- | --- | --- |
+| **RSA** 2048 / 3072 / 4096 | 署名、暗号化（鍵の受け渡し） | 256〜512 バイト | 2048 で 112 ビット、3072 で 128 ビット |
+| **EC** P-256 / P-384 | 署名（ECDSA）、鍵交換（ECDH） | 65 / 97 バイト（非圧縮の点） | 128 / 192 ビット |
+| **Ed25519** | 署名だけ | 32 バイト | 約 128 ビット |
+| **X25519** | 鍵交換だけ | 32 バイト | 約 128 ビット |
+
+強度の目安は NIST SP 800-57 Part 1 の表に基づきます（[NIST SP 800-57 Pt.1 Rev.5](https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final)）。OpenSSH は 8.0（2019 年）で RSA の既定を 3072 ビットに上げ、9.5（2023 年）で既定の鍵の種類を Ed25519 にしました（[OpenSSH Release Notes](https://www.openssh.com/releasenotes.html)）。
+
+厄介なのは、**同じ曲線に名前がいくつもある**ことです。P-256 は、どの文書が名付けたかで呼び名が変わります（[RFC 5480 2.1.1.1](https://www.rfc-editor.org/rfc/rfc5480.html#section-2.1.1.1)）。
+
+| 名付けた側 | P-256 の名前 | P-384 の名前 |
+| --- | --- | --- |
+| NIST（FIPS 186） | P-256 | P-384 |
+| SECG（SEC 2） | secp256r1 | secp384r1 |
+| ANSI X9.62 / OpenSSL の表示 | prime256v1 | （secp384r1） |
+| SSH | `ecdsa-sha2-nistp256` | `ecdsa-sha2-nistp384` |
+| JWK の `crv` | `P-256` | `P-384` |
+| OID | 1.2.840.10045.3.1.7 | 1.3.132.0.34 |
+
+どれも同じ曲線です。似た名前の **secp256k1**（ビットコインの曲線）は**別物**なので、取り違えると読めません。
+
+<Callout type="warn" title="よくある誤解: Ed25519 と X25519 は同じ鍵">
+  どちらも Curve25519 という同じ系統の曲線を使うので、名前も長さ（32 バイト）もそっくりです。
+  しかし **Ed25519 は署名用、X25519 は鍵交換用**で、ファイルの中の OID も違います（[RFC 8410 3](https://www.rfc-editor.org/rfc/rfc8410.html#section-3)）。
+  X25519 の鍵で署名しようとすると、OpenSSL ははっきり断ります。
+
+```
+$ openssl pkeyutl -sign -inkey x25519.pem -rawin -in m.txt
+error:03000096:digital envelope routines:do_sigver_init:operation not supported for this keytype
+```
+
+  第 106 回の鍵交換と第 107 回の署名は、別の部品です。1 つの鍵を両方に使い回す設計は避けます。
+</Callout>
+
+## 形式の層を分ける
+
+鍵ファイルの形式が分かりにくいのは、**いくつもの層が重なっている**のに、それぞれの名前が混ぜて使われるからです。下から順に見ます。
+
+```
+ 層                    例                                           決めているもの
+─────────────────────────────────────────────────────────────────────────────────
+ 4. 包装（テキスト化）   -----BEGIN PRIVATE KEY----- ... -----END ...   PEM（RFC 7468）
+ 3. 符号化（バイト列化） 30 2e 02 01 00 30 05 ...                       DER（ASN.1 の規則）
+ 2. 構造（どの数を並べるか）PrivateKeyInfo / RSAPrivateKey / SPKI ...   PKCS#8, PKCS#1, SEC1, X.509
+ 1. 中身（数）           n, e, d, p, q / 曲線上の点 / 32 バイトのシード   各アルゴリズム
+```
+
+- **ASN.1** はデータ構造の書き方で、**DER** はそれを一意のバイト列にする規則です。DER は「型・長さ・値」（TLV）の繰り返しです
+- **PEM** は、DER を Base64（バイト列を 64 種類の英数字と記号で表す方式）にして、`-----BEGIN ラベル-----` と `-----END ラベル-----` で挟んだものです。元はメールで送るための形式でした（[RFC 7468 1](https://www.rfc-editor.org/rfc/rfc7468.html#section-1)）
+
+つまり **PEM と DER は同じ中身の別の書き方**で、「PEM 形式の鍵」と言っても、中の構造（層 2）は何も決まっていません。層 2 を教えてくれるのが、PEM の**ラベル**です。
+
+| PEM のラベル | 構造 | 中身 | 定めている文書 |
+| --- | --- | --- | --- |
+| `PRIVATE KEY` | PKCS#8 PrivateKeyInfo | どのアルゴリズムの秘密鍵でも | [RFC 5208](https://www.rfc-editor.org/rfc/rfc5208.html)、[RFC 5958](https://www.rfc-editor.org/rfc/rfc5958.html) |
+| `ENCRYPTED PRIVATE KEY` | PKCS#8 EncryptedPrivateKeyInfo | 上をパスフレーズで暗号化したもの | 同上 |
+| `RSA PRIVATE KEY` | PKCS#1 RSAPrivateKey | RSA の秘密鍵だけ | [RFC 8017 A.1.2](https://www.rfc-editor.org/rfc/rfc8017.html#appendix-A.1.2) |
+| `EC PRIVATE KEY` | SEC1 ECPrivateKey | EC の秘密鍵だけ | [RFC 5915](https://www.rfc-editor.org/rfc/rfc5915.html) |
+| `PUBLIC KEY` | SubjectPublicKeyInfo（SPKI） | どのアルゴリズムの公開鍵でも | [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1) |
+| `RSA PUBLIC KEY` | PKCS#1 RSAPublicKey | RSA の公開鍵だけ | [RFC 8017 A.1.1](https://www.rfc-editor.org/rfc/rfc8017.html#appendix-A.1.1) |
+| `CERTIFICATE` | X.509 Certificate | 公開鍵 + 名前 + CA の署名 | RFC 5280（第 110 回） |
+| `CERTIFICATE REQUEST` | PKCS#10 CSR | 公開鍵 + 名前 + 自分の署名 | [RFC 2986](https://www.rfc-editor.org/rfc/rfc2986.html) |
+| `OPENSSH PRIVATE KEY` | OpenSSH 独自 | SSH の秘密鍵 | [PROTOCOL.key](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key) |
+
+見分けの要点は 1 つです。**アルゴリズム名の入ったラベル（`RSA` `EC`）は古い、アルゴリズム専用の構造**で、名前の無い `PRIVATE KEY` / `PUBLIC KEY` は、**中に「どのアルゴリズムか」を示す OID を持つ汎用の入れ物**です。RFC 7468 が標準として挙げているのも汎用の方だけです（[RFC 7468 4](https://www.rfc-editor.org/rfc/rfc7468.html#section-4)）。
+
+<Callout type="warn" title="よくある誤解: 拡張子で中身が分かる">
+  `.pem` `.key` `.crt` `.cer` `.der` は、付けた人の習慣にすぎません。`.crt` の中身が DER のこともあれば、
+  `.pem` に鍵と証明書が 3 つ連結されていることもあります。**PEM なら 1 行目のラベル、DER なら `openssl asn1parse` の出力**で判断します。
+  `file` コマンドも、PEM のラベルを読んでいるだけで、DER はただの `data` と表示されます。
+</Callout>
+
+## 手元で確かめる: 鍵を作って中を読む
+
+作業には openssl 3.6、ssh-keygen（macOS 付属の OpenSSH 10.0p2）、Python 3 の cryptography 48 を使いました。まず 4 種類の鍵を作ります。OpenSSL 3 の `genpkey` は、どれも PKCS#8 で書き出します。
+
+```
+$ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out rsa.pem
+$ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ec.pem
+$ openssl genpkey -algorithm ED25519 -out ed.pem
+$ openssl genpkey -algorithm X25519 -out x25519.pem
+$ head -1 rsa.pem ec.pem ed.pem
+-----BEGIN PRIVATE KEY-----       ← 3 つとも同じラベル
+$ wc -c rsa.pem ec.pem ed.pem
+    1704 rsa.pem
+     241 ec.pem
+     119 ed.pem
+```
+
+一番小さい Ed25519 を、バイト単位で読みます。
+
+```
+$ cat ed.pem
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIPEd1PrCl+NTv1HfuahbUSyyEsxTxk0C9j7hxKKeCuHA
+-----END PRIVATE KEY-----
+$ openssl pkey -in ed.pem -outform DER | xxd
+00000000: 302e 0201 0030 0506 032b 6570 0422 0420  0....0...+ep.".
+00000010: f11d d4fa c297 e353 bf51 dfb9 a85b 512c  .......S.Q...[Q,
+00000020: b212 cc53 c64d 02f6 3ee1 c4a2 9e0a e1c0  ...S.M..>.......
+```
+
+```
+30 2e                SEQUENCE（入れ物）、長さ 46 バイト
+   02 01 00          INTEGER 0            … PKCS#8 の版
+   30 05             SEQUENCE             … アルゴリズムの識別子
+      06 03 2b 65 70   OID 1.3.101.112    … Ed25519
+   04 22             OCTET STRING         … 秘密鍵の本体を包む
+      04 20 f1 1d ...  OCTET STRING 32 バイト … Ed25519 のシード
+```
+
+`openssl asn1parse` は、この TLV を読んで表示してくれます。
+
+```
+$ openssl asn1parse -in ed.pem
+    0:d=0  hl=2 l=  46 cons: SEQUENCE
+    2:d=1  hl=2 l=   1 prim: INTEGER           :00
+    5:d=1  hl=2 l=   5 cons: SEQUENCE
+    7:d=2  hl=2 l=   3 prim: OBJECT            :ED25519
+   12:d=1  hl=2 l=  34 prim: OCTET STRING      [HEX DUMP]:0420F11DD4FA...
+```
+
+EC と RSA の PKCS#8 は、OID の違う同じ入れ物です。**最後の OCTET STRING の中に、アルゴリズム専用の構造がもう 1 段入っています**。`-strparse` でその位置から読み直すと見えます。
+
+```
+$ openssl asn1parse -in ec.pem
+    8:d=2  hl=2 l=   7 prim: OBJECT            :id-ecPublicKey
+   17:d=2  hl=2 l=   8 prim: OBJECT            :prime256v1
+   27:d=1  hl=2 l= 109 prim: OCTET STRING      [HEX DUMP]:306B020101...
+$ openssl asn1parse -in ec.pem -strparse 27        ← 中身は SEC1 の ECPrivateKey
+    2:d=1  hl=2 l=   1 prim: INTEGER           :01
+    5:d=1  hl=2 l=  32 prim: OCTET STRING      [HEX DUMP]:E9100C06...  ← 秘密の数 d
+   39:d=1  hl=2 l=  68 cons: cont [ 1 ]
+   41:d=2  hl=2 l=  66 prim: BIT STRING                               ← 公開点 Q
+
+$ openssl asn1parse -in rsa.pem -strparse 22       ← 中身は PKCS#1 の RSAPrivateKey
+    4:d=1  hl=2 l=   1 prim: INTEGER           :00
+    7:d=1  hl=4 l= 257 prim: INTEGER           :BED67036...   ← n（modulus）
+  268:d=1  hl=2 l=   3 prim: INTEGER           :010001        ← e = 65537
+  273:d=1  hl=4 l= 256 prim: INTEGER           :47C096C6...   ← d
+  533:d=1  hl=3 l= 129 prim: INTEGER           :ED4D8CC9...   ← p
+  665:d=1  hl=3 l= 129 prim: INTEGER           :CDDFAC84...   ← q
+   ...                                                        ← d mod (p-1), d mod (q-1), q⁻¹ mod p
+```
+
+ここから分かるのは、**PKCS#1 の `RSA PRIVATE KEY` は、PKCS#8 の中身そのもの**だということです。`openssl rsa -traditional` で外側の入れ物を外すと、ラベルが変わります。EC も同じで、`openssl ec` で書き出すと SEC1 の `EC PRIVATE KEY` になります。
+
+```
+$ openssl rsa -in rsa.pem -traditional -out rsa-pkcs1.pem && head -1 rsa-pkcs1.pem
+-----BEGIN RSA PRIVATE KEY-----
+$ openssl ec -in ec.pem -out ec-sec1.pem && head -1 ec-sec1.pem
+-----BEGIN EC PRIVATE KEY-----
+```
+
+公開鍵も同じ見方で読めます。SPKI は「アルゴリズムの識別子 + BIT STRING」の 2 つだけです。
+
+```
+$ openssl pkey -in ed.pem -pubout -outform DER | xxd
+00000000: 302a 3005 0603 2b65 7003 2100 9a16 c9d5  0*0...+ep.!.....
+          ↑SEQ ↑アルゴリズム(Ed25519)  ↑BIT STRING 33 バイト（先頭 00 + 公開鍵 32 バイト）
+```
+
+## 秘密鍵から公開鍵は導ける。逆はできない
+
+EC の秘密鍵ファイルに公開点 Q が入っていたように、秘密鍵ファイルには公開鍵の情報もたいてい入っています。仮に入っていなくても、**秘密鍵があれば公開鍵は計算で求められます**。
+
+| アルゴリズム | 秘密鍵 | 公開鍵の導き方 | 逆向きが難しい理由 |
+| --- | --- | --- | --- |
+| RSA | d, p, q | n = p × q、e はファイルにそのまま入っている | n から p, q を求める素因数分解 |
+| EC | 数 d | 曲線の基点 G を d 回足した点 Q = dG | Q から d を求める離散対数問題 |
+| Ed25519 | 32 バイトのシード | シードを SHA-512 にかけ、前半を整えた数で基点を掛ける（[RFC 8032 5.1.5](https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1.5)） | 同上 + ハッシュの一方向性 |
+
+Python で、ファイルから取り出した秘密の値だけを使って公開鍵を作り直してみます。
+
+```python
+from cryptography.hazmat.primitives import serialization as s
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+
+pn = s.load_pem_private_key(open("rsa.pem", "rb").read(), None).private_numbers()
+print("RSA: p*q == n ?", pn.p * pn.q == pn.public_numbers.n)
+
+d = s.load_pem_private_key(open("ec.pem", "rb").read(), None).private_numbers().private_value
+Q = ec.derive_private_key(d, ec.SECP256R1()).public_key().public_numbers()
+print("EC : Q = dG の x =", hex(Q.x)[:18])
+
+seed = s.load_pem_private_key(open("ed.pem", "rb").read(), None).private_bytes_raw()
+print("Ed25519 pub =", ed25519.Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw().hex()[:16])
+```
+
+```
+RSA: p*q == n ? True
+EC : Q = dG の x = 0x67d1a06d9704b0dd     ← asn1parse で見た BIT STRING の 04 67d1a06d... と一致
+Ed25519 pub = 9a16c9d5e6194c41            ← 公開鍵の DER の 9a16c9d5... と一致
+```
+
+この「一方向だけ計算できる」性質が、次の節のペア判定の土台になります。
+
+## 秘密鍵を暗号化する
+
+秘密鍵のファイルをパスフレーズで守るとき、PKCS#8 では `ENCRYPTED PRIVATE KEY` という別の構造になります。中を読むと、**パスフレーズから鍵を作る方法**と**暗号化の方式**が書かれています。
+
+```
+$ openssl pkey -in ec.pem -aes-256-cbc -passout pass:hunter2 -out ec-enc.pem
+$ openssl asn1parse -in ec-enc.pem
+    5:d=2  hl=2 l=   9 prim: OBJECT            :PBES2
+   20:d=4  hl=2 l=   9 prim: OBJECT            :PBKDF2
+   33:d=5  hl=2 l=  16 prim: OCTET STRING      [HEX DUMP]:24C01F48...   ← ソルト
+   51:d=5  hl=2 l=   2 prim: INTEGER           :0800                   ← 繰り返し 2048 回
+   57:d=6  hl=2 l=   8 prim: OBJECT            :hmacWithSHA256
+   71:d=4  hl=2 l=   9 prim: OBJECT            :aes-256-cbc
+  100:d=1  hl=3 l= 144 prim: OCTET STRING      [HEX DUMP]:D9F0C13A...   ← 暗号化された PKCS#8
+```
+
+`openssl pkcs8 -topk8 -scrypt` とすれば、PBKDF2 の代わりに scrypt も選べます。パスワードから鍵を作る関数の違いは第 109 回で扱います。
+
+古い PKCS#1 形式にも暗号化はありますが、PEM のヘッダ行（`Proc-Type: 4,ENCRYPTED` と `DEK-Info:`）で表す独自の方式で、OpenSSL の文書によれば**鍵の導出は MD5 を 1 回かけるだけ**です（[OpenSSL PEM_read_bio_PrivateKey](https://docs.openssl.org/3.6/man3/PEM_read_bio_PrivateKey/)）。パスフレーズを総当たりされやすいので、使う理由がなければ PKCS#8 に移します。
+
+## OpenSSH の形式
+
+SSH は、ASN.1 ではなく独自の書き方を使います。公開鍵は、おなじみの 1 行です。
+
+```
+$ ssh-keygen -q -t ed25519 -N '' -C 'alice@laptop' -f id_ed25519
+$ cat id_ed25519.pub
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEf4GME0X+Cu5/cWXBjeYlSLv2hYOJvxPeonVQkizLY alice@laptop
+```
+
+`種類 Base64 コメント` の 3 つで、真ん中の Base64 を戻すと、「4 バイトの長さ + 中身」の並びが出てきます。これは SSH のプロトコルで公開鍵を送るときの形そのものです（[RFC 4253 6.6](https://www.rfc-editor.org/rfc/rfc4253.html#section-6.6)、[RFC 8709](https://www.rfc-editor.org/rfc/rfc8709.html)）。
+
+```
+00 00 00 0b  "ssh-ed25519"          ← 長さ 11 + 種類の名前
+00 00 00 20  f1 1f e0 63 ...         ← 長さ 32 + 公開鍵
+```
+
+`authorized_keys` は、この 1 行を並べたファイルで、行頭に `from="10.0.0.0/8",no-agent-forwarding` のような制限を足せます（[sshd(8) AUTHORIZED_KEYS FILE FORMAT](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT)）。コメントは照合に使われない、ただのメモです。
+
+秘密鍵は `-----BEGIN OPENSSH PRIVATE KEY-----` で始まります。PEM に似ていますが、中は DER ではありません。
+
+```
+$ sed '1d;$d' id_ed25519 | base64 -d | xxd | head -3
+00000000: 6f70 656e 7373 682d 6b65 792d 7631 0000  openssh-key-v1..
+00000010: 0000 046e 6f6e 6500 0000 046e 6f6e 6500  ...none....none.   ← 暗号なし、KDF なし
+00000020: 0000 0000 0000 0100 0000 3300 0000 0b73  ..........3....s   ← 鍵 1 つ、公開鍵が続く
+```
+
+パスフレーズを付けると `none` が `aes256-ctr` と `bcrypt` に変わります。構造は PROTOCOL.key のとおり、**先頭に公開鍵が平文で置かれ、その後ろに暗号化された秘密鍵とコメントが続きます**（[PROTOCOL.key](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key)）。この形式は OpenSSH 7.8（2018 年）から `ssh-keygen` の既定で、それ以前の既定だった OpenSSL の PEM より総当たりに強いと説明されています（[OpenSSH 7.8 Release Notes](https://www.openssh.org/txt/release-7.8)）。
+
+ほかに、RFC 4716 の `---- BEGIN SSH2 PUBLIC KEY ----` という形式もあります。ダッシュが 4 つで空白が入る点が PEM と違います（[RFC 4716](https://www.rfc-editor.org/rfc/rfc4716.html)）。
+
+## JWK と PKCS#12
+
+**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 128 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
+
+```
+$ node -e 'const c=require("crypto"),fs=require("fs");
+  console.log(c.createPublicKey(fs.readFileSync("ec.pem")).export({format:"jwk"}))'
+{
+  kty: 'EC',
+  x: 'Z9GgbZcEsN1XpjzQLRngFRZMSP4unSMCHHDDUnLuhew',
+  y: '1HPnG9k4TB-irx372DOZaJDGl6rJmvWQyHgb2R5OtlY',
+  crv: 'P-256'
+}
+```
+
+`kty` が種類、EC なら `crv` と点の座標 `x` `y`（[RFC 7518 6.2](https://www.rfc-editor.org/rfc/rfc7518.html#section-6.2)）、RSA なら `n` と `e`、Ed25519 は `kty: "OKP"` と `crv: "Ed25519"` と `x` です（[RFC 8037](https://www.rfc-editor.org/rfc/rfc8037.html)）。値は Base64URL（`+/` を `-_` に替え、末尾の `=` を省いた Base64）です。秘密鍵なら `d` が加わります。複数の JWK を `{"keys": [...]}` にまとめたものが **JWKS** で、各鍵に `kid`（鍵の識別子）を付けて、どの鍵で署名したかを JWT のヘッダで示します。
+
+**PKCS#12**（拡張子 `.p12` `.pfx`）は、**秘密鍵と証明書（とその中間証明書）を 1 つのファイルにまとめ、パスワードで守る**形式です（[RFC 7292](https://www.rfc-editor.org/rfc/rfc7292.html)）。Windows や Java のキーストア、ブラウザへのクライアント証明書の取り込みでよく使われます。
+
+```
+$ openssl pkcs12 -export -inkey ec.pem -in ec.crt -passout pass:hunter2 -out ec.p12
+$ openssl pkcs12 -in ec.p12 -info -noout -passin pass:hunter2
+MAC: sha256, Iteration 2048
+PKCS7 Encrypted data: PBES2, PBKDF2, AES-256-CBC, Iteration 2048, PRF hmacWithSHA256
+Certificate bag
+Shrouded Keybag: PBES2, PBKDF2, AES-256-CBC, Iteration 2048, PRF hmacWithSHA256
+```
+
+中身は証明書の袋（Certificate bag）と、暗号化された秘密鍵の袋（Shrouded Keybag）です。古い Java や Windows は、OpenSSL 3 の既定の AES を読めず、`-legacy`（3DES と RC2）で作り直す必要があることがあります。
+
+## ペアかどうかを確かめる
+
+ここからが本題です。**ペアである**とは、「その秘密鍵から導いた公開鍵が、相手の公開鍵と同じである」ことです。前の節で見たとおり秘密鍵から公開鍵は計算できるので、原理は 1 つしかありません。
+
+```
+秘密鍵 ──導出──→ 公開鍵 A ─┐
+                          ├─ 同じ形に正規化して比べる
+証明書 / CSR / .pub ─取り出す→ 公開鍵 B ─┘
+```
+
+比べる形として便利なのが、**SPKI の DER**です。アルゴリズムを問わず 1 つの形に揃うので、その SHA-256 を比べれば済みます。どのファイルでも同じ手順で比べられるよう、小さな関数にしました。
+
+```bash
+spki() {
+  case "$(head -1 "$1")" in
+    *"CERTIFICATE REQUEST"*) openssl req  -in "$1" -noout -pubkey ;;
+    *CERTIFICATE*)           openssl x509 -in "$1" -noout -pubkey ;;
+    *"PUBLIC KEY"*)          openssl pkey -pubin -in "$1" ;;
+    *)                       openssl pkey -in "$1" -pubout ;;
+  esac | openssl pkey -pubin -outform DER | openssl dgst -sha256 -r | cut -c1-16
+}
+```
+
+自前の CA（`Demo Intermediate CA`）でサーバ証明書 `srv.crt` を発行し、証明書を正しい順と逆順に連結した 2 つのファイルも用意して比べます。
+
+```
+srv.key            d5c7c30e18502bc3     ← 秘密鍵
+srv.crt            d5c7c30e18502bc3     ← 証明書: 一致
+srv.csr            d5c7c30e18502bc3     ← CSR: 一致
+fullchain.pem      d5c7c30e18502bc3     ← 先頭がサーバ証明書: 一致
+wrong-chain.pem    0211fb165698e7b8     ← 先頭が中間 CA の証明書: 不一致
+ec2.pem            231176c1a5a0f3e8     ← 別の鍵: 不一致
+rsa-pkcs1.pem      b38dc6b49bb60dd5     ← PKCS#1 の秘密鍵
+rsa-pkcs1.pub      b38dc6b49bb60dd5     ← PKCS#1 の公開鍵: 形式が違っても一致
+rsa.pub            b38dc6b49bb60dd5     ← SPKI の公開鍵: 一致
+```
+
+**形式が違っても、同じ鍵なら同じ値になり、違う鍵なら違う値になります**。`openssl x509 -pubkey` は、複数の証明書が連結されたファイルでは**先頭の 1 つだけ**を読むことにも注意します。
+
+よく紹介される `openssl rsa -noout -modulus` と `openssl x509 -noout -modulus` の比較も、同じ原理の RSA 版です（n が同じなら同じ鍵）。ただし EC や Ed25519 の証明書では `Modulus=No modulus for this public key type` となり使えません。SPKI での比較は、どのアルゴリズムでも使えます。
+
+### SSH の鍵
+
+SSH では、`ssh-keygen -y` で秘密鍵から公開鍵の 1 行を導き、`ssh-keygen -lf` で **fingerprint** にして比べます。fingerprint は、先ほど見た Base64 の中身（ワイヤ形式の公開鍵）の SHA-256 を Base64 にしたものです。
+
+```
+$ ssh-keygen -y -f id_ed25519 | ssh-keygen -lf -
+256 SHA256:yNvdgXJp8rp1klJEYo3r96kUfPE3xKTyiYOA5K6Imi8 alice@laptop (ED25519)
+$ ssh-keygen -lf authorized_keys
+256 SHA256:yNvdgXJp8rp1klJEYo3r96kUfPE3xKTyiYOA5K6Imi8 alice@laptop (ED25519)   ← 一致
+$ python3 -c 'import base64,hashlib; b=base64.b64decode(open("id_ed25519.pub").read().split()[1]);
+  print("SHA256:"+base64.b64encode(hashlib.sha256(b).digest()).decode().rstrip("="))'
+SHA256:yNvdgXJp8rp1klJEYo3r96kUfPE3xKTyiYOA5K6Imi8
+```
+
+`SHA256:` で始まるこの形は OpenSSH 6.8（2015 年）からの既定で、それ以前は MD5 を 16 進で並べた `aa:bb:...` でした（[OpenSSH 6.8 Release Notes](https://www.openssh.org/txt/release-6.8)）。古い手順書の fingerprint と比べるときは `ssh-keygen -E md5 -lf` で形を合わせます。
+
+`-lf` と `-y` には違いがあります。パスフレーズ付きの秘密鍵に `-lf` を使うと、パスフレーズを聞かれずに fingerprint が出ます。**ファイルの先頭の、平文の公開鍵を読んでいるだけ**だからです（コメントは暗号化された側にあるので `no comment` と表示されます）。一方 `-y` はパスフレーズを要求し、秘密鍵を復号して公開鍵を導きます。**秘密の部分と組になっているかを確かめたいなら `-y`** です。
+
+### JWK の thumbprint
+
+JWK には、鍵を識別するための **JWK Thumbprint** が定められています（[RFC 7638](https://www.rfc-editor.org/rfc/rfc7638.html)）。必須のメンバーだけを取り出し、名前の辞書順に並べ、空白なしの JSON にして SHA-256 をとり、Base64URL にします。
+
+```python
+REQUIRED = {"EC": ["crv", "kty", "x", "y"], "OKP": ["crv", "kty", "x"], "RSA": ["e", "kty", "n"]}
+def thumbprint(jwk):
+    canon = json.dumps({k: jwk[k] for k in REQUIRED[jwk["kty"]]}, separators=(",", ":"), sort_keys=True)
+    return b64u(hashlib.sha256(canon.encode()).digest())
+```
+
+```
+RFC 7638 example: NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs   ← RFC 3.1 の値と一致
+from private:     dith7DdLHcx_tU3pIWvsduMjviQmGCkajRks2XeDRUA   ← ec.pem から導いた公開鍵
+from public :     dith7DdLHcx_tU3pIWvsduMjviQmGCkajRks2XeDRUA   ← ec.pub: 一致
+other key   :     1l1lVkoi4GA4tRxwT6pI7FZ56Sip88RKitTeauz8l3c   ← ec2.pem: 不一致
+```
+
+`kid` や `alg` のような付加情報を含めないので、同じ鍵なら誰が計算しても同じ値になります。`kid` にこの値を使う IdP もあります。
+
+<Callout type="warn" title="よくある誤解: ハッシュが違えば別の鍵">
+  同じ鍵でも、**何をハッシュしたか**で値は変わります。SSH の fingerprint（ワイヤ形式）、SPKI の SHA-256（DER）、JWK Thumbprint（JSON）は、同じ鍵に対して 3 つとも別の値です。
+  さらに、同じ SPKI でも書き方が 1 通りとは限りません。macOS 付属の `ssh-keygen`（OpenSSH 10.0p2、LibreSSL 3.3.6）で ECDSA の公開鍵を `-e -m PKCS8` で書き出すと、
+  曲線を OID で示す代わりに**曲線のパラメータを全部書き並べた** SPKI（335 バイト。通常は 91 バイト）になり、OpenSSL で作った同じ鍵の SPKI とハッシュが一致しませんでした。
+  RFC 5480 はこの書き方を使ってはならないとしています（[RFC 5480 2.1.1](https://www.rfc-editor.org/rfc/rfc5480.html#section-2.1.1)）。
+  `openssl pkey -pubin -ec_param_enc named_curve` で書き直すと一致します。**比べる前に同じ形に正規化する**のが原則です。
+</Callout>
+
+### 署名して確かめる、との違い
+
+もう 1 つの確かめ方は、秘密鍵で署名し、公開鍵で検証することです（第 107 回）。
+
+```
+$ openssl dgst -sha256 -sign rsa.pem -out m.sig m.txt
+$ openssl dgst -sha256 -verify rsa.pub  -signature m.sig m.txt
+Verified OK
+$ openssl dgst -sha256 -verify rsa2.pub -signature m.sig m.txt
+Verification failure
+```
+
+結果は公開鍵の比較と同じですが、**意味が違います**。公開鍵の比較は「この 2 つのファイルは同じ鍵を指している」ことを、手元で静かに確かめるだけです。署名の検証は「**今この瞬間、秘密鍵を持っている誰かが応答した**」ことを示します。後者は、秘密鍵を見せられない相手に対して「持っている」ことを示す手段で、プロトコルが使うのはこちらです。CSR に自分の署名が付いているのも（`openssl req -verify` で `self-signature verify OK`）、TLS の CertificateVerify（第 113 回）も、SSH の公開鍵認証（第 115 回）も同じ考え方です。
+
+秘密鍵を HSM や KMS から取り出せない場合（第 109 回）は、公開鍵をそこから取り出して比べるか、署名を 1 回頼んで検証するかのどちらかになります。
+
+## 形式を変換する
+
+| やりたいこと | コマンド |
+| --- | --- |
+| PKCS#1 / SEC1 → PKCS#8 | `openssl pkey -in old.pem -out new.pem` |
+| PKCS#8 → PKCS#1（RSA） | `openssl rsa -in k.pem -traditional -out k-rsa.pem` |
+| PKCS#8 → SEC1（EC） | `openssl ec -in k.pem -out k-ec.pem` |
+| PEM ⇔ DER | `openssl pkey -in k.pem -outform DER -out k.der`（逆は `-inform DER`） |
+| パスフレーズを付ける / 外す | `openssl pkey -in k.pem -aes-256-cbc -out enc.pem` / `openssl pkey -in enc.pem -out k.pem` |
+| 公開鍵を取り出す | `openssl pkey -in k.pem -pubout`（RSA の PKCS#1 公開鍵は `openssl rsa -RSAPublicKey_out`） |
+| OpenSSL の秘密鍵 → SSH の公開鍵 | `ssh-keygen -y -f k.pem` |
+| OpenSSH の秘密鍵 → PEM / PKCS#8 | `ssh-keygen -p -m PEM -f id_ecdsa`（`-m PKCS8` も可。ファイルを上書きする） |
+| SSH の公開鍵 → SPKI / RFC 4716 | `ssh-keygen -e -m PKCS8 -f id.pub` / `ssh-keygen -e -f id.pub` |
+| SPKI → SSH の公開鍵 | `ssh-keygen -i -m PKCS8 -f pub.pem` |
+| PKCS#12 → PEM | `openssl pkcs12 -in b.p12 -nodes`（鍵が平文で出るので扱いに注意） |
+
+**Ed25519 は、この表のとおりにいかないことがあります**。macOS 付属の `ssh-keygen` では、OpenSSL で作った Ed25519 の PKCS#8 を `-y` で読もうとすると `invalid format` になり、`-e -m PKCS8` は `unsupported key type ED25519` で失敗し、`-p -m PEM` はエラーを出さずに OpenSSH 形式のまま保存しました。ssh-keygen が使う暗号ライブラリ次第なので、Ed25519 の変換は Python の cryptography（`load_ssh_private_key` と `private_bytes`）のようなライブラリで行う方が確実です。
+
+## よくある事故
+
+**形式違いでライブラリが読めない。** 言語によって、関数が構造ごとに分かれています。Go で PKCS#1 の鍵を PKCS#8 の関数に渡すと、エラーが次に呼ぶべき関数を教えてくれます。
+
+```
+rsa-pkcs1.pem RSA PRIVATE KEY  x509: failed to parse private key (use ParsePKCS1PrivateKey instead for this key format)
+ec-sec1.pem   EC PRIVATE KEY   x509: failed to parse private key (use ParseECPrivateKey instead for this key format)
+```
+
+**証明書と秘密鍵がペアでなくてサーバが起動しない。** 証明書を更新したのに鍵は古いまま、という取り違えです。OpenSSL を使うサーバは、起動時に次のように止まります。
+
+```
+$ openssl s_server -cert ec.crt -key ec2.pem
+error setting private key
+error:05800074:x509 certificate routines:ossl_x509_check_private_key:key values mismatch
+```
+
+**中間証明書と取り違える。** 上の `wrong-chain.pem` のように、連結の順番を逆にすると、先頭の中間 CA の証明書と秘密鍵を比べることになり、同じ `key values mismatch` になります。証明書のファイルは**サーバ証明書を先頭に**置きます（チェーンは第 111 回）。
+
+**改行コードと BOM。** Windows で編集したファイルは、行末が CRLF になったり、先頭に BOM（UTF-8 であることを示す 3 バイト `EF BB BF`）が付いたりします。手元で試すと、読めるかどうかは道具によって分かれました。
+
+| 道具 | 行末が CRLF | 先頭に BOM |
+| --- | --- | --- |
+| openssl 3.6 | 読める | 読める |
+| Python cryptography 48 | 読める | 読める |
+| Node 20 `crypto.createPrivateKey` | 読める | 読める |
+| Go 1.24 `pem.Decode` | 読める | **読めない**（ブロックが見つからない） |
+| ssh-keygen（macOS 付属） | 読める | **読めない**（`invalid format`） |
+
+手元の openssl では読めても、本番の Go のサービスでは読めない、ということが起きます。`xxd file | head -1` で先頭の 3 バイトを見れば BOM はすぐ分かります。
+
+## どの部品と組み合わさるか
+
+鍵ファイルは、それ単体では何も守りません。**誰の鍵かを示す仕組み**と組み合わさって初めて意味を持ちます。
+
+| 鍵が入る場所 | 「誰の鍵か」を示すもの | 回 |
+| --- | --- | --- |
+| 証明書の SPKI | CA の署名 | 第 110〜112 回 |
+| TLS のサーバの秘密鍵 | 証明書 + CertificateVerify の署名 | 第 113 回 |
+| SSH のホスト鍵・ユーザ鍵 | known_hosts / authorized_keys（fingerprint） | 第 115〜116 回 |
+| JWKS の公開鍵 | TLS で守られた IdP の URL と `kid` | 第 128、130 回 |
+
+どの場合も、確かめているのは第 107 回で見たとおり「**この鍵**で署名された」ことだけです。その鍵が本物かどうかは、ペアの確認とは別に、それぞれの仕組みが引き受けています。
+
+## まとめ
+
+- 鍵の種類は RSA、EC（P-256 = secp256r1 = prime256v1）、Ed25519（署名用）、X25519（鍵交換用）。名前の別名と用途の違いを押さえる
+- 鍵ファイルは「中身（数）→ 構造（PKCS#8、PKCS#1、SEC1、SPKI）→ 符号化（DER）→ 包装（PEM）」の層でできている。構造は PEM のラベルで分かり、拡張子では分からない
+- `PRIVATE KEY` / `PUBLIC KEY` は OID でアルゴリズムを示す汎用の入れ物、`RSA` `EC` の付くラベルはアルゴリズム専用の古い構造
+- OpenSSH の秘密鍵は独自形式で、公開鍵は平文、秘密鍵とコメントは暗号化される。JWK は JSON、PKCS#12 は鍵と証明書をまとめた暗号化ファイル
+- 秘密鍵から公開鍵は導けるが逆はできない。**ペアの確認は「秘密鍵から導いた公開鍵」と「相手の公開鍵」を同じ形に正規化して比べる**こと
+- 比べる形は SPKI の DER の SHA-256、SSH の fingerprint、JWK Thumbprint など。同じ鍵でも何をハッシュしたかで値は変わる
+- 署名して検証する方法は、比較ではなく「今、秘密鍵を持つ者が応答した」ことの証明で、プロトコルはこちらを使う
+- 事故の多くは、形式違い、証明書と鍵の取り違え、連結順の誤り、BOM で起きる
+
+この回で、鍵がファイルとしてどう書かれ、どう照合できるかを見ました。では、その鍵の元になる乱数はどこから来て、できた鍵はどこに置けばよいのか。次の第 109 回で、乱数と鍵の管理を見て、この章を締めます。

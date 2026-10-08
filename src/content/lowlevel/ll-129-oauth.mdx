@@ -1,0 +1,343 @@
+---
+title: OAuth 2.0 が決めていること
+description: 写真を印刷するサービスに、自分のパスワードを渡さずに写真だけを読ませるには。OAuth 2.0 は「誰の代わりに、何をしてよいか」を渡す委任の仕組みです。認可コードフローを 1 往復ずつ追い、PKCE、redirect_uri、廃止された流れまでを見ます
+chapter: identity
+order: 5
+status: published
+topics:
+  - OAuth 2.0
+  - 委任
+  - 認可コードフロー
+  - PKCE
+  - redirect_uri
+  - スコープ
+  - client credentials
+  - デバイスフロー
+  - リフレッシュトークン
+  - RFC 9700
+requires:
+  - ll-128-jwt
+  - ll-125-authn-authz
+  - ll-127-session-cookie
+---
+
+import Callout from '../../components/Callout.astro'
+
+## パスワードを渡さずに、写真だけを読ませたい
+
+写真を保存しているサービスがあり、別の会社の「写真を印刷して郵送するサービス」を使いたいとします。印刷サービスは、あなたの写真を読めなければ仕事になりません。
+
+いちばん素朴な方法は、写真サービスの ID とパスワードを印刷サービスに教えることです。しかしこれには問題が 3 つあります。
+
+- 印刷サービスは写真を**読む**だけでなく、削除も、パスワードの変更も、**あなたができることは何でも**できてしまう
+- 印刷サービスだけの権限を取り消すには、パスワードを変えるしかない。変えれば、同じパスワードを教えた他のサービスもすべて止まる
+- 写真サービスから見ると、アクセスしてきたのが本人なのか印刷サービスなのか区別できない
+
+欲しいのは、**「この利用者の代わりに、写真を読むことだけを、しばらくの間だけ許す」という許可証**を、パスワードとは別に発行する仕組みです。第 125 回で「誰の代わりに動くか（委任）」として予告したのがこれで、OAuth 2.0（[RFC 6749](https://www.rfc-editor.org/rfc/rfc6749.html)）はその許可証の**もらい方**を決めた仕様です。
+
+## 登場人物は 4 人
+
+RFC 6749 は 4 つの役割を定義しています（[RFC 6749 1.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-1.1)）。
+
+| 役割 | 例 | 何をするか |
+| --- | --- | --- |
+| リソースオーナ | あなた | 守られた資源（写真）へのアクセスを許可できる者 |
+| クライアント | 印刷サービス | リソースオーナの**代わりに、その許可を得て**資源にアクセスするアプリ |
+| 認可サーバ | 写真サービスのログイン基盤 | リソースオーナを認証し、許可を得たうえで**アクセストークン**を発行する |
+| リソースサーバ | 写真サービスの API | アクセストークンを受け取って資源を返す |
+
+「クライアント」は利用者の端末のことではなく、**アクセスしに来るアプリ**のことです。サーバ上で動く Web アプリでも、クライアントと呼びます。
+
+**アクセストークン**は、第 125 回の言葉で言えば「委任された権限」を表す文字列です。持っている者は、決められた範囲（**スコープ**）で、決められた期間だけ API を呼べます。
+
+## 認可コードフローを 1 往復ずつ
+
+OAuth にはトークンのもらい方（**グラント**）がいくつかありますが、利用者が関わる場合の基本は**認可コードフロー**です（[RFC 6749 4.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1)）。全体は次のとおりです。
+
+```
+ ブラウザ(利用者)            クライアント(印刷)         認可サーバ           リソースサーバ
+      |  「写真を選ぶ」を押す      |                         |                      |
+      |-------------------------->|                         |                      |
+      |  ① 302 認可サーバへ行け    |                         |                      |
+      |<--------------------------|                         |                      |
+      |  ② GET /authorize?response_type=code&client_id=...&state=...&code_challenge=...
+      |---------------------------------------------------->|                      |
+      |  ③ ログイン画面・同意画面（「写真の閲覧」を許可しますか）                    |
+      |<--------------------------------------------------->|                      |
+      |  ④ 302 redirect_uri?code=...&state=...               |                      |
+      |<----------------------------------------------------|                      |
+      |  ⑤ GET /cb?code=...&state=...                        |                      |
+      |-------------------------->|                         |                      |
+      |                           | ⑥ POST /token (code, code_verifier, クライアント認証)
+      |                           |------------------------>|                      |
+      |                           | ⑦ access_token, refresh_token                  |
+      |                           |<------------------------|                      |
+      |                           | ⑧ GET /photos  Authorization: Bearer ...       |
+      |                           |----------------------------------------------->|
+```
+
+①〜⑤ は**ブラウザを経由する**やり取り（フロントチャネル）、⑥⑦ はクライアントと認可サーバが直接話す**サーバ間のやり取り**（バックチャネル）です。この 2 つに分かれていることが、フロー全体の設計の要です。
+
+- ② の認可リクエストには、誰がどこへ戻ってきてほしいか（`client_id`、`redirect_uri`）、何を求めるか（`scope`）、そして後で説明する `state` と `code_challenge` を入れます
+- ③ で利用者は**認可サーバに**パスワードを入力します。**印刷サービスはパスワードを一度も見ません**
+- ④ で認可サーバが返すのはトークンではなく、**認可コード**という短命な引換券です。RFC は有効期間を最大 10 分にするよう勧め、**1 回しか使えない**と定めています（[RFC 6749 4.1.2](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1.2)）
+- ⑥ でクライアントはコードをトークンに引き換えます。このとき、機密クライアント（後述）は自分の秘密で**クライアント認証**をします
+
+なぜ一度コードを挟むのでしょうか。④⑤ はブラウザのアドレスバーを通るので、URL は**履歴、`Referer`、アクセスログ、ブラウザ拡張**などに残りえます。そこに長く使えるトークンを載せたくありません。コードなら、短命で 1 回きりで、しかも引き換えには ⑥ の直接の通信（と、クライアント認証や PKCE）が要ります。
+
+### state: 戻ってきた応答は、自分が始めたものか
+
+⑤ でクライアントの `/cb` に届く `code` は、誰でも作れる URL に載っています。攻撃者は**自分のアカウント**で ②〜④ を進めてコードを手に入れ、それを載せた `/cb?code=...` を被害者のブラウザに踏ませることができます。すると、被害者は気づかないまま**攻撃者の写真アカウントにつながった状態**になり、以後アップロードした写真が攻撃者の手元に入ります。これは第 127 回で見た CSRF の一種です（[RFC 6749 10.12](https://www.rfc-editor.org/rfc/rfc6749.html#section-10.12)）。
+
+対策は、② の前に推測できない値 `state` を作って**利用者のセッション（第 127 回の Cookie）に保存**し、⑤ で戻ってきた `state` と一致するか確かめることです。一致しなければ、自分が始めたフローではありません。RFC 9700 は、CSRF を防ぐ手段として、PKCE、OIDC の `nonce`、利用者のブラウザに結び付けた 1 回限りの `state` のいずれかを使うよう求めています（[RFC 9700 2.1](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1)）。
+
+### redirect_uri は完全一致で
+
+④ で認可サーバがコードを送る先は `redirect_uri` です。ここを攻撃者が自由に書き換えられれば、コードは攻撃者のサーバに届きます。そこで認可サーバは、クライアントを登録するときに戻り先を決めておき、認可リクエストの `redirect_uri` を照合します。
+
+かつては前方一致やワイルドカードで照合する実装が多く、`https://client.example/cb/../../evil` のようなパスや、同じドメインの別のページ（オープンリダイレクタ）を経由してコードが漏れる事故が繰り返されました。RFC 9700 は、ネイティブアプリの `localhost` のポート番号を除き、**文字列の完全一致**で照合しなければならないとしています（[RFC 9700 2.1](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1)、[4.1.3](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.1.3)）。さらに ⑥ では、② と同じ `redirect_uri` が送られてきたかも確かめます（[RFC 6749 4.1.3](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1.3)）。
+
+## PKCE: コードを盗まれても使わせない
+
+`state` は「自分が始めたフローか」を確かめますが、**正規のコードが途中で盗まれる**ことは防げません。スマートフォンのアプリは `myapp://cb` のような独自の URL スキームで戻り先を受け取ることがありますが、別の悪意のあるアプリが同じスキームを登録すると、④ のコードがそちらに渡ります（[RFC 7636 1](https://www.rfc-editor.org/rfc/rfc7636.html#section-1)）。アプリには守れる秘密がないので、盗んだ側もそのまま ⑥ を実行できます。
+
+**PKCE**（Proof Key for Code Exchange、[RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html)）は、このコードを**フローを始めた本人にしか引き換えられない**ようにします。
+
+```
+② の前: code_verifier  = 推測できない乱数（43〜128 文字）       ← クライアントだけが持つ
+         code_challenge = BASE64URL(SHA256(code_verifier))       ← ② で認可サーバに送る
+⑥ で:   code_verifier をそのまま送る
+         認可サーバは SHA256 して、② で受け取った code_challenge と比べる
+```
+
+途中で盗めるのは ② の `code_challenge` と ④ の `code` だけです。第 104 回のハッシュの**原像耐性**により、`code_challenge` から `code_verifier` は求まりません。だから盗んだコードは ⑥ で失敗します（[RFC 7636 4.1、4.2、4.6](https://www.rfc-editor.org/rfc/rfc7636.html#section-4.1)）。`code_challenge_method=plain`（ハッシュせずに同じ値を送る）は互換性のためだけにあり、使うべきではありません（[RFC 7636 7.2](https://www.rfc-editor.org/rfc/rfc7636.html#section-7.2)）。
+
+PKCE は当初、ネイティブアプリのための仕組みでした。しかし今では、**攻撃者が別の場所で盗んだコードを自分のセッションに差し込む攻撃（認可コードの注入）**も防げることから、RFC 9700 は公開クライアントに PKCE を必須とし、機密クライアントにも推奨しています。認可サーバは PKCE に対応しなければならず、`S256` を使うべきとされています（[RFC 9700 2.1.1](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1.1)）。
+
+## 手元で確かめる: 小さな認可サーバの模型
+
+実物の認可サーバ（Keycloak）は第 130 回で動かします。この回では、HTTP のやり取りだけを見るために、Python の標準ライブラリだけで書いた 100 行ほどの模型を `127.0.0.1:18102` で動かしました。`/authorize`、`/token`、リソースサーバ役の `/api/photos` を 1 つのプロセスに同居させ、ログイン画面と同意画面は `user=alice&approve=yes` というパラメータで代用しています。コードの中心は、⑥ で行う検証の順番です。
+
+```python
+rec = codes.pop(f.get("code"), None)                    # pop: 取り出した時点で使用済みにする
+if not rec or rec["exp"] < time.time() or rec["client_id"] != cid:
+    return self.send(400, {"error": "invalid_grant", ...})
+if f.get("redirect_uri") != rec["redirect_uri"]:        # ② と同じ戻り先か
+    return self.send(400, {"error": "invalid_grant", ...})
+if s256(f.get("code_verifier", "")) != rec["challenge"]:  # PKCE
+    return self.send(400, {"error": "invalid_grant", ...})
+```
+
+クライアント側は curl と openssl で動かします。まず `code_verifier` と `code_challenge` と `state` を作ります。
+
+```
+$ VERIFIER=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
+$ CHALLENGE=$(printf %s "$VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+$ STATE=$(openssl rand -hex 8)
+verifier=NmsH-rx9_IQQAzqT101jWYDn2I15cot_frsO7DyGzac
+challenge=vCSAa8uYk9Tk_w_dtdI_DuORhjG77CwgL5LTD2lm8T0
+state=0f1da2b26df06b58
+```
+
+②〜④ の認可リクエストを送ると、トークンではなくコードが、`state` とともに `redirect_uri` への 302 で返ってきます。
+
+```
+$ curl -si "$B/authorize?response_type=code&client_id=photo-printer&redirect_uri=http%3A%2F%2F127.0.0.1%3A18102%2Fcb&scope=photos.read&state=$STATE&code_challenge=$CHALLENGE&code_challenge_method=S256&user=alice&approve=yes"
+HTTP/1.0 302 Found
+Location: http://127.0.0.1:18102/cb?code=xW7S_nEKAI30ojiBInYG1Q&state=0f1da2b26df06b58
+```
+
+⑥ でコードを引き換えます。`code_verifier` が違えば失敗し、正しければトークンが返ります。同じコードを 2 回使うと失敗します。
+
+```
+--- 違う code_verifier
+{"error": "invalid_grant", "error_description": "PKCE verification failed"}
+
+--- 正しい code_verifier（新しくコードを取り直して）
+HTTP/1.0 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{"access_token": "p2qVcjGfH5WtUQHOwUCxKDVXupGLL2Ts", "token_type": "Bearer", "expires_in": 300, "scope": "photos.read", "refresh_token": "IdB4lc9tEswXMJqvccXZy8vVpduJ2jCi"}
+
+--- 同じコードをもう一度
+{"error": "invalid_grant", "error_description": "code unknown, used, or expired"}
+```
+
+模型では、PKCE の検証に失敗したコードも、`pop` した時点で使えなくなっています。盗んだ側が一度でも試せば、正規のクライアントも引き換えられなくなりますが、それで構いません。トークンの応答に `Cache-Control: no-store` を付けるのは RFC の求めです（[RFC 6749 5.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-5.1)）。
+
+⑧ では、アクセストークンを `Authorization: Bearer` ヘッダに載せて API を呼びます（[RFC 6750 2.1](https://www.rfc-editor.org/rfc/rfc6750.html#section-2.1)）。トークンが無ければ 401、スコープが足りなければ 403 が、`WWW-Authenticate` の理由付きで返ります（[RFC 6750 3.1](https://www.rfc-editor.org/rfc/rfc6750.html#section-3.1)）。第 125 回で見た 401 と 403 の使い分けそのものです。
+
+```
+HTTP/1.0 200 OK
+{"owner": "alice", "photos": ["beach.jpg", "cat.jpg"]}
+
+--- トークンなし
+HTTP/1.0 401 Unauthorized
+WWW-Authenticate: Bearer error="invalid_token"
+
+--- photos.write のスコープしか持たないトークン
+HTTP/1.0 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope", scope="photos.read"
+```
+
+登録と違う `redirect_uri` や、後で述べる廃止された `response_type=token` を送ると、次のように断られます。前者は戻り先そのものが信用できないので、リダイレクトせずにその場で 400 を返しているのが要点です（[RFC 6749 4.1.2.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1.2.1)）。
+
+```
+--- redirect_uri=http://127.0.0.1:18102/cb/../evil
+HTTP/1.0 400 Bad Request
+{"error": "invalid_request", "error_description": "unknown client or redirect_uri"}
+
+--- response_type=token
+HTTP/1.0 302 Found
+Location: http://127.0.0.1:18102/cb?error=unsupported_response_type&state=x
+```
+
+<Callout type="warn" title="よくある誤解: OAuth でログインできる">
+  「Google で続ける」のようなボタンがあるので、OAuth はログインの仕組みだと思われがちです。
+  しかし OAuth が決めているのは、**クライアントに API を呼ぶ権限を渡す方法**だけです。
+  アクセストークンは**リソースサーバに見せるための物**で、クライアントに「誰がログインしたか」を伝える形式も、
+  そのトークンが**自分に宛てて発行されたか**を確かめる方法も、OAuth は定めていません。
+  上の模型の応答にも、利用者が誰かを示す欄はありません（`/api/photos` の `owner` は、たまたまその API が返しただけです）。
+  OAuth の解説サイトも「OAuth 2.0 is not an authentication protocol」と明言しています（[oauth.net](https://oauth.net/articles/authentication/)）。
+  アクセストークンの所持を根拠にログインさせると、**別のアプリ向けに発行されたトークン**を持ち込まれただけで、
+  その利用者としてログインさせてしまいます。ログインに必要な「誰が・いつ・どのアプリに対して認証したか」を載せたのが、
+  次の第 130 回の OpenID Connect です。
+</Callout>
+
+## スコープは「クライアントに許した範囲」
+
+`scope` は空白区切りの文字列の並びで、中身の意味は認可サーバとリソースサーバが決めます（[RFC 6749 3.3](https://www.rfc-editor.org/rfc/rfc6749.html#section-3.3)）。`photos.read` のような名前は慣習にすぎません。認可サーバは、求められたスコープの一部だけを許してもよく、その場合は応答の `scope` で実際に許した範囲を伝えます。
+
+<Callout type="warn" title="よくある誤解: スコープがあれば権限の確認は済んでいる">
+  `photos.read` は「このクライアントが、利用者の代わりに写真を読むこと」を利用者が許した、という意味です。
+  **その利用者がその写真を読んでよいか**は別の問いです。
+  スコープが合っていても、リソースサーバは「トークンの利用者が、要求された写真 ID の持ち主か」を毎回確かめなければなりません。
+  これを怠ると、第 125 回で見た BOLA（ID を書き換えると他人の資源が見える）になります。
+  スコープと権限の区別は第 132 回で詳しく見ます。
+</Callout>
+
+## 公開クライアントと機密クライアント
+
+RFC 6749 は、クライアントを**秘密を守れるかどうか**で 2 種類に分けます（[RFC 6749 2.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.1)）。
+
+| 種類 | 例 | ⑥ でのクライアント認証 |
+| --- | --- | --- |
+| 機密クライアント | サーバで動く Web アプリ、バッチ | `client_secret`、秘密鍵で署名した JWT（第 107 回、第 128 回）、mTLS（第 114 回） |
+| 公開クライアント | スマートフォンのアプリ、SPA、CLI | できない。アプリの中の秘密は取り出せるので、秘密を持たせても意味がない |
+
+公開クライアントの `client_id` は誰でも名乗れます。そのため公開クライアントでは、⑥ で「コードを引き換えに来たのが、② を始めた本人か」を確かめる手段が PKCE しかありません。RFC 9700 が公開クライアントに PKCE を必須にしている理由はここにあります。模型でも、`photo-printer` は秘密を持たない公開クライアントとして登録し、⑥ では `client_id` だけを送っています。
+
+## 利用者がいない場合、画面がない場合
+
+**client credentials**（[RFC 6749 4.4](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.4)）は、利用者の代わりではなく**クライアント自身の権限で**トークンをもらう流れです。②〜⑤ がなく、⑥ だけで済みます。夜間のバッチが別のサービスの API を呼ぶ、といった用途です。クライアント認証が唯一の根拠なので、機密クライアントでしか使えません。
+
+```
+$ curl -s -u batch-job:s3cr3t -d grant_type=client_credentials -d scope=photos.read $B/token
+{"access_token": "QHrMjKzYg1mRSker5GmN7O4KEY_0BahG", "token_type": "Bearer", "expires_in": 300, "scope": "photos.read"}
+$ curl -s -u batch-job:wrong -d grant_type=client_credentials $B/token
+{"error": "invalid_client"}
+$ curl -s -d client_id=photo-printer -d grant_type=client_credentials $B/token
+{"error": "unauthorized_client"}
+```
+
+ここで使う `client_secret` は長期の秘密で、漏れれば誰でもこのクライアントになりすませます。この問題と、秘密を持たずに済ませる方法（ワークロード ID フェデレーション）は第 137 回で見ます。
+
+**デバイスフロー**（[RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html)）は、テレビや CLI のように、ブラウザがない、または文字を打ちにくい機器のための流れです。
+
+```
+機器 → 認可サーバ   POST /device_authorization  client_id=...
+機器 ← 認可サーバ   device_code, user_code="WDJB-MJHT", verification_uri, interval=5
+機器の画面:        「スマートフォンで https://example.com/device を開き、WDJB-MJHT を入力」
+利用者             別の端末でログインし、コードを入力して許可する
+機器 → 認可サーバ   POST /token  grant_type=urn:ietf:params:oauth:grant-type:device_code
+                    を interval 秒ごとに繰り返す
+                    → 許可されるまで authorization_pending、速すぎれば slow_down
+```
+
+応答の `interval` は省略時 5 秒で、`slow_down` を受けたら間隔を 5 秒延ばします（[RFC 8628 3.2、3.5](https://www.rfc-editor.org/rfc/rfc8628.html#section-3.5)）。このフローは、攻撃者が自分で始めたフローの `user_code` を被害者に送り、「このコードを入力してください」と入力させるフィッシングに弱い点に注意が要ります。RFC も、許可する画面で**どの機器を許可しようとしているか**を利用者に確かめさせるよう勧めています（[RFC 8628 5.4](https://www.rfc-editor.org/rfc/rfc8628.html#section-5.4)）。
+
+## リフレッシュトークンとローテーション
+
+アクセストークンは短命にしておきたいものです。第 127 回で見たとおり、自己完結型のトークンは途中で失効させるのが難しく、盗まれたときの被害は有効期間の長さで決まるからです。しかし短命にすると、そのたびに利用者を ②〜④ に戻すことになります。
+
+そこで ⑦ の応答に**リフレッシュトークン**を付け、アクセストークンが切れたらそれで新しいものをもらいます（[RFC 6749 6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6)）。リフレッシュトークンは**認可サーバにしか送らない**ので、多くのリソースサーバに見せるアクセストークンより漏れる経路が少なくなります。
+
+公開クライアントのリフレッシュトークンは、盗まれても引き換えを止める手段（クライアント認証）がありません。RFC 9700 は、公開クライアントのリフレッシュトークンを**送信者に結び付ける**か、**ローテーション**するよう求めています（[RFC 9700 2.2.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.2.2)）。ローテーションとは、使うたびに新しいリフレッシュトークンを発行し、古いものを無効にすることです。模型でも、1 回使ったリフレッシュトークンは 2 回目に断られます。
+
+```
+$ curl -s -d grant_type=refresh_token -d client_id=photo-printer -d refresh_token=$RT $B/token
+{"access_token": "nOOdR6UZh8GSTA4gWfrFN_M2J2SeWNj7", ..., "refresh_token": "nYYaJw2sjY2G-9findSZpiBCMycULV8Z"}
+$ curl -s -d grant_type=refresh_token -d client_id=photo-printer -d refresh_token=$RT $B/token
+{"error": "invalid_grant", "error_description": "refresh token unknown or already used"}
+```
+
+ローテーションの本当の価値は、**盗難の検知**にあります。攻撃者と正規のクライアントの両方が同じリフレッシュトークンを使えば、どちらかが必ず使用済みのものを出すことになり、認可サーバは漏洩に気づけます。RFC 9700 は、そのとき同じ系列の有効なリフレッシュトークンもまとめて失効させる動きを説明しています（[RFC 9700 4.14.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2)）。模型はそこまでは実装していません。送信者に結び付ける方法（DPoP、mTLS）は第 131 回で見ます。
+
+## 廃止されたもの
+
+RFC 6749 には、今では使ってはいけないとされるグラントが 2 つあります。2025 年 1 月に出た **OAuth 2.0 Security Best Current Practice**（[RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html)、BCP 240）が、RFC 6749 以降に見つかった攻撃を踏まえてまとめたものです。
+
+| グラント | どんな流れか | 廃止の理由 |
+| --- | --- | --- |
+| implicit（`response_type=token`） | ④ でコードではなく**アクセストークンそのもの**を URL の断片（`#access_token=...`）で返す | トークンが URL に載って漏れる。引き換えの段がないので PKCE もクライアント認証も効かない。RFC 9700 は使うべきでないとする（[2.1.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1.2)） |
+| resource owner password credentials | 利用者のパスワードをクライアントが受け取り、それを ⑥ に送る | 冒頭の「パスワードを渡す」問題そのもの。多要素認証やパスキー（第 126 回）とも組み合わせられない。RFC 9700 は使ってはならないとする（[2.4](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.4)） |
+
+implicit は、ブラウザの JavaScript が別オリジンの `/token` を呼べなかった時代（CORS 以前）の SPA のために作られました。今では SPA でも**認可コードフロー + PKCE** を使います。ブラウザにトークンを持たせないという、さらに進んだ型（BFF）は第 131 回と第 138 回で扱います。
+
+<Callout type="note" title="OAuth 2.1 はまだ RFC ではない">
+  RFC 6749 と、その後の RFC（PKCE、ネイティブアプリの RFC 8252、ブラウザの扱いなど）と RFC 9700 の要求を
+  1 つにまとめ直す文書が **OAuth 2.1** です。implicit と password を削除し、PKCE を必須にし、
+  redirect_uri の完全一致を求めています。
+  執筆時点（2026 年 9 月）で、最新版は 2026 年 9 月 3 日の draft-ietf-oauth-v2-1-16 で、まだ Internet-Draft です（[IETF Datatracker](https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/)）。
+  「OAuth 2.1 準拠」と書かれた製品は、この草案に沿っているという意味です。
+</Callout>
+
+## アクセストークンの形式は決まっていない
+
+RFC 6749 は、アクセストークンの形式や構造を定めていません（[RFC 6749 1.4](https://www.rfc-editor.org/rfc/rfc6749.html#section-1.4)）。模型のトークンのような**意味を持たない乱数の文字列**（不透明なトークン）でも、第 128 回で見た **JWT** でもかまいません。
+
+| 形式 | リソースサーバはどう確かめるか | 失効 |
+| --- | --- | --- |
+| 不透明な文字列 | 認可サーバに問い合わせる（イントロスペクション、RFC 7662）か、保存先を共有する | 問い合わせた時点で分かる |
+| JWT（[RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html)） | 認可サーバの公開鍵（JWKS）で署名を検証する。ヘッダの `typ` は `at+jwt` | 期限が切れるまで有効なまま |
+
+どちらを選ぶかは、第 127 回で見た「サーバ側の状態か、自己完結型か」と同じ trade-off です。第 131 回で、受け取る側の検証として詳しく見ます。
+
+<Callout type="warn" title="よくある誤解: アクセストークンはクライアントが読むもの">
+  アクセストークンが JWT だと、クライアントがそれを Base64URL デコードして中の `sub` や `email` を読み、
+  画面に出したり、ログインの判定に使ったりすることがあります。
+  しかしアクセストークンは**リソースサーバ宛て**で、クライアントにとっては中身を気にしない不透明な文字列として扱うのが OAuth の前提です。
+  認可サーバはいつでも形式を不透明な文字列に変えてよく、中の項目を増減させてもかまいません。
+  クライアントが利用者の情報を知りたいなら、それはクライアント宛てに発行される ID トークン（第 130 回）の役目です。
+</Callout>
+
+## どの部品と組み合わさっているか
+
+OAuth 自体は「どの順で何を送るか」の取り決めにすぎず、安全性は周りの部品に頼っています。
+
+| 守りたいこと | 担う部品 |
+| --- | --- |
+| コードやトークンが経路で盗まれない | TLS（第 17 章）。RFC 6749 は認可サーバとのやり取りに TLS を必須にしている |
+| 認可サーバが本物であること | 証明書と信頼の連鎖（第 110、111 回） |
+| 自分が始めたフローであること | `state` と、利用者のセッションの Cookie（第 127 回） |
+| 盗んだコードを使わせない | PKCE = ハッシュの原像耐性（第 104 回） |
+| 引き換えに来たのが登録したクライアントであること | クライアント認証: 秘密、署名した JWT（第 107、128 回）、mTLS（第 114 回） |
+| リソースサーバがトークンを確かめる | JWT の署名と JWKS（第 128 回）、またはイントロスペクション（第 131 回） |
+| 利用者本人が許可したこと | 認可サーバでの利用者の認証（第 126 回のパスワード、多要素、パスキー） |
+
+最後の行が示すとおり、**利用者の認証は OAuth の外**、認可サーバの内部で行われます。OAuth は、その結果として許可された権限を**クライアントに渡す**ところだけを決めています。
+
+## まとめ
+
+- OAuth 2.0 は、利用者のパスワードを渡さずに、クライアントへ「利用者の代わりに、この範囲で、しばらく」という権限を渡す**委任**の仕組み。認証の仕組みではない
+- 登場人物は、リソースオーナ、クライアント、認可サーバ、リソースサーバの 4 つ
+- 認可コードフローは、ブラウザ経由で短命・1 回限りの**コード**を受け取り、サーバ間でトークンに引き換える。URL にトークンを載せないため
+- `state` は自分が始めたフローかを確かめ（CSRF 対策）、`redirect_uri` は完全一致で照合し、PKCE は盗んだコードを引き換えさせない
+- 公開クライアントは秘密を持てないので、PKCE が必須。機密クライアントはクライアント認証もする
+- client credentials は利用者なしでクライアント自身の権限を、デバイスフローは画面のない機器の権限をもらう
+- リフレッシュトークンは認可サーバにだけ送る。公開クライアントではローテーションか送信者への結び付けが必要
+- implicit と password は RFC 9700（2025）で廃止。OAuth 2.1 は執筆時点でまだ草案
+- アクセストークンの形式は決まっておらず、クライアントが中身を読むものでもない。スコープはクライアントに許した範囲で、利用者の権限の確認は別に要る
+
+OAuth のアクセストークンは「誰がログインしたか」を教えてくれませんでした。次の第 130 回では、OAuth の流れの上に、クライアント宛ての **ID トークン**を載せてログインを作る OpenID Connect を見ます。

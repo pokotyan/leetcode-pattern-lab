@@ -1,0 +1,477 @@
+---
+title: 上に載せる 3 つの型
+description: TLS や SSH は、それだけで使われることはほとんどありません。HTTPS、IMAP、データベース、ファイル転送、VPN は、それぞれどうやって暗号化された通信路の上に載っているのか。載せ方を 3 つの型に分けて章全体の地図を作り、平文から途中で切り替える型に共通する弱点を、手元の Dovecot と自作のサーバで確かめます
+chapter: atop
+order: 1
+status: published
+topics:
+  - 暗黙の TLS
+  - STARTTLS
+  - 専用ポート
+  - ALPN による振り分け
+  - SSH のサブシステム
+  - ダウングレード
+  - 平文のコマンド注入
+  - CVE-2011-0411
+  - RFC 8314
+requires:
+  - ll-116-ssh-ops
+  - ll-115-ssh-protocol
+  - ll-114-tls-ops
+  - ll-113-tls13-handshake
+---
+
+import Callout from '../../components/Callout.astro'
+
+## この章で見るもの
+
+第 17 章では、TLS と SSH を使って**相手の鍵を確かめ、暗号化された通信路を作る**ところまでを見ました。しかし、TLS も SSH も、それだけで仕事が終わるプロトコルではありません。TLS が運ぶのは HTTP であり、IMAP であり、データベースへの問い合わせです。SSH が運ぶのはシェルのほかに、ファイル転送や Git の転送や、別のポートへのトンネルです。
+
+この章では、**別のプロトコルを、その通信路の上にどう載せるか**を見ます。載せ方には少数の決まった型があり、どの型を選んだかによって、生まれる弱点がほぼ決まります。
+
+| 回 | 見るもの |
+| --- | --- |
+| 第 117 回（この回） | 上に載せる 3 つの型。この章の地図 |
+| 第 118 回 | SSH でファイルを運ぶ（SCP と SFTP） |
+| 第 119 回 | FTP と FTPS |
+| 第 120 回 | SSH で穴を通す（ポート転送、Git over SSH、Mosh） |
+| 第 121 回 | データベースと中間層の TLS |
+| 第 122 回 | TLS で作るトンネルと VPN |
+| 第 123 回 | 裏方を守る TLS（802.1X、RADIUS、NTS、syslog） |
+| 第 124 回 | 混線と選び方 |
+
+この回では、まず載せ方の型を分け、主なプロトコルがどの型に当たるかを 1 枚の表にまとめます。そのうえで、最も事故の多い「途中で切り替える型」の弱点を、手元のメールサーバと自作のサーバで確かめます。
+
+## 載せ方は 3 つ
+
+TLS や SSH の上にプロトコルを載せる方法は、次の 3 つにほぼ分けられます。
+
+```
+型 1: 最初から TLS                型 2: 平文で始めて切り替える         型 3: SSH のチャネルに載せる
+                                                                    
+ C ── TCP 接続 ──▶ S               C ── TCP 接続 ──▶ S                C ── TCP 接続 ──▶ S
+ C ══ ClientHello ═▶ S             S ── 挨拶（平文）──▶ C              C ══ SSH の鍵交換・認証 ══ S
+ C ◀═ TLS ════════ S               C ── STARTTLS（平文）──▶ S          C ══ CHANNEL_OPEN "session" ═▶ S
+ C ══ 上のプロトコル ══ S           S ── OK（平文）──▶ C                C ══ "subsystem" や "exec" ══▶ S
+                                  C ══ ClientHello ═▶ S              C ══ 上のプロトコル ══ S
+ 専用のポート（443、993 など）       C ══ 上のプロトコル（やり直し）══ S   ポートは SSH の 22（または 830 など）
+```
+
+### 型 1: 接続の最初から TLS
+
+TCP がつながった直後に、クライアントが ClientHello を送ります。上のプロトコルのバイトは、1 バイト目から TLS の中にあります。HTTPS（443 番）、IMAPS（993 番）、POP3S（995 番）、メールの提出の 465 番がこの型です。
+
+この型は **暗黙の TLS**（implicit TLS）と呼ばれます。「このポートにつないだら TLS で話す」という約束がポート番号に込められていて、プロトコルの中では何も交渉しないからです。そのため、平文の HTTP と HTTPS、平文の IMAP と IMAPS のように、**同じプロトコルにポートが 2 つ**できます。IANA の登録を見ると、`https` は 443 番、`imaps` は 993 番、`pop3s` は 995 番、`submissions` は 465 番として登録されています（[IANA Service Name and Transport Protocol Port Number Registry](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml)）。
+
+### 型 1 の変種: 1 つのポートを分け合う
+
+ポートを分けると、ファイアウォールで開けるポートが増えます。そこで、**1 つのポートで TLS を受け、ハンドシェイクの中身を見て行き先を変える**使い方が広がりました。手がかりは 2 つです。
+
+- **SNI**: ClientHello に入っている接続先のホスト名（第 113 回）。どのサイトの証明書を出すか、どの後段に渡すかを名前で決める
+- **ALPN**: ClientHello で「TLS の上で何を話したいか」の一覧を出し、サーバが 1 つを選ぶ拡張（[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)）。第 113 回で `h2` が選ばれるのを見ました
+
+ALPN の識別子は IANA が登録しています。HTTP 用の `http/1.1`、`h2`、`h3` のほかに、`imap`、`pop3`、`ftp`、`managesieve`、`xmpp-client`、`mqtt`、`dot`、`doq`、`ntske/1`、`postgresql`、`radius/1.1` などが並んでいます（[IANA TLS ALPN Protocol IDs](https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids)）。メールや FTP の識別子が並んでいるのは、第 124 回で見る、別のプロトコルのサーバに HTTPS の要求を送り込む攻撃への対策として、TLS の上で何を話すつもりかを双方が確かめられるようにするためです。
+
+さらに手前で、**最初の数バイトを覗いて**見分ける方法もあります。TLS のレコードは、ハンドシェイクなら先頭のバイトが 22（`0x16`）です（[RFC 8446 5.1](https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1)）。SSH は `SSH-` という文字列で始まります（第 115 回）。sslh は、この最初のパケットを見て SSH、TLS、HTTP、OpenVPN などを見分け、それぞれのサーバに転送する道具で、TLS についてはさらに SNI と ALPN でも振り分けられます（[sslh](https://github.com/yrutschle/sslh)）。
+
+### 型 2: 平文で始めて途中で切り替える
+
+上のプロトコルを平文で話し始め、そのプロトコルの命令で「ここから TLS にしよう」と合意してから、同じ TCP 接続の上で TLS のハンドシェイクを始めます。代表がメールの **STARTTLS** で、ポートは平文のときと同じです。
+
+この型は、メールだけのものではありません。切り替えの命令の名前と形はプロトコルごとに違います。
+
+| プロトコル | 切り替えの合図 | 仕様 |
+| --- | --- | --- |
+| SMTP | `STARTTLS` コマンド → `220` | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html)（第 145 回） |
+| IMAP | `STARTTLS` コマンド → `OK` | [RFC 9051](https://www.rfc-editor.org/rfc/rfc9051.html) |
+| POP3 | `STLS` コマンド → `+OK` | [RFC 2595 4](https://www.rfc-editor.org/rfc/rfc2595.html#section-4) |
+| FTP | `AUTH TLS` コマンド → `234` | [RFC 4217 4](https://www.rfc-editor.org/rfc/rfc4217.html#section-4)（第 119 回） |
+| XMPP | `<starttls/>` 要素 → `<proceed/>` | [RFC 6120 5](https://www.rfc-editor.org/rfc/rfc6120.html#section-5) |
+| LDAP | 拡張操作 `1.3.6.1.4.1.1466.20037` → success | [RFC 4511 4.14](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.14) |
+| HTTP/1.1 | `Upgrade: TLS/1.0` → `101 Switching Protocols` | [RFC 2817](https://www.rfc-editor.org/rfc/rfc2817.html)（ほぼ使われていない） |
+| PostgreSQL | 8 バイトの SSLRequest → 1 バイトの `S` / `N` | [PostgreSQL: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)（第 121 回） |
+| MySQL | 初期ハンドシェイクの後に SSLRequest（SSL を使う能力のフラグ） | [MySQL: Connection Phase](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html)（第 121 回） |
+| RDP | X.224 の接続要求に `PROTOCOL_SSL` / `PROTOCOL_HYBRID` を載せる | [MS-RDPBCGR: RDP_NEG_REQ](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/902b090b-9cb3-4efc-92bf-ee13373371e3) |
+
+RDP は意外かもしれません。接続の最初に X.224 の接続要求を送り、その中の `requestedProtocols` で「TLS（`PROTOCOL_SSL`）を使える」「CredSSP（`PROTOCOL_HYBRID`）を使える」と申し出て、合意したら TLS に移ります（[MS-RDPBCGR](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/902b090b-9cb3-4efc-92bf-ee13373371e3)）。最初の数十バイトだけ平文で交渉する、という意味で型 2 です。
+
+`openssl s_client` の `-starttls` に指定できるプロトコルの一覧を見ると、この型の広さが分かります。手元の OpenSSL 3.6.2 の説明書きには `smtp`、`pop3`、`imap`、`ftp`、`xmpp`、`xmpp-server`、`irc`、`postgres`、`mysql`、`lmtp`、`nntp`、`sieve`、`ldap` が並んでいました（`man openssl-s_client`）。
+
+### 型 3: SSH のチャネルに載せる
+
+SSH は、第 115 回で見たとおり、認証が済んだ 1 本の接続の上に**チャネル**を開きます。セッションのチャネルで頼めることは `shell`（ログインシェル）、`exec`（コマンドを 1 つ実行）、`subsystem`（あらかじめ決めた名前のサービス）の 3 つで、1 つのチャネルで成功するのはどれか 1 つだけです（[RFC 4254 6.5](https://www.rfc-editor.org/rfc/rfc4254.html#section-6.5)）。
+
+- **subsystem に載せる**: SFTP は `sftp` という名前のサブシステムです（第 118 回）。ネットワーク機器の設定を扱う NETCONF も `netconf` というサブシステムとして起動し、既定では 830 番で SSH を受けたときだけ提供すると決められています（[RFC 6242 3](https://www.rfc-editor.org/rfc/rfc6242.html#section-3)）
+- **exec に載せる**: Git は、`git clone ssh://user@example.com/project.git` を、`ssh user@example.com "git-upload-pack '/project.git'"` とほぼ同じ形でサーバ側のコマンドを起動して実現します（[gitprotocol-pack](https://git-scm.com/docs/gitprotocol-pack)）。そのコマンドの標準入出力が、そのまま Git のプロトコルの通り道になります（第 120 回）
+- **転送のチャネルに載せる**: `-L` や `-D` のポートフォワーディング（第 115 回）は、任意の TCP 接続を `direct-tcpip` チャネルに載せます（第 120 回）
+
+型 3 の特徴は、**上のプロトコルが暗号化も相手の確認も何もしなくてよい**ことです。SSH が済ませた利用者の認証が、そのまま上のプロトコルの「誰か」になります。代わりに、SSH の利用者が持つ権限（シェルを使えるか、どのコマンドを実行できるか）が、上のプロトコルの権限と混ざります。`authorized_keys` の `command=` で実行できるコマンドを縛る運用は、この混ざり方を切り離すためのものです（第 118 回、第 120 回）。
+
+### 型に収まらないもの: TLS を部品として使う
+
+最後に、TLS の通信路の**上に**載るのではなく、TLS を**鍵を決めるための部品**として使うものがあります。
+
+- **OpenVPN**: TLS のセッションは認証と鍵の交換に使い、トンネルを通る IP パケットそのものは、その鍵で独自に暗号化して UDP で運びます。TLS には OpenVPN が自前で用意した信頼できる転送の層を貸します（[OpenVPN: Cryptographic layer](https://openvpn.net/community-resources/openvpn-cryptographic-layer/)）。第 122 回で見ます
+- **NTS**: TLS で鍵を確立したあと（NTS-KE、TCP 4460 番）、時刻の問い合わせは NTP のまま、拡張フィールドで守ります（[RFC 8915](https://www.rfc-editor.org/rfc/rfc8915.html)）。第 123 回で見ます
+- **EAP-TLS**: IP アドレスをまだ持たない段階の無線や有線の認証で、TLS のハンドシェイクを EAP のパケットのデータ部に入れて運びます（[RFC 9190 2.1](https://www.rfc-editor.org/rfc/rfc9190.html#section-2.1)）。第 123 回で見ます
+- **Mosh**: SSH でログインして `mosh-server` を起動するところまでは型 3 で、その後は UDP 上の独自のプロトコルに移り、AES-128 の OCB3 モードで守ります（[mosh.org](https://mosh.org/)）。第 120 回で見ます
+
+DTLS（UDP の上の TLS。第 77 回）や QUIC（TLS 1.3 のハンドシェイクを自分のフレームで運ぶ。第 66 回）も、この「部品として使う」側に近い仕組みです。
+
+## 章全体の地図
+
+主なプロトコルを、土台、ポート、型で並べます。ポートは IANA の登録（[IANA ポート番号の登録](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml)）に合わせ、登録がないものは「設定次第」としました。
+
+| プロトコル | 土台 | ポート | 型 | 扱う回 |
+| --- | --- | --- | --- | --- |
+| HTTPS | TLS（HTTP/3 は QUIC） | 443 | 1（ALPN で `h2` などを選ぶ） | 第 113、114 回、第 66 回 |
+| SMTP の中継 | TLS | 25 | 2（STARTTLS） | 第 145 回 |
+| メールの提出 | TLS | 587 / 465 | 2 / 1 | 第 145 回 |
+| IMAP | TLS | 143 / 993 | 2 / 1 | 第 150 回、この回 |
+| POP3 | TLS | 110 / 995 | 2（STLS） / 1 | この回 |
+| FTPS | TLS | 21 / 990 | 2（AUTH TLS） / 1（標準化されていない） | 第 119 回 |
+| SFTP、SCP | SSH | 22 | 3（subsystem、exec） | 第 118 回 |
+| LDAP | TLS | 389 / 636 | 2（StartTLS） / 1（LDAPS） | 第 123 回、第 136 回 |
+| PostgreSQL | TLS | 5432 | 2（SSLRequest）。17 から 1 も選べる | 第 121 回 |
+| MySQL | TLS | 3306 | 2 | 第 121 回 |
+| Redis | TLS | 設定次第（`tls-port`） | 1（平文とは別のポート） | 第 121 回 |
+| MongoDB | TLS | 27017 | 1 つのポートで TLS と平文を受けられる | 第 121 回 |
+| Kafka | TLS | 設定次第（リスナごと） | 1 | 第 121 回 |
+| MQTT | TLS | 8883 | 1 | 第 74 回、第 121 回 |
+| AMQP | TLS | 5671 | 1 | 第 121 回 |
+| XMPP | TLS | 5222 | 2。XEP-0368 で 1 も選べる | この回 |
+| SIP | TLS | 5061 | 1（`sips:`） | この表のみ |
+| syslog | TLS | 6514 | 1 | 第 123 回 |
+| RDP | TLS / CredSSP | 3389 | 2（X.224 で交渉） | この回 |
+| DoT / DoH / DoQ | TLS / HTTPS / QUIC | 853 / 443 / 853（UDP） | 1 | 第 62 回、第 75 回 |
+| NTS | TLS で鍵、NTP で時刻 | 4460 → 123（UDP） | 部品 | 第 123 回、第 158 回 |
+| RADIUS/TLS（RadSec） | TLS | 2083 | 1 | 第 123 回 |
+| EAP-TLS | EAP の中の TLS | （IP の前） | 部品 | 第 123 回 |
+| stunnel | TLS | 任意 | 1（平文のサービスを包む） | 第 122 回 |
+| OpenVPN | TLS で鍵、独自形式でデータ | 1194 | 部品 | 第 122 回 |
+| SSTP | HTTPS | 443 | 1（HTTPS の上で L2 のフレーム） | 第 122 回 |
+| NETCONF | SSH | 830 | 3（subsystem） | この回 |
+| Git over SSH | SSH | 22 | 3（exec） | 第 120 回 |
+| SSH のポート転送 | SSH | 22 | 3（`direct-tcpip`） | 第 115 回、第 120 回 |
+| Mosh | SSH で起動、UDP で通信 | 22 → 60000〜61000（UDP） | 3 → 部品 | 第 120 回 |
+
+いくつか補足します。
+
+- **LDAPS の 636 番と FTPS の 990 番**は、IANA に登録はありますが、参照する RFC がありません。標準の文書が定めているのは、どちらも型 2（LDAP の StartTLS、FTP の AUTH TLS）だけです。FTPS の事情は第 119 回で見ます
+- **SSTP** は、Microsoft の仕様で「HTTPS の接続の上でデータリンク層（L2）のフレームを運ぶ仕組み」とされています（[MS-SSTP](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-sstp/c50ed240-56f3-4309-8e0c-1644898f0ea8)）。443 番の HTTPS に見えるので、ほかのポートを閉じた網でも通ります
+- **Redis** は `tls-port` で TLS を受けるポートを別に開き、`port 0` で平文のポートを閉じます（[Redis: TLS](https://redis.io/docs/latest/operate/oss_and_stack/management/security/encryption/)）。**MongoDB** は待ち受けのポートが 1 つで、`net.tls.mode` を `allowTLS` や `preferTLS` にすると、受ける接続について TLS と非 TLS の両方を受け入れます（[MongoDB: Configuration File Options](https://www.mongodb.com/docs/manual/reference/configuration-options/)）
+- **XMPP** の XEP-0368 は、SRV レコード `_xmpps-client` で「最初から TLS」の接続先を知らせる方式で、ALPN の `xmpp-client` を使うよう勧めています。ALPN を使わないと XMPP の TLS は HTTPS の TLS と見分けがつかない、とも書いています（[XEP-0368](https://xmpp.org/extensions/xep-0368.html)）
+
+## 途中で切り替える型の弱点
+
+型 1 と型 3 では、上のプロトコルのバイトは最初から暗号化された通信路の中にあります。型 2 だけは、**平文の段階**と**暗号化された段階**が 1 本の接続の中に同居します。その境目から、3 種類の弱点が生まれます。
+
+### 1. 切り替えの申し出を消される
+
+平文の段階で「TLS を話せます」と申し出るので、途中の機器はそれを消せます。クライアントが「申し出がなければ平文で続ける」作りなら、それだけで全部が平文に落ちます。メールの `250 STARTTLS` の行を書き換える攻撃と、それが実際に行われた例は、第 145 回で再現しました。
+
+同じ構図は、メール以外にもあります。
+
+- **PostgreSQL** の libpq は、`sslmode` の既定が `prefer` で、「まず SSL を試し、失敗したら SSL なしで試す」と説明されています（[libpq: Connection Strings](https://www.postgresql.org/docs/current/libpq-connect.html)）。サーバの `S` を `N` に書き換えられても、接続は平文で成立します（第 121 回）
+- **IMAP** では、サーバが最初の挨拶で `PREAUTH`（もう認証済みです）と返すと、STARTTLS を使える状態を飛ばしてしまいます。2021 年の研究は、これを使って STARTTLS を迂回させる攻撃を報告し、IMAP の実装は PREAUTH と STARTTLS を組み合わせて許してはならない、としています（[NO STARTTLS](https://nostarttls.secvuln.info/)）
+
+守り方は、型 2 でも**クライアント側で TLS を必須にする**ことです。必須にすれば、申し出が消されたときに接続が失敗するだけで、平文にはなりません。
+
+### 2. 境目のバイトが混ざる
+
+2 つ目は、実装の誤りから生まれる弱点です。2011 年、Postfix の作者 Wietse Venema は、SMTP の STARTTLS で**平文の段階に送り込まれたコマンドが、TLS の段階で実行される**欠陥を見つけました（CVE-2011-0411）。説明の文書は、`s_client` のソースを 1 行だけ変えて `STARTTLS\r\nRSET\r\n` を 1 つのパケットで送ると、欠陥のあるサーバは `RSET` への `250` を余分に返す、という確かめ方を示しています（[Postfix: CVE-2011-0411](https://www.postfix.org/CVE-2011-0411.html)）。
+
+```
+C: STARTTLS\r\nRSET\r\n        ← 中間者が平文の STARTTLS の後ろに 1 行を足す
+S: 220 Ready to start TLS
+   ======== TLS 開始 ========
+S: 250 ...                      ← 平文で届いた RSET を、TLS の中で届いたものとして実行
+```
+
+原因について、同じ文書の分析は示唆に富んでいます。
+
+- Postfix は、入出力を**ストリーム**（読み書きの関数とバッファの組）で包んでいて、TLS に切り替えるときに**読み書きの関数だけ**を TLS 用に差し替え、バッファはそのまま使い続けていた。STARTTLS と同じパケットで届いた残りの行は、そのバッファに残っていた
+- Sendmail はストリームを丸ごと（バッファごと）作り直し、Exim はストリームという抽象を持たず関数を差し替えていたため、どちらもこの欠陥を持たなかった
+- TLS に切り替えるときは、TLS より上のすべての層が、**平文で受け取った情報をすべて捨てる**必要がある。文書はこれを「世界観の切り替え」と呼んでいる
+
+対策も 2 つ挙げられています。STARTTLS の後ろに平文が続いていたらプロトコル違反として**エラーにする**（RFC 3207 は STARTTLS をパイプラインの最後に置くよう定めている）こと、そして切り替えの前後で同じ入力バッファを使うなら**中身を捨てる**ことです。文書の結論は、切り替えをアプリケーションの外（カーネル、ハードウェア、プロキシ）に移す開発が進むほど、同じ欠陥が再発しやすくなる、と警告しています。
+
+この警告は当たりました。2021 年の研究「Why TLS is better without STARTTLS」は、SMTP、POP3、IMAP の 28 のクライアントと 23 のサーバを 100 以上のテストで調べ、40 件以上の問題を報告しました。インターネット全体では約 32 万台（メールサーバの約 2%）がコマンド注入の影響を受け、28 のクライアントのうち STARTTLS に固有の問題がなかったのは 3 つだけでした（[Poddebniak ほか, USENIX Security 2021](https://www.usenix.org/conference/usenixsecurity21/presentation/poddebniak)）。向きを逆にした**応答の注入**（サーバの `OK` の後ろに偽の応答を足し、クライアントに TLS の中の応答として読ませる）も報告され、メールボックスの中身の偽装につながるとされています（[NO STARTTLS](https://nostarttls.secvuln.info/)）。
+
+PostgreSQL の文書にも、同じ種類の注意があります。SSLRequest に対してサーバは `S` の 1 バイトだけを返して待つはずなので、その時点で読めるバイトがさらにあれば、中間者がバッファに詰め込む攻撃（[CVE-2021-23222](https://www.cve.org/CVERecord?id=CVE-2021-23222)）をしている可能性が高い。クライアントは、ソケットを SSL のライブラリに渡す前に**ちょうど 1 バイトだけ**読むか、余分なバイトを見つけたらプロトコル違反として扱うべきだ、と書かれています（[PostgreSQL: Message Flow 54.2.10](https://www.postgresql.org/docs/current/protocol-flow.html)）。
+
+### 3. 平文の段階で聞いたことを信じる
+
+3 つ目は、平文の段階で得た情報を、TLS の後も使い続けることです。各仕様は、切り替えの後にそれを捨てるよう求めています。POP3 の STLS では、クライアントは前に受け取った能力の一覧を捨て、`CAPA` を送り直すべき（SHOULD）とされ、理由は平文の間に攻撃者が一覧を書き換えうるからです（[RFC 2595 4](https://www.rfc-editor.org/rfc/rfc2595.html#section-4)）。SMTP の RFC 3207 が EHLO の送り直しを求めるのも同じ理由です（第 145 回）。
+
+PostgreSQL の文書は、SSLRequest への応答としてエラーが返ってきた場合、**サーバはまだ認証されていないので、そのエラーの文面を利用者に表示してはならない**、とまで書いています（[CVE-2024-10977](https://www.cve.org/CVERecord?id=CVE-2024-10977)、[PostgreSQL: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)）。平文の段階で届いたものは、中身を表示することさえ危ないということです。
+
+<Callout type="warn" title="よくある誤解: STARTTLS も、TLS が始まってしまえば暗黙の TLS と同じ">
+  TLS のハンドシェイクが成功した後の暗号化は、確かに同じです。違うのは**そこに至るまで**です。
+  型 2 では、TLS を始めるかどうかの合意が平文で行われ（消される）、平文と暗号文の境目を実装が正しく処理しなければならず（混ざる）、
+  平文の段階で得た情報を忘れなければなりません（信じる）。
+  暗黙の TLS は、この 3 つを**構造として持たない**ので、実装が正しいかどうかに頼らずに済みます。
+</Callout>
+
+## 振り子: 専用ポートから STARTTLS へ、そしてまた専用ポートへ
+
+型 1 と型 2 のどちらがよいかについて、IETF の考えは一度逆転しています。
+
+1999 年の RFC 2595 は、IMAP と POP3 の STARTTLS（STLS）を定めた文書ですが、その 7 節で、`imaps` や `pop3s` の専用ポートは**使わないよう勧める**と書いています（[RFC 2595 7](https://www.rfc-editor.org/rfc/rfc2595.html#section-7)）。理由は、専用ポートは別の URL の形式を生んで利用者の画面に悪い影響を与える、「安全か安全でないか」の二択を思わせてしまう、クライアントが「TLS を使える相手なら使う」という方針を取りにくくなる、ポート番号を消費する前例になる、というものでした。
+
+19 年後の 2018 年、RFC 8314 はこれを逆にしました。POP、IMAP、メールの提出には**暗黙の TLS を勧める**とし（[RFC 8314 3](https://www.rfc-editor.org/rfc/rfc8314.html#section-3)）、付録 A で、専用ポートの方式は**実装、デバッグ、展開が本質的に単純**であり、STARTTLS はわずかに複雑に見えるだけだが、コマンド注入の脆弱性の歴史（CERT VU#555316）を見ると、暗黙の TLS より安全でない設計だと示唆される、と述べています（[RFC 8314 付録 A](https://www.rfc-editor.org/rfc/rfc8314.html#appendix-A)）。
+
+RFC 2595 の論点のうち、「TLS を使える相手なら使う」ことのしやすさは、裏を返せば第 1 の弱点（申し出を消される）そのものでした。暗号化が例外だった時代には型 2 の柔軟さに価値があり、暗号化が当たり前になると、その柔軟さが攻撃の入口として残った、と読めます。
+
+同じ流れはメール以外でも起きています。
+
+- **XMPP** は、STARTTLS の 5222 番に加えて、XEP-0368 で最初から TLS の接続先を SRV で知らせる方式を足しました。HTTPS しか通さないファイアウォールを越えられることと、往復が減ることを利点に挙げています（[XEP-0368](https://xmpp.org/extensions/xep-0368.html)）
+- **PostgreSQL** は 17 で `sslnegotiation=direct` を加え、SSLRequest を送らずに TCP の直後から TLS を始められるようにしました。往復が 1 回減り、プロトコルを知らない TLS の道具も使えるようになる、と説明されています。この方式ではクライアントは ALPN の `postgresql` を使わなければならず、また `sslmode=require` 以上でしか使えません。弱い設定で使うと、サーバが対応していないときに平文の認証に意図せず戻りうるからです（[libpq: sslnegotiation](https://www.postgresql.org/docs/current/libpq-connect.html)、[PostgreSQL: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)）
+
+一方、MTA 同士の 25 番のように、相手が TLS を話せるか分からないまま誰とでも通信しなければならない場面では、型 2 から離れられません。そこで MTA-STS や DANE のように「消されたら気づける」仕組みを外から足しました（第 145 回）。**型 2 を使い続けるなら、TLS を必須にする情報を別の経路で持つ**、というのがここでの答えです。
+
+## 実験の環境
+
+| 項目 | 版 |
+| --- | --- |
+| 手元の OS | macOS 26.2 |
+| Docker | 29.2.1 |
+| メールサーバ | Dovecot 2.4.1-4（Alpine 3.22.6 のコンテナ `ll116-imap`） |
+| TLS のクライアント | OpenSSL 3.6.2（`openssl s_client`） |
+| 自作のサーバ、クライアント | Python 3.14.0（`ssl` は OpenSSL 3.6.2） |
+
+証明書は `mail.ll116.test` の名前で自己署名したものを 1 枚作り、Dovecot と自作のサーバの両方で使いました。
+
+## 手元で確かめる: 143 番と 993 番
+
+Dovecot を、IMAP（143 番）と IMAPS（993 番）、POP3（110 番）と POP3S（995 番）を受けるように起動します。設定の要点は、TLS を有効にし、TLS の外ではパスワードを受け付けないことです。
+
+```
+ssl = yes
+ssl_server_cert_file = /etc/ssl/dovecot/server.pem
+ssl_server_key_file = /etc/ssl/dovecot/server.key
+auth_allow_cleartext = no
+```
+
+### 平文の 143 番
+
+`nc` で 143 番につなぎ、能力の一覧を聞いてからログインを試します。
+
+```
+$ (printf 'a1 CAPABILITY\r\n'; sleep 1; printf 'a2 LOGIN alice correct-horse\r\n'; sleep 1; printf 'a3 LOGOUT\r\n') | nc 127.0.0.1 11643
+* OK [CAPABILITY IMAP4rev1 LOGIN-REFERRALS ID ENABLE IDLE SASL-IR LITERAL+ STARTTLS LOGINDISABLED] Dovecot ready.
+* CAPABILITY IMAP4rev1 LOGIN-REFERRALS ID ENABLE IDLE SASL-IR LITERAL+ STARTTLS LOGINDISABLED
+a1 OK Pre-login capabilities listed, post-login capabilities have more.
+* BAD [ALERT] cleartext authentication not allowed without SSL/TLS, but your client did it anyway. If anyone was listening, the password was exposed.
+a2 NO [PRIVACYREQUIRED] Cleartext authentication disallowed on non-secure (SSL/TLS) connections.
+```
+
+読み取れることが 3 つあります。
+
+- 挨拶の時点で、能力の一覧（`STARTTLS` を含む）が**平文で**届いています。第 1 の弱点で消されるのは、この `STARTTLS` の文字列です
+- `LOGINDISABLED` は「この状態では LOGIN を受け付けない」という印です。サーバはパスワードを拒みました
+- しかし、拒む前に**パスワードはもう回線を流れています**。Dovecot の警告文がそのことを正直に書いています。サーバ側の設定で守れるのは「受け付けない」ところまでで、送ってしまうのを止めるのはクライアントの設定です
+
+### STARTTLS で切り替える
+
+`openssl s_client -starttls imap` は、挨拶を読み、`STARTTLS` を送り、`OK` を受け取ってから TLS を始めます。TLS の中で能力の一覧を聞き直します。
+
+```
+$ openssl s_client -starttls imap -connect 127.0.0.1:11643 -servername mail.ll116.test \
+    -CAfile cert.pem -verify_return_error -quiet
+depth=0 CN=mail.ll116.test
+verify return:1
+. OK Pre-login capabilities listed, post-login capabilities have more.
+a1 CAPABILITY
+* CAPABILITY IMAP4rev1 LOGIN-REFERRALS ID ENABLE IDLE SASL-IR LITERAL+ AUTH=PLAIN
+a1 OK Pre-login capabilities listed, post-login capabilities have more.
+```
+
+TLS の中の一覧からは `STARTTLS` と `LOGINDISABLED` が消え、`AUTH=PLAIN` が現れました。第 145 回の SMTP で、TLS の後に `AUTH` が現れたのと同じ振る舞いです。先頭の `. OK` の行は、`s_client` が切り替えの前に自動で送る `. CAPABILITY`（タグが `.`）への応答の文面です。何も送らずにつないでも TLS の確立の後に表示されましたが、`s_client` がどの段階でこの行を受け取ったのかは、ここでは追っていません。
+
+### 993 番は最初から TLS
+
+```
+$ openssl s_client -connect 127.0.0.1:11699 -servername mail.ll116.test \
+    -CAfile cert.pem -verify_return_error -quiet
+depth=0 CN=mail.ll116.test
+verify return:1
+* OK [CAPABILITY IMAP4rev1 LOGIN-REFERRALS ID ENABLE IDLE SASL-IR LITERAL+ AUTH=PLAIN] Dovecot ready.
+```
+
+挨拶そのものが TLS の中で届き、最初から `AUTH=PLAIN` が入っています。**平文の段階が 1 バイトもない**ので、消すべき申し出も、捨てるべき平文の情報もありません。往復の数で見ても、143 番は TCP の後に「挨拶を待つ → STARTTLS を送って OK を待つ」が加わってから ClientHello を送るのに対し、993 番は TCP の直後に ClientHello を送れます。
+
+POP3 でも同じでした。左が平文の 110 番での `CAPA` の応答、右が `openssl s_client -starttls pop3` で切り替えた後の `CAPA` の応答です（`+OK` の後ろの一覧部分）。
+
+```
+平文の 110 番        TLS の後
+TOP                  TOP
+UIDL                 UIDL
+RESP-CODES           RESP-CODES
+PIPELINING           PIPELINING
+AUTH-RESP-CODE       AUTH-RESP-CODE
+STLS                 USER
+SASL                 SASL PLAIN
+.                    .
+```
+
+`STLS` が消え、TLS の外では空だった `SASL` に `PLAIN` が入り、`USER`（`USER` と `PASS` で利用者名とパスワードを送る方式）が使えるようになりました。
+
+## 手元で確かめる: 境目に残ったバイト
+
+第 2 の弱点を、自作の小さなサーバで再現します。Dovecot のような実際のサーバはこの欠陥を直しているので、わざと持たせた実装を作ります。
+
+サーバは「メモを受け取るだけ」の行単位のプロトコルを話します。`STARTTLS` で TLS に切り替え、`NOTE 文字列` でメモを受け取り、`QUIT` で終わります。受け取った行を、平文で来たか TLS で来たかと一緒に記録します。違いは 1 か所だけです。
+
+```python
+buf = b""                       # 受信バッファ（平文の段階から使い続ける）
+...
+if cmd[0] == b"STARTTLS" and not tls:
+    conn.sendall(b"+OK begin TLS\r\n")
+    if MODE == "discard" and buf:
+        print(f"[{MODE}] discarded {len(buf)} plaintext bytes after STARTTLS")
+        buf = b""               # discard: 平文の残りを捨てる
+    conn = ctx.wrap_socket(conn, server_side=True)    # carry: そのまま持ち越す
+    tls = True
+```
+
+`carry` の版は、Postfix の 2011 年の欠陥と同じく、**読み書きの手段だけを TLS に替え、バッファは持ち越します**。間に挟む中間者は、クライアントの `STARTTLS\r\n` を見つけたら、後ろに `NOTE injected-by-mitm\r\n` を足して送るだけで、あとはバイトをそのまま流します。クライアントは証明書を検証する、まっとうな TLS のクライアントです。
+
+```
+### via mitm, carry
+S: +OK ll116 notes ready
+S: +OK begin TLS
+--- TLS TLSv1.3
+S: +OK noted
+S: +OK noted
+```
+
+サーバの記録はこうなりました。
+
+```
+[carry] plain <- STARTTLS
+[carry] TLS   <- NOTE injected-by-mitm
+[carry] TLS   <- NOTE hello
+[carry] TLS   <- QUIT
+```
+
+**中間者が平文で足した 1 行が、TLS の中で届いた行として記録されています**。クライアントは証明書を正しく検証し、TLS 1.3 で接続しているのに、です。中間者は TLS の鍵を何も知りません。平文の段階の最後に 1 行を置いただけです。
+
+クライアント側の画面にも、ずれが出ています。クライアントは `NOTE hello` を送って `+OK noted` を受け取り、`QUIT` を送って `+OK bye` を待っていましたが、2 回目に受け取ったのも `+OK noted` でした。1 回目の `+OK noted` は注入された行への応答で、クライアントは自分の命令への応答と取り違えています。研究で報告された「応答の取り違え」は、この形のずれを攻撃に使うものです。
+
+`discard` の版では、同じ中間者を挟んでも注入は効きません。
+
+```
+[discard] plain <- STARTTLS
+[discard] discarded 23 plaintext bytes after STARTTLS
+[discard] TLS   <- NOTE hello
+[discard] TLS   <- QUIT
+```
+
+捨てた 23 バイトは `NOTE injected-by-mitm\r\n` の長さです。Venema の文書が挙げた 2 つの対策のうち、こちらは「捨てる」ほうです。もう 1 つの「エラーにする」では、ここで接続を切ります。
+
+<Callout type="tip" title="バッファは、思っているより多くの層にある">
+  この実験では受信バッファを自分で書いたので、どこに平文が残るかが見えました。
+  実際のプログラムでは、言語の標準ライブラリのバッファ付きの読み込み（Python の `makefile()`、Go の `bufio.Reader`、C の `FILE*` など）や、
+  イベントループのライブラリの読み込みバッファが間に入ります。TLS に切り替えるときは、**自分が書いていないバッファも含めて**、
+  平文で読んだものがどこにも残っていないことを確かめる必要があります。
+  PostgreSQL の文書が「ちょうど 1 バイトだけ読め」と書くのは、この確かめを不要にする最も確実な方法だからです。
+</Callout>
+
+## 手元で確かめる: 1 つのポートで振り分ける
+
+型 1 の変種も試します。1 つのポートで待ち受け、最初の数バイトを `MSG_PEEK`（読んでもバッファから取り除かない読み方）で覗き、`SSH-` で始まれば SSH の後段へ、`0x16` で始まれば TLS として受けて ALPN で後段を選ぶ、という小さな振り分け役を Python で書きました。
+
+```python
+ctx.set_alpn_protocols(["http/1.1", "imap"])
+...
+first = c.recv(8, socket.MSG_PEEK)
+if first.startswith(b"SSH-"):   ...  # SSH の後段へ
+if first[:1] != b"\x16":        ...  # 知らないものは切る
+t = ctx.wrap_socket(c, server_side=True)
+alpn = t.selected_alpn_protocol()    # "imap" なら IMAP の後段、それ以外は HTTP の後段
+```
+
+4 通りのクライアントでつなぎました。
+
+```
+$ printf 'SSH-2.0-probe\r\n' | nc -w 1 127.0.0.1 12643
+SSH-2.0-ll116-would-forward-to-sshd
+
+$ openssl s_client -connect 127.0.0.1:12643 -servername mail.ll116.test -CAfile cert.pem -alpn imap -quiet
+* OK imap backend
+
+$ curl -s --cacert cert.pem --resolve mail.ll116.test:12643:127.0.0.1 https://mail.ll116.test:12643/
+http backend
+
+$ printf 'a1 CAPABILITY\r\n' | nc -w 1 127.0.0.1 12643; echo "(closed)"
+(closed)
+```
+
+振り分け役の記録です。
+
+```
+peek b'SSH-' -> ssh backend
+peek 0x16 -> TLS, ALPN=imap
+peek 0x16 -> TLS, ALPN=http/1.1
+peek 0x16 -> TLS, ALPN=None
+peek b'a1 CAPAB' -> unknown, close
+```
+
+3 行目までは期待どおりです。curl は ALPN で `http/1.1` を申し出たので、HTTP の後段に渡りました。
+
+4 行目は、`openssl s_client -alpn smtp` で**サーバが知らない識別子**を申し出たときのものです。
+
+```
+$ openssl s_client -connect 127.0.0.1:12643 -servername mail.ll116.test -CAfile cert.pem -alpn smtp
+...
+No ALPN negotiated
+```
+
+RFC 7301 は、クライアントが出した識別子をサーバが 1 つも扱えない場合、サーバは致命的な `no_application_protocol` のアラートを返さなければならない（SHALL）と定めています（[RFC 7301 3.2](https://www.rfc-editor.org/rfc/rfc7301.html#section-3.2)）。しかし、この Python（OpenSSL 3.6.2）のサーバは、アラートを返さずに **ALPN なしでハンドシェイクを完了**し、振り分け役は ALPN がないものを HTTP の後段に回しました。「SMTP を話すつもりのクライアント」が HTTP のサーバにつながったことになります。
+
+これは、第 124 回で扱う混線の小さな形です。ALPN は、**サーバが一致しないものを拒んで初めて**「双方が同じプロトコルを話すつもりだ」の確認になります。ライブラリの既定の振る舞いに任せず、選ばれた識別子を確かめて、なければ切る処理を自分で書く必要があります。
+
+## どの型を選ぶか
+
+新しくプロトコルを載せる、あるいは既存のものの設定を選ぶときの目安をまとめます。
+
+| 場面 | 選ぶ型 | 理由 |
+| --- | --- | --- |
+| 新しく設計するプロトコル | 型 1。ALPN の識別子を決めて登録する | 平文の段階を持たない。ほかのプロトコルとポートを共有しても見分けられる |
+| 既存の型 2 のプロトコルを使う（IMAP、提出、LDAP、DB） | 型 1 のポートがあればそちら。なければ**クライアントで TLS を必須に**する | 申し出を消されても平文に落ちない |
+| 相手が TLS を話せるか分からない（MTA 同士） | 型 2 ＋ 外から方針を与える（MTA-STS、DANE） | 誰とでも話す必要があり、型 1 にできない |
+| すでに SSH で入れる相手との転送や操作 | 型 3 | 認証と暗号化を SSH に任せられる。代わりに SSH の権限を絞る |
+| 平文しか話せない古いサービス | 型 1 の外付け（stunnel など） | アプリを変えずに包む（第 122 回） |
+
+<Callout type="warn" title="よくある誤解: 型を選べば、相手の確認もできている">
+  型が決めるのは、**いつ TLS を始めるか**だけです。始めた TLS で相手の証明書を確かめるかどうかは別の話で、
+  第 145 回の MTA 同士の STARTTLS は、型 2 で TLS を始めても証明書を確かめないのが普通でした。
+  型 1 でも、クライアントが `verify=False` で接続していれば、相手が誰かは分かりません（第 114 回）。
+  データベースのドライバやライブラリの既定値がどこまで確かめているかは、第 121 回と第 124 回で見ます。
+</Callout>
+
+## 何と組み合わさって機能するか
+
+| 部品 | この回での役割 | 呼び戻す回 |
+| --- | --- | --- |
+| TCP の接続 | どの型も 1 本の TCP の上で始まる。型 2 は同じ接続の中で状態を変える | 第 53 回 |
+| TLS 1.3 のハンドシェイク | 型 1 と型 2 で上のプロトコルを包む本体 | 第 113 回 |
+| SNI と ALPN | 1 つのポートで行き先と話すプロトコルを決める | 第 113 回、第 124 回 |
+| 証明書の検証 | どの型でも、相手を確かめるのはここ | 第 111 回、第 114 回 |
+| SSH のチャネル | 型 3 の土台。subsystem と exec | 第 115 回 |
+| SSH の権限の絞り込み | 型 3 で SSH の利用者の権限と上のプロトコルの権限を切り離す | 第 116 回、第 118 回、第 120 回 |
+| 方針の外付け（MTA-STS、DANE） | 型 2 を使い続けるときに、TLS を必須にする情報を別の経路で与える | 第 145 回 |
+
+## まとめ
+
+- TLS や SSH の上にプロトコルを載せる方法は、**最初から TLS（型 1）**、**平文で始めて途中で切り替える（型 2）**、**SSH のチャネルに載せる（型 3）**の 3 つにほぼ分けられる。OpenVPN、NTS、EAP-TLS のように TLS を鍵の確立の部品として使うものは、この外にある
+- 型 1 はポートで TLS を約束する（443、993、995、465 など）。1 つのポートを分け合うときは、SNI、ALPN、最初のバイトで振り分ける。ALPN の識別子には `imap`、`ftp`、`postgresql` なども登録されている
+- 型 2 の合図はプロトコルごとに違う（SMTP と IMAP の STARTTLS、POP3 の STLS、FTP の AUTH TLS、LDAP の拡張操作、PostgreSQL の SSLRequest、MySQL の SSLRequest、RDP の X.224 での交渉）
+- 型 3 は SSH の `subsystem`（SFTP、NETCONF）、`exec`（Git）、転送のチャネルに載せる。上のプロトコルは認証も暗号化もしなくてよいが、SSH の権限と混ざる
+- 型 2 の弱点は 3 つ。**申し出を消される**（ダウングレード）、**境目のバイトが混ざる**（CVE-2011-0411 などのコマンド注入と応答の注入）、**平文で聞いたことを信じる**。手元の自作サーバでも、バッファを持ち越すだけで、中間者の 1 行が TLS の中の命令として実行された
+- IETF の推奨は、1999 年の RFC 2595（専用ポートを使うな）から、2018 年の RFC 8314（暗黙の TLS を使え）へ逆転した。XMPP の XEP-0368、PostgreSQL 17 の `sslnegotiation=direct` も同じ向き
+- 型 2 を使い続けるなら、クライアントで TLS を必須にするか、MTA-STS や DANE のように方針を外から与える
+- ALPN は、一致しないものをサーバが拒んで初めて確認になる。手元の Python のサーバは拒まずに ALPN なしで続けた
+
+この回では、載せ方の型を地図として並べました。次の第 118 回からは、型ごとに具体的なプロトコルを見ていきます。最初は型 3 の代表である SSH のファイル転送です。`scp` が長く抱えてきた「リモートのシェルがファイル名を解釈する」問題と、それを置き換えた SFTP のパケットの並びを、手元の sshd で確かめます。

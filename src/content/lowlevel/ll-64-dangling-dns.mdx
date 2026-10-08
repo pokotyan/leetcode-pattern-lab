@@ -56,7 +56,7 @@ shop.example.com.   CNAME   example-shop.herokuapp.com.
 攻撃者は、空いた `example-shop.herokuapp.com` を**自分のアカウントで取り直します**。すると、`shop.example.com` を引いた利用者は攻撃者の資源に案内されます。これが成り立つのは、事業者側に 2 つの性質があるからです。
 
 - **「そのホスト名はまだ誰にも使われていない」と判定して、先着順で払い出す。** 解約された名前が空きに戻る
-- **ホスト名で顧客を振り分ける。** 事業者の 1 つの入口に届いたリクエストを、`Host` ヘッダや TLS の SNI に書かれた名前で「どの顧客のものか」判断する（SNI は第 112 回、SNI での振り分けは第 113 回で詳しく見ます）
+- **ホスト名で顧客を振り分ける。** 事業者の 1 つの入口に届いたリクエストを、`Host` ヘッダや TLS の SNI に書かれた名前で「どの顧客のものか」判断する（SNI は第 113 回、SNI での振り分けは第 114 回で詳しく見ます）
 
 この 2 つがそろうと、攻撃者は「同じ名前で枠を取る」だけで、その名前宛ての通信を受け取れます。事業者ごとに `*.azurewebsites.net`、`*.cloudapp.azure.com`、Traffic Manager、Front Door、CloudFront、S3 の静的サイト、GitHub Pages など、対象は広く知られています。Microsoft は自社のどの資源型が対象になるかを表にまとめ、Front Door・Blob Storage・CDN・パブリック IP・Traffic Manager・Container Instance・API Management・App Service などを挙げています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。
 
@@ -85,7 +85,7 @@ shop.example.com.   CNAME   example-shop.herokuapp.com.
 
 静的サイトのホスティングでは**バケット名をドメイン名にぴったり合わせる**決まりなので（[AWS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/website-hosting-custom-domain-walkthrough.html)）、`shop.example.com` を載せていたなら、乗っ取るのに必要なバケット名も `shop.example.com` だと分かってしまいます。
 
-対して **GitHub Pages** は、`Edge case`（条件つき）に分類されています。カスタムドメインを**あらかじめ検証**しておけば、他人が同じ名前で Pages を立てられなくなるからです。検証は第 58 回・第 133 回の所有確認と同じで、`_github-pages-challenge-<ユーザ名>` という TXT レコードを置きます。検証済みのドメインは**その直下のサブドメインもまとめて守られ**、`example.com` を検証すれば `docs.example.com` なども保護されます（[GitHub Docs](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)）。ただし GitHub は**ワイルドカードの DNS レコードを使わないよう強く勧めて**います。`*.example.com` を置くと、検証した名前の**さらに下**（`b.a.example.com` など）が守りの外に残るためです。乗っ取りは、リポジトリを消したりプランを下げたりして Pages の割り当てが外れたのに、DNS がそこを指したまま、という第 58 回と同じ「消し忘れ」から起こります。
+対して **GitHub Pages** は、`Edge case`（条件つき）に分類されています。カスタムドメインを**あらかじめ検証**しておけば、他人が同じ名前で Pages を立てられなくなるからです。検証は第 58 回・第 134 回の所有確認と同じで、`_github-pages-challenge-<ユーザ名>` という TXT レコードを置きます。検証済みのドメインは**その直下のサブドメインもまとめて守られ**、`example.com` を検証すれば `docs.example.com` なども保護されます（[GitHub Docs](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)）。ただし GitHub は**ワイルドカードの DNS レコードを使わないよう強く勧めて**います。`*.example.com` を置くと、検証した名前の**さらに下**（`b.a.example.com` など）が守りの外に残るためです。乗っ取りは、リポジトリを消したりプランを下げたりして Pages の割り当てが外れたのに、DNS がそこを指したまま、という第 58 回と同じ「消し忘れ」から起こります。
 
 ## NS 委任の消し忘れ: 委任の乗っ取り
 
@@ -138,21 +138,21 @@ Route 53 は、この報告のあと対策を入れました。ゾーンを消�
 | 型 | 指す先 | 持ち主が変わる形 |
 | --- | --- | --- |
 | A / AAAA | クラウドのグローバル IP | 解放した Elastic IP などが別の利用者に再割り当てされる |
-| MX | メールの届け先ホスト | そのホストを他人が取ると、メールを他人が受け取れる（第 142 回） |
-| TXT（SPF） | `include:` の先のドメイン | 先のドメインが失効し、他人に渡る（第 145 回） |
-| ドメインそのもの | 独自ドメインの登録 | 期限切れの独自ドメインを他人が取り直す（第 133 回） |
+| MX | メールの届け先ホスト | そのホストを他人が取ると、メールを他人が受け取れる（第 143 回） |
+| TXT（SPF） | `include:` の先のドメイン | 先のドメインが失効し、他人に渡る（第 146 回） |
+| ドメインそのもの | 独自ドメインの登録 | 期限切れの独自ドメインを他人が取り直す（第 134 回） |
 
 A の例では、AWS の Elastic IP を解放すると**アドレスのプールに戻り、別の AWS アカウントに割り当てられうる**と明記されています（[AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing-eips-releasing.html)）。DNS に古い IP を書いたまま解放すると、その IP を引き当てた別の利用者に通信が届きます。CNAME のように名前で指していなくても、**共有のプールから借りている資源はいつか他人に回る**という点は同じです。
 
-MX の例は、乗っ取りの向きが「送る」ではなく「受ける」になります。第 142 回で見るように、メールの送信側は宛先ドメインの MX を引いてそこへ配送します。MX が指す届け先ホストを他人が取れば、そのドメイン宛てのメールを他人が受け取れます。SPF の `include:` は逆に、指す先が**消えると壊れる**型です。第 145 回で見るとおり、`include:` の先の SPF が無くなると自分のドメインの評価全体が permerror になり、契約をやめた配信サービスの SPF を誰かが取り直せば、その事業者を名乗るメールを通してしまいます。ドメインそのものの再取得は第 133 回で、廃業した会社のドメインを買い直して、そのドメインのメールアドレスで外部サービスに入れてしまう事故として見ます。
+MX の例は、乗っ取りの向きが「送る」ではなく「受ける」になります。第 143 回で見るように、メールの送信側は宛先ドメインの MX を引いてそこへ配送します。MX が指す届け先ホストを他人が取れば、そのドメイン宛てのメールを他人が受け取れます。SPF の `include:` は逆に、指す先が**消えると壊れる**型です。第 146 回で見るとおり、`include:` の先の SPF が無くなると自分のドメインの評価全体が permerror になり、契約をやめた配信サービスの SPF を誰かが取り直せば、その事業者を名乗るメールを通してしまいます。ドメインそのものの再取得は第 134 回で、廃業した会社のドメインを買い直して、そのドメインのメールアドレスで外部サービスに入れてしまう事故として見ます。
 
 ## 乗っ取られると何が起きるか
 
 サブドメインを 1 つ握られただけ、と侮れないのは、その名前が**ほかの仕組みの信頼の土台**になっているからです。
 
-- **正規の TLS 証明書を取れる。** ACME の HTTP-01 は `http://<名前>/.well-known/acme-challenge/<トークン>` に置いたトークンを、DNS-01 は `_acme-challenge.<名前>` の TXT を確かめるだけです（[RFC 8555](https://www.rfc-editor.org/rfc/rfc8555.html)）。どちらも「その名前を**今**動かしている者」を確かめるだけなので、乗っ取った側が有効な証明書を取れます（第 111 回）。Microsoft も「SSL 証明書があれば守られる」は誤解だと明記しています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。手元の実験でも、攻撃者役のゾーンが `_acme-challenge.sub.example.test` の TXT を自由に返せたことを見ました。ACME から見れば、これは検証が通る、ということです
-- **親ドメインの Cookie が届く。** `Domain=example.com` で置かれた Cookie は、`shop.example.com` にも送られ、上書きもできます（[RFC 6265 8.6](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.6)、第 93・96・126 回）。乗っ取ったサブドメインで、本体のセッション Cookie を集められます
-- **許可リストに載っていた信頼が渡る。** `*.example.com` を CORS や CSP、OAuth の `redirect_uri` の許可に入れていると、その許可が攻撃者のサブドメインにも及びます（第 95・99 回、第 128 回）
+- **正規の TLS 証明書を取れる。** ACME の HTTP-01 は `http://<名前>/.well-known/acme-challenge/<トークン>` に置いたトークンを、DNS-01 は `_acme-challenge.<名前>` の TXT を確かめるだけです（[RFC 8555](https://www.rfc-editor.org/rfc/rfc8555.html)）。どちらも「その名前を**今**動かしている者」を確かめるだけなので、乗っ取った側が有効な証明書を取れます（第 112 回）。Microsoft も「SSL 証明書があれば守られる」は誤解だと明記しています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。手元の実験でも、攻撃者役のゾーンが `_acme-challenge.sub.example.test` の TXT を自由に返せたことを見ました。ACME から見れば、これは検証が通る、ということです
+- **親ドメインの Cookie が届く。** `Domain=example.com` で置かれた Cookie は、`shop.example.com` にも送られ、上書きもできます（[RFC 6265 8.6](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.6)、第 93・96・127 回）。乗っ取ったサブドメインで、本体のセッション Cookie を集められます
+- **許可リストに載っていた信頼が渡る。** `*.example.com` を CORS や CSP、OAuth の `redirect_uri` の許可に入れていると、その許可が攻撃者のサブドメインにも及びます（第 95・99 回、第 129 回）
 - **本物のドメインでフィッシングが立つ。** 見た目も証明書も本物なので、利用者にもブラウザにも見破れません。ドメインが積み上げてきた検索やメールの評判も、そのまま使われます
 
 第 93 回で「サブドメインが違えば別のサイト」という誤解を扱いました。放置されて乗っ取られた古いサブドメインは、本体と**同じサイトの内側**にいます。そこが握られると、上の 4 つがまとめて崩れます。
@@ -183,9 +183,9 @@ MX の例は、乗っ取りの向きが「送る」ではなく「受ける」�
 
 **台帳と突き合わせる。** DNS のレコードと、実際に持っている資源の一覧を定期的に照合します。Infrastructure as Code で「レコードと資源を同じ単位で」管理すると、片方だけ残る状態が生まれにくくなります。Microsoft は、消す前提の資源に削除ロックを掛け、「先に DNS を消す」印にする方法も挙げています（[Microsoft Learn](https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover)）。
 
-**所有を証明させる事業者を選ぶ。** 第 58 回・第 133 回で見た TXT の所有確認は、ここでも効きます。Azure App Service は `asuid.<サブドメイン>` の TXT を、GitHub Pages は `_github-pages-challenge-<ユーザ名>` の TXT を置かせ、確認済みの名前を他人が取れないようにします（[GitHub Docs](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)）。
+**所有を証明させる事業者を選ぶ。** 第 58 回・第 134 回で見た TXT の所有確認は、ここでも効きます。Azure App Service は `asuid.<サブドメイン>` の TXT を、GitHub Pages は `_github-pages-challenge-<ユーザ名>` の TXT を置かせ、確認済みの名前を他人が取れないようにします（[GitHub Docs](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/verifying-your-custom-domain-for-github-pages)）。
 
-**見知らぬ証明書に気づく。** CAA（第 58 回）で証明書を出してよい CA を絞っても、**乗っ取られた名前の証明書は防げません**。乗っ取った側は、あなたが許した CA を使えば普通に発行を受けられるからです。代わりに、Certificate Transparency（第 111 回）のログを監視し、自分のドメインに対する見知らぬ証明書の発行に気づく方が現実的です。
+**見知らぬ証明書に気づく。** CAA（第 58 回）で証明書を出してよい CA を絞っても、**乗っ取られた名前の証明書は防げません**。乗っ取った側は、あなたが許した CA を使えば普通に発行を受けられるからです。代わりに、Certificate Transparency（第 112 回）のログを監視し、自分のドメインに対する見知らぬ証明書の発行に気づく方が現実的です。
 
 <Callout type="warn" title="よくある誤解">
   - **「使っていないサブドメインだから、放っておいても害はない」** — 使っていないからこそ、指す先が空いていれば他人に取られます。害は「使うこと」ではなく「指したまま残すこと」から来ます。
@@ -288,10 +288,10 @@ sub.example.test.    NS    ns1.dnshost.test.           LAME SERVFAIL
 | 部品 | 見た回 | 乗っ取りでの役割 |
 | --- | --- | --- |
 | NS 委任 / CNAME の指さし | 第 56・58 回 | 消し忘れると、指す先を他人に取られる入口になる |
-| 事業者のホスト名での振り分け | 第 98・112 回 | 同じ名前で枠を取れば、その名前宛ての通信が届く |
-| ACME の検証 | 第 111 回 | 「今その名前を動かす者」に証明書を出す |
-| Cookie の Domain 属性 | 第 96・126 回 | 親ドメインの Cookie がサブドメインに届く |
-| CORS / CSP / redirect_uri の許可 | 第 95・99・128 回 | `*.example.com` の許可が攻撃者に渡る |
+| 事業者のホスト名での振り分け | 第 98・113 回 | 同じ名前で枠を取れば、その名前宛ての通信が届く |
+| ACME の検証 | 第 112 回 | 「今その名前を動かす者」に証明書を出す |
+| Cookie の Domain 属性 | 第 96・127 回 | 親ドメインの Cookie がサブドメインに届く |
+| CORS / CSP / redirect_uri の許可 | 第 95・99・129 回 | `*.example.com` の許可が攻撃者に渡る |
 
 ## まとめ
 

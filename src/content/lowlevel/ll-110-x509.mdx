@@ -1,0 +1,387 @@
+---
+title: 証明書の中身
+description: ブラウザの鍵のマークの向こうにある「証明書」には、いったい何が書かれているのか。X.509 の構造を 1 項目ずつ読み、証明書が何を保証し、何を保証しないのかを分けます
+chapter: tls
+order: 1
+status: published
+topics:
+  - X.509
+  - tbsCertificate
+  - Subject / Issuer
+  - SubjectPublicKeyInfo
+  - SAN（subjectAltName）
+  - Basic Constraints
+  - Key Usage / Extended Key Usage
+  - AKI / SKI
+  - ワイルドカード証明書
+requires:
+  - ll-109-key-management
+  - ll-108-key-format
+  - ll-107-signature
+  - ll-85-navigation
+---
+
+import Callout from '../../components/Callout.astro'
+
+## この章で見るもの
+
+第16章では、暗号の部品を 1 つずつ見ました。ハッシュ、MAC、共通鍵暗号、鍵交換、署名、鍵ファイル、鍵の管理です。そして第 109 回の最後に、1 つの穴を残しました。**ここまでの部品は、相手が誰かを知りません。**
+
+第 106 回で見たとおり、鍵交換だけでは、画面の向こうの相手が本物のサーバなのか、途中に割り込んだ中間者なのか区別できません。第 107 回の署名も、保証するのは「この**鍵**で署名された」ことまでで、その鍵が誰のものかは教えてくれません。
+
+この章は、その穴を埋める仕組みを見ます。
+
+| 回 | 見るもの |
+| --- | --- |
+| 第 110 回（この回） | 証明書には何が書かれているのか |
+| 第 111 回 | 信頼の連鎖とトラストストア |
+| 第 112 回 | 証明書を発行する・失効させる・監視する |
+| 第 113 回 | TLS 1.3 のハンドシェイクを 1 メッセージずつ |
+| 第 114 回 | TLS をどこで終えるか、mTLS、よくある障害 |
+| 第 115 回 | SSH の仕組み（CA を使わない信頼の置き方） |
+| 第 116 回 | SSH を大勢で使う |
+
+前半の TLS は「第三者（CA）に保証してもらう」やり方、後半の SSH は「最初に会ったときの鍵を覚えておく」やり方です。同じ部品を使いながら、**信頼をどこに置くか**が違います。この回は、その第三者の保証そのものである**証明書**を読みます。
+
+## 証明書は何を言っているのか
+
+証明書の中身を 1 文にすると、こうなります。
+
+```
+「公開鍵 04:6a:69:d1:... は、名前 example.com のものである」
+                           ── Cloudflare TLS Issuing ECC CA 3 が署名して保証する
+```
+
+つまり証明書は、**公開鍵と名前の対応表の 1 行に、第三者が署名したもの**です。部品に分けると次の 3 つです。
+
+| 中身 | 何の部品か |
+| --- | --- |
+| 公開鍵 | 第 106 回・第 108 回で見た鍵（ここでは EC P-256） |
+| 名前（と有効期間、用途） | 「誰の鍵か」の主張 |
+| 発行者の署名 | 第 107 回の署名。主張を書き換えられないようにする |
+
+受け取った側は、発行者（CA）の公開鍵で署名を検証し、名前が接続先と一致するかを確かめます。一致すれば、「この公開鍵の持ち主が example.com だ」と信じる。そのあと、相手に**この公開鍵に対応する秘密鍵で署名させて**（TLS の CertificateVerify、第 113 回）、本当に持ち主と話しているかを確かめます。
+
+<Callout type="warn" title="よくある誤解: 証明書が通信を暗号化している">
+  「SSL 証明書を入れると通信が暗号化される」という言い方をよく見ます。しかし証明書そのものは何も暗号化しません。
+  中身は**公開の文書**で、サーバは接続してきた誰にでも同じものを送ります（下の「手元で確かめる」で実際に取ってきます）。
+
+  TLS の暗号化を担っているのは、第 106 回の鍵交換（ECDHE）で作った共有の秘密と、第 105 回の AEAD です。
+  TLS 1.3 では、サーバの証明書の鍵は**鍵交換に使われず**、署名にだけ使われます（[RFC 8446 4.4.3](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4.3)）。
+  証明書が要るのは、**暗号化した相手が誰かを確かめるため**です。証明書なしでも暗号化はできますが、その相手が中間者でないとは言えません。
+</Callout>
+
+## 3 つの部分: tbsCertificate、アルゴリズム、署名値
+
+X.509 v3 の証明書は、ASN.1 で書かれた 3 つの要素の並びです（[RFC 5280 4.1](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1)）。第 108 回で見たとおり、それを DER でバイト列にし、Base64 にしてヘッダで挟んだものが `-----BEGIN CERTIFICATE-----` の PEM です。
+
+```
+Certificate ::= SEQUENCE {
+    tbsCertificate       TBSCertificate,        署名される中身（to be signed）
+    signatureAlgorithm   AlgorithmIdentifier,   発行者がどの方式で署名したか
+    signatureValue       BIT STRING             署名そのもの
+}
+```
+
+**tbsCertificate** は「署名される予定の証明書」の意味で、名前も鍵も期限も拡張も、全部この中にあります。発行者は tbsCertificate の DER のバイト列全体に署名し、その結果を signatureValue に入れます。第 107 回の言葉で言えば、「tbsCertificate をハッシュし、秘密鍵で演算する」です。
+
+tbsCertificate の中身を並べると次のとおりです（[RFC 5280 4.1.2](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2)）。
+
+| 項目 | 中身 |
+| --- | --- |
+| version | 拡張を使うなら 3（値としては 2 を入れる） |
+| serialNumber | 発行者の中で一意な番号。失効のときにこれで指す |
+| signature | 署名方式。外側の signatureAlgorithm と一致しなければならない |
+| issuer | 発行者の名前 |
+| validity | notBefore と notAfter |
+| subject | 持ち主の名前 |
+| subjectPublicKeyInfo | 持ち主の公開鍵（第 108 回の `BEGIN PUBLIC KEY` の中身そのもの） |
+| extensions | v3 で加わった拡張の並び |
+
+**署名方式が内と外に 2 回書かれている**のは、署名の外側にある signatureAlgorithm だけでは、それを書き換えられても気づけないからです。内側の値は署名に守られているので、両者を比べれば方式のすり替えを検出できます。
+
+## Subject と Issuer
+
+subject と issuer は、どちらも **識別名**（DN: Distinguished Name）という形式で書かれます。`C=US, O=SSL Corporation, CN=...` のように、国（C）、組織（O）、共通名（CN）などの属性を並べたものです。これは電話帳のような巨大なディレクトリ（X.500）を想定していた時代の名残です。
+
+証明書の連鎖は、**ある証明書の issuer が、上の証明書の subject と一致する**ことでつながります。
+
+```
+サーバ証明書    subject: CN=example.com
+                issuer:  C=US, O=SSL Corporation, CN=Cloudflare TLS Issuing ECC CA 3
+                                           ↓ 一致
+中間 CA 証明書  subject: C=US, O=SSL Corporation, CN=Cloudflare TLS Issuing ECC CA 3
+                issuer:  C=US, O=SSL Corporation, CN=SSL.com TLS Transit ECC CA R2
+                                           ↓
+                ...ルートまで（第 111 回）
+```
+
+ただし、名前が一致するだけでは不十分です。同じ名前の CA が鍵を替えることがあるからです。そこで次の 2 つの拡張が、**鍵の識別子**で上下を結びます（[RFC 5280 4.2.1.1](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.1)、[4.2.1.2](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.2)）。
+
+- **SKI**（Subject Key Identifier）: この証明書の公開鍵の識別子。多くは公開鍵のハッシュ
+- **AKI**（Authority Key Identifier）: 署名した発行者の公開鍵の識別子
+
+下の証明書の AKI が、上の証明書の SKI と一致します。手元で取った example.com の証明書では、サーバ証明書の AKI と中間 CA 証明書の SKI がどちらも `83:03:FD:E7:...` でした。
+
+## 有効期間
+
+validity には、notBefore と notAfter の 2 つの時刻が入っています。検証する側は、**自分の時計の現在時刻**がこの間にあるかを確かめます。時計が大きくずれた機器では、正しい証明書でも「まだ有効でない」「期限切れ」になります（時計のずれは第 158 回で詳しく見ます）。
+
+公開のサーバ証明書の有効期間は短くなり続けていて、手元で取った example.com の証明書は 2026 年 9 月 26 日から 12 月 25 日までの約 90 日でした。この短縮の経緯と、それが失効の問題とどう関係するかは第 112 回で見ます。
+
+## 名前は SAN を見る
+
+ここがこの回で最も実務に効くところです。**接続先のホスト名と照らし合わせるのは、subject の CN ではなく、拡張の SAN（subjectAltName）です。**
+
+```
+Subject: CN=example.com                         ← 照合に使わない
+X509v3 Subject Alternative Name:
+    DNS:example.com, DNS:*.example.com          ← ここを見る
+```
+
+SAN には、DNS 名、IP アドレス、URI、メールアドレスなど、**型の付いた名前**を複数並べられます（[RFC 5280 4.2.1.6](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.6)）。CN はただの文字列で、それがホスト名なのか組織の名前なのか人名なのか、形式からは分かりません。
+
+歴史的には、SAN が無ければ CN をホスト名として見る、という逃げ道がありました。今はそれがはっきり閉じられています。
+
+- [RFC 9525](https://www.rfc-editor.org/rfc/rfc9525.html)（2023 年 11 月。RFC 6125 を置き換え）は「Common Name の RDN は、強く型付けされていないので、サービスの識別に使ってはならない（MUST NOT）」と書き、サーバの名前は subjectAltName でしか表せないとしました
+- Chrome は 2017 年の Chrome 58 で、CN との照合をやめました（[Chrome 58 の非推奨と削除](https://developer.chrome.com/blog/chrome-58-deprecations/)）
+- Go は 1.15（2020 年）で、SAN が無いときに CN を見る動作を既定で無効にしました（[Go 1.15 リリースノート](https://go.dev/doc/go1.15)）
+- 公開 CA が守る CA/Browser Forum の Baseline Requirements では、CN は非推奨で、入れる場合も SAN にある値のどれか 1 つでなければなりません（[Baseline Requirements](https://cabforum.org/working-groups/server/baseline-requirements/requirements/)）
+
+<Callout type="warn" title="よくある誤解: CN を見ないのは、もう全部の実装でそうなっている">
+  そうではありません。ブラウザと Go は CN を見ませんが、**SAN の無い証明書を通してしまうクライアントはまだ残っています**。
+  下の「手元で確かめる」で、CN にだけ `localhost` を書いた証明書を試すと、Go 1.24 は拒否し、
+  Python 3.14 の既定、Node 20、macOS 付属の curl、`openssl` コマンドは通しました。
+  Python は `SSLContext.hostname_checks_common_name` の既定値が今も真です（[Python ssl](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.hostname_checks_common_name)）。
+
+  このため「curl では通るのに、ブラウザや Go のサービスからは名前が合わないと言われる」ことが起きます。
+  社内 CA や自己署名で証明書を作るときは、**名前を必ず SAN に書く**のが唯一の安全な選択です。
+</Callout>
+
+### ワイルドカードは 1 ラベルだけ
+
+SAN に `*.example.com` と書くと、ワイルドカード証明書になります。規則は DNS のワイルドカード（第 58 回）よりずっと狭く、**`*` は一番左のラベル全体としてだけ書け、ちょうど 1 ラベルにしか一致しません**（[RFC 9525 6.3](https://www.rfc-editor.org/rfc/rfc9525.html#section-6.3)）。
+
+| SAN が `*.example.com` のとき | 一致するか |
+| --- | --- |
+| `www.example.com` | する |
+| `api.example.com` | する |
+| `example.com` | **しない**（ラベルが 1 つ足りない） |
+| `a.b.example.com` | **しない**（`*` は 2 ラベルに広がらない） |
+
+example.com の証明書が `DNS:example.com` と `DNS:*.example.com` を**両方**並べているのはこのためです。頂点の名前はワイルドカードに含まれないので、別に書く必要があります。
+
+## 拡張: 何に使ってよい鍵か
+
+v3 の拡張は、それぞれ critical（重要）の印を持てます。**知らない拡張に critical が付いていたら、検証する側はその証明書を拒否しなければなりません**（[RFC 5280 4.2](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2)）。critical でなければ、知らない拡張は読み飛ばせます。例の証明書にも OpenSSL が名前を知らない拡張（`1.3.6.1.4.1.44363.44`）が 1 つありますが、critical ではないので検証は通ります。
+
+主な拡張を、例の証明書と中間 CA 証明書の実物で並べます。
+
+| 拡張 | サーバ証明書 | 中間 CA 証明書 | 意味 |
+| --- | --- | --- | --- |
+| Basic Constraints（critical） | `CA:FALSE` | `CA:TRUE, pathlen:0` | 他の証明書に署名してよいか。pathlen は下にいくつ CA を挟めるか |
+| Key Usage（critical） | Digital Signature | Digital Signature, Certificate Sign, CRL Sign | 鍵で何に署名してよいか |
+| Extended Key Usage | TLS Web Server Authentication | Client と Server の Authentication | どの用途の証明書か（serverAuth、clientAuth など） |
+| SKI / AKI | AKI のみ | 両方 | 鍵の識別子（上で見た） |
+| CRL Distribution Points | URL | URL | 失効リストの置き場所（[4.2.1.13](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.13)） |
+| Authority Information Access | CA Issuers と OCSP の URL | CA Issuers の URL | 上の証明書と失効確認の問い合わせ先（[4.2.2.1](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.2.1)） |
+| CT Precertificate SCTs | 2 つ | なし | Certificate Transparency のログに載せた証拠 |
+
+いくつか補足します。
+
+**Basic Constraints** が、この表で最も重い項目です（[RFC 5280 4.2.1.9](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.9)）。サーバ証明書が `CA:FALSE` だから、example.com の持ち主が自分の秘密鍵で `google.com` の証明書を作っても、誰も受け入れません。**この拡張を確かめない実装は、どのサーバ証明書の持ち主でも CA になれてしまいます**。2002 年には、Windows の CryptoAPI（Internet Explorer などが使う検証部品）がこの確認を欠いていたことが報告されました（[CVE-2002-0862](https://nvd.nist.gov/vuln/detail/CVE-2002-0862)）。
+
+**Key Usage** は鍵でできる操作、**Extended Key Usage** は証明書の用途です。サーバ証明書の鍵が Digital Signature だけなのは、TLS 1.3 でサーバの鍵がする仕事は署名だけだからです（上の Callout）。EKU の serverAuth が無い証明書は、中身が正しくても TLS のサーバ証明書としては使えません。第 114 回の mTLS では、クライアント証明書に clientAuth が要ります。
+
+**AIA の CA Issuers** は、サーバが中間 CA 証明書を送り忘れたときに、ブラウザがそれを取りに行く先です。この補完をしないクライアントがあるため、送り忘れが障害になります。**CRL と OCSP** は失効を確かめる入口で、実際にどれほど使われているかは第 112 回で見ます。
+
+**SCT**（Signed Certificate Timestamp）は、Certificate Transparency のログが「この証明書を一定時間内に公開ログに載せる」と約束した署名です（[RFC 6962 3.3](https://www.rfc-editor.org/rfc/rfc6962.html#section-3.3)）。発行前にログに登録するので、証明書の中に埋め込めます。仕組みと、不正な発行を見つける使い方は第 112 回で扱います。
+
+<Callout type="note" title="EV や OV の区別も拡張に書かれている">
+  例の証明書の Certificate Policies にある `2.23.140.1.2.1` は、CA/Browser Forum が定めた「ドメインの管理だけを確かめて発行した（DV）」ことを示す識別子です。
+  組織の実在を確かめた OV や EV には別の識別子が入ります。
+  証明書のどこにも「安全なサイトだ」とは書かれていません。書かれているのは、**CA が発行前に何を確かめたか**です。
+</Callout>
+
+## 証明書が保証しないもの
+
+ここまでを踏まえて、証明書が約束しないものを分けておきます。
+
+- **通信の暗号化**。上で見たとおり、証明書は公開の文書で、暗号化は鍵交換と AEAD の仕事です
+- **相手が秘密鍵を持っていること**。証明書は誰でもコピーして送れます。本物の持ち主かどうかは、TLS のハンドシェイクで秘密鍵による署名をさせて初めて分かります（第 113 回）
+- **サイトの中身の安全性**。DV の証明書が保証するのは、発行の時点で申請者がそのドメインを管理していたことだけです。フィッシングサイトも正規の証明書を取れます
+- **今も有効であること**。証明書には失効したかどうかは書かれていません。確かめるには外の情報（CRL や OCSP）が要ります
+- **CA が信頼できること**。どの CA を信じるかは、証明書の外のトラストストアが決めます（第 111 回）
+
+<Callout type="warn" title="よくある誤解: 証明書の署名が検証できれば、相手は本物">
+  署名の検証が示すのは、「この文書は、この発行者の鍵で署名されてから書き換えられていない」ことだけです。
+  そこから「相手は本物の example.com だ」と言うには、少なくとも次がすべて要ります。
+  発行者の鍵が信頼するルートまでつながること、期限内であること、名前が SAN と一致すること、用途（Basic Constraints、EKU）が合うこと、失効していないこと、
+  そして相手がこの証明書の秘密鍵で署名できること。
+  **名前の確認を省く**のは特に典型的な失敗で、有効な証明書さえ持っていれば、誰でもどのサーバにもなりすませてしまいます。
+</Callout>
+
+## 手元で確かめる
+
+以下は openssl 3.6.2 で、2026 年 9 月に実行した結果です（作業ファイルはスクラッチパッドに置きました）。
+
+### 実サイトの証明書を取ってくる
+
+`openssl s_client` でサーバに TLS の接続をし、`-showcerts` でサーバが送ってきた証明書を全部表示させます。
+
+```
+$ echo | openssl s_client -connect example.com:443 -servername example.com -showcerts
+ 0 s:CN=example.com
+   i:C=US, O=SSL Corporation, CN=Cloudflare TLS Issuing ECC CA 3
+   a:PKEY: EC, (prime256v1); sigalg: ecdsa-with-SHA256
+   v:NotBefore: Sep 26 22:49:11 2026 GMT; NotAfter: Dec 25 22:56:35 2026 GMT
+ 1 s:C=US, O=SSL Corporation, CN=Cloudflare TLS Issuing ECC CA 3
+   i:C=US, O=SSL Corporation, CN=SSL.com TLS Transit ECC CA R2
+ 2 s:C=US, O=SSL Corporation, CN=SSL.com TLS Transit ECC CA R2
+   i:C=US, O=SSL Corporation, CN=SSL.com TLS ECC Root CA 2022
+ 3 s:C=US, O=SSL Corporation, CN=SSL.com TLS ECC Root CA 2022
+   i:C=GB, ST=Greater Manchester, L=Salford, O=Comodo CA Limited, CN=AAA Certificate Services
+-----BEGIN CERTIFICATE-----
+...
+```
+
+`s:` が subject、`i:` が issuer です。0 番の issuer が 1 番の subject に、1 番の issuer が 2 番の subject に、と並んでいるのが分かります。3 番は、別のルートから署名をもらった「クロス署名」の証明書で、この組み立て方は第 111 回で見ます。**`-servername` は SNI を送る指定**で、1 つの IP で複数の名前を扱うサーバは、これを見てどの証明書を返すかを決めます。
+
+最初の `BEGIN CERTIFICATE` から `END CERTIFICATE` までを leaf.pem に保存し、中身を読みます。
+
+```
+$ openssl x509 -in leaf.pem -noout -text
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            01:ee:e6:aa:bb:52:1d:5e:14:fc:31:5f:d9:98:56:90
+        Signature Algorithm: ecdsa-with-SHA256
+        Issuer: C=US, O=SSL Corporation, CN=Cloudflare TLS Issuing ECC CA 3
+        Validity
+            Not Before: Sep 26 22:49:11 2026 GMT
+            Not After : Dec 25 22:56:35 2026 GMT
+        Subject: CN=example.com
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                pub:
+                    04:6a:69:d1:31:5b:3c:53:27:84:b7:2d:2c:ca:23: ...
+                ASN1 OID: prime256v1
+        X509v3 extensions:
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+            X509v3 Authority Key Identifier:
+                83:03:FD:E7:F6:F5:4A:4D:15:41:F4:ED:22:16:D3:32:0A:3E:CA:66
+            Authority Information Access:
+                CA Issuers - URI:http://i.cf-i.ssl.com/Cloudflare-TLS-I-E3.cer
+                OCSP - URI:http://o.cf-i.ssl.com
+            X509v3 Subject Alternative Name:
+                DNS:example.com, DNS:*.example.com
+            X509v3 Extended Key Usage:
+                TLS Web Server Authentication
+            X509v3 Key Usage: critical
+                Digital Signature
+            CT Precertificate SCTs:
+                Signed Certificate Timestamp: ...（2 つ）
+    Signature Algorithm: ecdsa-with-SHA256
+    Signature Value:
+        30:44:02:20:34:69:57:c5:62:d3:4e:a9: ...
+```
+
+`Version: 3 (0x2)` は、表で見たとおり「値 2 が v3 を表す」ことの表れです。`Data:` の中が tbsCertificate で、最後の 2 行が外側の signatureAlgorithm と signatureValue です。
+
+### 3 つの部分を切り出して、署名を自分で検証する
+
+`openssl asn1parse` で DER の構造を見ると、一番外の SEQUENCE の直下に要素が 3 つあります。
+
+```
+$ openssl asn1parse -in leaf.pem -i | grep 'd=1'
+    4:d=1  hl=4 l= 909 cons:  SEQUENCE       ← tbsCertificate
+  917:d=1  hl=2 l=  10 cons:  SEQUENCE       ← signatureAlgorithm
+  929:d=1  hl=2 l=  71 prim:  BIT STRING     ← signatureValue
+```
+
+tbsCertificate と署名を別々のファイルに取り出し、**中間 CA 証明書の公開鍵**で検証します。証明書の検証の核心は、これだけです。
+
+```
+$ openssl asn1parse -in leaf.pem -strparse 4   -out tbs.der -noout
+$ openssl asn1parse -in leaf.pem -strparse 929 -out sig.der -noout
+$ openssl x509 -in int.pem -pubkey -noout > intpub.pem
+$ openssl dgst -sha256 -verify intpub.pem -signature sig.der tbs.der
+Verified OK
+```
+
+tbs.der の 1 バイトを書き換えると失敗します。そして、**サーバ証明書自身の公開鍵では検証できません**。署名したのは発行者だからです。
+
+```
+$ openssl dgst -sha256 -verify intpub.pem  -signature sig.der tbs-modified.der
+Verification failure
+$ openssl dgst -sha256 -verify leafpub.pem -signature sig.der tbs.der
+Verification failure
+```
+
+### 名前の照合
+
+`-checkhost` で、SAN との照合を試せます。ワイルドカードが 1 ラベルにしか一致しないことが確かめられます。
+
+```
+$ openssl x509 -in leaf.pem -noout -checkhost www.example.com
+Hostname www.example.com does match certificate
+$ openssl x509 -in leaf.pem -noout -checkhost a.b.example.com
+Hostname a.b.example.com does NOT match certificate
+```
+
+最後に、CN にだけ名前を書いた証明書が、クライアントによって扱いが分かれるのを確かめます。自前の CA を作り、`CN=localhost` で SAN の無い証明書と、`CN=wrong.invalid` で SAN に `DNS:localhost` を入れた証明書を発行して、Python の `ssl` で 2 つの HTTPS サーバを立てました。
+
+```
+$ openssl x509 -req -in cn.csr  -CA ca.pem -CAkey ca.key -days 1 -out cn.pem  -extfile leaf.ext
+$ openssl x509 -req -in san.csr -CA ca.pem -CAkey ca.key -days 1 -out san.pem -extfile san.ext
+# san.ext には subjectAltName=DNS:localhost、leaf.ext と共通の basicConstraints・keyUsage・EKU
+```
+
+それぞれに `localhost` という名前で接続した結果です。
+
+| クライアント | CN のみ（8443） | SAN あり（8444） |
+| --- | --- | --- |
+| Go 1.24 | `x509: certificate relies on legacy Common Name field, use SANs instead` | 成功 |
+| Python 3.14 既定 | 成功 | 成功 |
+| Python 3.14、`hostname_checks_common_name = False` | `Hostname mismatch` | 成功 |
+| Node 20.19 | 成功 | 成功 |
+| curl 8.7.1（macOS 付属） | 成功 | 成功 |
+
+SAN を持つ証明書は、subject の CN が `wrong.invalid` とまったく違う名前でも、どのクライアントでも通りました。**照合に使われているのは SAN だけ**だからです。逆に CN だけの証明書は、実装によって通ったり落ちたりします。
+
+<Callout type="tip" title="自前の CA では、拡張を省くと別の理由で落ちる">
+  最初に CA 証明書を Key Usage なしで作ったところ、Python 3.14 は名前を調べる前に
+  `CA cert does not include key usage extension` で拒否しました。
+  Python 3.13 から `create_default_context()` が `VERIFY_X509_STRICT` を既定で付けるようになり、RFC 5280 に沿わない証明書を厳しく拒むためです（[Python ssl](https://docs.python.org/3/library/ssl.html#ssl.create_default_context)）。
+  社内の CA を作るなら、Basic Constraints と Key Usage と SAN を省かないようにします。
+</Callout>
+
+## この部品は何と組み合わさるか
+
+証明書 1 枚では、何も確かめられません。組み合わせを並べると、この章の地図になります。
+
+```
+証明書 = 公開鍵（第 106・108 回）+ 名前 + CA の署名（第 107 回）+ ハッシュ（第 104 回）
+   │
+   ├─ 上の CA 証明書とトラストストア ──→ 署名した鍵を信じてよいか（第 111 回）
+   ├─ 時計（第 158 回）             ──→ 期限内か
+   ├─ CRL / OCSP / CT              ──→ 失効していないか、隠れた発行はないか（第 112 回）
+   └─ TLS の CertificateVerify     ──→ 相手が秘密鍵を持っているか（第 113 回）
+```
+
+DNSSEC（第 61 回）と比べると、構造はよく似ています。どちらも「上位が下位の鍵に署名し、検証する側は一番上の鍵だけを最初から持つ」形です。違うのは、DNSSEC では**親ゾーンだけが子の鍵を保証できる**のに対し、Web の PKI では**トラストストアにあるどの CA でも、どの名前の証明書でも発行できる**ことです。この違いが、第 111 回と第 112 回の多くの話題（Name Constraints、CAA、Certificate Transparency）の出発点になります。
+
+## まとめ
+
+- 証明書は「この公開鍵はこの名前のものだ」という文書に、CA が署名したもの。**それ自体は何も暗号化しない**公開の文書で、暗号化は鍵交換と AEAD の仕事
+- X.509 は tbsCertificate、signatureAlgorithm、signatureValue の 3 つの並び。署名は tbsCertificate の DER 全体に対して行われ、検証には**発行者**の公開鍵を使う
+- subject と issuer の一致、AKI と SKI の一致で、証明書を上下につなぐ
+- ホスト名は **SAN で照合し、CN は見ない**（RFC 9525、Chrome 58、Go 1.15）。ただし CN を見てしまうクライアントもまだあるので、名前は必ず SAN に書く
+- ワイルドカードは一番左の 1 ラベルだけに一致する。頂点の名前は含まれない
+- Basic Constraints が CA かどうかを、Key Usage と EKU が何に使ってよい鍵かを決める。知らない critical 拡張があれば拒否する
+- 証明書が保証しないのは、相手が秘密鍵を持っていること、今も失効していないこと、CA が信頼できること、サイトの中身の安全性
+
+証明書の署名を検証するには、発行者の公開鍵が要りました。その発行者の証明書はまた誰かが署名していて、どこかで止まらなければなりません。次の回では、その止まる場所であるルート CA とトラストストアを見ます。

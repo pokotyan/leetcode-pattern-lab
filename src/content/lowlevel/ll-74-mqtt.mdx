@@ -464,7 +464,7 @@ IANA に登録されたポートは、平文の MQTT が 1883、TLS の上の MQ
 00 06 73 33 63 72 65 74          パスワード "s3cret"   ← そのまま読める
 ```
 
-接続フラグ `0xc2` は、ユーザ名あり（ビット 7）、パスワードあり（ビット 6）、Clean Start（ビット 1）です。TLS を使わなければ、パスワードは途中の誰からでも読めます。仕様は、この欄にトークンを入れる使い方も想定しています（[MQTT 5.0 4.12](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。多数の端末を扱うクラウドのブローカでは、TLS のクライアント証明書（第 113 回の mTLS）で端末を識別する形もよく使われます。AWS IoT Core はその代表です（[AWS IoT Core: X.509 client certificates](https://docs.aws.amazon.com/iot/latest/developerguide/x509-client-certs.html)）。
+接続フラグ `0xc2` は、ユーザ名あり（ビット 7）、パスワードあり（ビット 6）、Clean Start（ビット 1）です。TLS を使わなければ、パスワードは途中の誰からでも読めます。仕様は、この欄にトークンを入れる使い方も想定しています（[MQTT 5.0 4.12](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)）。多数の端末を扱うクラウドのブローカでは、TLS のクライアント証明書（第 114 回の mTLS）で端末を識別する形もよく使われます。AWS IoT Core はその代表です（[AWS IoT Core: X.509 client certificates](https://docs.aws.amazon.com/iot/latest/developerguide/x509-client-certs.html)）。
 
 認証の次は**認可**です。どのクライアントがどのトピックに PUBLISH / SUBSCRIBE してよいかを、ブローカの ACL で決めます。ワイルドカードの `#` を誰でも購読できる設定は、全端末の通信を誰でも盗み見られる設定と同じです。
 

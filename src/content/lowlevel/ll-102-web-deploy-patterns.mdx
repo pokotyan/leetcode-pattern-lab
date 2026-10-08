@@ -1,0 +1,350 @@
+---
+title: フロントと API をどこに置くか
+description: 画面と API を同じホストに置くか、サブドメインに分けるか、別のドメインに出すか。その選択だけで、Cookie が届くか、CORS が要るか、CSRF の心配がどこに残るか、第三者 Cookie の制限に巻き込まれるかが決まります。よく見る 6 つの構成を、この章の部品で読み直します
+chapter: websec
+order: 10
+status: published
+topics:
+  - 構成の型
+  - 同一オリジン構成（リバースプロキシ）
+  - サブドメインの API
+  - 別サイトの API
+  - Cookie の Domain 属性
+  - 埋め込みウィジェット
+  - 開発環境の localhost
+  - Public Suffix List への登録
+  - サンドボックス用ドメイン
+requires:
+  - ll-101-iframe
+  - ll-100-cross-origin-isolation
+  - ll-93-origin-site
+  - ll-95-cors
+  - ll-96-third-party-cookie
+  - ll-98-request-headers
+  - ll-127-session-cookie
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 同じアプリなのに、置き場所で動き方が変わる
+
+画面（HTML と JavaScript）と API を、どこに置くか。多くの場合、これは運用の都合で決まります。CDN に静的ファイルを置きたい、API は別のチームが別のクラスタで動かしている、ドメインは広告の部署が持っている、といった理由です。
+
+ところがブラウザから見ると、この選択はそのまま**境界の引き方**になります。第 93 回で見たとおり、ブラウザはオリジンとサイトという 2 つの単位で境界を引き、仕組みごとにどちらを使うかが違います。
+
+- 画面と API が**同じオリジン**なら、CORS は要らない
+- **同じサイト**なら、`SameSite=Lax` の Cookie が届く
+- **別のサイト**なら、Cookie は第三者 Cookie になり、ブラウザの制限の対象になる
+
+この回では、よく見る 6 つの構成の型を並べ、それぞれで Cookie、CORS、CSRF、第三者 Cookie の制限がどう効くかを確かめます。章の最後の回として、第 93〜101 回の部品を組み合わせて読む回です。
+
+## 判断に使う 3 つの問い
+
+どの型でも、次の 3 つを順に問えば、何が起きるかがほぼ決まります。
+
+| 問い | 何が決まるか | 回 |
+| --- | --- | --- |
+| 画面と API は**同じオリジン**か | CORS が要るか。`fetch` の既定で Cookie が付くか | 第 93、95 回 |
+| 画面と API は**同じサイト**か | `SameSite=Lax` / `Strict` の Cookie が付くか。`Sec-Fetch-Site` の値 | 第 93、98、127 回 |
+| API の Cookie は、今の**トップレベルのサイト**から見て第一者か | 第三者 Cookie の制限（遮断、分割）の対象になるか | 第 96、97 回 |
+
+3 つ目の問いの「トップレベル」は、アドレスバーに出ているページのことです。第 96 回で見たとおり、**同じ Cookie でも、どのページの中で使われるかによって第一者（ファーストパーティ）にも第三者（サードパーティ）にもなります**。
+
+もう 1 つ、Fetch Standard の `fetch()` は、資格情報（Cookie など）の既定の扱いが `"same-origin"` です（[Fetch Standard: credentials mode](https://fetch.spec.whatwg.org/#concept-request-credentials-mode)）。**同じオリジンでなければ、同じサイトであっても、`credentials: 'include'` を書かない限り Cookie は付きません**。これは後の実験でも確かめます。
+
+## 型 1: 同一オリジン（リバースプロキシでまとめる）
+
+```
+ブラウザ ── https://example.com/ ──→ リバースプロキシ ──┬─ /       → 静的ファイル（CDN、S3 など）
+                                                   └─ /api/  → API サーバ
+```
+
+画面と API を**同じホスト名の下のパスで分け**、手前のリバースプロキシや CDN で振り分けます。ブラウザから見れば、すべて `https://example.com` という 1 つのオリジンです。
+
+| 部品 | この型での効き方 |
+| --- | --- |
+| CORS | 不要。プリフライトも起きない |
+| Cookie | `__Host-sid; Secure; HttpOnly; SameSite=Lax; Path=/` がそのまま使える（第 127 回） |
+| CSRF | 別のサイトからの POST には Lax の Cookie が付かない。それでも同期トークンか `Sec-Fetch-Site` の確認を重ねる（第 98、127 回） |
+| 第三者 Cookie の制限 | 無関係。Cookie は常に第一者 |
+| XSS | 画面と API が同じオリジンなので、XSS が起きれば API も呼ばれる（第 99 回の CSP で抑える） |
+
+**ブラウザの境界の面では、最も考えることが少ない型**です。代わりに、振り分けの層（第 114 回で扱う TLS の終端と同じ機械であることが多い）が必要になり、画面と API で配信の経路を分けにくくなります。
+
+注意点は 2 つです。1 つは、同じオリジンに**利用者が書いたものや外部のものを置かない**こと。同じオリジンに置いたものは、すべて同じ権限で動きます（後の「利用者のコンテンツを別のドメインに置く」で扱います）。もう 1 つは、プロキシが付け足す `X-Forwarded-*` を API が信じる範囲を決めておくことです（第 114 回）。
+
+## 型 2: 同じサイトの別オリジン（サブドメインの API）
+
+```
+https://app.example.com  （画面）
+        │ fetch(..., { credentials: 'include' })
+        ↓
+https://api.example.com  （API）   ← 別オリジン、同じサイト（example.com）
+```
+
+画面と API をサブドメインで分ける型です。CDN と API のクラスタを別々に運用しやすく、よく使われます。
+
+| 部品 | この型での効き方 |
+| --- | --- |
+| CORS | **必要**。`Access-Control-Allow-Origin: https://app.example.com` と `Access-Control-Allow-Credentials: true`、`Vary: Origin`（第 95 回）。JSON を送ればプリフライトが起きる |
+| Cookie | API のホストが設定した `SameSite=Lax` の Cookie が**届く**。同じサイトからの要求だから |
+| `fetch` の書き方 | `credentials: 'include'` が要る。既定の `same-origin` では付かない |
+| CSRF | `Sec-Fetch-Site` は `same-site`。**兄弟のサブドメインは SameSite の外側ではない** |
+| 第三者 Cookie の制限 | 基本は無関係（同じサイトなので第一者） |
+
+### Cookie の Domain 属性で共有する是非
+
+この型では、「画面のホストでログインし、`Domain=example.com` の Cookie を API にも送る」という作り方がよく出てきます。動きますが、代償があります。
+
+- `Domain=example.com` の Cookie は、`example.com` の下の**すべてのサブドメイン**に送られる。放置された古いサブドメインや、外部のサービスに向けたサブドメインにも届く
+- 逆に、どのサブドメインからも同じ名前の Cookie を**設定し直せる**。Cookie の完全性は弱い、と RFC 自身が書いている（[RFC 6265bis 8.6](https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-22.html#section-8.6)）
+- `__Host-` 接頭辞は `Domain` を付けられないので、**共有する Cookie には `__Host-` の守りが使えない**
+
+多くの場合は、**セッションの Cookie は API のホストで host-only（`Domain` なし、できれば `__Host-`）に設定し**、画面からは `credentials: 'include'` で送るほうが境界は狭く保てます。サブドメインをまたいで共有したい情報があるなら、それが本当にすべてのサブドメインに渡ってよいものかを先に問います。
+
+<Callout type="warn" title="よくある誤解: 「同じサイトの中だから、別のサブドメインは味方」">
+  `SameSite` の境界も、`Sec-Fetch-Site` で `cross-site` だけを弾く対策も、**サイトの内側の兄弟サブドメインを区別しません**（第 93 回、第 98 回）。
+  利用者が HTML を置ける `user.example.com` や、乗っ取られた古い `promo.example.com` からの要求は、`same-site` として届き、Lax の Cookie も付きます。
+  型 2 を選ぶなら、同じ登録可能なドメインの下に**信用できないものを置かない**ことが前提になります。置く必要があるなら、それは別のドメインへ（後述）。
+</Callout>
+
+### API のサブドメインを他社の機械に向けるとき
+
+`api.example.com` を CNAME で外部のサービスに向けることがあります。Safari の ITP は 2020 年の Safari 14 から、**第一者のサブドメインが第一者と違う CNAME を経由して解決される場合**（「第三者の CNAME クローキング」）、その応答で設定された Cookie の寿命を 7 日に縛っています（[WebKit Blog: CNAME Cloaking and Bounce Tracking Defense](https://webkit.org/blog/11338/cname-cloaking-and-bounce-tracking-defense/)）。追跡を第一者に見せかける手口への対策ですが、正当な構成も同じ条件なら巻き込まれます。同じ記事は、サイト全体が同じエッジのサーバを通る場合は対象外になりうることも説明しています。**同じサイトでも、DNS の向け先によってブラウザの扱いが変わりうる**ことは覚えておく価値があります。詳しくは第 97 回で見ました。
+
+## 型 3: 別サイトの API
+
+```
+https://app.example         （画面）
+        │ fetch(..., { credentials: 'include' })
+        ↓
+https://api.example-cdn.net （API）  ← 別オリジン、別サイト
+```
+
+API を別の登録可能なドメインに置く型です。買収したサービスのドメイン、クラウド事業者が払い出したホスト名（`*.cloudfront.net` のような Public Suffix の下）をそのまま使う場合などに起きます。
+
+| 部品 | この型での効き方 |
+| --- | --- |
+| CORS | 必要。資格情報つきなので、許可するオリジンを 1 つずつ明示する（第 95 回） |
+| Cookie | API の Cookie は画面から見て**第三者 Cookie**。`SameSite=Lax` の Cookie は設定すら無視される。`SameSite=None; Secure` が必要 |
+| 第三者 Cookie の制限 | **直撃する**。Safari は既定で遮断、Firefox はトップレベルのサイトごとに分割、Chrome は利用者の設定しだい（第 97 回） |
+| CSRF | `SameSite=None` にした時点で、別のサイトからのフォーム送信にも Cookie が付く。トークンか Fetch Metadata が必須 |
+
+`SameSite=Lax` の Cookie が設定されない理由は、RFC 6265bis の保存の手順にあります。SameSite が `None` 以外の Cookie は、別のサイトからの要求への応答で届いた場合、トップレベルの移動でない限り**捨てられます**（[6265bis 5.7](https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-22.html#section-5.7)）。
+
+**この型で Cookie のセッションを維持するのは、執筆時点（2026 年 9 月）でも不安定です**。Safari は 2020 年から第三者 Cookie を既定で遮断しています（[WebKit Blog](https://webkit.org/blog/10218/full-third-party-cookie-blocking-and-more/)）。Chrome は廃止の計画を撤回し、利用者に選ばせる現在の方式を続けると 2025 年に発表しました（[Privacy Sandbox, 2025 年 10 月](https://privacysandbox.google.com/blog/update-on-plans-for-privacy-sandbox-technologies)）。つまり**遮断している利用者が一定数いる前提で作る**ことになります。
+
+取れる道は 3 つです。
+
+1. **型 1 か型 2 に寄せる**。画面のドメインの下に `api.app.example` を作ってプロキシする。多くの場合これが最も確実
+2. Cookie をやめ、**トークンを `Authorization` ヘッダで送る**。第三者 Cookie の制限は受けないが、トークンをブラウザのどこに置くかという第 128 回の問題が戻ってくる
+3. 画面と同じサイトに **BFF** を置き、BFF から API を呼ぶ（第 131 回、第 138 回の型 2）
+
+## 手元で確かめる: 3 つの型を同じブラウザで比べる
+
+型 1〜3 を、1 台の機械の上で再現しました。Python の `http.server` で HTTPS のサーバを 4 つ立て（自己署名の証明書、127.0.0.1 に限定）、ホスト名は Chrome の `--host-resolver-rules` で 127.0.0.1 に向けています。
+
+| ポート | ホスト名 | 役割 |
+| --- | --- | --- |
+| 18195 | `app.example.test` | 画面。`/api/` の下は型 1 の API |
+| 18196 | `api.example.test` | 型 2 の API（同じサイト） |
+| 18197 | `api.other-cdn.test` | 型 3 の API（別サイト） |
+| 18198 | `evil.attacker.test` | 攻撃者のページ（各 API へのフォーム） |
+
+API は `POST /login` で Cookie を設定し、`GET /me` で届いた Cookie の名前を返します。型 1 の API は `__Host-sid`（Lax）と `shared`（`Domain=example.test`、Lax）を、型 2・3 の API は次の 3 つを設定します。CORS は `https://app.example.test:18195` だけを資格情報つきで許可し、`Vary: Origin` を付けています。
+
+```
+sid_lax=...;  Path=/; Secure; HttpOnly; SameSite=Lax
+sid_none=...; Path=/; Secure; HttpOnly; SameSite=None
+sid_part=...; Path=/; Secure; HttpOnly; SameSite=None; Partitioned
+```
+
+ブラウザは Playwright で操作するヘッドレスの Chrome 153 で、毎回新しく作った独立のプロファイルを使います。画面のページで、各 API に対して `login`（JSON の POST、`credentials: 'include'`）、`/me`（`include`）、`/me`（既定）を順に呼びました。
+
+### 第三者 Cookie を許している Chrome
+
+```
+1 same-origin {"login":"200 ok","me_include":"200 __Host-sid,shared","me_default":"200 __Host-sid,shared"}
+2 same-site   {"login":"200 ok","me_include":"200 shared,sid_lax,sid_none,sid_part","me_default":"200 -"}
+3 cross-site  {"login":"200 ok","me_include":"200 sid_none,sid_part","me_default":"200 -"}
+```
+
+サーバ側のログ（抜粋）では、プリフライトと `Sec-Fetch-Site` の値が見えます。
+
+```
+app.example.test   POST    /api/login  Origin=https://app.example.test:18195  Sec-Fetch-Site=same-origin
+api.example.test   OPTIONS /login      Origin=https://app.example.test:18195  Sec-Fetch-Site=same-site   (preflight)
+api.example.test   GET     /me         Origin=https://app.example.test:18195  Sec-Fetch-Site=same-site   Cookie=shared,sid_lax,sid_none,sid_part
+api.other-cdn.test OPTIONS /login      Origin=https://app.example.test:18195  Sec-Fetch-Site=cross-site  (preflight)
+api.other-cdn.test GET     /me         Origin=https://app.example.test:18195  Sec-Fetch-Site=cross-site  Cookie=sid_none,sid_part
+```
+
+- 型 1 はプリフライトなしで、既定の `fetch` でも Cookie が付いた
+- 型 2 では **Lax の `sid_lax` が届いた**。型 1 の画面側で設定した `Domain=example.test` の `shared` も API に届いている。ただし**既定の `fetch`（`me_default`）では何も付かなかった**
+- 型 3 では **`sid_lax` が保存されなかった**。届いたのは `SameSite=None` の 2 つだけ
+
+### 第三者 Cookie を遮断した Chrome
+
+同じ手順を、プロファイルの設定で第三者 Cookie を遮断した Chrome で繰り返しました（設定の「サードパーティ Cookie をブロックする」に当たる値を、起動前のプロファイルに書いておく）。
+
+```
+1 same-origin {"me_include":"200 __Host-sid,shared"}
+2 same-site   {"me_include":"200 shared,sid_lax,sid_none,sid_part"}
+3 cross-site  {"me_include":"200 sid_part"}
+```
+
+- 型 1 と型 2 は**何も変わらない**。同じサイトの Cookie は第一者だから
+- 型 3 では `sid_none` が消え、**`Partitioned` を付けた `sid_part` だけが残った**。CHIPS の Cookie は「`app.example.test` をトップレベルにしたときの `api.other-cdn.test`」という区画に保存されるので、遮断の対象にならない（第 96 回）。ただしその区画は、別のサイトに埋め込まれたときや、`api.other-cdn.test` を直接開いたときとは共有されない
+
+### 攻撃者のページからのフォーム送信
+
+最後に `evil.attacker.test` のページから、3 つの API の `/transfer` へフォームで POST しました（トップレベルの移動）。
+
+| 送り先 | 第三者 Cookie を許可 | 第三者 Cookie を遮断 |
+| --- | --- | --- |
+| 型 1 `/api/transfer` | 何も付かない | 何も付かない |
+| 型 2 `api.example.test` | `sid_none`, `sid_part` | `sid_none`, `sid_part` |
+| 型 3 `api.other-cdn.test` | `sid_none` | 何も付かない（そもそも保存されていない） |
+
+**第三者 Cookie を遮断しても、型 2 への CSRF は止まりませんでした**。フォームの送信はトップレベルの移動なので、送られる Cookie は移動先から見て第一者だからです。`sid_part` まで付いたのも同じ理由で、移動先の `api.example.test` がトップレベルになり、その区画（`example.test`）の Cookie が選ばれました。型 3 で何も付かなかったのは、遮断の下では最初のログインで Cookie が保存されなかったからで、CSRF への守りではありません。
+
+<Callout type="warn" title="よくある誤解: 「第三者 Cookie が遮断されるなら、CSRF は起きない」">
+  第三者 Cookie の制限が止めるのは、**別のサイトのページの中に埋め込まれた要求**（iframe、画像、`fetch`）に付く Cookie です。
+  攻撃者のページからのフォーム送信やリンクは**トップレベルの移動**で、移動先の Cookie は第一者として扱われます。上の実験では、遮断した Chrome でも `SameSite=None` の Cookie が CSRF の POST に付きました。
+  CSRF を止めるのは SameSite（`Lax` 以上）と、同期トークンや Fetch Metadata による確認です（第 98 回、第 127 回）。
+</Callout>
+
+<Callout type="warn" title="よくある誤解: 「CORS を正しく書けば、別サイトの API でも Cookie のセッションで動く」">
+  CORS はブラウザに**応答を読ませてよいか**をサーバが緩める仕組みで（第 95 回）、Cookie を送るかどうかは決めません。
+  上の実験の型 3 は CORS をすべて正しく返していましたが、`SameSite=Lax` の Cookie は保存されず、第三者 Cookie を遮断すると `SameSite=None` の Cookie も消えました。
+  **CORS の正しさと、Cookie が届くことは別の問題**です。型 3 で Cookie に頼るなら、遮断する利用者のために代わりの道（型 1・2 に寄せる、BFF、CHIPS）を用意します。
+</Callout>
+
+## 型 4: 別のサイトに埋め込まれるウィジェット
+
+```
+https://news.example （トップレベル）
+  └─ <iframe src="https://widget.example/comments">   ← widget.example にとって自分は第三者
+```
+
+コメント欄、チャットの窓、決済のフォーム、地図のように、**自分のページを他社のサイトの中に iframe で置いてもらう**型です。型 3 と違い、トップレベルのサイトを選べないのが特徴です。
+
+| やりたいこと | 使う仕組み | 注意 |
+| --- | --- | --- |
+| 埋め込み先ごとに状態を持つ（チャットの履歴など） | **CHIPS**（`Partitioned`、`Secure` 必須） | 埋め込み先ごとに別の区画。サイトをまたいだ「同じ人」は分からない |
+| 利用者の既存のログインを iframe の中で使う | **Storage Access API**（`document.requestStorageAccess()`） | 利用者の操作が条件。ブラウザによって確認の出し方が違う（第 96 回） |
+| 埋め込まれてよい相手を絞る | CSP の `frame-ancestors`（第 99 回） | クリックジャッキングへの対策にもなる |
+| 親のページとやり取りする | `postMessage` と、受け手での `origin` の確認（第 94 回） | `targetOrigin` に `*` を使わない |
+
+`Partitioned` の Cookie は `Secure` でなければならず、MDN はホスト名に結び付く `__Host-` 接頭辞との併用を勧めています（[MDN: Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)）。
+
+Chrome には、同じ組織の複数のドメインを 1 つの集合として届け出て、第三者 Cookie の制限を緩めてもらう Related Website Sets という仕組みがありました。Google は 2025 年 10 月、利用が少ないことを理由に、これを関連する `requestStorageAccessFor` とともに廃止すると発表しています（[Privacy Sandbox](https://privacysandbox.google.com/blog/update-on-plans-for-privacy-sandbox-technologies)）。一方、同じ発表で **CHIPS と FedCM は他のブラウザにも広がっているとして、支持を続ける**としています。新しく作るなら、この 2 つと Storage Access API を前提にします。
+
+## 型 5: 複数のブランド・ドメインでログインを共有する
+
+`brand-a.example` と `brand-b.example` のように、**別のサイトどうしで 1 回のログインを共有したい**型です。Cookie はサイトをまたいで共有できないので、どの方法も「それぞれのサイトに、自分の第一者の Cookie を持たせる」ところに行き着きます。
+
+```
+brand-a.example ──リダイレクト（トップレベル）──→ id.example（ログイン済みなら即座に戻す）
+                ←── 認可コード ─────────────────
+brand-a.example が自分の Cookie でセッションを作る
+```
+
+- **IdP へのトップレベルのリダイレクト**（OIDC、SAML）。`id.example` の Cookie はトップレベルの移動では第一者なので、第三者 Cookie の制限を受けない（第 129、130、133 回）
+- **隠した iframe で IdP のセッションを確かめる方式は避ける**。iframe の中の IdP の Cookie は第三者 Cookie で、Safari や Firefox では動かない（第 133 回）
+- ブラウザにログインを仲介させる **FedCM**。Chrome 108 で提供が始まり、W3C で標準化が進んでいる（第 133 回）
+
+この型の中身は SSO そのものなので、第 133 回と第 138 回の型 10 で詳しく見ます。ここで押さえるのは、**ブラウザの境界の面では、別のサイトどうしは「リダイレクトで第一者として往復する」以外に確実な道がない**ことです。
+
+## 型 6: 開発環境（localhost）
+
+開発では、画面を `http://localhost:5173`、API を `http://localhost:8080` のように動かすことがよくあります。ここで本番と違うことが 3 つ起きます。
+
+| 違い | 何が起きるか |
+| --- | --- |
+| ポート違いは別オリジンだが**同じサイト** | サイトはポートを見ない（第 93 回）。本番が型 3 でも、開発では SameSite の問題が見えない |
+| `localhost` と `127.0.0.1` は**別のサイト** | 片方で開いた画面から、もう片方の API への Cookie は第三者 Cookie になる |
+| `localhost` は安全な文脈 | 平文の `http` でも `Secure` の Cookie や `__Host-` 接頭辞が使える |
+
+最後の点を、平文の http のサーバ（127.0.0.1:18198）で確かめました。`/set` で `SameSite=None; Secure`、`__Host-`、属性なしの 3 つの Cookie を返し、次のページで届いた Cookie を表示します。3 つ目のホスト名は `--host-resolver-rules` で 127.0.0.1 に向けた普通の名前です。
+
+```
+localhost         isSecureContext=true  cookie=dev_none=1; __Host-dev=1; plain=1
+127.0.0.1         isSecureContext=true  cookie=dev_none=1; __Host-dev=1; plain=1
+dev.example.test  isSecureContext=false cookie=plain=1
+```
+
+`localhost` と `127.0.0.1` では `Secure` の Cookie も受け付けられ、普通のホスト名では `plain` だけが残りました。MDN も、`Secure` の Cookie は平文の `http` のサイトからは設定できないが、`localhost` ではこの要件が無視されると説明しています（[MDN: Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)）。
+
+よく使われるのは、開発用のサーバのプロキシで**同一オリジンに見せる**方法です。Vite なら `server.proxy` に `/api` を書くと、そのパスへの要求が指定したサーバへ中継されます（[Vite: server.proxy](https://vite.dev/config/server-options)）。
+
+```js
+// vite.config.js
+export default {
+  server: { proxy: { '/api': { target: 'http://127.0.0.1:8080', changeOrigin: true } } },
+}
+```
+
+これは本番が型 1 なら素直な再現です。しかし**本番が型 2 や型 3 なら、開発のプロキシは CORS と Cookie の問題を隠します**。本番と同じ構成を試す場として、本番と同じ形のホスト名（`app.dev.example.com` と `api.dev.example.com`）と HTTPS で動くステージング環境を 1 つ持っておくと、「手元では動くのに本番で Cookie が付かない」を早く見つけられます。
+
+## 境界を自分で引く
+
+ここまでは、与えられたオリジンとサイトの境界の上で配置を選ぶ話でした。逆に、**境界そのものを自分で引く**方法が 2 つあります。
+
+### 利用者のコンテンツを別のドメインに置く
+
+利用者がアップロードした HTML や、利用者ごとのページを、自社の画面と同じオリジンや同じサイトに置くとどうなるか。同じオリジンなら利用者のスクリプトが自社の画面と同じ権限で動き、同じサイトなら型 2 の誤解の欄で見たとおり、Cookie を送られ、設定し直されます。
+
+GitHub は 2013 年、GitHub Pages を `github.com` のサブドメインから **`github.io`** という別のドメインへ移しました。理由として、サブドメインで設定された Cookie が親のドメインへの要求に送られてしまうことや、Cookie を上書きして偽の Cookie に置き換える攻撃を挙げ、利用者のコンテンツを本体のサブドメインで配信するのは危険だと書いています（[GitHub Blog: Yummy cookies across domains](https://github.blog/news-insights/company-news/yummy-cookies-across-domains/)）。リポジトリの生のファイルを `raw.githubusercontent.com` から配るのも同じ考え方です。Google も利用者のファイルを `googleusercontent.com` で配っており、その考え方を 2012 年に説明しています（[Google Online Security Blog: Content hosting for the modern web](https://security.googleblog.com/2012/08/content-hosting-for-modern-web.html)）。
+
+こうした**サンドボックス用のドメイン**は、本体とは別の登録可能なドメインにするのが要点です。別のサイトなので、本体の Cookie は届かず、本体の Cookie を設定することもできず、サイト分離（第 86 回）で別のプロセスに入ります。
+
+### Public Suffix List に自社のドメインを登録する
+
+サンドボックス用のドメインの下で、さらに**利用者どうし**を分けたいことがあります。`alice.github.io` と `bob.github.io` が同じサイトだと、互いの Cookie を設定し直せてしまいます。
+
+そこで使うのが Public Suffix List の私的な区画（第 93 回）です。`github.io` はここに登録されているので、ブラウザは `alice.github.io` と `bob.github.io` を**別のサイト**として扱います。リストの手引きは、登録の対象を「**互いに信用しない相手にサブドメインを発行する**、私的に登録されたドメインの持ち主」としています（[PSL Guidelines](https://github.com/publicsuffix/list/wiki/Guidelines)）。登録の申請には、対象のドメインに `_psl` という TXT レコードを置いて持ち主であることを示し、登録された後もそのレコードを残すよう求めています。
+
+登録には重い効果があります。
+
+- 登録したドメインそのもの（`github.io`）には、Cookie を設定できなくなる
+- 利用者のサブドメインどうしは別のサイトになる。SameSite も第三者 Cookie の判定も、この境界で引かれる
+- リストをいつ取り込むかは、ブラウザや各種のライブラリの側が決める（同じ手引き）。登録も取り消しも、すぐに行き渡るとは限らない
+
+**自社の画面と同じ登録可能なドメインに登録するものではありません**。利用者のコンテンツ専用のドメインを別に取り、そちらを登録します。
+
+## 6 つの型を並べる
+
+| 型 | オリジン | サイト | CORS | Cookie（`SameSite`） | CSRF で注意すること | 第三者 Cookie の制限 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 同一オリジン | 同じ | 同じ | 不要 | `Lax` / `Strict`、`__Host-` | 同じオリジンの XSS | 無関係 |
+| 2 サブドメインの API | 別 | 同じ | 必要（資格情報つき） | `Lax` が届く。`include` が必要 | 兄弟のサブドメインは `same-site` | 基本は無関係（CNAME の向け先に注意） |
+| 3 別サイトの API | 別 | 別 | 必要（資格情報つき） | `None; Secure` が必要 | `None` にした時点で素通り | **直撃**。CHIPS か型 1・2 に寄せる |
+| 4 埋め込みウィジェット | 別 | 別 | 場合による | `None; Secure; Partitioned` | `frame-ancestors`、`postMessage` の確認 | **直撃**。CHIPS と Storage Access API |
+| 5 複数ブランドの SSO | 別 | 別 | 不要（リダイレクト） | 各サイトで第一者の Cookie | リダイレクト先の検証（第 129 回） | iframe に頼らなければ回避できる。FedCM |
+| 6 開発環境 | 別（ポート） | 同じ（`localhost`） | プロキシなら不要 | `localhost` は `Secure` を受け付ける | 本番と違う | 本番と違う |
+
+表を縦に見ると、**型の番号が大きくなるほど、ブラウザが代わりに守ってくれる範囲が狭くなり、サーバが自分で確かめることが増えます**。迷ったら、型 1 か型 2 に寄せられないかを最初に考えます。
+
+## この章の部品の組み合わせ
+
+| やりたいこと | 組み合わせる部品 |
+| --- | --- |
+| 画面と API を分けても Cookie のセッションを保つ | 型 2 の配置＋ host-only の `__Host-` Cookie ＋資格情報つき CORS と `Vary: Origin`（第 95 回）＋ `credentials: 'include'` |
+| CSRF を止める | `SameSite=Lax` 以上（第 127 回）＋同期トークン、または `Sec-Fetch-Site` の確認（第 98 回）。第三者 Cookie の制限には頼らない |
+| 埋め込まれても動く | CHIPS ＋ Storage Access API（第 96 回）＋ `frame-ancestors`（第 99 回）＋ `postMessage` の origin の確認（第 94 回） |
+| 利用者のコンテンツで本体を汚さない | 別の登録可能なドメイン＋ Public Suffix List（第 93 回）＋サイト分離（第 86 回）＋ CSP（第 99 回） |
+| 強い機能（`SharedArrayBuffer`）を使う | COOP と COEP、外部の資源には CORP か CORS（第 100 回）。型 3・4 の資源は許可を得る必要がある |
+
+## まとめ
+
+- 画面と API の置き場所は、そのままブラウザの境界の引き方になる。**同じオリジンか、同じサイトか、トップレベルから見て第一者か**の 3 つを問えば、CORS、SameSite、第三者 Cookie の制限がどう効くかが決まる
+- 型 1（同一オリジン）は考えることが最も少ない。型 2（サブドメインの API）は CORS が要るが Lax の Cookie は届き、`fetch` には `credentials: 'include'` が要る
+- 型 2 では兄弟のサブドメインは `same-site`。`Domain` 属性での共有は範囲を広げ、`__Host-` の守りを失う
+- 型 3（別サイトの API）は Lax の Cookie が保存すらされず、`SameSite=None` の Cookie は第三者 Cookie の制限を直撃する。実験では遮断した Chrome で `Partitioned` の Cookie だけが残った
+- 第三者 Cookie の遮断は CSRF を止めない。フォーム送信はトップレベルの移動で、Cookie は第一者として付く
+- 型 4（埋め込み）は CHIPS と Storage Access API、型 5（複数ブランド）はトップレベルのリダイレクトと FedCM。Chrome の Related Website Sets は 2025 年に廃止が決まった
+- 型 6（開発環境）では `localhost` が安全な文脈として扱われ、ポート違いは同じサイト。開発のプロキシは本番の型 2・3 の問題を隠す
+- 利用者のコンテンツは別の登録可能なドメインに置き、利用者どうしも分けるなら、そのドメインを Public Suffix List に登録する
+
+この章で見たブラウザの境界は、どれも**通信そのものが盗まれず、書き換えられない**ことを前提にしていました。`Origin` のヘッダも、`Secure` の Cookie も、HTTPS の上でなければ意味を持ちません。次の第16章では、その前提を支える暗号の部品を、第 103 回の「暗号は何を約束するのか」から見ていきます。

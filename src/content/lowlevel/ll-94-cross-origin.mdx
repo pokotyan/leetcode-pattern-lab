@@ -65,7 +65,7 @@ import Callout from '../../components/Callout.astro'
 <Callout type="warn" title="よくある誤解: 「同一オリジンポリシーがあるので、別のサイトからリクエストは来ない」">
   同一オリジンポリシーが止めるのは、多くの場合**応答を読むこと**で、**リクエストが届くこと**ではありません。
   フォームの POST も、`img` の GET も、読めない `fetch` も、サーバには届きます（下の実験のサーバのログを見てください）。
-  状態を変える要求が別のサイトから届いてしまう問題が CSRF で、これは第 126 回で詳しく見ます。
+  状態を変える要求が別のサイトから届いてしまう問題が CSRF で、これは第 127 回で詳しく見ます。
   CORS の設定も同じで、「CORS で弾いたのでサーバは守られている」とは言えません。これは第 95 回で扱います。
 </Callout>
 
@@ -121,7 +121,7 @@ postMessage reply: http://127.0.0.1:18184 -> {"user":"alice","seen_origin":"http
 <Callout type="note" title="なぜ Lax の Cookie が付いたのか">
   127.0.0.1:18184 と 127.0.0.1:18185 は、別のオリジンですが**同じサイト**です（サイトはポートを見ない。第 93 回）。
   SameSite はサイトを単位にするので、`SameSite=Lax` の Cookie も付きました。
-  B が `localhost` のような別のサイトなら、POST や `fetch` には付きません（第 126 回の実験）。第三者 Cookie としての扱いは第 96 回で見ます。
+  B が `localhost` のような別のサイトなら、POST や `fetch` には付きません（第 127 回の実験）。第三者 Cookie としての扱いは第 96 回で見ます。
 </Callout>
 
 ### fetch: 届くが、応答は渡されない
@@ -218,7 +218,7 @@ A の `/avatar.png` は、ログインしていれば画像を、していなけ
 
 | 対策 | 何を止めるか | 詳しく見る回 |
 | --- | --- | --- |
-| SameSite の Cookie | 別のサイトからの要求に Cookie が付かず、「ログインしている状態」の応答を返さない | 第 126 回 |
+| SameSite の Cookie | 別のサイトからの要求に Cookie が付かず、「ログインしている状態」の応答を返さない | 第 127 回 |
 | Fetch Metadata でサーバ側で弾く | `Sec-Fetch-Site: cross-site` の要求に、そもそも中身を返さない | 第 98 回 |
 | ストレージとキャッシュの分割 | 「以前に見たか」をキャッシュで調べる経路を塞ぐ | 第 96 回 |
 | COOP | 開いたウィンドウへの参照を切り、`length` などを数えさせない | 第 100 回 |
@@ -273,7 +273,7 @@ sandbox="allow-scripts"                    → origin: null                    c
 <Callout type="warn" title="同じオリジンのページに allow-scripts と allow-same-origin を両方付けない">
   HTML Standard は、埋め込むページと同じオリジンのページに `allow-scripts` と `allow-same-origin` を同時に付けると、
   **中のページが自分で `sandbox` 属性を外して読み込み直せるので、sandbox から完全に抜け出せる**と警告しています（[HTML Standard 4.8.5](https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox)）。
-  同じオリジンのスクリプトは親の DOM に触れられるからです。信用しない内容は、別のオリジン（できれば別のサイト）から配信したうえで sandbox に入れます。第 101 回の「サンドボックス用のドメイン」はこのためです。
+  同じオリジンのスクリプトは親の DOM に触れられるからです。信用しない内容は、別のオリジン（できれば別のサイト）から配信したうえで sandbox に入れます。第 102 回の「サンドボックス用のドメイン」はこのためです。
 </Callout>
 
 ## window.opener と noopener
@@ -314,13 +314,13 @@ window.open(A)                          → opener=Window  opener.document:Secur
 
 | この回の境界 | 残る穴 | 塞ぐ部品 |
 | --- | --- | --- |
-| 応答を読ませない（同一オリジンポリシー） | 要求は届き、状態が変わる（CSRF） | SameSite（第 126 回）、CSRF トークン、Fetch Metadata（第 98 回） |
+| 応答を読ませない（同一オリジンポリシー） | 要求は届き、状態が変わる（CSRF） | SameSite（第 127 回）、CSRF トークン、Fetch Metadata（第 98 回） |
 | 応答を読ませない | 本当に読ませてよい相手にも読ませられない | CORS（第 95 回） |
 | JavaScript から読ませない | 同じプロセスに載ったデータは Spectre で読めうる | ORB、CORP、COOP / COEP（第 100 回）、サイト分離（第 86 回） |
 | 埋め込みは許す | 自分のページが他人の iframe に入れられる（クリックジャッキング） | `frame-ancestors`、`X-Frame-Options`（第 99 回） |
 | 埋め込みは許す | エラー、フレームの数、時間から情報が漏れる（XS-Leaks） | SameSite、Fetch Metadata、COOP、キャッシュの分割（第 96 回） |
 | `postMessage` で越える | 相手を確かめないと任意のサイトの命令を受ける | `event.origin` の完全一致、targetOrigin の指定 |
-| `sandbox` で削る | 同じオリジンでは抜けられる | 別のオリジン・別のサイトから配信する（第 101 回） |
+| `sandbox` で削る | 同じオリジンでは抜けられる | 別のオリジン・別のサイトから配信する（第 102 回） |
 
 ## ブラウザごとの違い
 
