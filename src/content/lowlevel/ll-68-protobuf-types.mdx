@@ -307,7 +307,7 @@ ParseError: Message type "shop.v1.Item" has no field named "colour" at "Item".
 
 ## ほかの IDL と比べる
 
-| 観点 | Protobuf | JSON Schema / OpenAPI | Avro | WIT（第 155 回） |
+| 観点 | Protobuf | JSON Schema / OpenAPI | Avro | WIT（第 158 回） |
 | --- | --- | --- | --- | --- |
 | 主な目的 | 版の違う相手とのデータ交換 | JSON 文書の検証と API の記述 | データの保存と交換 | 同じプロセス内のコンポーネントの境界 |
 | 値の無さ | 存在（暗黙 / 明示的） | 必須かどうかと `null` を別々に書く | `["null", "string"]` のような和型 | `option<T>` |

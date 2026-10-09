@@ -1,0 +1,371 @@
+---
+title: IdP の種類と選び方
+description: 「ログインは IdP に任せる」と決めたあと、どの IdP にするのか。従業員向けと顧客向けで求められることの違い、SaaS・クラウド付属・セルフホスト・自前実装という運営の形、選ぶときの軸を並べ、いちばん見落とされやすい「あとで乗り換えられるか」を、iss と sub、パスワードのハッシュ、パスキーの 3 つから確かめます
+chapter: sso
+order: 3
+status: published
+topics:
+  - IdP の選定
+  - Workforce と CIAM
+  - マネージドとセルフホスト
+  - IdP の仲介（ブローカー）
+  - MAU 課金
+  - ベンダロックイン
+  - 遅延移行
+  - pairwise の sub
+  - RP ID と独自ドメイン
+requires:
+  - ll-137-provisioning
+  - ll-136-saml-sso
+  - ll-133-oidc
+  - ll-131-jwt
+  - ll-129-password-mfa
+---
+
+import Callout from '../../components/Callout.astro'
+
+## どれを選んでも OIDC なら同じ、なのか
+
+第 136 回と第 137 回では、IdP は「誰かがすでに運営しているもの」として話を進めました。では、その IdP は何を選べばよいのでしょうか。
+
+名前だけでも、Microsoft Entra ID、Okta、Google、Auth0、Amazon Cognito、Firebase Authentication、Keycloak と、すぐに 10 を超えます。どれも「OIDC と SAML に対応」と書いてあります。**対応するプロトコルが同じなら、どれを選んでも同じ**に見えます。
+
+実際には違います。違いは 3 つの層に出ます。
+
+1. **誰のための IdP か。** 社員が社内の SaaS に入るための IdP と、自社サービスの利用者が登録してログインするための IdP では、求められる機能がほとんど重なりません
+2. **誰が運営するか。** 借りるのか、自分で動かすのか、自分で作るのか。第 139 回で見るとおり、運営の形で引き受ける仕事が変わります
+3. **あとで離れられるか。** IdP を替えると、アプリが利用者を見分けている鍵（第 133 回の `iss` と `sub`）が変わりえます。パスワードのハッシュも、パスキーも、持ち出せるとは限りません
+
+この回は、この 3 つを順に見ます。特定の製品を勧めることはしません。料金や機能は変わりやすいので、数字は**執筆時点（2026 年 9 月）**のもので、公式の資料で確かめられたものだけを書きます。
+
+## 誰のための IdP か
+
+IdP は、用途で大きく 2 つに分かれます。
+
+- **従業員向け**（Workforce、B2E）: 社員や業務委託の人が、社内のシステムや契約している SaaS に入るための IdP
+- **顧客向け**（CIAM: Customer Identity and Access Management）: 自社サービスの利用者が登録し、ログインするための IdP。相手が個人なら B2C、企業なら B2B
+
+| | 従業員向け | 顧客向け（CIAM） |
+| --- | --- | --- |
+| 利用者の数 | 社員の数（数十〜数十万） | 利用者の数（数千〜数億）。増減が読めない |
+| 利用者はどこから来るか | 人事の台帳。管理者が作る | 本人が自分で登録する |
+| つなぐ先 | 契約している多数の SaaS（SAML が多い） | 自社のアプリ（OIDC が多い） |
+| 大事な機能 | SCIM での配布（第 137 回）、端末の管理、条件付きアクセス、管理者の監査 | 登録画面の作り込み、ソーシャルログイン、パスキー、不正登録やボットへの対策 |
+| B2B で加わるもの | ― | **顧客企業ごとの SSO**（相手の IdP を受け入れる）と SCIM、組織ごとの管理画面 |
+| 課金の単位の典型 | ユーザ数 × 月 | 月間アクティブユーザ（MAU）、B2B では接続数 |
+
+従業員向けの IdP は、**「会社の人の台帳」が主役**です。第 137 回で見たとおり、入社と退職を SCIM で各 SaaS へ押し込み、どの端末からどの条件で入れるかを決めます。顧客向けの IdP は、**「知らない人が自分で入ってくる入口」が主役**です。登録の手間を減らしながら、ボットや不正な登録を止め、利用者が 10 倍に増えても落ちないことが求められます。
+
+名前を当てはめると、次のようになります（分け方は代表的な使われ方で、各社は両側に手を伸ばしています）。
+
+| 用途 | 例 |
+| --- | --- |
+| 従業員向け | Microsoft Entra ID、Okta Workforce Identity、Google Workspace / Cloud Identity、JumpCloud、OneLogin、Ping Identity |
+| 顧客向け | Auth0、Amazon Cognito、Firebase Authentication / Google Cloud Identity Platform、Microsoft Entra External ID、Clerk、WorkOS、Stytch、Descope、Supabase Auth、FusionAuth |
+
+いくつか補足します。
+
+- **Auth0 は Okta の傘下**です。Okta は 2021 年 5 月に Auth0 の買収を完了し、独立した事業部門として運営すると発表しました（[Okta](https://www.okta.com/uk/press-room/press-releases/okta-completes-acquisition-of-auth0-old/)）。Okta は別に、従業員向けと同じ基盤に載せた顧客向けの製品も出しています（[Okta, 2025-05](https://www.okta.com/blog/product-innovation/one-platform-every-identity-unifying-okta-customer-identity-with-okta-workforce/)）
+- **Azure AD B2C は新規には売られていません。** 2025 年 5 月 1 日から新規の顧客は購入できず、既存の顧客は使い続けられ、少なくとも 2030 年 5 月まではサポートされます。後継の位置づけが Microsoft Entra External ID です（[Microsoft Learn: External ID FAQ](https://learn.microsoft.com/en-us/entra/external-id/customers/faq-customers)）
+- **Firebase Authentication と Identity Platform は段階の違い**です。Google の比較表では、SAML や OIDC の外部 IdP との連携、マルチテナント、99.95% の SLA は Identity Platform の側にだけあります（[Google Cloud: Product comparison](https://docs.cloud.google.com/identity-platform/docs/product-comparison)）
+- **AWS IAM Identity Center は、IdP というより仲介に近い**立ち位置で使われます。Okta や Entra ID などの外部 IdP を SAML 2.0 でつなぎ、利用者とグループを SCIM で受け取り、それを AWS のアカウントとロールへの割り当てに結びつけます（[AWS: External identity providers](https://docs.aws.amazon.com/singlesignon/latest/userguide/manage-your-identity-source-idp.html)）。自前の利用者の台帳も持てますが、会社の台帳はすでに別の IdP にある、という場面が多いからです
+
+### 同じ IdP で両方をやるか
+
+社員も顧客も 1 つの IdP に入れれば、管理する物は 1 つで済みます。しかし、両方を扱う製品でも、**入れ物は分けてある**ことが多いのです。
+
+Microsoft Entra のテナントは、従業員向けの構成（workforce）か外部向けの構成（external）のどちらかで作ります（同じ FAQ）。Okta も、従業員向けと顧客向けを別の製品として売っています。分ける理由は、上の表の差そのものです。
+
+- **既定の方針が逆**: 従業員向けは「管理者が作った人だけ」、顧客向けは「誰でも登録できる」が出発点です。1 つの入れ物に同居させると、どちらかの既定を例外で崩すことになります
+- **権限の事故が大きくなる**: 顧客の誰かが、設定の誤りで社員向けのグループに入れば、社内の SaaS への入口が開きます。第 135 回で見たテナントの境界を、IdP の中にも引く必要があります
+- **規模と課金が違う**: 数百万の顧客を、ユーザ数で課金される従業員向けの契約に入れることは普通しません
+
+逆に、**同じ製品で入れ物だけ分ける**のは合理的な選択です。運用の知識、監査ログの見方、契約をまとめられます。
+
+## 運営の形で並べる
+
+もう 1 つの軸は、誰がその IdP を動かすかです。
+
+| 形 | 例 | 何を買っているか | 自分に残るもの |
+| --- | --- | --- | --- |
+| SaaS（専業） | Okta、Auth0、Clerk、WorkOS、Stytch、Descope | IdP の機能と運用の全部 | 設定、アプリ側の検証、契約と移行の計画 |
+| クラウド付属 | Amazon Cognito、Google Cloud Identity Platform、Microsoft Entra | 同上。加えてそのクラウドの権限や他のサービスとの結合 | 同上。クラウドの外で使うときの制約 |
+| セルフホスト | Keycloak、authentik、ZITADEL、Ory、Dex、Authelia | ソフトウェアだけ | 署名鍵、TLS、DB、冗長化、更新、監視（第 139 回） |
+| 自前実装 | node-oidc-provider や Spring Authorization Server の上に作る | 仕様の部品だけ | 上の全部と、ログイン画面、利用者の保存、MFA、回復の経路 |
+
+セルフホストとマネージドは、きれいに分かれていません。ZITADEL は自分で動かせるだけでなく、米国・EU・豪州・スイスの地域を選べるクラウド版を持っています（[README](https://github.com/zitadel/zitadel)）。Ory も、オープンソースを自分で動かす形と、フルマネージドの Ory Network の両方を用意しています（[Ory](https://www.ory.com/docs/welcome)）。**「今は借りて、必要になったら同じソフトウェアを自分で動かす」**という逃げ道があることは、後で見る移行のしやすさに効きます。
+
+セルフホストの選択肢の中身（全部入り・部品・仲介・前段の違い）と、引き受ける仕事の一覧は第 139 回で詳しく見ます。
+
+### 自前実装を勧めない理由
+
+OIDC のプロバイダを作るライブラリはよくできています。node-oidc-provider は OpenID Foundation の認証（OpenID Certified）を受けたプロファイルを README に並べています（[node-oidc-provider](https://github.com/panva/node-oidc-provider)）。Spring Authorization Server は、自分で「OpenID Connect 1.0 の IdP や OAuth2 の認可サーバの製品」を組むための、カスタマイズできる土台だと自己紹介しています（[Spring Authorization Server](https://docs.spring.io/spring-authorization-server/reference/overview.html)）。
+
+どちらも**土台**です。仕様どおりのトークンエンドポイントや Discovery は用意してくれますが、次のものはこちらで書きます。
+
+- ログイン画面、パスワードの保存（第 129 回の Argon2id などの選択とパラメータ）
+- 多要素認証とパスキー、アカウント回復の経路
+- ブルートフォースやクレデンシャルスタッフィングへの対策
+- 署名鍵の保管とローテーション（第 111 回、第 131 回）
+
+第 105 回で「自分で暗号を組むな」と述べたのは、アルゴリズムではなく組み合わせ方で壊れるからでした。IdP も同じです。**プロトコルの部品が正しくても、回復の経路 1 つ、比較 1 つで全体が破れます。** 自前実装が正当化されるのは、上の全部を続ける体制があり、既存の製品ではどうしても満たせない要件があるときだけです。
+
+### 第 3 の役割: 仲介
+
+IdP には、利用者の台帳を持たず、**他の IdP のログイン結果を受け取って、自分の名前でトークンを出し直す**使われ方があります。第 137 回で IdP ブローカーと呼んだものです。
+
+```
+  顧客 A 社の Entra ID ─┐ SAML / OIDC
+  顧客 B 社の Okta ─────┼──→ 仲介（ブローカー） ──→ 自社のアプリ
+  Google、GitHub ───────┘     iss = 仲介の URL       アプリは仲介だけを信じる
+```
+
+| 仲介の例 | 形 |
+| --- | --- |
+| Dex | 利用者を持たず、「コネクタ」で LDAP、SAML、GitHub などに認証を任せ、結果を OIDC の ID トークンにする（第 139 回） |
+| Keycloak の identity brokering | 認証を 1 つ以上の外部 IdP に委ねる（[Keycloak: Integrating identity providers](https://www.keycloak.org/docs/latest/server_admin/index.html)） |
+| Auth0 の enterprise connections | Entra ID、Google Workspace、PingFederate など外部の IdP で認証する接続（[Auth0](https://auth0.com/docs/authenticate/enterprise-connections)） |
+| AWS IAM Identity Center | 外部 IdP を SAML と SCIM で受け、AWS のアカウントとアプリへの入口にする（前述） |
+
+仲介を挟むと、アプリが信じる相手は 1 つになり、顧客企業の IdP が何であってもアプリのコードは変わりません。B2B の CIAM が「顧客企業ごとの SSO」を売りにしているのは、この仲介の機能です。その代わり、**第 137 回の突き合わせの責任が仲介に集まり、仲介が止まれば、裏の IdP がすべて健在でも誰も入れません。**
+
+## 選ぶときの軸
+
+ここまでを、比べる項目の形にまとめます。
+
+| 軸 | 何を確かめるか | 関係する回 |
+| --- | --- | --- |
+| プロトコル | OIDC、SAML、SCIM（受ける側か出す側か）、WebAuthn / パスキー、バックチャネルログアウト | 第 129、133、136、137 回 |
+| 規模と課金の単位 | ユーザ数か MAU か。B2B の SSO 接続や SCIM が別料金か。MFA の SMS の従量 | ― |
+| データの置き場所 | 利用者のデータをどの地域に置けるか。規制や契約で国内に置く必要があるか | ― |
+| 可用性と SLA | 止まったときに何が止まるか。SLA の数字と、その対象範囲 | 第 139、142 回 |
+| カスタマイズの自由度 | ログイン画面、登録の流れ、トークンに載せるクレーム。フック（Auth0 の Actions、Cognito の Lambda トリガなど）でどこまで割り込めるか | 第 131 回 |
+| 運用の負担 | 鍵、TLS、DB、更新、監視を誰が持つか | 第 139 回 |
+| 移行のしやすさ | 利用者とパスワードのハッシュを書き出せるか。取り込めるか。`iss` を自分のドメインにできるか | この回の後半 |
+
+課金について、執筆時点で公式の料金ページから確かめられた例をいくつか挙げます。**B2B の SSO 接続が、利用者の数とは別に数えられる**ことが共通しています。
+
+- Amazon Cognito: 直接または Google などのソーシャル IdP でサインインする利用者と、**SAML / OIDC のフェデレーションでサインインする利用者を別に数えます**。無料枠は前者が月 10,000 MAU、後者が月 50 MAU で、後者の超過分は Lite と Essentials のプランで 1 MAU あたり 0.015 ドルです（[Amazon Cognito Pricing](https://aws.amazon.com/cognito/pricing/)）
+- Auth0: 無料プランは 25,000 MAU まで。B2B の有料プランでは enterprise connections（SAML / OIDC の SSO 接続）の数に上限があり、Essentials で 3、Professional で 5 が含まれ、追加は 1 接続あたり月 100 ドルです（[Auth0 Pricing](https://auth0.com/pricing)）
+- WorkOS: 利用者の管理は 100 万 MAU まで無料で、SSO と Directory Sync（SCIM）は接続ごとの課金で、15 接続までは 1 接続あたり月 125 ドルです（[WorkOS Pricing](https://workos.com/pricing)）
+- Microsoft Entra External ID: MAU での課金で、基本の部分は 50,000 MAU まで無料です。追加の機能には無料枠がありません（[Microsoft Learn: External ID FAQ](https://learn.microsoft.com/en-us/entra/external-id/customers/faq-customers)）
+
+数字そのものより、**自分のサービスがどの単位で増えるか**を当てはめることが大事です。個人向けで利用者が多いなら MAU の単価が効き、企業向けで顧客企業が増えるなら接続の単価が効きます。
+
+## 手元で確かめる: 同じ OIDC でも中身は違う
+
+実際のアカウントは作らずに、公開されている Discovery 文書（第 133 回）を取り、実装ごとの違いを見ます。Google、Microsoft の `common` エンドポイント、ソーシャルログインで使われる Apple の 3 つです。比べるために、手元の Docker で仲介の Dex（v2.46.0）も起動しました。
+
+```
+$ curl -s https://accounts.google.com/.well-known/openid-configuration > google.json
+$ curl -s https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration > ms.json
+$ curl -s https://appleid.apple.com/.well-known/openid-configuration > apple.json
+$ docker run -d --name ll108-dex -p 18113:5556 \
+    -v "$PWD/dex.yaml:/etc/dex/config.yaml:ro" ghcr.io/dexidp/dex:latest dex serve /etc/dex/config.yaml
+$ curl -s http://localhost:18113/dex/.well-known/openid-configuration > dex.json
+$ jq -c '{issuer, response_types_supported, code_challenge_methods_supported,
+          subject_types_supported}' google.json
+{"issuer":"https://accounts.google.com",
+ "response_types_supported":["code","token","id_token","code token","code id_token",
+   "token id_token","code token id_token","none"],
+ "code_challenge_methods_supported":["plain","S256"],"subject_types_supported":["public"]}
+```
+
+4 つを表に並べます（執筆時点の 2026 年 9 月 28 日に取得）。
+
+| 項目 | Google | Microsoft（common） | Apple | Dex |
+| --- | --- | --- | --- | --- |
+| `issuer` | `https://accounts.google.com` | `https://login.microsoftonline.com/{tenantid}/v2.0` | `https://appleid.apple.com` | `http://localhost:18113/dex` |
+| `response_types_supported` | 8 種（implicit を含む） | `code`、`id_token`、`code id_token`、`id_token token` | `code` だけ | `code` だけ |
+| `id_token_signing_alg_values_supported` | RS256 | RS256 | RS256 | RS256 |
+| `code_challenge_methods_supported` | plain、S256 | **項目なし** | **項目なし** | S256、plain |
+| `subject_types_supported` | public | **pairwise** | **pairwise** | public |
+| JWKS の鍵 | RSA 2 本 | RSA 8 本（`x5c` 付き、鍵ごとに `issuer`） | RSA 3 本 | RSA 1 本 |
+| 文書の項目数 | 17 | 25 | 12 | 15 |
+
+同じ OIDC の、同じ名前の項目ですが、読み取れることがいくつもあります。
+
+- **Microsoft の `issuer` には `{tenantid}` という置き場所が入っています。** OIDC Discovery は、返ってきた `issuer` が取りに行った URL と一致することを求めています（第 133 回）。`common` は複数のテナントの入口なので、この文字列は文字どおりには一致せず、実際の ID トークンの `iss` はテナントの ID が入った URL になります。個人の Microsoft アカウントのテナント（`9188040d-...`）の Discovery を取ると、`issuer` はその ID が入った URL で返ってきました。**汎用の OIDC ライブラリに `common` の URL を渡すと、`iss` の検証で落ちるか、検証を緩めることになります**
+- **項目が無いことは、対応していないことを意味しません。** Microsoft の Discovery に `code_challenge_methods_supported` はありませんが、Microsoft の文書は PKCE をすべての種類のアプリに勧め、SPA では必須としています（[Microsoft Learn: Authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow)）。逆に、Google の一覧に implicit の `token` があっても、使ってよいことにはなりません（第 133 回）
+- **Microsoft の JWKS の鍵には、`issuer` という項目が付いています。** RFC 7517 が定める JWK の項目にはないものです。企業のテナント用（`{tenantid}`）と個人アカウント用（`9188040d-...`）の鍵が同じ一覧に並んでいて、どの鍵がどの発行者のものかを区別する手がかりになっています。第 142 回の Storm-0558 で問題になったのは、消費者向けと企業向けの鍵をまとめて公開する共通の鍵メタデータと、**鍵が本物でも、その鍵に許された範囲かを確かめなかった**検証でした。鍵ごとの `issuer` は、その範囲を区別するための手がかりです
+- **`pairwise` は、アプリごとに `sub` が違うという宣言です。** 次の節で見るとおり、これが移行の話に直結します
+
+### 仲介の `sub` の中身
+
+Dex で、試験用の mockCallback コネクタを通して認可コード + PKCE のフロー（第 133 回）を 1 回通し、ID トークンの `sub` を見ます。
+
+```
+# ID トークンの payload を Base64URL デコードして 3 項目を抜き出す
+{"iss": "http://localhost:18113/dex", "sub": "Cg0wLTM4NS0yODA4OS0wEgRtb2Nr", "email": "kilgore@kilgore.trout"}
+$ python3 -c 'import base64;print(base64.urlsafe_b64decode("Cg0wLTM4NS0yODA4OS0wEgRtb2Nr"))'
+b'\n\r0-385-28089-0\x12\x04mock'
+```
+
+Base64URL を外すと、裏の IdP での利用者の ID（`0-385-28089-0`）と、Dex の設定の中の**コネクタの ID**（`mock`）が並んでいます。Dex の `sub` はこの 2 つを protobuf で詰めたものです（[dexidp/dex #1719](https://github.com/dexidp/dex/issues/1719)）。設定ファイルでコネクタの ID を `corp-ldap` に書き換えて同じ人でもう一度ログインすると、こうなりました。
+
+```
+{"iss": "http://localhost:18113/dex", "sub": "Cg0wLTM4NS0yODA4OS0wEgljb3JwLWxkYXA", "email": "kilgore@kilgore.trout"}
+b'\n\r0-385-28089-0\x12\tcorp-ldap'
+```
+
+`iss` も、裏の利用者も、メールアドレスも同じなのに、**`sub` が変わりました**。アプリが（`iss`, `sub`）で利用者を引いていれば、この人は「知らない人」になります。コネクタの名前を整理しただけでも、アカウントの突き合わせは壊れるのです。
+
+終わったら `docker stop ll108-dex` で止めます。
+
+## ロックインと移行
+
+IdP の選定でいちばん見落とされるのが、**あとで乗り換えるときに何が起きるか**です。プロトコルは標準でも、利用者を見分ける鍵と、本人を確かめる材料は、IdP の中にあります。
+
+### iss が変わり、sub も変わりうる
+
+第 133 回と第 137 回で、アプリは利用者を（`iss`, `sub`）の組で覚えるべきだと見ました。これは、**IdP を替えると、アプリの側の対応表を作り直す必要がある**ということでもあります。
+
+- `iss` は発行者の URL そのものです。IdP を替えれば必ず変わります
+- `sub` は、発行者が自分の規則で割り当てた値です。新しい IdP に同じ値を入れられるとは限りません
+
+同じ製品の中でさえ変わる例があります。
+
+| 場面 | 何が変わるか | 出典 |
+| --- | --- | --- |
+| Cognito のユーザプールを作り直す | AWS の書き出しの手引きで新しいプールに利用者を入れると、`sub` は新しく割り当てられる。パスワードは複製されず、利用者は再設定が要る。MFA を有効にしたプールは対象外 | [AWS: Guidance components](https://docs.aws.amazon.com/solutions/latest/cognito-user-profiles-export-reference-architecture/guidance-components.html) |
+| Cognito の発行者の種類を替える | 従来の `https://cognito-idp.<地域>.amazonaws.com/<プール ID>` と、推奨される `https://issuer-cognito-idp.<地域>...` の 2 種類がある | [AWS: User pools as an OIDC issuer](https://docs.aws.amazon.com/cognito/latest/developerguide/federation-endpoints.html#user-pool-oidc-issuer) |
+| Entra ID で別のアプリ登録に移る | `sub` はアプリの ID ごとに違う pairwise の値。アプリをまたいで同じなのは `oid` | [Microsoft Learn: ID token claims](https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference) |
+| Apple でアプリを別の開発者チームに移す | 利用者の ID はチーム単位。移管では「移管用の ID」を介して新しいチームの ID に交換し、受け取り側は移管の承認から 60 日以内に交換する | [Apple: Transferring your apps and users](https://developer.apple.com/documentation/signinwithapple/transferring-your-apps-and-users-to-another-team) |
+| Dex のコネクタの ID を変える | 上で見たとおり `sub` が変わる | 手元の実験 |
+
+<Callout type="tip" title="アプリの側で、自分の利用者 ID を持つ">
+  アプリのデータベースで、利用者を**自分で採番した ID** で表し、（`iss`, `sub`）はそれに結びつく「外部の身元」の表に置いておくと、IdP を替えるときの作業は「外部の身元の表を張り替える」ことに限られます。
+  第 137 回の突き合わせの表と同じ形です。IdP の `sub` をそのまま主キーにして全部の表から参照していると、乗り換えは全テーブルの書き換えになります。
+  張り替えの間は、新旧の IdP の（`iss`, `sub`）を両方持てる形にしておきます。
+</Callout>
+
+### パスワードのハッシュを持ち出せるか
+
+利用者の名前やメールアドレスは、たいてい API で書き出せます。問題はパスワードです。IdP が持っているのはパスワードそのものではなく、第 129 回で見たハッシュ（とソルトとパラメータ）です。**ハッシュを書き出せて、移行先がその形式を取り込めれば**、利用者はパスワードを変えずに移れます。
+
+| | 書き出し | 取り込み |
+| --- | --- | --- |
+| Auth0 | API では書き出せない。サポートへの申請で、PGP で暗号化した書き出しを受け取る。無料プランでは不可。役員級の承認の書面が要り、ダウンロードは 3 日で期限切れ。日時の保証はない（[Auth0: Export data](https://auth0.com/docs/troubleshoot/customer-support/manage-subscriptions/export-data)、[Export password hashes](https://auth0.com/docs/manage-users/user-migration/export-password-hashes-and-mfa-secrets)） | ― |
+| Amazon Cognito | AWS 自身の書き出しの手引きでもパスワードは対象外で、移した先では再設定が要る（上の表） | CSV で取り込める。既定ではパスワードなしで取り込み、再設定が要る。新しい基盤のプールでは bcrypt、scrypt、Argon2id、PBKDF2-SHA256 のハッシュを、パラメータの上限つきで取り込める（[AWS: Importing users from a CSV file](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-using-import-tool.html)） |
+
+取り込みの側の条件にも注意が要ります。Cognito の場合、bcrypt のコストは 12 まで、Argon2id はメモリ 19,456 KiB・反復 2 回まで、というように上限があり、超えた利用者は取り込みに失敗します（同じ文書）。**第 129 回で強くしたパラメータが、移行先では強すぎて入らない**ことがありえます。TOTP の秘密（第 129 回）やパスキーは、この表のさらに外にあります。
+
+### 持ち出せないなら: ログインのときに移す
+
+ハッシュを持ち出せない、または取り込めないときの定番が、**遅延移行**（lazy migration）です。利用者が新しい IdP にログインしようとしたときに、入力されたパスワードを**古い仕組みで確かめ**、正しければその場で新しい IdP に利用者を作ります。
+
+```
+  利用者 ──(ID とパスワード)──→ 新しい IdP
+                                  │ この人はまだいない
+                                  ├──→ 移行用のフック ──→ 古い IdP / 古い DB で確かめる
+                                  │                          │ 正しい
+                                  │ ←──── 属性を返す ─────────┘
+                                  └─ 新しい IdP に利用者を作り、パスワードを自分の形式で保存
+```
+
+公式の仕組みとして、次のものがあります。
+
+- **Cognito の移行用 Lambda トリガ**: パスワードでサインインしたときや、パスワードを忘れたときの流れで、利用者がプールにいなければ呼ばれます。関数が成功を返すと、Cognito がその利用者を作ります。パスワードなしのサインインでは呼ばれません。また、移行のときにはプールのパスワードの強度の方針が適用されないので、必要なら関数の中で確かめます（[AWS: Migrate user Lambda trigger](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-migrate-user.html)）
+- **Auth0 の Custom Database の「Import Users to Auth0」**: Auth0 にいない利用者がログインすると、外部の利用者の保存先に対して認証し、成功すればその ID とパスワードで Auth0 に利用者を作ります（[Auth0: Configure automatic migration](https://auth0.com/docs/manage-users/user-migration/configure-automatic-migration-from-your-database)）
+
+遅延移行は、**ログインしてこない人は永遠に移らない**という点で、第 137 回の JIT と同じ弱点を持ちます。古い仕組みをいつ止めるかを決め、残った人にはパスワードの再設定をお願いすることになります。また、移行の期間中は、**新旧の 2 つの IdP と、その間をつなぐフックが全部、攻撃の入口**です。
+
+### パスキーはドメインに結びつく
+
+第 129 回で見たとおり、パスキーは **RP ID**（通常はドメイン名）に結びつけて作られ、ブラウザはページのオリジンと RP ID が合わなければ使わせません。IdP がログイン画面を出しているなら、RP ID は**IdP のドメイン**になりがちです。すると、IdP を替えてドメインが変わった時点で、利用者の端末にある鍵は使えなくなります。各社の文書も同じことを書いています。
+
+- Cognito: 既定の RP ID は、独自ドメインがあればそれ、なければ Cognito が割り当てるプレフィックスのドメイン。**RP ID を変えると、利用者は新しい RP ID で登録し直す必要がある**ので、公開前に決めておくよう勧めています（[AWS: Authentication flows](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-authentication-flow-methods.html)）
+- Auth0: RP ID を変えると、**他のドメインのパスキーはすべて使えなくなり、利用者は登録し直す**（[Auth0: Configure passkey policy](https://auth0.com/docs/authenticate/database-connections/passkeys/configure-passkey-policy)）
+- Okta: 組織の既定の RP ID は Okta のドメイン。新しい RP ID を設定しても古い登録は消えないが、**ブラウザはサインインのときにそれを出さない**（[Okta Developer: Passkeys and custom domains](https://developer.okta.com/docs/guides/custom-passkeys/main/)）
+
+パスキーは、パスワードのハッシュと違って、**原理的に持ち出せません**。秘密鍵は利用者の端末や、その同期先にあり、IdP は公開鍵しか持っていないからです。
+
+### 独自ドメインで IdP を公開しておく
+
+ここまでの 3 つをまとめると、IdP を最初から**自分のドメイン**（例: `login.example.com`）で公開しておく意味が見えます。
+
+| 何が自分のドメインに乗るか | 乗り換えのときの効き目 |
+| --- | --- |
+| パスキーの RP ID | 移行先も同じドメインで RP ID を名乗れれば、登録し直さずに済む見込みが立つ（移行先がその RP ID で既存の公開鍵を取り込めることが前提） |
+| ログイン画面の URL | 利用者のブックマークや、パスワードマネージャに保存された URL が変わらない |
+| `iss`（製品が許せば） | 独自ドメインを `iss` に使える製品なら、RP 側の設定の変更を減らせる。ただし `sub` の一致は別問題 |
+
+ただし、独自ドメインを使っても、**IdP の中身を替えれば `sub` や署名鍵は変わる**ことが多く、RP の側の作業がなくなるわけではありません。独自ドメインは「乗り換えを無痛にする」ものではなく、「乗り換えで壊れる物の数を減らす」ものです。
+
+## よくある誤解
+
+<Callout type="warn" title="誤解 1: マネージドにすれば、IdP の障害とは無縁になる">
+  借りた IdP も止まります。第 142 回で見る 2021 年 3 月の Azure AD の障害では、署名鍵のローテーションの誤りで、Azure AD に認証を頼る多数のアプリでログインが失敗しました。
+  マネージドにすると、**直す人が自分でなくなる**だけで、**止まったときに全部のログインが止まる**ことは変わりません。
+  SLA は「止まったときに返金される条件」であって、止まらない保証ではありません。IdP が止まったときに、発行済みのセッションで何を続けられるか（第 136 回の 2 段のセッション）を、自分のアプリの側で決めておく必要があります。
+</Callout>
+
+<Callout type="warn" title="誤解 2: IdP を入れれば、認可も済む">
+  IdP が決めるのは「この人は誰か」と、せいぜい「どのグループに属するか」までです。
+  第 137 回で見たとおり、グループが何を意味するかはアプリが決め、第 135 回で見たとおり、**このオブジェクトをこの人が触ってよいか**はアプリの中でしか判断できません。
+  IdP の機能表に「ロール」や「権限」とあっても、それはトークンにクレームを載せる仕組みです。BOLA / IDOR を防ぐのは IdP ではありません。
+</Callout>
+
+<Callout type="warn" title="誤解 3: Cognito や Firebase は IdP なのだから、社内 SSO にもそのまま使える">
+  どちらも OIDC のトークンを出す IdP ですが、作りは**自社サービスの利用者向け**です。
+  従業員向けに要る、人事の台帳からの SCIM での配布、契約している多数の SaaS への SAML の IdP としての連携、端末の状態を見る条件付きアクセスは、主な用途に入っていません。
+  むしろ Cognito も Identity Platform も、**社員の IdP を外部 IdP として受け入れる側**の機能（SAML / OIDC のフェデレーション）を持っています。Cognito では、そのフェデレーションの利用者が別の単価で数えられます（前述）。
+</Callout>
+
+<Callout type="warn" title="誤解 4: OIDC に対応していれば、どれに替えても同じ">
+  手元で見たとおり、同じ OIDC でも、`issuer` の形、PKCE の書き方、`sub` が pairwise か、JWKS の鍵の持ち方が違います。
+  そしてプロトコルが同じでも、**`iss` と `sub` は IdP を替えれば変わりうる**ので、アプリの利用者の対応表は作り直しになります。
+  パスワードのハッシュや TOTP の秘密、パスキーは、OIDC の外にあって、持ち出せるかどうかは製品しだいです。「標準に対応」は、つなぎやすさの保証であって、離れやすさの保証ではありません。
+</Callout>
+
+## 組み合わせる: IdP は 1 つとは限らない
+
+実際の会社では、用途ごとに別の IdP を持ち、それを仲介でつなぐ構成がよく見られます。
+
+```
+  社員 ──→ 従業員向け IdP（Entra ID、Google など）
+             │ SAML / OIDC + SCIM（第 136、137 回）
+             ├──→ 社内の SaaS（経費、チャット、Git ホスティング）
+             ├──→ AWS IAM Identity Center ──→ AWS のアカウントとロール
+             └──→ 自社サービスの管理画面（社員として入る）
+
+  顧客 ──→ 顧客向け IdP（CIAM）──→ 自社サービス
+             ↑ ソーシャルログイン（Google、Apple）
+             ↑ 顧客企業の IdP（B2B の SSO）: CIAM が仲介して受ける
+```
+
+ポイントは 3 つです。
+
+- **社員と顧客の入口を分ける。** 自社サービスの管理画面に社員が入るときは、従業員向けの IdP を通します。顧客向けの IdP に社員のアカウントを作ると、退職の処理（第 137 回）が従業員向けの台帳から届きません
+- **顧客企業の IdP は、仲介で受ける。** アプリが信じるのは CIAM の `iss` だけにして、顧客企業ごとの違いは仲介の中で吸収します。突き合わせは第 137 回のとおり、顧客企業の（`iss`, `sub`）とテナントで行います
+- **IdP ごとに止まり方が違う。** 従業員向けの IdP が止まれば社内の業務が止まり、CIAM が止まれば売上が止まります。どちらの停止に何を備えるかは別々に考えます
+
+こうした構成を、1 つずつ図と「どの部品が何を保証しているか」の表で見るのが第 141 回です。
+
+## この回の部品の組み合わせ
+
+| 選ぶときに見るもの | 実体 | 前の回 |
+| --- | --- | --- |
+| 何を話せるか | Discovery の各項目、SAML のメタデータ、SCIM の `/ServiceProviderConfig` | 第 133、136、137 回 |
+| 利用者を誰と見分けるか | （`iss`, `sub`）。pairwise か public か。アプリ側の利用者 ID との対応表 | 第 133、137 回 |
+| トークンを誰の鍵で信じるか | JWKS と `kid`、鍵ごとの発行者の範囲 | 第 131、142 回 |
+| 本人を何で確かめるか | パスワードのハッシュ、TOTP の秘密、パスキー（RP ID）。どれが持ち出せるか | 第 129 回 |
+| 誰が動かすか | SaaS、クラウド付属、セルフホスト、自前実装 | 第 139 回 |
+| 何を許すか | IdP の外、アプリの中 | 第 135 回 |
+
+IdP は 1 つの製品に見えますが、選ぶときに比べているのは、この表の部品の**組み合わせ方と、持ち出し方**です。
+
+## まとめ
+
+- IdP は用途で**従業員向け**（台帳、SCIM、多数の SaaS との SAML、端末と条件付きアクセス）と**顧客向け**（自己登録、ソーシャルログイン、大量の利用者、B2B では顧客企業ごとの SSO）に分かれ、求められることがほとんど重ならない
+- 両方を扱う製品でも入れ物は分けることが多い。既定の方針が逆で、混ぜると権限の事故が大きくなる
+- 運営の形は SaaS、クラウド付属、セルフホスト、自前実装の 4 つ。ZITADEL や Ory のように、同じソフトウェアを借りても自分で動かしてもよいものもある
+- 自前実装のライブラリは土台で、ログイン画面、パスワードの保存、MFA、回復の経路、鍵の管理は自分で書く。勧められるのは、それを続けられる体制があるときだけ
+- 台帳を持たずに他の IdP の結果を出し直す**仲介**という役割がある。アプリが信じる相手を 1 つにできる代わりに、突き合わせの責任と停止の影響が集まる
+- 比べる軸は、プロトコル、課金の単位、データの置き場所、可用性、カスタマイズ、運用の負担、**移行のしやすさ**。B2B の SSO 接続は利用者の数とは別に数えられることが多い
+- 同じ OIDC でも、`issuer` の形、PKCE の書き方、pairwise の `sub`、JWKS の持ち方は実装ごとに違う
+- IdP を替えると `iss` は必ず、`sub` もしばしば変わる。アプリは自分の利用者 ID を持ち、（`iss`, `sub`）は張り替えられる表に置く
+- パスワードのハッシュの書き出しと取り込みは製品しだい。持ち出せなければ、ログインのときに古い仕組みで確かめて移す遅延移行を使う
+- パスキーは RP ID に結びつき、原理的に持ち出せない。IdP を最初から自分のドメインで公開しておくと、乗り換えで壊れる物を減らせる
+
+この回では、IdP を「借りる」側から並べ、セルフホストは名前を挙げるだけにしました。次の第 139 回では、そのセルフホストを実際に動かします。Keycloak を手元で起こし、署名鍵を入れ替え、止め、書き出しながら、借りていれば誰かがしてくれていた仕事を 1 つずつ確かめます。

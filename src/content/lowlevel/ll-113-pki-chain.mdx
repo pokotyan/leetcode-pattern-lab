@@ -1,0 +1,384 @@
+---
+title: 信頼の連鎖
+description: 証明書は CA の署名付きの文書でした。では、その CA の署名はなぜ信じてよいのか。ルート・中間・サーバの 3 段をたどる仕組みと、「どのルートを信じるか」がプログラムごとに違うせいで起きる障害を、自前の CA を作りながら見ます
+chapter: tls
+order: 2
+status: published
+topics:
+  - ルート CA / 中間 CA
+  - トラストストア
+  - 証明書チェーン
+  - パス検証
+  - AIA
+  - クロス署名
+  - Name Constraints
+  - プライベート PKI
+  - TLS 検査プロキシ
+  - DANE
+requires:
+  - ll-112-x509
+  - ll-109-signature
+  - ll-61-dnssec
+---
+
+import Callout from '../../components/Callout.astro'
+
+## その CA の署名は、誰が保証するのか
+
+第 112 回で、証明書は「この公開鍵はこの名前のものだ」という文書に、**発行者（Issuer）が署名したもの**だと見ました。検証する側は、Issuer の公開鍵で署名を確かめます（第 109 回）。
+
+すると、すぐに次の問いが出てきます。**その Issuer の公開鍵は、どうして本物だと言えるのか。** Issuer の公開鍵もまた、別の誰かが署名した証明書に入っています。その誰かの公開鍵は、さらに別の証明書に……とたどっていくと、どこかで止めなければなりません。
+
+止める場所が**ルート CA** です。ルート CA の証明書は自分自身が署名した（自己署名の）証明書で、署名を検証しても「自分で自分を保証している」ことしか分かりません。**ルートは検証で信じるのではなく、最初から信じることにしておく**ものです。その「最初から信じる」一覧を**トラストストア**と呼びます。
+
+第 61 回の DNSSEC で、ルートゾーンの鍵 1 つをトラストアンカーとして持っておけば、そこから下の署名をすべて確かめられるのを見ました。Web の PKI（公開鍵基盤）も形は同じです。違いは、**アンカーが 1 つではなく、100 を超える CA の一覧で、しかもその一覧がプログラムごとに違う**ことです。この回の障害の多くは、ここから生まれます。
+
+## 3 段の形
+
+実際のサーバ証明書は、ほぼ必ず次の 3 段になっています。
+
+```
+[ルート CA]      Subject = Issuer = Demo Root CA         ← トラストストアに入っている
+     │ 署名                                            （サーバは送らなくてよい）
+     ▼
+[中間 CA]        Subject = Demo Intermediate CA
+                 Issuer  = Demo Root CA                  ← サーバが送る
+     │ 署名
+     ▼
+[サーバ証明書]   SAN = app.internal.test
+                 Issuer  = Demo Intermediate CA          ← サーバが送る（先頭）
+```
+
+なぜ 2 段ではなく中間を挟むのか。**ルートの秘密鍵を普段使わないため**です。ルートの鍵が漏れれば、そのルートの下の証明書を全部作り直すうえに、世界中のトラストストアを更新しなければなりません。そこでルートの鍵はネットワークから切り離して保管し、数年に一度、中間 CA の証明書に署名するときだけ取り出します。日々の発行は中間 CA の鍵で行い、中間が漏れたらその中間だけを失効させて替えます。
+
+第 61 回の KSK と ZSK が「親との手続きを減らすために鍵を 2 段に分けた」のと、同じ発想です。
+
+## 誰が、何を送るのか
+
+TLS のハンドシェイクで、サーバは Certificate メッセージに証明書の列を入れて送ります。TLS 1.3 の決まりは次のとおりです（[RFC 8446 4.4.2](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4.2)）。
+
+- 先頭はサーバ自身の証明書でなければならない（MUST）
+- 続く証明書は、直前の証明書に署名したものであるべき（SHOULD）
+- トラストアンカー（ルート）は、相手が持っていると分かっていれば省いてよい（MAY）
+
+ここで大事なのは役割の分担です。**中間証明書を届けるのはサーバの責任、ルートを選ぶのはクライアントの権利**です。
+
+<Callout type="warn" title="よくある誤解: ルートも送れば確実に信頼される">
+  サーバがルート証明書を一緒に送っても、クライアントはそれを「信じる根拠」には使いません。
+  送られてきた証明書はすべて、チェーンを組み立てるための**材料**にすぎず、
+  最後にたどり着いた先が**自分のトラストストアにあるか**だけで判定します。
+  そうでなければ、攻撃者は自前のルートを添えて送るだけで何でも通せてしまいます。
+  後で使う `openssl verify` が、サーバから届いた証明書を渡すオプションを `-untrusted` と名付けているのはこのためです。
+  ルートを送るのは、バイト数が増えるだけで害はないが益もない、という扱いです。
+</Callout>
+
+## トラストストアはどこにあるのか
+
+「信頼するルートの一覧」は 1 つではありません。**証明書を検証するプログラムが、どの一覧を読むか**で決まります。
+
+| 検証する側 | 読むトラストストア |
+| --- | --- |
+| macOS / Windows の OS の API | OS のキーチェーン / 証明書ストア |
+| Firefox | Mozilla が管理する NSS の一覧（Mozilla の CA プログラム） |
+| Chrome | Chrome 105 から、OS ではなく自前の **Chrome Root Store** へ順次移行（[Chrome Root Store](https://chromium.googlesource.com/chromium/src/+/HEAD/net/data/ssl/chrome_root_store/README.md)） |
+| Java | `$JAVA_HOME/lib/security/cacerts`（JDK に同梱。[keytool](https://docs.oracle.com/en/java/javase/21/docs/specs/man/keytool.html)） |
+| Python の `requests` など | `certifi` パッケージ（Mozilla の一覧を抜き出したもの。[certifi](https://github.com/certifi/python-certifi)） |
+| Python の標準 `ssl` | リンクしている OpenSSL の既定の場所（`SSL_CERT_FILE` で上書き可） |
+| Node.js | バイナリに**埋め込まれた**一覧。`--use-system-ca` で OS のストアも使う |
+| Go | macOS と Windows では OS の検証器、Linux では `/etc/ssl/certs` などのファイル（[crypto/x509](https://go.dev/src/crypto/x509/verify.go)） |
+| Linux のコンテナ | `ca-certificates` パッケージが置く `/etc/ssl/certs`。**入れなければ空** |
+
+Node.js の `--use-system-ca` は v23.8.0 と v22.15.0 で入りました（[Node.js CLI](https://nodejs.org/api/cli.html#--use-system-ca)）。執筆時点（2026 年 9 月）で Node 20 には無く、社内のルートを足すには `NODE_EXTRA_CA_CERTS` 環境変数を使います。
+
+<Callout type="warn" title="よくある誤解: OS に入れた証明書は、全部のプログラムが信頼する">
+  社内のルート証明書を OS のキーチェーンに入れると、Safari や Chrome では開けるようになります。
+  ところが同じマシンで、Node.js のスクリプト、`pip`、Java のアプリ、Docker の中の `curl` は失敗し続けます。
+  それぞれが**別のトラストストアを持っている**からです。
+  「ブラウザでは開けるのに、CLI だけ `unable to get local issuer certificate`」という相談の大半はこれです。
+  直すには、プログラムごとの流儀（`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`keytool -importcert`、イメージへの `update-ca-certificates`）で、それぞれに入れる必要があります。
+</Callout>
+
+## 検証の手順
+
+チェーンが組み上がったら、クライアントはそれを端から確かめます。手順の本体は [RFC 5280 6.1](https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1) のパス検証です。要点だけを並べると、次のとおりです。
+
+| 確かめること | 見る場所 | 呼び戻す回 |
+| --- | --- | --- |
+| **署名**: 各証明書が、1 つ上の公開鍵で検証できる | signatureValue | 第 109 回 |
+| **期限**: すべての証明書が、今の時刻で有効期間内 | notBefore / notAfter | 第 112 回、第 161 回（時計） |
+| **CA であること**: 上の段がすべて `CA:TRUE`、段数が pathLenConstraint 以内 | Basic Constraints | 第 112 回 |
+| **用途**: サーバ証明書の EKU に serverAuth、CA の KU に keyCertSign | Key Usage / EKU | 第 112 回 |
+| **名前の範囲**: 上の段の Name Constraints に収まっている | Name Constraints | この回 |
+| **名前**: 接続先のホスト名が SAN に一致 | subjectAltName | 第 112 回 |
+| **失効**: 途中の証明書が取り消されていない | CRL / OCSP | 第 114 回 |
+| **終点**: 最後の証明書がトラストストアにある | — | この回 |
+
+1 つでも欠ければ失敗です。ここで、この回の主題がはっきりします。**署名（第 109 回）は「この鍵で署名された」ことしか保証しません。** 鍵が誰のものかは証明書（第 112 回）が言い、その証明書を信じてよいかは連鎖とトラストストアが決め、今それが有効かは時計と失効情報が決めます。どれか 1 つでは、何も言えません。
+
+## 中間証明書の送り忘れ
+
+いちばん多い設定ミスは、サーバが**サーバ証明書だけを送り、中間証明書を送らない**ことです。nginx で `ssl_certificate` に中間を連結していないファイルを指定した、といった形で起こります。
+
+厄介なのは、**ブラウザでは開けてしまう**ことです。
+
+- **Chrome** は、足りない中間を、サーバ証明書の **AIA**（Authority Information Access）拡張に書かれた URL から取りに行きます（[RFC 5280 4.2.2.1](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.2.1) の caIssuers。Chromium での扱いは [net-dev の議論](https://groups.google.com/a/chromium.org/g/net-dev/c/H-ysp5UM_rk/m/TcKRw3pbDAAJ)）
+- **Firefox** は AIA を取りに行かない代わりに、Mozilla の CA プログラムに開示された**中間証明書を全部あらかじめ配っておきます**（Firefox 75 から。[Intermediate Preloading](https://wiki.mozilla.org/Security/CryptoEngineering/Intermediate_Preloading)）
+
+一方、curl、Python、Node.js、Java、Go（Linux）は、どちらもしません。送られてきた材料と自分のトラストストアだけでチェーンを組もうとし、中間が無ければ失敗します。
+
+<Callout type="warn" title="よくある誤解: ブラウザで緑なら、証明書の設定は正しい">
+  ブラウザは送り忘れを黙って補います。
+  そのため「サイトは見られるのに、API を呼ぶバッチや、Webhook を受ける相手のサーバだけが失敗する」という形で表に出ます。
+  確かめるときは、ブラウザではなく `openssl s_client -connect host:443 -servername host` を使い、
+  `Certificate chain` に中間が並んでいるか、`Verify return code: 0 (ok)` になるかを見ます（手元で確かめる節で実演します）。
+</Callout>
+
+## 経路は 1 本とは限らない: クロス署名
+
+同じ中間 CA（あるいは同じルートの鍵）に、**複数の上位が署名する**ことがあります。これを**クロス署名**と呼びます。新しい CA が、まだ各所のトラストストアに入っていない時期に、古くから入っている CA に署名してもらって「古い端末でもつながる」ようにするのが典型です。
+
+```
+                         ┌── ISRG Root X1（自己署名）    ← 新しいストアにある
+[サーバ] → [中間 R3] → [ISRG Root X1]
+                         └── ISRG Root X1（DST Root CA X3 が署名）→ DST Root CA X3 ← 古いストアにある
+```
+
+同じ公開鍵と Subject を持つ証明書が 2 枚あり、チェーンは 2 通りに組めます。どちらを選ぶかはクライアントの**チェーン組み立て**の実装次第で、ここに実装の差が出ます。
+
+### Let's Encrypt のルート期限切れ（2021）
+
+Let's Encrypt は、自前の ISRG Root X1 が普及するまで、IdenTrust の **DST Root CA X3** によるクロス署名で信頼を得ていました。その DST Root CA X3 は **2021 年 9 月 30 日**に期限を迎えました（[Let's Encrypt](https://letsencrypt.org/docs/dst-root-ca-x3-expiration-september-2021/)）。
+
+- ISRG Root X1 をストアに持たない古い端末（例として iPhone 4 が挙げられています）は、この日から警告を出すようになりました
+- 例外は古い Android です。Android は**トラストアンカーの有効期限を意図的に確かめない**ので、DST Root CA X3 が ISRG Root X1 に署名した、ルートの期限を越える 3 年のクロス署名を使って動き続けました（[Let's Encrypt 2020-12](https://letsencrypt.org/2020/12/21/extending-android-compatibility/)）
+- **OpenSSL 1.0.2** は、ISRG Root X1 をストアに持っていても失敗しました。OpenSSL の説明によれば、1.0.2 は**サーバが送ってきた（信頼されていない）チェーンを優先**し、その先に期限切れの DST Root CA X3 があると、ストアにある期限内の別の経路を探さずに期限切れと報告しました（[OpenSSL Blog](https://openssl-library.org/post/2021-09-13-letsencryptrootcertexpire/)）。1.1.0 以降は、トラストストアの証明書を先に使います
+
+Android 向けのクロス署名も 2024 年 9 月 30 日に切れ、Let's Encrypt はそれに先立つ 2024 年 2 月 8 日から、既定のチェーンを ISRG Root X1 で終わる短いものに切り替えました（[Let's Encrypt 2023-07](https://letsencrypt.org/2023/07/10/cross-sign-expiration/)）。
+
+**教訓は 2 つあります。** 同じ証明書でも、クライアントのトラストストアの中身とチェーン組み立ての実装によって、結果が変わること。そして、自分では更新できない端末（組み込み機器、古い OS）のトラストストアは、何年も古いまま残ることです。
+
+## ルートを外す
+
+トラストストアの一覧は、足すだけではありません。ブラウザや OS の CA プログラムは、運用に問題のある CA を**外します**。
+
+- **Symantec**: Chrome は Chrome 66 で 2016 年 6 月 1 日より前に発行された Symantec の証明書を、Chrome 70（2018 年 10 月）で旧基盤の証明書をすべて信頼しなくなりました（[Google Security Blog 2017](https://security.googleblog.com/2017/09/chromes-plan-to-distrust-symantec.html)）
+- **Entrust**: Chrome は 2024 年 6 月、繰り返されたインシデント対応への懸念を理由に、Chrome 131 以降、Entrust のルートにつながるサーバ証明書のうち、**最初の SCT が 2024 年 11 月 11 日より後**のものを既定で信頼しないと発表しました（[Google Security Blog 2024](https://security.googleblog.com/2024/06/sustaining-digital-certificate-security.html)）
+
+Entrust の措置が「ルートを丸ごと消す」ではなく「ある日付より後に発行されたもの」になっているのは、既存の証明書を一斉に壊さずに段階的に退場させるためです。発行日の基準には、証明書が自己申告する notBefore ではなく、第 114 回で見る Certificate Transparency のログの時刻（SCT）を使っています。**CA が書き換えられない時刻**を使うわけです。
+
+## 名前の範囲を縛る: Name Constraints
+
+ルートや中間の CA は、原則として**どの名前の証明書でも**発行できます。社内用に作った CA でも、`www.example.com` の証明書に署名すれば、その CA を信じている端末では通ってしまいます。
+
+**Name Constraints** 拡張は、CA の証明書に「この CA の下で発行してよい名前の範囲」を書き込みます（[RFC 5280 4.2.1.10](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.10)）。`permitted;DNS:.internal.test` と書けば、その下の証明書の SAN は `internal.test` の配下でなければ検証に失敗します。社内 CA や、取引先に中間 CA を渡す場合に、被害の範囲を限る手段です。
+
+## 自分で CA を持つ: プライベート PKI
+
+社内のサービス間通信や、第 177 回のサービスメッシュの mTLS では、公開の CA ではなく**自前の CA** を使うのが普通です。公開の CA は、`db.internal.test` のような社内だけの名前には発行しませんし、有効期間の短い証明書を大量に発行し続ける用途にも向きません。
+
+選択肢は、`openssl` で手作りするところから、[step-ca](https://smallstep.com/docs/step-ca/) のような ACME 対応の CA サーバ、[AWS Private CA](https://docs.aws.amazon.com/privateca/latest/userguide/PcaWelcome.html) のようなマネージドなものまであります。仕組みはこの回の 3 段と同じで、**そのルートを、使う側のトラストストアにどう配るか**が運用の中心になります。前の節の表のとおり、配り先は OS だけでは足りません。
+
+### TLS 検査プロキシ
+
+企業のネットワークでは、外向きの HTTPS を**途中で復号して検査する**プロキシが置かれることがあります。プロキシは接続先ごとにその場で証明書を作り、自分の CA で署名して端末に返します。端末がそれを受け入れるのは、**会社がそのプロキシの CA のルートを、管理下の端末のトラストストアに配っている**からです。
+
+PKI の仕組みから見れば、これは「端末の持ち主が信じると決めたルートで署名されている」ので正しく検証が通る、ということにすぎません。**トラストストアに 1 枚ルートを足すことは、そのルートの持ち主に、あらゆるサイトの証明書を作る権限を与えることと同じ**です。そして Node.js や Python のように独自のストアを持つプログラムは、このルートを知らないので、プロキシ越しでは失敗します。社内で開発ツールだけが動かない、という相談の定番です。
+
+## DNSSEC の連鎖との比較: DANE
+
+第 61 回の DNSSEC も信頼の連鎖でした。並べると、違いは**アンカーの数**と、**誰が名前を保証するか**です。
+
+| | Web PKI | DNSSEC |
+| --- | --- | --- |
+| アンカー | 100 を超えるルート CA | ルートゾーンの鍵 1 つ |
+| 名前を保証する者 | どの CA でもどの名前にでも発行できる | そのゾーンの親だけが子を保証する |
+| 誤発行への備え | CT（第 114 回）、Name Constraints | 構造上、他人のゾーンには署名できない |
+
+DNSSEC は「`example.com` の鍵を保証できるのは `.com` だけ」という木の形をしています。そこで、TLS で使う証明書や公開鍵のハッシュを **TLSA レコード**として DNS に載せ、DNSSEC で保証する **DANE** が定められました（[RFC 6698](https://www.rfc-editor.org/rfc/rfc6698.html)）。
+
+ただし、執筆時点（2026 年 9 月）で、主要なブラウザは Web の証明書検証に DANE を使っていません。Chrome の開発者だった Adam Langley は、その理由を次のように説明しています（[ImperialViolet 2015](https://www.imperialviolet.org/2015/01/17/notdane.html)）。DANE で不正な証明書を**拒む**には、DANE の情報を毎回必ず取れなければならない。取れなかったときに接続を続けるなら、攻撃者は取得の失敗を装うだけで済むからです。ところが Chrome の実験では、存在すると分かっている TXT レコードを 4〜5% の利用者が引けませんでした。途中のネットワークが見慣れない種類の DNS レコードを通さないためと見られています。
+
+DANE の使い道として規格になっているものには、メールサーバ同士の SMTP があります（[RFC 7672](https://www.rfc-editor.org/rfc/rfc7672.html)）。
+
+## 手元で確かめる
+
+openssl 3.6 で、ルート → 中間 → サーバの 3 段を作ります。拡張の定義を 1 つのファイルにまとめておきます（作業ディレクトリはスクラッチパッドの `work/ll-113-pki-chain/`）。
+
+```ini
+# root.cnf
+[v3_ca]
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+[v3_int]
+basicConstraints=critical,CA:TRUE,pathlen:0
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+[v3_leaf]
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:app.internal.test
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+```
+
+```sh
+# ルート（自己署名）
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout root.key -out root.crt -subj "/CN=Demo Root CA" -days 3650 \
+  -extensions v3_ca -config all.cnf        # all.cnf = [req] の最小設定 + root.cnf
+# 中間（ルートが署名）
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout int.key -out int.csr -subj "/CN=Demo Intermediate CA"
+openssl x509 -req -in int.csr -CA root.crt -CAkey root.key -out int.crt \
+  -days 1825 -extfile root.cnf -extensions v3_int
+# サーバ（中間が署名）
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout leaf.key -out leaf.csr -subj "/CN=app.internal.test"
+openssl x509 -req -in leaf.csr -CA int.crt -CAkey int.key -out leaf.crt \
+  -days 90 -extfile root.cnf -extensions v3_leaf
+```
+
+### 中間の有無で成否が変わる
+
+`-CAfile` がトラストストア、`-untrusted` が「サーバから届いた材料」の役です。
+
+```
+$ openssl verify -CAfile root.crt leaf.crt
+CN=app.internal.test
+error 20 at 0 depth lookup: unable to get local issuer certificate
+error leaf.crt: verification failed
+
+$ openssl verify -CAfile root.crt -untrusted int.crt -show_chain leaf.crt
+leaf.crt: OK
+Chain:
+depth=0: CN=app.internal.test (untrusted)
+depth=1: CN=Demo Intermediate CA (untrusted)
+depth=2: CN=Demo Root CA
+```
+
+中間が無いと、サーバ証明書の Issuer を探せずに止まります。これが `unable to get local issuer certificate` の意味です。**ルートが無いのではなく、ルートまでの道が途中で切れている**ときにも同じ文言が出ます。
+
+検証の手順の表の各行も、1 つずつ落とせます。
+
+```
+$ openssl verify -CAfile root.crt -untrusted int.crt -verify_hostname other.internal.test leaf.crt
+error 62 at 0 depth lookup: hostname mismatch
+$ openssl verify -CAfile root.crt -untrusted int.crt -purpose sslclient leaf.crt
+error 26 at 0 depth lookup: unsuitable certificate purpose
+$ openssl verify -CAfile root.crt -untrusted int.crt -attime $(date -v+200d +%s) leaf.crt
+error 10 at 0 depth lookup: certificate has expired
+```
+
+EKU が serverAuth だけなので、クライアント証明書としては使えません。`-attime` は時計を 200 日進めたふりをします。時計がずれた端末（第 161 回）では、これが本当に起きます。
+
+### サーバが中間を送らないと
+
+同じ証明書で TLS サーバを 2 つ立て、片方は中間を送らないようにします。
+
+```sh
+openssl s_server -accept 8443 -cert leaf.crt -key leaf.key -www &                       # 中間なし
+openssl s_server -accept 8444 -cert leaf.crt -cert_chain int.crt -key leaf.key -www &   # 中間あり
+```
+
+それぞれに、ルートだけを信頼させた curl、Python、Node.js で接続します（Python は `ssl.create_default_context(cafile='root.crt')`、Node.js は `tls.connect({ca: ...})`）。
+
+```
+== 8443（中間なし）
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+python [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate
+node UNABLE_TO_VERIFY_LEAF_SIGNATURE
+ 0 s:CN=app.internal.test
+   i:CN=Demo Intermediate CA
+Verify return code: 21 (unable to verify the first certificate)
+
+== 8444（中間あり）
+200
+python ok TLSv1.3
+node ok
+ 0 s:CN=app.internal.test
+   i:CN=Demo Intermediate CA
+ 1 s:CN=Demo Intermediate CA
+   i:CN=Demo Root CA
+Verify return code: 0 (ok)
+```
+
+下の 2〜5 行は `openssl s_client -CAfile root.crt` の出力で、`s:` が Subject、`i:` が Issuer です。**中間なしのほうは、先頭の証明書の Issuer に当たる証明書がどこにも無い**ことが、この表示だけで読み取れます。チェーンの確認は、まずここを見ます。
+
+### クロス署名と期限切れのルート
+
+2021 年の形を小さく再現します。期限切れの「Old Root CA」を作り、それに Demo Root CA の鍵と Subject をそのまま署名させます（`openssl x509 -x509toreq` で既存の証明書から CSR を作る）。
+
+```sh
+openssl req -x509 ... -subj "/CN=Old Root CA" \
+  -not_before 20150101000000Z -not_after 20210930000000Z ...
+openssl x509 -x509toreq -in root.crt -signkey root.key -out root-req.csr
+openssl x509 -req -in root-req.csr -CA old.crt -CAkey old.key -out cross.crt \
+  -not_before 20200101000000Z -not_after 20290101000000Z -extfile root.cnf -extensions v3_cross
+```
+
+```
+$ openssl x509 -in cross.crt -noout -subject -issuer
+subject=CN=Demo Root CA
+issuer=CN=Old Root CA
+
+$ cat root.crt old.crt > store.pem           # 新旧両方のルートを持つストア
+$ openssl verify -CAfile store.pem -untrusted int.crt -untrusted cross.crt -show_chain leaf.crt
+leaf.crt: OK
+Chain:
+depth=0: CN=app.internal.test (untrusted)
+depth=1: CN=Demo Intermediate CA (untrusted)
+depth=2: CN=Demo Root CA
+
+$ openssl verify -CAfile old.crt -untrusted int.crt -untrusted cross.crt leaf.crt   # 古いルートだけ
+CN=Old Root CA
+error 10 at 3 depth lookup: certificate has expired
+```
+
+クロス署名の証明書が材料にあっても、OpenSSL 3 はストアにある Demo Root CA で止まる 3 段の経路を選びます。古いルートしか持たない端末では、4 段目の Old Root CA の期限切れで失敗します。2021 年に iPhone 4 などで起きたのは後者です。
+
+### Name Constraints
+
+中間に `nameConstraints=critical,permitted;DNS:.internal.test` を付け、範囲の内と外の名前で 1 枚ずつ発行します。
+
+```
+$ openssl x509 -in nc.crt -noout -ext nameConstraints
+X509v3 Name Constraints: critical
+    Permitted:
+      DNS:.internal.test
+$ openssl verify -CAfile root.crt -untrusted nc.crt ok.crt       # SAN = db.internal.test
+ok.crt: OK
+$ openssl verify -CAfile root.crt -untrusted nc.crt evil.crt     # SAN = www.example.com
+error 47 at 0 depth lookup: permitted subtree violation
+```
+
+署名そのものは正しいのに、名前の範囲の外なので拒否されます。
+
+### トラストストアはプログラムごとに違う
+
+このマシン（macOS 26.2）で、それぞれが持つルートの枚数を数えました。
+
+```
+macOS のシステムルート（SystemRootCertificates.keychain）  156
+Homebrew の OpenSSL（/opt/homebrew/etc/openssl@3/cert.pem） 191
+Node.js 20.19 の埋め込み（tls.rootCertificates）            149
+Python の certifi 2026.04.22                                120
+```
+
+同じマシンの上で、**4 つの一覧が 4 つとも違う**ことが分かります。Docker の `debian:bookworm-slim` では、`ca-certificates` を入れるまで `/etc/ssl/certs` 自体が存在しませんでした（`ls: cannot access '/etc/ssl/certs'`）。後の第 166 回で、distroless などのイメージに CA 証明書を入れる話が出てくるのはこのためです。
+
+## まとめ
+
+- 証明書の署名は上の段の公開鍵で確かめる。たどった先の**ルートは検証せず、最初から信じる**。その一覧がトラストストア
+- 3 段（ルート・中間・サーバ）に分けるのは、ルートの鍵を普段使わずに済ませるため
+- **中間を送るのはサーバの責任、ルートを選ぶのはクライアント**。サーバがルートを送っても信頼の根拠にはならない
+- トラストストアはプログラムごとに違う（OS、Chrome Root Store、NSS、Java の cacerts、certifi、Node の埋め込み、コンテナの ca-certificates）。OS に入れただけでは全部に効かない
+- 中間の送り忘れは、Chrome の AIA 取得や Firefox の事前配布でブラウザでは隠れ、curl や各言語のクライアントでだけ失敗する
+- クロス署名でチェーンは複数通り組める。2021 年の DST Root CA X3 の期限切れでは、ストアの中身とチェーン組み立ての実装の差（OpenSSL 1.0.2、古い Android）で結果が分かれた
+- CA は外されることがある（Symantec、Entrust）。Name Constraints は CA が発行できる名前の範囲を縛る
+- ルートを 1 枚足すことは、その持ち主にあらゆる名前の証明書を作る力を渡すこと。社内 CA も TLS 検査プロキシもこの上に成り立つ
+- 検証は、署名（第 109 回）・証明書の中身（第 112 回）・時計（第 161 回）・失効（第 114 回）・トラストストアの組み合わせで、初めて意味を持つ
+
+検証の手順の表で、失効だけは「第 114 回」に送ったままでした。次の回では、証明書がどう発行され、どう取り消され、誤った発行がどう見つかるのかを見ます。

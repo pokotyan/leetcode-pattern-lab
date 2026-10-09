@@ -1,0 +1,389 @@
+---
+title: 負荷を振り分ける
+description: 1 つの名前の後ろで何台ものサーバが応えるとき、要求をどれに渡すかを決めるのがロードバランサです。接続を見る L4 と要求を見る L7 の違い、振り分けの規則、壊れたサーバの外し方と止め方、そして途中で消えるクライアントのアドレスの渡し方を、HAProxy と小さなサーバで確かめます
+chapter: rpc
+order: 9
+status: published
+topics:
+  - ロードバランサ
+  - L4 / L7 の振り分け
+  - least outstanding requests
+  - power of two choices
+  - コンシステントハッシュ / Maglev
+  - ヘルスチェック / 外れ値の検出
+  - コネクションドレイン
+  - X-Forwarded-For / Forwarded
+  - PROXY protocol
+  - DSR
+requires:
+  - ll-72-grpc-ops
+  - ll-116-tls-ops
+  - ll-176-k8s-service
+  - ll-178-rolling-update
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 1 つの名前の後ろに、何台も
+
+ここまでの回で、ロードバランサという言葉は何度も出てきました。第 60 回では「DNS による振り分けは即座には効かないので、秒単位で切り替えたいならロードバランサの出番」と書き、第 176 回では Kubernetes の Service が接続の最初の 1 回だけ行き先を決めると見て、第 72 回では gRPC の接続が 1 つの Pod に偏る問題を扱いました。第 116 回では、TLS をどこで終えるかの選択肢として登場しました。
+
+ただ、ロードバランサそのものを正面から扱った回はありません。この回で見るのは、次の 4 つの問いです。
+
+1. **何を単位に振り分けるのか**（接続か、要求か）
+2. **どの規則で行き先を選ぶのか**
+3. **壊れたサーバや止めたいサーバを、どう外すのか**
+4. **途中に 1 段挟まったことで、何が見えなくなるのか**
+
+実験には HAProxy 3.2.25（2026 年 9 月 28 日付の長期サポート版）を使い、後ろに Go 1.26 で書いた小さなサーバを 3 台（`b1`、`b2`、`b3`）置きました。サーバは、受けた要求のプロトコル、TCP の相手のアドレス、`X-Forwarded-For` と `Forwarded` の値を 1 行で返します。クライアントは curl 8.22.0 です。すべて Docker（29.2）の 1 つのネットワークの中で動かしました。
+
+## どこに置かれるか
+
+「振り分ける仕組み」は、通信の経路のいくつかの段に置けます。
+
+```
+  利用者
+    │ ① DNS が複数のアドレスを返す / 近いアドレスを返す       （第 58 回、第 60 回）
+    ▼
+  ルータ ── ② 同じアドレスを複数の場所や機械に向ける（anycast、ECMP）
+    │
+    ▼
+  ③ L4 のロードバランサ（TCP / UDP の接続を振り分ける）       （第 176 回の kube-proxy もここ）
+    │
+    ▼
+  ④ L7 のロードバランサ（HTTP の要求を振り分ける）             （第 116 回の TLS の終端もここ）
+    │
+    ▼
+  サーバ群   ⑤ クライアント自身が選ぶ（第 72 回の gRPC の round_robin）
+             ⑥ 各サーバの隣のプロキシが選ぶ（第 177 回のサービスメッシュ）
+```
+
+実際の構成では、これらを重ねて使います。たとえばクラウドでは、DNS が地域ごとのアドレスを返し、そのアドレスの L4 の装置が L7 のプロキシ群に接続を散らし、L7 のプロキシが要求をアプリに散らす、という 3 段がよくある形です。**どの段も、自分が見える単位でしか振り分けられません。** これが、この回の全体を通じた見方になります。
+
+## L4 と L7: 何が見えているか
+
+| | L4（接続を振り分ける） | L7（要求を振り分ける） |
+| --- | --- | --- |
+| 見えるもの | IP アドレス、ポート、プロトコル（第 53 回の 4 つ組または 5 つ組） | HTTP のメソッド、パス、ヘッダ、Cookie |
+| 振り分けの単位 | 接続 | 要求（HTTP/2 ならストリーム） |
+| TLS | 終えない（SNI だけは読める） | 終える（第 116 回の型 1、型 2） |
+| 後ろへの接続 | クライアントの接続をそのまま中継する | 自分で張り直し、複数のクライアントの要求で使い回す |
+| サーバから見た相手 | 構成による（アドレスを書き換えるかどうか） | ロードバランサのアドレス |
+| 例 | kube-proxy、AWS の Network Load Balancer、Maglev | HAProxy の http モード、Envoy、nginx、AWS の Application Load Balancer |
+
+L4 の装置は、接続の最初のパケットで行き先を決め、以後は同じ接続のパケットを同じサーバへ送り続けます（第 176 回の conntrack）。中で何回 HTTP の要求が行き来していても、L4 の装置には区別がつきません。
+
+### 手元で確かめる: 1 本の接続で 30 回
+
+HAProxy に 2 つの入口を作りました。`:7000` は `mode tcp`（L4）、`:8000` と `:8001` は `mode http`（L7。`:8001` は平文の HTTP/2 を受ける）です。どちらも後ろの 3 台に `balance roundrobin` で振り分けます。curl に同じ URL を 30 個並べると、curl は 1 本の接続を使い回して 30 回要求します（`%{num_connects}` が 1 回目だけ 1、以後 0 になることで確かめました）。
+
+```
+L4 HTTP/1.1 1接続30回: b1=30
+L7 HTTP/1.1 1接続30回: b1=10 b2=10 b3=10
+L4 h2c      1接続30回: b2=30
+L7 h2c      1接続30回: b1=10 b2=10 b3=10
+L4 HTTP/1.1 30接続:    b1=10 b2=10 b3=10
+```
+
+**同じ `roundrobin` でも、L4 では 30 回すべてが 1 台に行きます。** 接続を 30 本に分けると、L4 でも 10 回ずつに散ります。振り分けの規則が悪いのではなく、**規則が数えている単位が接続**だからです。HTTP/2 では 1 本の接続に要求を多重化するので（第 65 回）、この偏りが常態になります。第 72 回で見た gRPC の偏りは、この 2 行目と 3 行目の差そのものです。
+
+L7 側では、もう 1 つ面白いことが起きています。サーバが受け取った要求を並べます。
+
+```
+b3 proto=HTTP/2.0 remote=172.21.0.5:55800 xff=[] fwd=[]                 ← L4 経由
+b1 proto=HTTP/1.1 remote=172.21.0.5:49298 xff=["172.21.0.6"] fwd=[]     ← L7 経由
+```
+
+L7 経由では、クライアントが HTTP/2 で送ったのに、サーバには **HTTP/1.1** で届いています。L7 のロードバランサは要求を一度ばらして、後ろには自分で選んだプロトコルの接続で送り直すからです。HAProxy の文書は、後ろ向きの接続は既定で**どのクライアントの要求にも使い回してよい**ものとして扱い、そのためクライアントに固有の情報（送信元のアドレスなど）は要求ごとに付けて渡す必要がある、と説明しています（[HAProxy 3.2 Configuration Manual 1.1](https://docs.haproxy.org/3.2/configuration.html#1.1)）。2 行とも `remote` は `172.21.0.5`、つまりロードバランサのアドレスです。クライアント（`172.21.0.6`）のアドレスは、L7 経由のときだけ `X-Forwarded-For` に残っています。この点は後の節で詳しく見ます。
+
+<Callout type="warn" title="よくある誤解: 「ロードバランサを前に置けば、負荷は均等になる」">
+  均等になるのは、ロードバランサが**数えている単位**についてだけです。L4 なら接続の数、L7 なら要求の数です。
+  接続を長く使い回すクライアント（HTTP/2、gRPC、WebSocket、データベースの接続プール）の前に L4 の装置を置くと、
+  接続の数は揃っていても、要求の数は大きく偏ります。
+  L7 でも、要求ごとの重さが違えば、要求の数が揃っていても仕事の量は揃いません。次の節の規則の選び方は、この差を埋めるためにあります。
+</Callout>
+
+## どの規則で選ぶか
+
+### 順番に回す: round robin と重み
+
+最も単純なのは、使えるサーバを順番に選ぶ **round robin** です。サーバの性能が違うときは**重み**を付け、重み 2 のサーバに重み 1 のサーバの 2 倍を送ります。HAProxy の文書は、round robin を「処理時間が均等に分布しているときに最も滑らかで公平」と説明しています（[HAProxy: balance](https://docs.haproxy.org/3.2/configuration.html#4.2-balance)）。裏返せば、処理時間がばらつくときには公平ではなくなります。
+
+### 空いているところへ: least connections / least outstanding requests
+
+**いま抱えている仕事が最も少ないサーバ**を選ぶ規則です。L4 では接続の数（least connections）、L7 では処理中の要求の数（least outstanding requests）を数えます。AWS の Application Load Balancer は、既定の round robin のほかにこれを選べ、要求の重さやサーバの性能がばらつく場合に向く、と説明しています（[AWS ELB: Edit target group attributes](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html#modify-routing-algorithm)）。
+
+一方で HAProxy の文書は、`leastconn` を LDAP や SQL のような**長いセッション**に勧め、HTTP のような短いセッションには「あまり向かない」と書いています（[HAProxy: balance](https://docs.haproxy.org/3.2/configuration.html#4.2-balance)）。数えているのが接続の数なので、接続を使い回す HTTP では仕事の量を表さないからです。**「最小」を名乗る規則でも、何を数えているかを確かめる必要があります。**
+
+### 2 つだけ見る: power of two choices
+
+全サーバの状況を毎回比べるのは、サーバが多いと高くつきます。そこで、**無作為に 2 台を選び、空いているほうに送る**という規則があります。Mitzenmacher は、d 台から選ぶ待ち行列のモデルで、選ぶ数を 1 から 2 にすると系に滞在する時間が指数的に改善し、3 にしても 2 から定数倍しか良くならないことを示しました（[Mitzenmacher, The Power of Two Choices in Randomized Load Balancing, IEEE TPDS 2001](https://www.eecs.harvard.edu/~michaelm/abstracts/tpds2001.html)）。
+
+この規則は実装に入っています。Envoy の least request は、重みが等しいときは設定した数（既定で 2）のサーバを無作為に選び、処理中の要求が少ないほうを使います（[Envoy: Supported load balancers](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers)）。HAProxy の `random(<draws>)` も、既定で 2 回引いて負荷の低いほうを選び、2 台から選べば公平さが大きく改善することが示されている、と書いています（[HAProxy: balance](https://docs.haproxy.org/3.2/configuration.html#4.2-balance)）。
+
+### 手元で確かめる: 重さがばらつく要求を 4 つの規則で配る
+
+違いを数字で見るために、Python で小さな模擬を書きました。サーバ 10 台が、それぞれ 1 件ずつ順に処理します。要求の 98% は 0.5 の時間で終わり、2% は 10 かかります。到着は無作為で、全体の稼働率が 80% になるようにしました。20 万件を配ったときの、到着から完了までの時間です。
+
+```
+round robin        p50= 1.75  p99= 33.25  p99.9= 45.47
+random             p50= 2.80  p99= 41.58  p99.9= 67.36
+power of two       p50= 0.78  p99= 11.56  p99.9= 20.14
+least outstanding  p50= 0.50  p99= 10.38  p99.9= 12.95
+```
+
+round robin は、重い要求を抱えて詰まっているサーバにも順番どおりに送り続けるので、後ろに並んだ軽い要求が待たされます。**2 台を見比べるだけで、99 パーセンタイルが 3 分の 1 近くまで縮みます。** 全台を見る least outstanding がさらに良いのは、この模擬ではロードバランサが 1 台で、全サーバの状況を正確に知っているからです。ロードバランサが複数台あると、それぞれが自分の知る範囲で「いま最も空いている 1 台」を選ぶので、同じ 1 台に一斉に送ってしまうことがあります（この模擬では確かめていません）。HAProxy の文書も `random` の利点として、サーバが頻繁に増減する大きな構成で、round robin や leastconn が起こしうる特定のサーバへの集中を避けられることを挙げています（[HAProxy: balance](https://docs.haproxy.org/3.2/configuration.html#4.2-balance)）。
+
+### 同じものは同じところへ: ハッシュ
+
+キャッシュを持つサーバや、利用者ごとの状態を持つサーバでは、**同じキー（利用者、URL など）を毎回同じサーバへ**送りたくなります。キーのハッシュ値をサーバの台数で割った余りを使えば実現できますが、台数が変わると、ほぼすべてのキーの行き先が変わります。HAProxy の文書も、この方式（`map-based`）では台数が変わると多くの接続が別のサーバに振り直されると注意しています（[HAProxy: hash-type](https://docs.haproxy.org/3.2/configuration.html#4.2-hash-type)）。
+
+これを避けるのが**コンシステントハッシュ**です。Karger らがウェブのキャッシュの負荷を散らすために提案したもので（[Karger et al., STOC 1997](https://dl.acm.org/doi/10.1145/258533.258660)）、サーバとキーを同じ円周上のハッシュ値に置き、キーから時計回りに最初に出会うサーバを選びます。サーバが 1 台増えても、動くのはその新しいサーバの手前にあったキーだけです。
+
+Google の L4 ロードバランサ **Maglev** は、別の作り方をしています。素数の大きさの表（論文の評価では 65537）を、各サーバが自分の順列に従って順番に埋めていき、キーのハッシュ値で表を引きます（[Eisenbud et al., Maglev, NSDI 2016](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud)）。論文は、先行する方式が行き先の変わりにくさを優先したのに対し、Maglev は**負荷の均等さを優先した**と述べています。Envoy も同じ方式を持ち、表を作るのも引くのも ring hash より速いが、サーバが変わったときの安定性は ring hash に及ばない、と説明しています（[Envoy: Supported load balancers](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers)）。
+
+10 万個のキーを 10 台に配り、11 台目を足したときに行き先が変わったキーの割合と、11 台での最大と最小の担当数を数えました（Python、SHA-256 の先頭 8 バイトをハッシュ値に使用）。理想は 1/11、約 9.1% です。
+
+```
+modulo             moved= 90.9%  load max/min=9232/9001
+ring vnodes=1      moved=  0.5%  load max/min=22471/530
+ring vnodes=100    moved= 10.2%  load max/min=10195/8006
+maglev M=65537     moved=  9.3%  load max/min=9207/8988
+```
+
+- 余りを使う方式は、**9 割のキーの行き先が変わります**。キャッシュなら、ほぼ全部が一度に外れます
+- 円周に各サーバを 1 点ずつしか置かないと、動くキーは少ないのですが、新しいサーバは 0.5% しか受け持たず、担当数も 530 から 22471 まで 40 倍以上ばらつきます。そのため実装は、各サーバを円周の何か所にも置きます（仮想ノード）。HAProxy の `consistent` も「各サーバを何度も登場させた木」を使い、それでも分布は完全には滑らかにならないと書いています（[HAProxy: hash-type](https://docs.haproxy.org/3.2/configuration.html#4.2-hash-type)）
+- Maglev の表は、動いた割合が理想に近く、担当数のばらつきも余りを使う方式並みに小さくなりました
+
+### 利用者を同じサーバに付ける: セッションアフィニティ
+
+L7 では、ハッシュの代わりに **Cookie** で行き先を覚えさせる方法もあります。ALB は最初の要求で選んだサーバを暗号化した Cookie（`AWSALB`）に書き、以後の要求をそのサーバに送ります（[AWS ELB: Sticky sessions](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html#sticky-sessions)）。同じ文書は、台数を大きく増やしたときに、すでに付いた利用者のせいで負荷が偏りうることにも触れています。**アフィニティは振り分けの自由を手放す設定**で、偏りや、そのサーバが落ちたときの状態の喪失を引き受けることになります。状態はサーバの外（共有のストアや、第 134 回のトークン）に出すのが基本で、アフィニティは最後の手段です。
+
+## 生きているかを確かめる
+
+### 能動的なヘルスチェック
+
+ロードバランサは、各サーバに定期的に問い合わせて、応えないサーバを振り分け先から外します。HAProxy の設定は次のとおりです。
+
+```
+backend l7be
+    option httpchk GET /health
+    default-server check inter 1s fall 2 rise 2
+```
+
+1 秒ごとに `GET /health` を送り、2 回続けて失敗したら外し（`fall`）、2 回続けて成功したら戻します（`rise`）。サーバ `b2` の `/health` だけが 503 を返すように切り替え、前後で 30 回ずつ要求しました。
+
+```
+before:          b1=10 b2=10 b3=10
+b2 /health=503:  b1=15 b3=15
+recovered:       b1=10 b2=10 b3=10
+
+Server l7be/b2 is DOWN, reason: Layer7 wrong status, code: 503, info: "Service Unavailable" ...
+Server l7be/b2 is UP, reason: Layer7 check passed, code: 200 ...
+```
+
+`b2` は `/` には正常に応えられる状態でしたが、`/health` が 503 を返した時点で外されました。**ヘルスチェックの応答は、「仕事を受けてよいか」をサーバ自身が申告する窓口**です。第 178 回の readiness probe と同じ考え方で、止める前に自分から 503 を返し始めれば、自分を振り分け先から外させることができます。
+
+### 検出までの間に何が起きるか
+
+ヘルスチェックには間隔があるので、サーバが突然死んでから外されるまでには時間差があります。0.1 秒ごとに要求を送りながら、`b3` のコンテナを SIGKILL で止めました。
+
+```
+ 9 b1 200 0.001805
+10 b2 200 0.001561
+11 <html><body><h1>503 ... 503 8.038743
+12 b1 200 0.003213
+
+... l7 l7be/b3 0/0/-1/-1/8036 503 217 - - sC-- 1/1/0/0/3 0/0 "GET / HTTP/1.1"
+```
+
+11 番目の要求は、死んだ `b3` に割り当てられ、**8 秒待たされた末に 503** になりました。コンテナが消えたのでアドレスに誰もおらず、接続の試みは拒否もされずに待たされます。ログの終了状態 `sC` は、接続のタイムアウトで終わったことを表します（[HAProxy: Stream state at disconnection](https://docs.haproxy.org/3.2/configuration.html#8.5)）。末尾の `3` は再試行の回数で、`timeout connect 2s` の試みを 4 回繰り返して 8 秒です。HAProxy の再試行は、既定では**同じサーバへの**接続のやり直しです（[HAProxy: retries](https://docs.haproxy.org/3.2/configuration.html#4.2-retries)）。
+
+`option redispatch` を加えると、再試行を別のサーバに振り替えられます。同じ実験をやり直すと、こうなりました。
+
+```
+11 b1 200 2.003644
+12 b2 200 0.001446
+13 b1 200 2.010372
+
+... l7 l7be/b1 0/2001/0/1/2002 200 188 - - ---- 1/1/0/0/+1 0/0 "GET / HTTP/1.1"
+```
+
+今度は失敗せず、2 秒の遅れで別のサーバが応えています。再試行の欄の `+` は、別のサーバに振り替えたことを示します（[HAProxy: HTTP log format](https://docs.haproxy.org/3.2/configuration.html#8.2.3)）。文書は、既定では最後の再試行で振り替えると説明していますが（[HAProxy: option redispatch](https://docs.haproxy.org/3.2/configuration.html#4.2-option%20redispatch)）、手元では 1 回目の失敗のあとで振り替わりました。その理由は、この回では確かめていません。いずれにしても、**ヘルスチェックが気づくまでの間の要求は、再試行の設定で救うしかありません。** そして、接続を張る前の失敗なら安全に送り直せますが、要求を送ったあとの失敗を送り直してよいかは、第 72 回で見たとおり操作が冪等かどうかによります。
+
+### 受動的な検出と、外しすぎの歯止め
+
+問い合わせを待たず、**本物の要求の結果**から異常を見つける方法もあります。Envoy はこれを外れ値の検出（outlier detection）と呼び、受動的なヘルスチェックの一種と位置付けています（[Envoy: Outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier)）。既定では、5xx が 5 回続いたサーバを 30 秒を基準に外し、外すのは全体の 10% までです（[Envoy API: OutlierDetection](https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/outlier_detection.proto)）。
+
+最後の上限には意味があります。ヘルスチェックの先（データベースなど）が落ちると、**全サーバが一斉に不健全と判定**されます。全部外せば、ロードバランサは誰にも送れません。そのため Envoy は、使えるサーバの割合が既定で 50% を下回ると健全かどうかを無視して全サーバに振り分けます（[Envoy: Panic threshold](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/panic_threshold)）。ALB も、健全なサーバが足りないときは全サーバに送る（fail open）と説明しています（[AWS ELB: Health settings](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html#modify-target-group-health-settings)）。
+
+<Callout type="warn" title="よくある誤解: 「ヘルスチェックは詳しいほど良い」">
+  `/health` の中でデータベースや下流のサービスまで確かめると、下流の 1 か所が落ちただけで、
+  **全サーバが同時に不健全になり、全部外されます**。上の panic threshold や fail open は、この事故への歯止めです。
+  振り分け先から外すかどうかの判定は、「このサーバ自身が要求を受けられるか」に絞るのが基本です。
+  下流の障害は、外すことではなく、デッドラインや再試行の制限（第 72 回）で受け止めます。
+</Callout>
+
+## 外すときの手順
+
+### 戻ってきたサーバは少しずつ
+
+外したサーバが戻った直後や、新しく足したサーバは、キャッシュが空で、JIT のコンパイルも済んでいません。そこにいきなり同じ割合を送ると、そのサーバだけが遅くなります。**slow start** は、戻ったサーバへの割合を時間をかけて上げる設定です。HAProxy の `slowstart` は、指定した時間をかけて重みと同時接続数の上限を直線的に 100% まで上げます（[HAProxy: slowstart](https://docs.haproxy.org/3.2/configuration.html#5.2-slowstart)）。ALB にも同じ名前の設定があります（[AWS ELB: Slow start mode](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html#slow-start-mode)）。
+
+なお、least connections のような規則には、別の形で同じ問題が出ます。新しいサーバは処理中の要求が 0 なので、**すべての新しい要求がそこへ殺到**します。ALB で slow start と least outstanding requests を同時に使えないのは、両者が同じ問題に別々の答えを出しているからだと考えられます（同上）。
+
+### 止めるサーバは、新しい仕事を断ってから
+
+サーバを止めるときは、**新しい要求を送らないようにしてから、処理中の要求が終わるのを待つ**のが基本です。これをコネクションドレイン（drain）と呼びます。3 通りの止め方を比べました。どれも、5 秒かかる `/slow` を `b1` に送ってから 1 秒後に操作しています。
+
+```
+(a) ロードバランサで drain にする    /slow: 200 5.00s   新しい要求: b2=6 b3=6
+(b) サーバに SIGTERM（Go の Shutdown）  /slow: 200 5.00s   新しい要求: b2=15 b3=15
+(c) サーバに SIGKILL                  /slow: 502 0.96s
+```
+
+(a) は HAProxy の管理用ソケットに `set server l7be/b1 state drain` を送ったものです。drain は振り分けの対象から外すだけで、ヘルスチェックや既存の処理は続ける状態です（[HAProxy 3.2 Management Guide](https://docs.haproxy.org/3.2/management.html)）。処理中の `/slow` は最後まで返り、新しい要求は残りの 2 台に行きました。
+
+(b) は、サーバのプロセスが自分で丁寧に終わる場合です。Go の `http.Server.Shutdown` は、まず待ち受けのソケットを閉じ、アイドルな接続を閉じ、使用中の接続がアイドルに戻るのを待ちます（[Go: net/http Server.Shutdown](https://pkg.go.dev/net/http#Server.Shutdown)）。待ち受けが閉じたので、ヘルスチェックは即座に拒否され、HAProxy は `b1` を外しました。そのときのログに、処理中の要求がまだ 1 件あることが出ています。
+
+```
+Server l7be/b1 is DOWN, reason: Layer4 connection problem, info: "Connection refused", ... 1 sessions active, ...
+```
+
+この 1 件が `/slow` で、5 秒後に 200 で返りました。
+
+(c) は、処理中の要求ごと失われます。ログの終了状態 `SH` は、サーバが応答のヘッダを返す前に接続を切ったことを表します（[HAProxy: Stream state at disconnection](https://docs.haproxy.org/3.2/configuration.html#8.5)）。
+
+(b) には落とし穴が 1 つあり、実験でそのまま踏みました。最初に書いたサーバは、`Shutdown` を呼ぶと同時に main 関数が終わってしまい、(c) と同じ結果になりました。Go の文書は、`Shutdown` を呼ぶと `ListenAndServe` がすぐに戻るので、**プログラムを終わらせずに `Shutdown` が戻るのを待つ**ように、と注意しています（同上）。さらに同じ文書は、WebSocket のように乗っ取られた（hijack された）接続は閉じも待ちもしないと書いています。**長く生きる接続は、アプリが自分で終わりを知らせる必要があります**。HTTP/2 や gRPC なら GOAWAY（第 72 回）、WebSocket なら Close フレーム（第 74 回）です。
+
+### 2 つの側の時間を合わせる
+
+ドレインは、ロードバランサの側とサーバの側の両方の時間で決まります。
+
+| 時間 | 例 | 合わないと |
+| --- | --- | --- |
+| ロードバランサが外すまでの時間 | ヘルスチェックの `inter × fall`、Kubernetes の EndpointSlice の反映（第 178 回） | まだ送られてくるのに、サーバが待ち受けを閉じている |
+| ロードバランサが処理中の要求を待つ時間 | ALB の deregistration delay（既定 300 秒） | 待っている途中でサーバが切ると、クライアントに 5xx が返る |
+| サーバが処理中の要求を待つ時間 | Go の `Shutdown` に渡す期限、Kubernetes の猶予期間（第 46 回、第 178 回） | 期限を過ぎた要求は打ち切られる |
+
+ALB は、外し始めたターゲットへの新しい要求を止め、既定で 300 秒待ってから外し終えます。その途中でターゲットが接続を切ると、クライアントには 5xx が返ると明記しています（[AWS ELB: Deregistration delay](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html#deregistration-delay)）。**サーバ側の待ち時間は、ロードバランサが外し終えるまでより長く**取る必要があります。第 178 回で preStop に数秒の sleep を入れたのも、この順番を作るためでした。
+
+## クライアントのアドレスが消える
+
+L7 のロードバランサの後ろでは、サーバから見た TCP の相手は常にロードバランサです。実験の `remote=172.21.0.5` がそれでした。アクセスの記録、利用者ごとの流量制限、IP アドレスによる許可は、どれもクライアントのアドレスを必要とします。そこで、ロードバランサがアドレスを書き足して後ろへ渡します。第 116 回で概要を見た 3 つの方法を、実際に確かめます。
+
+### X-Forwarded-For は、末尾から読む
+
+HAProxy の `option forwardfor` は、`X-Forwarded-For` ヘッダを付けます。クライアントが自分で `X-Forwarded-For: 203.0.113.7` を付けて送ると、サーバにはこう届きました。
+
+```
+# option forwardfor だけ（素朴な設定）
+xff=["203.0.113.7" "172.21.0.6"]
+
+# 外から来た X-Forwarded-For と Forwarded を消してから付ける設定
+xff=["172.21.0.6"] fwd=["proto=http;for=172.21.0.6"]
+
+# ロードバランサを通らず、サーバに直接送った場合
+xff=["203.0.113.7"]
+```
+
+1 つ目では、ヘッダが **2 行**になっています。HAProxy はクライアントが付けた行を残したまま、自分の行を最後に足すからです。同名のヘッダが複数行あるときは、カンマでつないだ 1 行と同じ意味になります（[RFC 9110 5.3](https://www.rfc-editor.org/rfc/rfc9110.html#section-5.3)）。つまりアプリから見れば `203.0.113.7, 172.21.0.6` です。**先頭の値は、クライアントが好きに書けます。** 実験のサーバで使った Go の `Header.Get` は最初の 1 行だけを返すので、素朴に書くと偽の `203.0.113.7` を利用者のアドレスとして記録します。
+
+HAProxy の文書は、このヘッダは常に既存の並びの最後に足されるので、**サーバは最後の値だけを使うように設定しなければならない**、と書いています（[HAProxy: option forwardfor](https://docs.haproxy.org/3.2/configuration.html#4.2-option%20forwardfor)）。MDN の説明はより一般的で、インターネットとサーバの間にある信頼できるプロキシの数を設定しておき、**右から数えて**値を取ること、そしてサーバにインターネットから直接つながれる経路があるなら、並びの**どの値も**安全の判断に使えないことを述べています（[MDN: X-Forwarded-For](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For)）。3 つ目の結果が、その直接の経路です。
+
+`Forwarded` は、同じ目的のために標準化されたヘッダです。`for`（要求してきた相手）、`by`（受けたプロキシ）、`host`、`proto` を 1 つのヘッダに書けます（[RFC 7239](https://www.rfc-editor.org/rfc/rfc7239.html)）。ただし RFC 自身が、この値は途中のどのノードでも、要求を出したクライアント自身でも書き換えられるので、正しいとは限らないと述べています（[RFC 7239 8.1](https://www.rfc-editor.org/rfc/rfc7239.html#section-8.1)）。**形式が標準になっても、信頼の問題は変わりません。**
+
+<Callout type="warn" title="よくある誤解: 「X-Forwarded-For の先頭がクライアントのアドレス」">
+  先頭の値は、**最も信頼できない値**です。クライアントが書いた値がそのまま先頭に残ります。
+  安全の判断（流量制限、IP アドレスによる許可、不正の検出）に使えるのは、**自分が管理するプロキシが書き足した値**だけで、
+  それは右から、信頼するプロキシの段数で数えて取り出します。
+  加えて、入口のロードバランサで外から来た同名のヘッダを消し、サーバにはロードバランサからしか届かないように網を閉じます（第 116 回、第 134 回）。
+</Callout>
+
+### PROXY protocol: 接続の先頭に書く
+
+L4 のロードバランサは HTTP を読まないので、ヘッダを足せません。PROXY protocol は、**後ろへの TCP 接続の先頭に、元の接続の情報を書き込む**仕様です（[The PROXY protocol](https://www.haproxy.org/download/3.2/doc/proxy-protocol.txt)）。HAProxy の `send-proxy` と `send-proxy-v2` で、後ろに置いた「届いたバイトをそのまま表示するだけのサーバ」に送らせました。
+
+```
+# v1（人が読める 1 行）
+b'PROXY TCP4 172.21.0.6 172.21.0.5 44146 7001\r\nGET / HTTP/1.1\r\nHost: lb:7001\r\n...'
+
+# v2（バイナリ）
+0d 0a 0d 0a 00 0d 0a 51 55 49 54 0a   ← 12 バイトの署名
+21                                    ← 版 2、コマンド PROXY
+11                                    ← IPv4 の TCP
+00 0c                                 ← 以下 12 バイト
+ac 15 00 06  ac 15 00 05              ← 送信元 172.21.0.6、宛先 172.21.0.5
+c0 6e  1b 5a                          ← 送信元ポート 49262、宛先ポート 7002
+47 45 54 20 2f ...                    ← ここから元の "GET / ..."
+```
+
+v2 の署名は、HTTP、TLS、SMTP、FTP、POP のサーバが受け取ると直ちに解析に失敗するように作られています。設定を誤ったサーバがすぐに見つかるようにするためです（同上）。
+
+PROXY protocol にも、ヘッダと同じ問題があります。PROXY protocol を受け付けるように設定した HAProxy（`bind :9001 accept-proxy`）に、curl の `--haproxy-protocol` と `--haproxy-clientip` で**直接**つなぎました。
+
+```
+$ curl --haproxy-protocol http://ppsink:9001/
+src=172.21.0.6 (tcp peer=172.21.0.6)
+
+$ curl --haproxy-protocol --haproxy-clientip 203.0.113.7 http://ppsink:9001/
+src=203.0.113.7 (tcp peer=172.21.0.6)
+
+$ curl http://ppsink:9001/; echo "exit=$?"
+exit=56
+```
+
+2 つ目では、**クライアントが自分で書いた先頭行がそのまま採用され**、サーバ側の `src` が偽のアドレスになりました。HAProxy の `src` は、`accept-proxy` を使うと PROXY protocol で伝えられたアドレスになり、`fc_src` は接続の実際の送信元です（[HAProxy: src / fc_src](https://docs.haproxy.org/3.2/configuration.html#7.3.3-src)）。仕様は、受け手が PROXY protocol だけを受け付けるように設定し、付いているかどうかを推測してはならないこと（3 つ目のように、付いていない接続は受け付けない。curl は受信の失敗を表す終了コード 56 で終わった）、そして信頼できるプロキシだけがこれを使えるよう接続元を絞るべきことを定めています（[The PROXY protocol](https://www.haproxy.org/download/3.2/doc/proxy-protocol.txt)）。
+
+もう 1 つ、仕様には L7 のプロキシにとって大事な規定があります。複数のクライアントの要求を 1 本の後ろ向きの接続で使い回すプロキシは、**その接続に PROXY protocol を使ってはならない**（MUST NOT）とされています。受け手が、先頭に書かれた 1 つのアドレスを全要求の送り手とみなしてしまうからです（同上）。最初の実験で見たとおり、L7 のロードバランサは後ろの接続を使い回します。**接続の単位で渡す PROXY protocol は L4 向け、要求の単位で渡すヘッダは L7 向け**、と分かれているのはこのためです。
+
+### アドレスを書き換えない L4
+
+L4 の装置の中には、送信元のアドレスを書き換えずにそのまま届けるものもあります。Kubernetes の Service では、`externalTrafficPolicy: Local` にすると、クライアントの送信元アドレスを保ち、別のノードへの 2 段目の転送も避けます。代わりに、Pod の数がノードごとに違うと振り分けが偏るおそれがあると文書は注意しています（[Kubernetes Docs: Preserving the client source IP](https://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip)）。既定の `Cluster` は、アドレスを隠す代わりに全体へ均等に散らします。**アドレスを残すことと、均等に散らすことが、ここでも引き換えになっています。**
+
+## 戻り道を通さない: DSR と、前段の ECMP
+
+L4 の装置は、行きのパケットだけを見ればよい場合があります。**DSR**（Direct Server Return）では、サーバが応答をロードバランサを通さずに直接返します。Maglev の論文は、応答は一般に要求より大きいので、DSR でロードバランサが戻りのパケットを扱わずに済むようにしていると説明しています（[Eisenbud et al., Maglev, NSDI 2016](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud)）。行きの小さなパケットだけを扱えばよいので、1 台で多くの接続をさばけます。その代わり、TLS を終えることも HTTP を読むこともできません。
+
+同じ論文では、Maglev の手前でルータが **ECMP**（等コストの複数経路）によってパケットを Maglev の各台に均等に散らしています（同上）。どの Maglev の台にパケットが届いても同じサーバを選べるよう、先に見たコンシステントハッシュの表と接続の追跡を組み合わせています。同じアドレスを複数の場所から経路として広告し、利用者に近い場所へ届ける **anycast**（[RFC 4786](https://www.rfc-editor.org/rfc/rfc4786.html)）も、この「ロードバランサの手前の振り分け」の一種です。CDN が利用者を近い拠点へ届ける仕組みと、その拠点に置かれる共有のキャッシュは、第 103 回で扱います。
+
+## 用途別の組み合わせ
+
+| 場面 | 置く段と規則 | 気をつけること |
+| --- | --- | --- |
+| 普通の Web API（HTTP/1.1、短い要求） | L7、round robin、またはばらつきがあれば least outstanding / power of two | 外から来た `X-Forwarded-For` を消して付け直す。アプリは右から読む |
+| HTTP/2、gRPC の内部通信 | L7 のプロキシ、メッシュ（第 177 回）、またはクライアントの振り分け（第 72 回） | L4 の前段だけでは 1 台に偏る。接続に寿命を設ける |
+| WebSocket、SSE などの長い接続 | L7 で最初の要求を振り分け、以後はその接続に固定 | 振り分け直しは効かない。止めるときはアプリが終わりを知らせる（第 74 回） |
+| キャッシュサーバ群 | コンシステントハッシュ（URL など） | 台数の増減で動くキーの割合と、担当数の偏りの両方を見る |
+| TLS をサーバまで届けたい | L4 のパススルー（第 116 回の型 3）、PROXY protocol v2 | 受け手はロードバランサからの接続だけに PROXY protocol を許す |
+| 非常に大きな流量の入口 | ECMP / anycast の後ろに L4（Maglev 型）、その後ろに L7 | L4 の台の増減で接続が切れないように、ハッシュと接続の追跡を組み合わせる |
+| 利用者ごとの状態を持つ古いアプリ | Cookie によるアフィニティ | 台数を増やしても偏りが残る。状態は外に出すのが本筋 |
+
+## 実装ごとの違い
+
+この回で確かめたのは HAProxy 3.2.25 だけです。ほかの実装は文書で確認した範囲で並べます（執筆時点、2026 年 10 月）。
+
+| 実装 | 既定の規則 | 選べる主な規則 | 健全性の確認 |
+| --- | --- | --- | --- |
+| HAProxy 3.2 | 設定で `balance` を指定 | roundrobin、leastconn、random(2)、source / uri / hash（consistent も可） | 能動的なチェック。`retries` と `redispatch` で再試行 |
+| Envoy | round robin | least request（P2C）、ring hash、Maglev、random | 能動的なチェックと外れ値の検出。panic threshold 50% |
+| AWS ALB | round robin | least outstanding requests、weighted random | ヘルスチェック。健全なターゲットが足りなければ fail open |
+| kube-proxy（第 176 回） | 接続ごとに無作為 | ― | readiness probe の結果が EndpointSlice に反映される |
+| gRPC のクライアント（第 72 回） | pick_first（振り分けない） | round_robin、xDS から配る規則 | `grpc.health.v1` の Watch |
+
+Envoy の既定が round robin であることは、cluster の設定の `lb_policy` の既定値として確認しました（[Envoy API: Cluster](https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto)）。Envoy の外れ値の検出と ALB の各機能は、手元では動かしていません。
+
+## まとめ
+
+- ロードバランサは、自分が**見える単位**でしか振り分けられない。L4 は接続、L7 は要求。1 本の接続で 30 回送ると、L4 では 30 回とも 1 台に行った
+- L7 のロードバランサは要求をばらして送り直すので、後ろのプロトコルも TCP の相手も変わる。後ろの接続は複数のクライアントで使い回される
+- round robin は要求の重さがそろっているときに公平。ばらつくなら空いているサーバを選ぶ。2 台を無作為に見比べるだけで、模擬の p99 は 33 から 12 に縮んだ
+- 同じキーを同じサーバに送るなら、余りではなくコンシステントハッシュ。11 台目を足したとき、余りの方式では 9 割、Maglev では 9.3% のキーが動いた
+- ヘルスチェックが気づくまでの要求は、再試行と振り替え（`redispatch`）で救う。詳しすぎるチェックは全台を同時に外すので、panic threshold や fail open が歯止めになる
+- 止めるときは、新しい要求を断ってから処理中の要求を待つ。ロードバランサとサーバの両側の待ち時間を合わせ、長い接続にはアプリから終わりを知らせる
+- `X-Forwarded-For` の先頭はクライアントが書ける。入口で消して付け直し、アプリは信頼するプロキシの段数だけ右から読む。PROXY protocol も、受け付ける相手を絞らなければ偽れる
+- 接続の単位で渡す PROXY protocol は L4 向け、要求の単位で渡すヘッダは L7 向け
+
+ここまでの 3 つの章で、データがネットワークを通って名前を引き、ロードバランサを経て別のサービスに届くまでを見てきました。ここまでの通信は、どれも呼び出した側が要求を送り、応答を待つ形でした。gRPC のストリーミングでさえ、始めるのは呼び出した側です。そして、この回で何度も「長く生きる接続は振り分け直されない」と書いたように、その形から外れる通信は、振り分けにも止め方にも別の手当てを必要とします。
+
+次の第 12 章「リアルタイムに届ける」では、この形に収まらない通信を扱います。サーバの側から好きなときに送りたい、端末同士で直接やり取りしたい、遅れて届いた情報には意味がない、同じものを複数人が同時に書き換える。まずは、HTTP の上でサーバから押す手段として、ロングポーリング、SSE、WebSocket を見ます。

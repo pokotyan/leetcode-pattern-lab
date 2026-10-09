@@ -1,0 +1,354 @@
+---
+title: IdP を自分で持つ
+description: ログインの仕組みを自分のサーバで動かすと、買わずに済むものの代わりに何を背負うのか。Keycloak を手元で起こし、署名鍵を入れ替え、止め、書き出しながら、セルフホストの IdP が引き受ける仕事を 1 つずつ確かめます
+chapter: sso
+order: 4
+status: published
+topics:
+  - セルフホスト
+  - Keycloak
+  - Dex / Ory Hydra / Authelia
+  - 署名鍵のローテーション
+  - JWKS のキャッシュ
+  - アクティブ鍵とパッシブ鍵
+  - realm のエクスポート
+  - IdP の可用性
+  - CVE の追従
+requires:
+  - ll-138-idp-choice
+  - ll-137-provisioning
+  - ll-133-oidc
+  - ll-131-jwt
+  - ll-111-key-management
+  - ll-110-key-format
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 何を買わずに済ませ、何を背負うのか
+
+第 136 回と第 137 回で、SSO は IdP を中心に回ることを見ました。どのアプリも、利用者が誰かを IdP の署名付きの文書（ID トークンや SAML のアサーション）で知ります。
+
+第 138 回では、IdP の種類と選び方を、マネージドや SaaS として借りるものからセルフホストまで並べました。この回はそのうち、**自分のサーバで動かす**セルフホストを掘り下げます。費用、データの置き場所、閉じたネットワークの中で使いたい、細かく作り込みたい、といった理由で選ばれる方式です。
+
+ただ、IdP は「ログイン画面を出すプログラム」ではありません。第 131 回と第 133 回で見たとおり、**全部のアプリが、IdP の署名鍵を信じることで成り立っています**。自分で持つとは、その鍵と、鍵を配る仕組みと、止まったときの影響を、まるごと引き受けることです。この回は、選択肢を並べたあと、Keycloak を手元で動かして、引き受けるものを 1 つずつ確かめます。
+
+## 選択肢の地図
+
+オープンソースの IdP は、どこまでを 1 つで受け持つかで大きく 4 つに分かれます。
+
+| 名前 | 言語 | 立ち位置 | 自己紹介（各リポジトリの README から） |
+| --- | --- | --- | --- |
+| Keycloak | Java | 全部入り | OIDC、SAML、他の IdP との仲介、LDAP 連携まで持つ。CNCF の incubation プロジェクト（[Keycloak](https://www.keycloak.org/server/importExport) のページ末尾） |
+| authentik | Python | 全部入り | SAML、OAuth2/OIDC、LDAP、RADIUS などに対応する IdP（[README](https://github.com/goauthentik/authentik)） |
+| ZITADEL | Go | 全部入り | SSO、MFA、パスキー、OIDC、SAML、SCIM とマルチテナントの階層。変更をすべてイベントとして残す（[README](https://github.com/zitadel/zitadel)） |
+| Kanidm | Rust | 全部入り | OAuth2/OIDC、RADIUS、読み取り専用の LDAPS の入口（[README](https://github.com/kanidm/kanidm)） |
+| Ory Hydra | Go | 部品 | OAuth 2.0 と OIDC のサーバだけ。**ログインと同意の画面は自分で書き**、既存の利用者管理につなぐ（[README](https://github.com/ory/hydra)） |
+| Ory Kratos | Go | 部品 | 登録、ログイン、回復、確認などの利用者管理だけ（[README](https://github.com/ory/kratos)） |
+| Dex | Go | 仲介 | 自分は利用者を持たず、「コネクタ」で LDAP、SAML、GitHub、Google などに認証を任せ、結果を OIDC の ID トークンにして出す（[README](https://github.com/dexidp/dex)） |
+| Authelia | Go | 前段 | リバースプロキシの横に置き、リクエストを通す・拒む・ログインへ回す（[README](https://github.com/authelia/authelia)） |
+
+**全部入り**は 1 つ動かせば済みますが、その分だけ守る面が広くなります。**部品**の組み合わせ（Hydra と Kratos）は、画面や利用者の保存先を自分の設計に合わせたいときに向きます。**仲介**の Dex は、Kubernetes の API サーバのように「OIDC しか話せない相手」の前に置き、裏の本当の IdP（社内の LDAP や GitHub）とつなぐ使い方が典型です。Authelia は、OIDC に対応しない古い社内ツールをリバースプロキシの段で守ります。第 141 回で見るゼロトラストの型に近い位置です。
+
+借りる側の選択肢（第 138 回で並べた Entra ID、Okta、Google、Auth0、Amazon Cognito など）との違いは、機能の多寡よりも、**次の節の表の仕事を誰がするか**にあります。
+
+<Callout type="warn" title="よくある誤解: オープンソースの IdP を使えば無料で済む">
+  ライセンス料はかかりませんが、借りるサービスが料金の中でしていた仕事は消えません。鍵の保管とローテーション、TLS と名前、DB、冗長化、パッチの適用、監視、監査ログ、メール送信は、全部こちらに移ります。
+  「どちらが安いか」は、この運用を誰が何人で続けるかまで含めて比べるものです。とくに**深夜に IdP が落ちたとき、全社のログインを直すのが自分たちになる**ことは、見積もりに入れておく必要があります。
+</Callout>
+
+## 自分で持つと引き受けるもの
+
+| 引き受けるもの | 何が起きるか | 呼び戻す回 |
+| --- | --- | --- |
+| 署名鍵 | 生成、保管、ローテーション、JWKS での配布。漏れれば誰にでもなりすませる | 第 110 回、第 111 回、第 131 回 |
+| TLS と自分のドメイン | `iss` は URL そのもの。名前を変えると全部の RP の `iss` の検証が合わなくなる | 第 113 回、第 133 回 |
+| DB とセッションの保存先 | 利用者、クライアント、鍵、セッションが入る。壊れれば IdP ごと失う | 第 130 回 |
+| 可用性 | 止まると新しいログインが全部止まる（後で実験） | 第 136 回 |
+| アップグレードと CVE | 認証を迂回する脆弱性が毎年のように出る | 第 131 回、第 136 回 |
+| ブルートフォース対策 | パスワードの総当たりとクレデンシャルスタッフィングを受け止める | 第 129 回 |
+| 監査ログ | 誰がいつログインし、管理者が何を変えたか | 第 135 回 |
+| メール送信 | パスワードのリセットやメールアドレスの確認。回復の経路は最も弱い入口になる | 第 129 回 |
+| バックアップと鍵の復旧 | 鍵を失えば、発行済みのトークンは全部検証できなくなる | 第 111 回 |
+
+いくつかは Keycloak の文書で既定値が確かめられます。
+
+- **本番用の起動（`kc.sh start`）は、ホスト名と HTTPS の設定が無いと起動しません。** 「HTTP is disabled as transport layer security (HTTPS) is essential」（[Configuring Keycloak](https://www.keycloak.org/server/configuration)）。以下で使う `start-dev` は開発用で、この確認を外しています
+- **既定の DB（dev-file）は開発用で、本番の前に取り替える必要があります**（[Configuring the database](https://www.keycloak.org/server/db)）。Keycloak 26.0.0 からは、利用者のセッションも DB に持つ構成が前提になりました（[リリースノート](https://www.keycloak.org/docs/latest/release_notes/index.html)）
+- **ブルートフォースの検出は既定で無効です。** 「Brute force detection is disabled by default」（[Server Administration Guide](https://www.keycloak.org/docs/latest/server_admin/index.html#password-guess-brute-force-attacks)）
+- **サポートされるのは最新のリリースだけです。** 「Keycloak currently only supports the latest release.」（執筆時点（2026 年 9 月）の [Issue #52656](https://github.com/keycloak/keycloak/issues/52656)。延長サポートの提案はまだ議論中）。つまり脆弱性の修正を受け取るには、マイナー版の更新についていく必要があります
+
+CVE の数も見ておきます。GitHub の [Keycloak のセキュリティ勧告](https://github.com/keycloak/keycloak/security/advisories)を API で数えると、2025 年 9 月 28 日からの 1 年間に **23 件**が公開されていました。中には、第 131 回で見た**アルゴリズムの取り違えで署名の検証を迂回できる**もの（[CVE-2026-11800](https://github.com/keycloak/keycloak/security/advisories/GHSA-j97h-3f8r-mrjr)、26.6.4 で修正）や、第 136 回で見た **SAML の署名がどの要素を覆っているかを位置で判断していた**もの（[CVE-2024-8698](https://github.com/keycloak/keycloak/security/advisories/GHSA-xgfv-xpx8-qhcr)）があります。IdP の脆弱性は、それを信じる全アプリの脆弱性です。
+
+## 手元で確かめる: Keycloak を起こす
+
+Docker で Keycloak（執筆時点の `latest` は 26.7.4）を開発モードで起動し、管理用の CLI（`kcadm.sh`）で realm を 1 つ作ります。realm は Keycloak の中の独立した IdP の単位で、利用者、クライアント、鍵をそれぞれ別に持ちます。
+
+```
+$ docker run -d --name kc-ll108 -p 18108:8080 \
+    -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+    quay.io/keycloak/keycloak:latest start-dev
+... Keycloak 26.7.4 on JVM (powered by Quarkus 3.33.3.2) started in 15.274s. Listening on: http://0.0.0.0:8080
+
+$ K="docker exec kc-ll108 /opt/keycloak/bin/kcadm.sh"
+$ $K config credentials --server http://localhost:8080 --realm master --user admin --password admin
+$ $K create realms -s realm=demo -s enabled=true
+$ $K create clients -r demo -s clientId=rp-app -s secret=rp-secret \
+    -s serviceAccountsEnabled=true -s standardFlowEnabled=false
+```
+
+`rp-app` は、client credentials（第 132 回）でトークンをもらうだけのクライアントです。ブラウザを使わずに、署名されたトークンを何度でも作れます。
+
+realm を作った時点で、鍵はもう生成されています。
+
+```
+$ $K get keys -r demo      # JSON の出力から 4 項目を表に整形
+kid                                           type  algorithm  use  status
+WNnfoZNViqUf17BFObl_8BOj5fN-x74ymQ4C485ruyA   RSA   RSA-OAEP   ENC  ACTIVE
+cibIPktujCuOotCRolH16LNjmTM41PKMQqsvfliwYVU   RSA   RS256      SIG  ACTIVE
+bed75c9e-164f-42fb-81ce-f1bb54a63a53          OCT   AES        ENC  ACTIVE
+9d52458d-78cd-42c7-a2e7-9361a3cf2d19          OCT   HS512      SIG  ACTIVE
+
+$ curl -s http://localhost:18108/realms/demo/protocol/openid-connect/certs   # 抜粋
+{"keys":[{"kid":"WNnfoZNV...","kty":"RSA","alg":"RSA-OAEP","use":"enc", ...},
+         {"kid":"cibIPktu...","kty":"RSA","alg":"RS256","use":"sig",
+          "x5c":["MIIClzCCAX8C..."],"n":"lvhBOhIatKO-XLGvXCnI8WEE...","e":"AQAB"}]}
+```
+
+読み取れることが 3 つあります。
+
+- **JWKS に出ているのは公開鍵の 2 つだけです。** OCT（共通鍵）の AES と HS512 は、Keycloak が自分で発行して自分で確かめる内部のトークンや Cookie に使うもので、公開できません。第 106 回で見たとおり、MAC の鍵は相手と共有するしかないからです
+- `x5c` には自己署名の証明書が入っています。取り出して読むと `subject=CN=demo`、`issuer=CN=demo`、期間は **2026 年 9 月 28 日から 2036 年 9 月 28 日まで**の 10 年でした。**放っておけば、この鍵を 10 年使い続けます**。入れ替えるのは運用する側の仕事です
+- `kid` は鍵の識別子で、トークンのヘッダに入ります（第 131 回）。以下では先頭 8 文字で呼びます
+
+## 手元で確かめる: 鍵を入れ替えて、RP の側で何が起きるか
+
+RP（トークンを受け取って検証する側）を、Python と cryptography だけで模型にします。JWKS を取ってキャッシュし、トークンのヘッダの `kid` で鍵を選んで RS256 の署名を確かめます（`exp` などの検証は省略）。違いは、**知らない `kid` に出会ったとき**の振る舞いだけです。
+
+```python
+def verify(tok, cache, refetch_on_miss):
+    h, p, s = tok.split(".")
+    kid = json.loads(b64d(h))["kid"]
+    if kid not in cache:
+        if not refetch_on_miss:
+            return f"NG 知らない kid {kid[:8]}..."
+        cache.clear(); cache.update(fetch_jwks())   # JWKS を取り直す
+        if kid not in cache:
+            return f"NG 取り直しても kid {kid[:8]}... が無い"
+    ...  # n と e から公開鍵を作り、PKCS#1 v1.5 + SHA-256 で検証
+```
+
+「キャッシュのみ」の RP は、起動時に取った JWKS を次の定期更新まで使い続けます。「取り直す」RP は、知らない `kid` を見たら JWKS を取りに行きます。
+
+### やり方 1: 新しい鍵をいきなり有効にする
+
+Keycloak では、鍵は「鍵の提供者（key provider）」という部品として足します。同じ用途の鍵が複数あるときは、**priority の大きいものがアクティブ**（新しい署名に使う鍵）になります。既存の鍵は 100 なので、200 で足します。
+
+```
+$ python3 step.py cache              # RP が JWKS をキャッシュ
+キャッシュした kid: ['cibIPktu']
+$ python3 step.py token t1
+t1 kid: cibIPktu
+
+$ $K create components -r demo -s name=rsa-2026-09 -s providerId=rsa-generated \
+    -s providerType=org.keycloak.keys.KeyProvider -s parentId=$REALM_ID \
+    -s 'config.priority=["200"]' -s 'config.algorithm=["RS256"]'
+$ ./keys.sh                          # get keys と JWKS を要約する自作の補助スクリプト
+active RS256: BIbNx2Av
+  BIbNx2Av RS256 ACTIVE priority 200
+  cibIPktu RS256 ACTIVE priority 100
+
+$ python3 step.py token t2; python3 step.py verify t1 t2
+t2 kid: BIbNx2Av
+t1: キャッシュのみ → OK kid cibIPktu... / 未知の kid で取り直す → OK kid cibIPktu...
+t2: キャッシュのみ → NG 知らない kid BIbNx2Av... / 未知の kid で取り直す → OK kid BIbNx2Av...
+```
+
+鍵を足した直後から、新しいトークン `t2` は新しい鍵で署名されます。**キャッシュしか見ない RP は、次に JWKS を更新するまで、新しくログインした人を全員拒みます。**
+
+OIDC Core は、検証する側が取り直すことを前提にしています。「The verifier knows to go back to the jwks_uri location to re-retrieve the keys when it sees an unfamiliar kid value.」（[OIDC Core 10.1.1](https://openid.net/specs/openid-connect-core-1_0.html#RotateSigKeys)）。Keycloak の文書が勧める手順も、まさにこの「priority を上げた鍵を足す」やり方です（同じ priority で足して古い鍵をパッシブにする方法も併記されています。[Rotating keys](https://www.keycloak.org/docs/latest/server_admin/index.html#rotating-keys)）。つまり、**このやり方が安全かどうかは IdP ではなく、全部の RP の実装で決まります**。自前の RP、古いライブラリ、JWKS を設定ファイルに書き写したゲートウェイが 1 つでもあれば、そこで障害になります。
+
+### やり方 2: 先に配ってから切り替える
+
+RP の実装に頼らない順序もあります。新しい鍵を**パッシブ**（検証には使えるが、新しい署名には使わない）で足し、JWKS に載せてから切り替えます。
+
+```
+$ $K create components -r demo -s name=rsa-2026-10 ... \
+    -s 'config.priority=["300"]' -s 'config.active=["false"]'
+$ ./keys.sh
+  jiPxjOKZ RS256 PASSIVE priority 300
+  BIbNx2Av RS256 ACTIVE priority 200
+  cibIPktu RS256 ACTIVE priority 100
+JWKS: [('jiPxjOKZ', 'sig'), ('BIbNx2Av', 'sig'), ('WNnfoZNV', 'enc'), ('cibIPktu', 'sig')]
+```
+
+パッシブの鍵も JWKS に出ます。ここで RP がキャッシュを更新したあと（実運用では、RP のキャッシュの寿命より長く待ったあと）に、アクティブにします。
+
+```
+$ python3 step.py cache
+キャッシュした kid: ['jiPxjOKZ', 'BIbNx2Av', 'cibIPktu']
+$ $K update components/$NEW -r demo -s 'config.active=["true"]'
+$ python3 step.py token t4; python3 step.py verify t3 t4
+t4 kid: jiPxjOKZ
+t3: キャッシュのみ → OK kid BIbNx2Av... / 未知の kid で取り直す → OK kid BIbNx2Av...
+t4: キャッシュのみ → OK kid jiPxjOKZ... / 未知の kid で取り直す → OK kid jiPxjOKZ...
+```
+
+**キャッシュしか見ない RP でも失敗しません。** 古い鍵の片づけも、同じく 2 段に分けます。まずパッシブにし（古い鍵で署名済みのトークンはまだ検証できる）、それらが期限切れになってから無効にします。
+
+```
+$ $K update components/$MID -r demo -s 'config.active=["false"]'    # パッシブへ
+$ python3 step.py verify t3
+t3: キャッシュのみ → OK kid BIbNx2Av... / 未知の kid で取り直す → OK kid BIbNx2Av...
+
+$ $K update components/$MID -r demo -s 'config.enabled=["false"]'   # 無効へ
+$ ./keys.sh
+  BIbNx2Av RS256 DISABLED priority 200
+JWKS: [('jiPxjOKZ', 'sig'), ('WNnfoZNV', 'enc'), ('cibIPktu', 'sig')]
+$ python3 step.py verify t3
+t3: キャッシュのみ → OK kid BIbNx2Av... / 未知の kid で取り直す → OK kid BIbNx2Av...
+```
+
+無効にした鍵は JWKS から消えました。ところが、**RP は `t3` をまだ受け入れています**。RP のキャッシュには古い鍵が残っていて、「知っている `kid`」なので取り直しもしないからです。同じ `t3` を Keycloak のイントロスペクション（第 134 回）に渡すと、IdP 自身は拒みます。問い合わせる側には別のクライアント `api` を作り、`rp-app` のトークンの `aud` に `api` が入るよう audience mapper を足してあります。Keycloak は、`aud` に含まれないクライアントからのイントロスペクションを「Client 'rp-app' is not in the token audience」として拒むからです（第 134 回の audience の制限）。
+
+```
+$ curl -s -d token=$T3 -d client_id=api -d client_secret=api-secret \
+    http://localhost:18108/realms/demo/protocol/openid-connect/token/introspect
+{"active":false}
+# Keycloak のログ
+type="INTROSPECT_TOKEN_ERROR", realmName="demo", clientId="api", error="invalid_token",
+reason="Access token JWT check failed"
+```
+
+順序をまとめると、次のようになります。
+
+```
+  時間 →
+  新しい鍵   [ 追加（パッシブ）]──待つ──[ アクティブ ]────────────────────────
+  古い鍵     [ アクティブ ]───────────[ パッシブ ]──待つ──[ 無効 ]──[ 削除 ]
+                          ↑                       ↑
+            RP のキャッシュ寿命より長く      古い鍵のトークンが全部期限切れ
+            （新しい鍵が全 RP に届く）       （リフレッシュトークン、オフライン
+                                             トークン、SSO の Cookie も含む）
+```
+
+Keycloak の文書は、3〜6 か月ごとに新しい鍵を作り、古い鍵はその 1〜2 か月後に消すことを目安に挙げています。古い鍵を消す前に、オフライントークンを持つアプリはリフレッシュしておく必要がある、とも書いています（[Rotating keys](https://www.keycloak.org/docs/latest/server_admin/index.html#rotating-keys)）。
+
+<Callout type="warn" title="よくある誤解: IdP で鍵を消せば、その鍵のトークンは使えなくなる">
+  上の実験のとおり、消えるのは IdP の JWKS からだけです。ローカルで JWT を検証する RP は、**キャッシュを更新するまで古い鍵を信じ続けます**。
+  ふだんのローテーションでは害はありませんが、**鍵が漏れたとき**はこれが問題になります。Keycloak の文書は、漏洩時には新しい鍵を作ってすぐに古い鍵を消し、クライアントに not-before（その時刻より前に発行したトークンを拒む）を押し付ける手順を示しています（[Compromised keys](https://www.keycloak.org/docs/latest/server_admin/index.html#compromised-keys)）。
+  それでも、キャッシュの寿命をどこまで短くできるか、RP に強制的に取り直させる手段があるかは RP 側の実装次第です。**JWKS のキャッシュの寿命が、そのまま漏洩時に悪用される窓の長さ**になります。
+</Callout>
+
+## 手元で確かめる: IdP を止める
+
+IdP が落ちると何が止まるのかを、コンテナを止めて確かめます。直前に発行した `t6` と、RP のキャッシュはそのままです。
+
+```
+$ docker stop kc-ll108
+$ python3 step.py verify t6
+t6: キャッシュのみ → OK kid jiPxjOKZ... / 未知の kid で取り直す → OK kid jiPxjOKZ...
+$ python3 step.py token t7
+urllib.error.URLError: <urlopen error [Errno 61] Connection refused>
+JWKS 取得: <urlopen error [Errno 61] Connection refused>
+```
+
+発行済みのトークンは、IdP が居なくても RP だけで検証できます。第 131 回で見た自己完結型トークンの性質そのものです。止まったものと続くものを分けると、次のとおりです。
+
+| 止まる | 続く |
+| --- | --- |
+| 新しいログイン、トークンの発行、リフレッシュ | 期限内のアクセストークン（Keycloak の既定は 300 秒） |
+| JWKS の取得。キャッシュを持たずに起動した RP は何も検証できない | JWKS をキャッシュ済みの RP での検証 |
+| イントロスペクションで毎回確かめるリソースサーバ | 各アプリが自分で持つセッション（第 136 回の 2 段のうち下の段） |
+| パスワードのリセット、MFA の登録 | |
+
+<Callout type="warn" title="よくある誤解: IdP が落ちたら、その瞬間に全部のアプリが使えなくなる">
+  半分だけ正しい見方です。**すでにログインしている人は、アプリのセッションやアクセストークンの期限までは使い続けられます**。止まるのは「新しく入る」「延長する」操作です。
+  そのため、影響は時間とともに広がります。アクセストークンが 5 分なら、5 分後にはリフレッシュが失敗し始めます。アプリのセッションが 8 時間なら、朝の出社時刻に一斉に困ります。
+  RP の側でできる備えもあります。**JWKS の取得に失敗したら、最後に取れた JWKS を使い続ける**ことです。取得の失敗でキャッシュを空にする実装は、IdP の短い停止を全アプリの停止に広げます。
+</Callout>
+
+## 手元で確かめる: 書き出しはバックアップになるか
+
+Keycloak には realm の設定を JSON に書き出す方法が 2 つあります。管理画面（と同じ REST API）からの**部分エクスポート**と、サーバを起動する代わりに書き出して終わる **`kc.sh export`** です。両方を試します。
+
+```
+$ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "http://localhost:18108/admin/realms/demo/partial-export?exportClients=true" > partial.json
+rp-app secret = **********
+rsa-2026-10 {'active': ['true'], 'priority': ['300'], 'algorithm': ['RS256']}
+```
+
+部分エクスポートでは、クライアントの秘密情報が `**********` に伏せられ、鍵の提供者は設定だけで**秘密鍵そのものが入っていません**。文書にも「Export files from the Admin Console are not suitable for backups or data transfer between servers.」とあります（[Server Administration Guide](https://www.keycloak.org/docs/latest/server_admin/index.html)）。これを戻しても、別の鍵を持った、別の IdP ができるだけです。
+
+`kc.sh export` は、動いているサーバの横では実行できませんでした。開発用の DB（H2 のファイル）が使用中だからです。
+
+```
+$ docker exec kc-ll108 /opt/keycloak/bin/kc.sh export --realm demo --file /tmp/demo-realm.json
+ERROR: Database may be already in use: "/opt/keycloak/data/h2/keycloakdb.mv.db". ...
+```
+
+コンテナを止め、データのディレクトリを別のコンテナに渡して書き出すと、成功します。
+
+```
+$ docker run --rm -v $PWD/data:/opt/keycloak/data -v $PWD/out:/out \
+    quay.io/keycloak/keycloak:latest export --realm demo --dir /out --users realm_file
+... Realm 'demo' - data exported
+... KC-SERVICES0035: Export finished successfully
+
+rp-app secret = rp-secret
+rsa-generated  ['active', 'certificate', 'keyUse', 'priority', 'privateKey']  MIIEpAIBAAKCAQEAlvhBOhIa...
+rsa-2026-10    ['active', 'algorithm', 'certificate', 'priority', 'privateKey']  MIIEpAIBAAKCAQEA7FNgVLXt...
+```
+
+今度はクライアントの秘密情報も、**署名用の秘密鍵も平文で入っています**。`MIIEpAIBAAKCAQEA` で始まる文字列は、第 110 回で見た PKCS#1 の RSA 秘密鍵の DER を、PEM のヘッダを付けずに Base64 にしたものです。その直後の `lvhBOhIa` は、先ほどの JWKS の `n` の先頭と同じです。**秘密鍵の中に公開鍵の modulus が入っている**ことが、ここでも見えます。
+
+この書き出しにも限界があります。文書は、書き出しの一貫性は全ノードを止めないと保証されず、利用者と管理者のイベント、保存されたセッション、失効させたトークンは含まれない、と明記しています（[Importing and exporting realms](https://www.keycloak.org/server/importExport)）。**本番のバックアップの本体は DB のバックアップ**で、書き出しは設定の移送や見直しの道具と考えるのが妥当です。
+
+<Callout type="warn" title="よくある誤解: 設定の書き出しファイルは、設定ファイルと同じ扱いでよい">
+  完全な書き出しは、**realm の署名鍵そのもの**です。これを手に入れた人は、どの利用者の ID トークンでも作れます。
+  リポジトリに置いて「設定をコードで管理する」ことや、チケットに添付して共有することは、第 111 回で見た「鍵をリポジトリに漏らす経路」そのものです。DB のバックアップも同じ重さで扱い、暗号化して保管する必要があります（第 111 回のエンベロープ暗号化）。
+  逆に、**鍵を HSM や KMS に置いて取り出せないようにした場合**は、バックアップから鍵を戻せません。その場合の復旧手順は「新しい鍵で作り直し、全 RP に取り直させる」になります。どちらを選ぶかは、漏洩と紛失のどちらを重く見るかの判断です。
+</Callout>
+
+## 既定で切ってあるもの
+
+最後に、完全な書き出しから realm の既定値をいくつか読んでおきます。
+
+```
+bruteForceProtected   False     # 総当たりの検出
+eventsEnabled         False     # 利用者のイベントの保存
+adminEventsEnabled    False     # 管理者の操作の保存
+smtpServer            {}        # メールの送信先
+accessTokenLifespan   300       # アクセストークンの寿命（秒）
+ssoSessionIdleTimeout 1800      # IdP とのセッションのアイドルタイムアウト（秒）
+sslRequired           external  # 外部からの接続にだけ HTTPS を求める
+```
+
+総当たりの検出も、監査のためのイベントの保存も、既定では切ってあります。上のイントロスペクションの失敗はサーバのログには出ていましたが、`eventsEnabled` が False なので、管理画面から後で検索できる形では残っていません。**どれも「作れば動く」状態で、「本番で必要な状態」ではない**ことが、自分で持つときのいちばんの落とし穴です。メールの送信先が空なら、パスワードのリセットは届きません。届くように設定すれば、今度はそのメールの経路が第 129 回で見た「回復の経路」として攻撃の入口になります。
+
+## この回の部品はどう組み合わさるか
+
+| IdP の機能 | 支えている部品 | 回 |
+| --- | --- | --- |
+| ID トークン、アクセストークン | JWT、RS256 の署名、`kid` | 第 109 回、第 131 回 |
+| 公開鍵の配布 | JWKS、`x5c` の証明書、HTTPS | 第 110 回、第 112 回、第 133 回 |
+| 鍵の入れ替え | アクティブとパッシブ、RP のキャッシュ | 第 111 回、この回 |
+| 失効 | イントロスペクション、not-before、短い寿命 | 第 130 回、第 134 回 |
+| 利用者の身元 | パスワードのハッシュ、MFA、パスキー | 第 129 回 |
+| 他の IdP との仲介 | OIDC、SAML、`iss` と `sub` での突き合わせ | 第 136 回、第 137 回 |
+
+IdP は新しい暗号を持ち込むわけではなく、**第 16 章から積み上げた部品を 1 か所に集め、その鍵を全部のアプリに信じさせる場所**です。自分で持つとは、その場所の鍵と時計と名前と DB を自分で守ることです。
+
+## まとめ
+
+- オープンソースの IdP は、全部入り（Keycloak、authentik、ZITADEL、Kanidm）、部品（Ory Hydra と Kratos）、仲介（Dex）、リバースプロキシの前段（Authelia）に分かれる
+- 自分で持つと、署名鍵、TLS と名前、DB、可用性、パッチの適用、総当たり対策、監査ログ、メール、バックアップを引き受ける。Keycloak は最新のリリースしかサポートせず、勧告は 1 年で 23 件出ていた
+- Keycloak は realm ごとに鍵を自動で作り、自己署名の証明書の期間は 10 年。入れ替えは運用する側の仕事
+- 新しい鍵をいきなりアクティブにすると、知らない `kid` で JWKS を取り直さない RP が失敗する。**パッシブで配ってから切り替え、古い鍵はパッシブを経て無効にする**
+- IdP の JWKS から鍵を消しても、キャッシュを持つ RP は古い鍵を信じ続ける。キャッシュの寿命が漏洩時の窓になる
+- IdP が止まると新しいログインと延長が止まるが、発行済みのトークンとアプリのセッションは期限まで生きる。RP は取得に失敗しても最後の JWKS を使い続けるべき
+- 管理画面の書き出しは秘密情報も秘密鍵も含まずバックアップにならない。`kc.sh export` は秘密鍵を平文で含むので、署名鍵と同じ重さで扱う
+- 総当たりの検出、イベントの保存、メールの送信先は既定で切ってある
+
+ここまでの 3 回は、ログインする「人」の話でした。次の第 140 回では、人ではなく CI のジョブや Pod のような機械が、長期の秘密情報を持たずに自分が誰かを示す仕組みを見ます。

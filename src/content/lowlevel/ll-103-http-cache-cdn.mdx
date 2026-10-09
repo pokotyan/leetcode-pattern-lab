@@ -1,0 +1,429 @@
+---
+title: 他人の応答を配るキャッシュ
+description: CDN やリバースプロキシのキャッシュは、1 人のために作られた応答を、次に来た別の人へそのまま返す機械です。何をどれだけの間使い回してよいかを決める HTTP キャッシュの規則と、それを踏み外したときに起きる取り違え、キャッシュを狙う攻撃を、手元の nginx と Varnish で確かめます
+chapter: websec
+order: 10
+status: published
+topics:
+  - 共有キャッシュ
+  - CDN
+  - Cache-Control
+  - s-maxage
+  - Age
+  - キャッシュのキー
+  - Vary
+  - Web キャッシュポイズニング
+  - Web キャッシュデセプション
+  - CDN-Cache-Control
+requires:
+  - ll-86-navigation
+  - ll-96-cors
+  - ll-100-security-headers
+  - ll-116-tls-ops
+  - ll-130-session-cookie
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 他人のページが届いた日
+
+この章ではここまで、ブラウザの**中**に引かれた境界を見てきました。オリジン、サイト、第三者の Cookie、そして前回の iframe です。どれも、ブラウザが「この応答は誰のものか」を知っていることを前提にしています。
+
+ところが、ブラウザとサーバの間には、応答を**覚えておいて、次に来た人に返す**機械が挟まることがあります。CDN やリバースプロキシのキャッシュです。この機械にとって、応答は誰のものでもありません。同じ URL を頼まれたら、同じ応答を返すだけです。
+
+2015 年 12 月 25 日、Steam のストアで、利用者が**他人のために作られたページ**を見るという事故が起きました。Valve の説明では、ストアが DoS 攻撃を受け、その対応として入れた 2 つ目のキャッシュの設定が、**ログインした利用者の通信を誤ってキャッシュした**ものでした。太平洋標準時の 11 時 50 分から 13 時 20 分の間に、約 3 万 4 千人分のページの要求が、請求先の住所やメールアドレス、カード番号の下 2 桁などを含んだまま、別の利用者に返された可能性があるとしています（[Steam のお知らせ](https://store.steampowered.com/news/19852/)）。
+
+侵入されたわけでも、パスワードが盗まれたわけでもありません。**キャッシュが、使い回してはいけない応答を使い回した**だけです。この回では、何を、誰に、どれだけの間使い回してよいかを決める HTTP キャッシュの規則と、その規則が破れたときに起きることを、手元の nginx と Varnish で確かめます。
+
+## 2 種類のキャッシュ
+
+HTTP キャッシュの規則（[RFC 9111](https://www.rfc-editor.org/rfc/rfc9111)）は、キャッシュを 2 種類に分けます。
+
+| 種類 | 例 | 誰の応答を持つか | 取り違えたときの被害 |
+| --- | --- | --- | --- |
+| **private cache**（専用のキャッシュ） | ブラウザのキャッシュ | 1 人の利用者の応答だけ | 本人が古いものを見る |
+| **shared cache**（共有のキャッシュ） | CDN、リバースプロキシ、社内のプロキシ | **多くの利用者の応答をまとめて** | **他人に個人情報が渡る** |
+
+第 86 回では、キャッシュを「取りに行かずに済ませる」速さの道具として見ました。ブラウザのキャッシュだけを考えるなら、それで十分です。共有のキャッシュでは、同じ仕組みが**情報の境界**になります。
+
+```
+ 利用者 A ─┐                                       
+ 利用者 B ─┼─→ CDN のエッジ（東京）─→ シールド（米国西海岸）─→ オリジン
+ 利用者 C ─┘      ↑ ここで当たれば、         ↑ エッジで外れた要求を
+                  オリジンには届かない          ここでまとめる
+```
+
+CDN は世界中に**拠点**（PoP）を置き、利用者を近い拠点へ振り分けます（DNS による振り分けは第 60 回）。拠点のキャッシュで外れた要求を、オリジンの手前の 1 つの拠点に集めてから送る構成を、Fastly は**シールド**（shielding）と呼んでいます（[Fastly: Shielding](https://www.fastly.com/documentation/guides/concepts/shielding/)）。
+
+## どれだけの間、使い回してよいか
+
+### 新しさ: max-age と s-maxage
+
+キャッシュは、保存した応答が**新しい**（fresh）間は、オリジンに問い合わせずに返します。新しさの期限は応答のヘッダで決まります。
+
+| 書き方 | 意味 | 根拠 |
+| --- | --- | --- |
+| `Cache-Control: max-age=N` | 生成から N 秒は新しい | [RFC 9111 5.2.2.1](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.1) |
+| `Cache-Control: s-maxage=N` | **共有のキャッシュでは**、`max-age` や `Expires` より優先して N 秒 | [5.2.2.10](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.10) |
+| `Expires: 日時` | その日時まで新しい。`max-age` があればそちらが優先 | [5.3](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.3) |
+| どれも無い | キャッシュが**推測で**期限を決めてよい | [4.2.2](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2.2) |
+
+最後の行の推測は **heuristic freshness** と呼ばれます。RFC 9111 は、`Last-Modified` があるなら「最終更新からの経過時間の一定割合」以下にするよう勧め、典型的な割合として 10% を挙げています。**何も書かなければキャッシュされない、とは限らない**ということです。
+
+キャッシュから返した応答には、**Age** のヘッダが付きます。オリジンで作られてから（または最後に確かめてから）何秒たったかの見積もりです（[5.1](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.1)）。`Age` が大きければ、その応答は自分のためにいま作られたものではありません。
+
+### 確かめ直し: ETag と 304
+
+期限が切れた応答（stale）は、捨てる必要はありません。第 86 回で見たとおり、`ETag` の値を `If-None-Match` に入れて問い合わせ、変わっていなければ本文の無い **304 Not Modified** を受け取って、手元の応答を新しいものとして使い続けます。これを**確かめ直し**（validation）と呼びます。
+
+期限切れの扱いを調整する指示が、いくつかあります。
+
+| 指示 | 意味 | 根拠 |
+| --- | --- | --- |
+| `must-revalidate` | 期限が切れたら、確かめ直すまで使ってはいけない（障害時に古いものを返さない） | [RFC 9111 5.2.2.2](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.2) |
+| `stale-while-revalidate=N` | 期限切れから N 秒は、**古いものを返しながら裏で**確かめ直してよい | [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861) |
+| `immutable` | 新しい間は中身が変わらないので、利用者が再読み込みしても確かめ直さなくてよい | [RFC 8246](https://www.rfc-editor.org/rfc/rfc8246) |
+
+### 保存させない: private と no-store
+
+| 指示 | 共有のキャッシュ | ブラウザのキャッシュ | 根拠 |
+| --- | --- | --- | --- |
+| `private` | **保存してはいけない** | 保存してよい | [5.2.2.7](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.7) |
+| `no-store` | 保存してはいけない | 保存してはいけない | [5.2.2.5](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.5) |
+| `no-cache` | 保存してよいが、**毎回確かめ直してから**使う | 同じ | [5.2.2.4](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4) |
+| `public` | 通常は保存しない場面（`Authorization` 付きの要求など）でも保存してよい | 同じ | [5.2.2.9](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.9) |
+
+利用者ごとに中身が変わるページは `private` か `no-store` です。第 100 回でも同じ表を見ました。この回では、それを**書き忘れたとき**に何が起きるかを実際に見ます。
+
+## 手元の環境
+
+Docker 29.2.1 の上に、次の 3 つのコンテナを同じネットワークで動かしました。
+
+```
+ curl ──→ nginx 1.31.6（proxy_cache）  :18401 ─┐
+ curl ──→ Varnish 9.1.0（既定の VCL）   :18402 ─┼─→ オリジン（Python 3.13 の http.server）
+ curl ──→ nginx（直した設定）           :18403 ─┘
+```
+
+オリジンは、受け取った要求を 1 行ずつ標準出力に記録し、要求ごとに通し番号（`#N`）を本文に入れて返します。**同じ番号が 2 回返れば、2 回目はキャッシュから**です。利用者は `Cookie: sid=s-alice` と `sid=s-bob`、または `Authorization: Bearer t-alice` と `t-bob` で区別します。
+
+nginx には `X-Cache-Status`（nginx の変数 `$upstream_cache_status`）、Varnish には当たった回数から作った `X-Cache` を付けて、キャッシュに当たったかを見えるようにしました。nginx の設定の要点は次のとおりです。
+
+```nginx
+proxy_cache_path /tmp/c levels=1:2 keys_zone=edge:10m inactive=1h;
+server {
+  proxy_cache edge;
+  proxy_cache_revalidate on;
+  location / { proxy_pass http://origin:8000; }
+  location ~* \.(css|js|png|jpg)$ {
+    proxy_pass http://origin:8000;
+    proxy_ignore_headers Cache-Control Expires Set-Cookie;
+    proxy_cache_valid 200 10m;
+  }
+}
+```
+
+2 つ目の `location` は、**静的なファイルらしい拡張子なら、オリジンの指示を無視して 10 分キャッシュする**という設定です。CDN でもよく見る形で、後で問題になります。curl は 8.7.1 です。
+
+## 手元で確かめる（1）: 新しさと Age と 304
+
+`Cache-Control: max-age=5` と `ETag` を返すページを、0 秒、2 秒、6 秒、7 秒の時点で取りました。まず Varnish です。
+
+```
+t=0s  Age: 0  X-Cache: MISS  generated #3
+t=2s  Age: 2  X-Cache: HIT   generated #3
+t=6s  Age: 6  X-Cache: HIT   generated #3     ← 期限（5 秒）切れなのに、すぐ返った
+t=7s  Age: 1  X-Cache: HIT   generated #3     ← Age が巻き戻った
+
+オリジンの記録
+origin #3 GET /news?cc=max-age%3D5 INM=None
+origin #4 GET /news?cc=max-age%3D5 INM="915cb4c3"   ← 6 秒の時点で、裏で確かめ直した（304）
+```
+
+6 秒の時点で、Varnish は**期限切れの応答をそのまま返しつつ**、裏でオリジンに `If-None-Match` を送っています。オリジンは 304 を返し、本文は作り直されていません（番号は #3 のまま）。確かめ直した時点から数え直すので、7 秒の時点の `Age` は 1 に戻っています。これは Varnish の **grace** という仕組みで、既定値は `default_grace` の 10 秒でした（`varnishadm param.show default_grace`）。`stale-while-revalidate` を書かなくても、同じ動きを既定でします。
+
+同じことを nginx で行うと、次のとおりでした。
+
+```
+t=0s  X-Cache-Status: MISS         generated #5
+t=2s  X-Cache-Status: HIT          generated #5
+t=6s  X-Cache-Status: REVALIDATED  generated #5   ← その場で確かめ直してから返した
+t=7s  X-Cache-Status: HIT          generated #5
+```
+
+nginx は 6 秒の時点で、**利用者を待たせて**確かめ直しました（`proxy_cache_revalidate on` のとき）。また、nginx の応答には **`Age` が付きません**。キャッシュから返ったかどうかを、`Age` だけで判断できない実装もあるということです。
+
+### 指示ごとに、2 つの実装はどう動いたか
+
+同じ URL を 3 回続けて取り、2 回目以降がキャッシュから返ったか、オリジンに何回届いたかを数えました。
+
+```
+Cache-Control              nginx                     Varnish
+max-age=60                 MISS,HIT,HIT   (1 回)      MISS,HIT,HIT   (1 回)
+max-age=0, s-maxage=30     MISS,HIT,HIT   (1 回)      MISS,HIT,HIT   (1 回)
+private, max-age=60        MISS,MISS,MISS (3 回)      MISS,MISS,MISS (3 回)
+no-cache                   MISS,MISS,MISS (3 回)      MISS,MISS,MISS (3 回)
+no-store                   MISS,MISS,MISS (3 回)      MISS,MISS,MISS (3 回)
+must-revalidate だけ        MISS,MISS,MISS (3 回)      MISS,HIT,HIT   (1 回)
+```
+
+- `s-maxage` は、`max-age=0` でも共有のキャッシュでは 30 秒効きました。**ブラウザには毎回確かめさせ、CDN では持たせる**、という使い分けができます
+- `no-cache` は、規則の上では「保存して毎回確かめる」ですが、どちらの実装も**保存そのものをしませんでした**。Varnish の既定の VCL（`varnishd -x builtin` で表示できます）は、`Cache-Control` に `no-cache`、`no-store`、`private` のどれかがあれば、まとめてキャッシュしない扱いにしています
+- 期限の書かれていない応答は、nginx は `proxy_cache_valid` が無いのでキャッシュせず、Varnish は既定の `default_ttl` の 120 秒でキャッシュしました。**期限を書かなかったときの扱いは、実装と設定しだい**です
+
+<Callout type="warn" title="よくある誤解: 「no-cache を付ければキャッシュされない」">
+  `no-cache` の意味は「使う前に毎回オリジンに確かめよ」で、保存は禁じていません（[RFC 9111 5.2.2.4](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4)）。手元の 2 つの実装はたまたま保存しませんでしたが、それに頼る理由はありません。
+  共有のキャッシュに置かせたくないなら `private`、どこにも残したくないなら `no-store` を書きます。逆に、HTML のように「置いてよいが、古いものは出したくない」応答こそ `no-cache` の出番です（第 86 回）。
+</Callout>
+
+## キャッシュは何で応答を見分けるか
+
+キャッシュが「この要求には、保存したあの応答を返してよい」と判断するときに使う情報を、**キャッシュのキー**と呼びます。RFC 9111 は、キーは少なくとも**要求のメソッドと URI** から成り、実際には GET しかキャッシュしない実装が多いので URI だけをキーにしていることが多い、と書いています（[RFC 9111 2](https://www.rfc-editor.org/rfc/rfc9111.html#section-2)）。nginx の既定のキーも `$scheme$proxy_host$request_uri` です（[nginx: proxy_cache_key](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_key)）。
+
+**キーに入っていないものは、キャッシュにとって存在しないのと同じ**です。`Cookie` も `Authorization` も、既定ではキーに入りません。同じ URL を alice が頼んでも bob が頼んでも、キャッシュから見れば同じ要求です。
+
+```
+キーに入るもの                      キーに入らないもの（既定）
+  メソッド（多くは GET だけ扱う）       Cookie
+  スキーム、ホスト、パス、クエリ         Authorization
+                                    X-Forwarded-Host などの独自ヘッダ
+                                    Accept-Language、User-Agent ...
+```
+
+応答の中身が要求のヘッダで変わるなら、オリジンは **Vary** でそれを伝えます。`Vary: Accept-Encoding` なら、キャッシュは `Accept-Encoding` の値ごとに別の応答を持ちます（[4.1](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1)）。第 96 回の `Vary: Origin`、第 99 回の Client Hints と `Vary` は、どれもこの仕組みです。
+
+### Authorization 付きの要求には、特別な規則がある
+
+`Authorization` の付いた要求への応答について、RFC 9111 は共有のキャッシュに強い制限を課しています。
+
+> A shared cache MUST NOT use a cached response to a request with an Authorization header field ... to satisfy any subsequent request unless the response contains a Cache-Control field with a response directive ... that allows it to be stored by a shared cache
+>
+> （[RFC 9111 3.5](https://www.rfc-editor.org/rfc/rfc9111.html#section-3.5)）
+
+許される指示は `must-revalidate`、`public`、`s-maxage` の 3 つです。つまり、`Authorization` 付きの要求に対する `max-age=60` だけの応答は、**規則の上では他の要求に使い回してはいけません**。
+
+一方で `Cookie` には、このような規則がありません。RFC 9111 は、`Set-Cookie` を含む応答もキャッシュを妨げず、実際に使い回されることが多いので、制御したいサーバは `Cache-Control` を出すように、とまで書いています（[7.3](https://www.rfc-editor.org/rfc/rfc9111.html#section-7.3)）。
+
+## 手元で確かめる（2）: private を書き忘れた個人のページ
+
+オリジンの `/mypage` は、Cookie から利用者を判別して名前とカード番号の下 4 桁を返します。ただし、`Cache-Control: max-age=60` だけを付けて、**`private` を書き忘れて**います。alice、bob の順に取りました。
+
+```
+nginx
+alice  <p>hello alice, card ****-1111</p> (#33)  [X-Cache-Status: MISS]
+bob    <p>hello alice, card ****-1111</p> (#33)  [X-Cache-Status: HIT]    ← bob に alice のページ
+
+Varnish
+alice  <p>hello alice, card ****-1111</p> (#34)  [X-Cache: MISS]
+bob    <p>hello bob, card ****-2222</p> (#35)    [X-Cache: MISS]
+```
+
+nginx は、Cookie の違いを見ずに、alice のために作られたページを bob に返しました。Steam で起きたのと同じ形です。
+
+Varnish が無事だったのは、オリジンが正しかったからではありません。**Varnish の既定の VCL が、`Cookie` か `Authorization` の付いた要求をキャッシュに通さない**からです（`varnishd -x builtin` の `vcl_req_cookie` と `vcl_req_authorization`）。同じ VCL は、`Set-Cookie` を含む応答もキャッシュしません。ただし、この既定ではログインした利用者には何もキャッシュが効かないので、実際の運用では Cookie を消したり、キーに入れたりする設定を足すことが多く、そこで同じ穴が開きえます。
+
+nginx で、オリジンの側を直しました。
+
+```
+Cache-Control: private, max-age=60
+alice  hello alice (#36)  MISS
+bob    hello bob   (#37)  MISS        ← 共有のキャッシュに保存されない
+
+Cache-Control: max-age=60 ＋ Vary: Cookie
+alice  hello alice (#38)  MISS
+bob    hello bob   (#39)  MISS
+alice  hello alice (#38)  HIT         ← Cookie の値ごとに別の応答として保存された
+```
+
+どちらも取り違えは止まりました。ただし `Vary: Cookie` は、Cookie の値ごとに応答を持つので、利用者 1 人ごとにキャッシュの項目が増え、当たる率はほぼ利用者本人だけになります。共有のキャッシュに置く意味がほとんど無いので、**個人のページは `private` か `no-store`** が素直です。
+
+### nginx は Authorization の規則を守らなかった
+
+同じページを、Cookie の代わりに `Authorization` で取りました。応答は `max-age=60` だけなので、上で見た RFC 9111 3.5 によれば、共有のキャッシュは使い回してはいけない応答です。
+
+```
+nginx    alice  hello alice, card ****-1111 (#40)  MISS
+nginx    bob    hello alice, card ****-1111 (#40)  HIT     ← 規則に反して使い回した
+Varnish  alice  hello alice, card ****-1111 (#41)  MISS
+Varnish  bob    hello bob,   card ****-2222 (#42)  MISS
+```
+
+手元の nginx 1.31.6 は、`Authorization` の有無を見ずにキャッシュから返しました。nginx の文書は、この規則について何も書いておらず、`proxy_no_cache $http_pragma $http_authorization;` という設定の例を載せているだけです（[nginx: proxy_no_cache](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_no_cache)）。**規則がある、ということと、手前の機械がそれを守る、ということは別**です。トークンで認証する API の前にキャッシュを置くなら、オリジンが `private` か `no-store` を付けるのが確実です。
+
+## 共有のキャッシュを狙う攻撃
+
+ここまでは、オリジンや設定の誤りで起きる事故でした。同じ仕組みを、攻撃者が**意図して**使うこともできます。どちらも、キャッシュとオリジンが**要求を違うように見ている**ところを突きます。
+
+### Web キャッシュポイズニング: キーに入らないヘッダで応答を変える
+
+James Kettle は 2018 年に、キャッシュのキーに入らない要求の部分（**unkeyed input**）で応答の中身が変わるなら、その変わった応答が保存され、他の利用者に配られうることを、多くの実際のサイトで示しました。Red Hat のトップページでは、`X-Forwarded-Host` の値が、ページの中の画像の URL にそのまま埋め込まれていました（[PortSwigger: Practical Web Cache Poisoning](https://portswigger.net/research/practical-web-cache-poisoning)）。
+
+手元のオリジンの `/home` も、`X-Forwarded-Host` があればそれを使ってスクリプトの URL を作ります。プロキシの後ろでも正しいホスト名でリンクを作りたい、というよくある実装です。応答は `public, max-age=60` です。
+
+```
+nginx
+attacker: <script src="https://evil.example/static/app.js"></script> (#43)  MISS
+victim1:  <script src="https://evil.example/static/app.js"></script> (#43)  HIT
+victim2:  <script src="https://evil.example/static/app.js"></script> (#43)  HIT
+
+Varnish
+attacker: <script src="https://evil.example/static/app.js"></script> (#44)  MISS
+victim1:  <script src="https://evil.example/static/app.js"></script> (#44)  HIT
+victim2:  <script src="https://evil.example/static/app.js"></script> (#44)  HIT
+```
+
+攻撃者は `X-Forwarded-Host: evil.example` を付けた要求を 1 回送っただけです。その後 60 秒間、普通にページを開いた全員が、**攻撃者のサーバのスクリプトを読み込むページ**を受け取ります。XSS（第 100 回）と違い、被害者に罠のリンクを踏ませる必要がありません。キャッシュが、攻撃者の代わりに配ってくれます。
+
+直し方は、キーに入らない入力で応答を変えないことです。手元では、nginx が `X-Forwarded-Host` を**自分で上書きして**オリジンへ送るようにしました（`proxy_set_header X-Forwarded-Host $host;`）。
+
+```
+nginx（直した設定）
+attacker: <script src="https://localhost/static/app.js"></script> (#50)  MISS
+victim:   <script src="https://localhost/static/app.js"></script> (#50)  HIT
+```
+
+攻撃者の値は、オリジンに届く前に捨てられました。ほかに、オリジンがそのヘッダを信用しない、応答を変えるなら `Vary` に書く、といった方法があります。第 96 回の `Vary: Origin` も、**応答を変える入力はキーに入れる**という同じ原則の 1 つの例です。
+
+### Web キャッシュデセプション: パスの解釈の違いで個人のページを置かせる
+
+ポイズニングとは逆に、**被害者の**個人のページを共有のキャッシュに置かせて、攻撃者が後から読む攻撃もあります。Omer Gil が 2017 年に PayPal などで示した **Web キャッシュデセプション**です。PayPal では `https://www.paypal.com/myaccount/home/attack.css` のような URL で、名前や残高、取引の履歴などを含むページがキャッシュされえました（[Omer Gil: Web Cache Deception Attack](https://omergil.blogspot.com/2017/02/web-cache-deception-attack.html)）。
+
+成り立つ条件は 2 つです。
+
+1. キャッシュが、**拡張子を見て**、オリジンのヘッダを無視してキャッシュする
+2. オリジンが、`/account/x.css` のような存在しないパスに、`/account` の中身を返す
+
+手元のオリジンは、`/account` で始まるパスすべてに口座のページを返し、`Cache-Control: no-store, private` を付けます。オリジンとしては正しい指示です。nginx は上で見た「拡張子ならヘッダを無視して 10 分」の設定です。
+
+```
+nginx
+alice    /account          account of alice: ... api_key=k-alice-9f2c (#45)  no-store, private  MISS
+alice    /account/x.css    account of alice: ... api_key=k-alice-9f2c (#46)  Content-Type: text/html  MISS
+attacker /account/x.css    account of alice: ... api_key=k-alice-9f2c (#46)  HIT   ← Cookie なしで読めた
+
+Varnish（拡張子の規則なし）
+attacker /account/x.css    302 Found  MISS
+```
+
+攻撃者は、alice に `/account/x.css` へのリンクを踏ませるだけです。alice の Cookie 付きで作られたページが、`.css` という名前で共有のキャッシュに入り、攻撃者は Cookie 無しでそれを取り出せます。オリジンの `no-store, private` は、キャッシュの設定で無視されたので効いていません。
+
+拡張子の規則を外し、オリジンの指示に従わせた nginx（:18403）では、次のとおりでした。
+
+```
+alice    /account/x.css   account of alice ... (#51)  MISS
+attacker /account/x.css   302 Found  MISS
+/static/app.css を 2 回     MISS → HIT     ← 本物の静的ファイルは、オリジンの max-age で普通にキャッシュされる
+```
+
+対策は両側にあります。
+
+- キャッシュの側: **オリジンの `Cache-Control` を無視する規則を作らない**。拡張子で決めるなら、応答の `Content-Type` と拡張子が合うときだけ保存する。Cloudflare の Cache Deception Armor は、まさにこの照合をして、合わなければキャッシュしない機能です（[Cloudflare: Cache Deception Armor](https://developers.cloudflare.com/cache/cache-security/cache-deception-armor/)）
+- オリジンの側: 存在しないパスには 404 を返す。個人のページには `private` か `no-store` を付ける
+
+<Callout type="warn" title="よくある誤解: 「.css や .js の URL なら静的ファイルなのでキャッシュしてよい」">
+  URL の末尾は、キャッシュが勝手に読み取った**名前**であって、オリジンが何を返したかではありません。パスの後ろを無視するフレームワークや、`;` や `%2F` の解釈がキャッシュとオリジンで違う構成では、`.css` で終わる URL に HTML の個人ページが返ります。
+  Cloudflare は、既定ではキャッシュの対象を MIME の種類ではなく拡張子で決め、HTML と JSON は既定ではキャッシュしないと説明しています（[Cloudflare: Default cache behavior](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/)）。既定のままなら安全側ですが、「全部キャッシュする」規則を足したときに、この穴が開きます。
+</Callout>
+
+## CDN という共有キャッシュ
+
+### TLS を終えるのは CDN
+
+CDN を使うと、ブラウザとの TLS は CDN の拠点で終わります（第 116 回）。CDN が暗号を解いて HTTP の要求と応答を読めるからこそ、URL をキーにキャッシュでき、`Cache-Control` を読めます。裏返せば、**CDN は全利用者の Cookie と、全利用者向けの応答を平文で見る位置**にいます。ドメインを CDN に CNAME で向けるのも（第 58 回）、使わなくなった CDN の設定に CNAME を残すと乗っ取られうるのも（第 64 回）、この位置の強さの表と裏です。
+
+### CDN にだけ効く指示
+
+`s-maxage` は共有のキャッシュ全部に効きます。CDN と社内のプロキシを区別したい、CDN には長く持たせてブラウザには毎回確かめさせたい、といった場面のために、**特定の種類のキャッシュだけに向けた** `Cache-Control` が標準になりました。**CDN-Cache-Control** です（[RFC 9213](https://www.rfc-editor.org/rfc/rfc9213)、2022 年）。
+
+```
+Cache-Control: no-cache                 ← ブラウザ（と CDN-Cache-Control を知らないキャッシュ）向け
+CDN-Cache-Control: max-age=86400        ← CDN 向け
+```
+
+Cloudflare は `CDN-Cache-Control` があればそれで判断し、`Cache-Control` は変えずに下流へ渡します。Cloudflare だけに効かせて下流へ渡さない `Cloudflare-CDN-Cache-Control` もあります（[Cloudflare: CDN-Cache-Control](https://developers.cloudflare.com/cache/concepts/cdn-cache-control/)）。RFC 9213 より前から使われてきた事業者ごとの仕組みとして、Fastly の `Surrogate-Control` があり、Fastly は利用者に返す前にこのヘッダを取り除きます（[Fastly: Cache freshness](https://www.fastly.com/documentation/guides/concepts/edge-state/cache/cache-freshness/)）。
+
+CDN 向けに長い期限を付けるなら、内容を変えたときに**消す手段**（purge、invalidation）が要ります。消す API の形は CDN ごとに違います。RFC 9213 も、CDN のように**消す手段を持っている相手**には寛大な期限を与えやすい、と導入の理由に挙げています。契約した CDN は外から消せますが、ブラウザや途中のプロキシに渡った分は、DNS のキャッシュ（第 60 回）と同じく、期限が切れるまで消せません。
+
+### キャッシュの状態を報告するヘッダ
+
+キャッシュに当たったかどうかの表し方は、これまで事業者ごとにばらばらでした（`X-Cache`、`cf-cache-status` など）。これを揃える **Cache-Status** のヘッダも 2022 年に標準になっています。`hit`、オリジンへ転送した理由の `fwd`、残りの新しさの `ttl` などを、キャッシュの段ごとに並べて書きます（[RFC 9211](https://www.rfc-editor.org/rfc/rfc9211)）。
+
+実際の CDN の応答を、`curl -sI` の HEAD 要求で見ました（2026 年 10 月 9 日、東京から）。
+
+```
+https://cdn.jsdelivr.net/npm/react@18.3.1/package.json
+  cache-control: public, max-age=31536000, s-maxage=31536000, immutable
+  age: 679364
+  x-served-by: cache-fra-etou8220037-FRA, cache-nrt-rjtf7700064-NRT
+  x-cache: HIT, HIT
+
+https://developer.mozilla.org/en-US/
+  cache-control: public, max-age=3600
+  age: 786
+  x-cache: MISS, MISS, HIT
+
+https://www.netlify.com/
+  cache-control: public,max-age=0,must-revalidate
+  age: 5530
+  cache-status: "Netlify Edge"; hit; ttl=31530471
+
+https://blog.cloudflare.com/
+  cache-control: no-cache
+  cf-cache-status: HIT
+  age: 31
+
+https://www.google.com/
+  cache-control: private
+```
+
+- jsDelivr の応答は、Fastly と同じ形式の `X-Served-By` に、フランクフルト（FRA）と東京（NRT）の 2 段を並べています。Fastly の文書は、シールドを使うと `X-Served-By` にシールドの拠点とエッジの拠点が並ぶと説明しています。バージョンを固定したパッケージのファイルなので、1 年の `max-age` と `immutable` です
+- Netlify は、ブラウザには `max-age=0, must-revalidate` を渡しながら、自分の段には約 1 年（`ttl=31530471` 秒）の期限を持たせています。**ブラウザ向けと CDN 向けの期限を分ける**形が、`Cache-Status` でそのまま見えます
+- blog.cloudflare.com も、ブラウザには `no-cache` を返しつつ CDN では当たっています。CDN 側の期限が `Cloudflare-CDN-Cache-Control` で与えられたのか、CDN の規則で与えられたのかは、応答からは分かりません
+- Google の検索のトップは `private` で、共有のキャッシュには置かせません
+
+## ブラウザの中のキャッシュも、分けられている
+
+共有のキャッシュは利用者の間で応答を共有しますが、ブラウザのキャッシュは 1 人の中で**サイトをまたいで**共有されていました。RFC 9111 も、あるサイトが別のサイトの資源の読み込み時間を測れば、利用者がそのサイトを訪れたかが分かるという問題を挙げ、キャッシュのキーに参照元のサイトを加える **double keying** を対策として挙げています（[7.2](https://www.rfc-editor.org/rfc/rfc9111.html#section-7.2)）。主要なブラウザは、HTTP キャッシュをトップレベルのサイトで分ける方向に進みました（第 97 回）。
+
+その結果、「有名な CDN の同じ URL のライブラリなら、別のサイトで読み込んだものがキャッシュに残っていて速い」という昔の利点は、今は成り立ちません。CDN の速さは、ブラウザのキャッシュではなく、**近い拠点の共有キャッシュ**から来ています。
+
+## 用途別の組み合わせ
+
+| 応答の種類 | オリジンが付ける指示 | CDN の設定で気を付けること |
+| --- | --- | --- |
+| 名前に中身のハッシュを入れた JS、CSS、画像 | `public, max-age=31536000, immutable` | そのまま従わせる |
+| HTML（誰に対しても同じ） | `no-cache`（ETag 付き）。CDN に持たせるなら `CDN-Cache-Control` か `s-maxage` を別に | 更新時に purge する手段を用意する |
+| ログインした利用者ごとのページ | `private` または `no-store` | **ヘッダを無視して全部キャッシュする規則を作らない** |
+| 認証付きの API（`Authorization`） | `private` または `no-store` | 規則（RFC 9111 3.5）を守らない実装がある。nginx なら `proxy_no_cache` を設定する |
+| `Access-Control-Allow-Origin` を要求で変える API | `Vary: Origin`（第 96 回） | キーに `Origin` を含めるか確かめる |
+| トークン、パスワードのリセットなど | `no-store`（OAuth のトークンの応答は RFC 6749 の要求、第 132 回） | — |
+| プロキシの後ろでホスト名を使ってリンクを作るページ | 独自のヘッダの値を信用しない | `X-Forwarded-Host` などは手前で上書きする |
+
+## 実装ごとの違い
+
+この回の実験は、nginx 1.31.6 と Varnish 9.1.0 だけで行いました（執筆時点、2026 年 10 月）。違いが出やすいのは次の点です。
+
+| 点 | nginx 1.31.6（手元） | Varnish 9.1.0（既定の VCL、手元） |
+| --- | --- | --- |
+| `Age` の付与 | 付かなかった | 付いた |
+| 期限切れの扱い | `proxy_cache_revalidate on` で、その場で確かめ直した | grace（既定 10 秒）の間は古いものを返し、裏で確かめ直した |
+| 期限の書かれていない応答 | キャッシュしない（`proxy_cache_valid` が無い場合） | 120 秒（`default_ttl`） |
+| `Cookie` 付きの要求 | 区別せずキャッシュから返した | キャッシュに通さない |
+| `Authorization` 付きの要求 | 区別せずキャッシュから返した（RFC 9111 3.5 に反する） | キャッシュに通さない |
+| `Set-Cookie` を含む応答 | キャッシュしない（文書に記載） | キャッシュしない |
+| `no-cache` | 保存しなかった | 保存しなかった |
+
+CDN は、これらの既定を事業者ごとに、さらに設定ごとに変えています。Cloudflare は HTML を既定ではキャッシュしませんが、規則を足せば変わります。**自分の CDN が `Cookie`、`Authorization`、`Vary`、オリジンの `Cache-Control` をどう扱っているかは、文書を読むだけでなく、2 人分の資格情報で同じ URL を取って確かめる**のが確実です。手元の実験の形が、そのまま使えます。
+
+## まとめ
+
+- ブラウザのキャッシュは 1 人の応答を、CDN やリバースプロキシのキャッシュは**多くの人の応答をまとめて**持つ。共有のキャッシュでの取り違えは、他人への情報の漏れになる
+- 新しさは `max-age`、共有のキャッシュでは `s-maxage` が優先。何も書かなければ、キャッシュが推測や既定値で期限を決めることがある。`Age` は、キャッシュから返った応答の古さを示す（付けない実装もある）
+- 期限切れの応答は `ETag` と 304 で確かめ直す。Varnish は既定で、古いものを返しながら裏で確かめ直した
+- `no-cache` は「毎回確かめる」、`private` は「共有のキャッシュに置くな」、`no-store` は「どこにも置くな」
+- キャッシュのキーは既定で URL。`Cookie` も `Authorization` も入らない。`private` を書き忘れた個人のページは、手元の nginx で別の利用者に返った
+- `Authorization` 付きの要求への応答は、RFC 9111 では原則として共有のキャッシュで使い回せないが、手元の nginx は使い回した
+- キーに入らないヘッダで応答が変わると、攻撃者が 1 回の要求でキャッシュを汚せる（ポイズニング）。拡張子でヘッダを無視してキャッシュすると、被害者の個人ページを置かせて読める（デセプション）
+- CDN 向けの期限は `CDN-Cache-Control`、状態の報告は `Cache-Status` が標準になった。CDN は TLS を終えるので、全利用者の通信を平文で見る位置にいる
+
+次は章の最後です。フロントエンドと API を同じオリジン、同じサイトの別オリジン、別サイトのどこに置くかで、ここまでの Cookie、CORS、CSRF、第三者 Cookie の制限がどう効くかを、構成の型ごとに並べます。その構成の多くで、画面の手前にはこの回で見た CDN やリバースプロキシが立っています。

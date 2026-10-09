@@ -1,0 +1,465 @@
+---
+title: 証明書の一生
+description: 証明書は誰が、何を確かめて発行しているのか。取り消したいときに本当に取り消せるのか。CSR と ACME で発行し、Certificate Transparency で監視し、CRL と OCSP で失効させるまでを、テスト用の CA を手元で動かしながら追います
+chapter: tls
+order: 3
+status: published
+topics:
+  - CSR
+  - DV / OV / EV
+  - ACME
+  - HTTP-01 / DNS-01 / TLS-ALPN-01
+  - CAA
+  - Certificate Transparency
+  - CRL / OCSP
+  - OCSP stapling
+  - CRLite / CRLSets
+  - 証明書の有効期間の短縮
+requires:
+  - ll-113-pki-chain
+  - ll-112-x509
+  - ll-58-dns-records
+  - ll-109-signature
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 証明書は、誰が何を確かめて出しているのか
+
+第 112 回で、証明書は「この公開鍵はこの名前のものだ」という CA の署名付きの文書だと見ました。第 113 回では、その CA をなぜ信じてよいのかを、ルートまでの連鎖でたどりました。
+
+残っている問いは 3 つです。
+
+1. CA は、申請してきた人が本当にその名前の持ち主だと、**何をもって**判断しているのか
+2. CA がだまされたり、乗っ取られたりして、他人の名前の証明書を出してしまったら、**誰が気づく**のか
+3. 秘密鍵が漏れたとき、まだ期限の残っている証明書を**取り消せる**のか
+
+この回は、証明書の一生を発行・監視・失効・更新の順に追います。先に結論を言うと、**1 は自動化され、2 は公開ログで見張られ、3 はうまく動かなかったので、証明書の寿命そのものを短くする方向に進んでいます。**
+
+## 申請書: CSR
+
+証明書を申請するとき、利用者は CA に **CSR**（Certificate Signing Request、証明書署名要求）を送ります。形式は PKCS#10 です（[RFC 2986](https://www.rfc-editor.org/rfc/rfc2986.html)）。中身は「この公開鍵に、この名前で証明書を出してほしい」という申請に、**その公開鍵と対になる秘密鍵で署名したもの**です。
+
+```
+$ openssl req -new -key csr.key -subj "/CN=app.example.test" \
+    -addext "subjectAltName=DNS:app.example.test,DNS:api.example.test" -out app.csr
+$ openssl req -in app.csr -noout -text
+        Subject: CN=app.example.test
+        Attributes:
+            Requested Extensions:
+                X509v3 Subject Alternative Name:
+                    DNS:app.example.test, DNS:api.example.test
+    Signature Algorithm: ecdsa-with-SHA256
+$ openssl req -in app.csr -noout -verify
+Certificate request self-signature verify OK
+```
+
+CSR の署名が示すのは、**申請者がこの公開鍵の秘密鍵を持っている**ことだけです（第 109 回）。名前の持ち主であることは、何も示していません。CSR には誰でも好きな名前を書けます。
+
+大事なのは、**秘密鍵は CA に渡らない**ことです。CA が受け取るのは公開鍵と申請内容だけで、秘密鍵は申請者の手元（第 111 回の保管場所）から出ません。PEM のヘッダは `BEGIN CERTIFICATE REQUEST` です（第 110 回）。
+
+<Callout type="warn" title="誤解: CSR に書いたとおりの証明書が出てくる">
+  CSR は「お願い」であって、証明書の下書きではありません。CA は確認できた名前だけを載せ、Subject の中身も自分の方針で決めます。
+  後の実験でこの CSR を送ると、返ってきた証明書の Subject は**空**でした。SAN は 2 つとも載っていますが、CN は落とされています。
+  第 112 回で見たとおり、名前の照合は SAN で行うので、CN は無くても困りません。Let's Encrypt の新しいプロファイルも CN を載せません（[Let's Encrypt: Profiles](https://letsencrypt.org/docs/profiles/)）。
+</Callout>
+
+## CA は何を確かめるのか: DV / OV / EV
+
+CA が確かめる範囲には 3 段階あり、証明書の Certificate Policies 拡張に、CA/Browser Forum が決めた OID で書かれます（[CA/B Forum Object Registry](https://cabforum.org/resources/object-registry/)）。
+
+| 種類 | OID | 確かめること |
+| --- | --- | --- |
+| **DV**（Domain Validated） | 2.23.140.1.2.1 | 申請者がそのドメインを管理していること。組織の身元は確かめない |
+| **OV**（Organization Validated） | 2.23.140.1.2.2 | DV に加えて、組織が実在すること |
+| **EV**（Extended Validation） | 2.23.140.1.1 | OV より厳格な手順で組織を確かめる（EV ガイドラインに従う） |
+
+実物を見ると違いが分かります。
+
+```
+$ ... letsencrypt.org の証明書
+subject=CN=letsencrypt.org
+    Policy: 2.23.140.1.2.1
+
+$ ... www.digicert.com の証明書
+subject=jurisdictionC=US, jurisdictionST=Utah, businessCategory=Private Organization,
+        serialNumber=5299537-0142, C=US, ST=Utah, L=Lehi, O=DigiCert, Inc., CN=www.digicert.com
+    Policy: 2.23.140.1.1
+```
+
+EV の Subject には登記の情報まで入っています。かつてブラウザは、EV の証明書を使うサイトのアドレスバーに会社名を緑色で表示していました。しかし Chrome は **Chrome 77（2019 年）で、この表示をアドレスバーから外し**、鍵のアイコンを押すと出るページ情報の中へ移しました。Chrome のセキュリティ UX チームの調査で、表示が利用者を期待どおりに守っていないと判断したためです（[Chromium Docs: EV UI Moving to Page Info](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/security/ev-to-page-info.md)）。
+
+<Callout type="warn" title="誤解: EV や OV の証明書は、DV より通信が安全">
+  DV・OV・EV の違いは、**CA が発行前に調べた範囲**だけです。鍵の種類も、TLS の暗号も、ブラウザの検証の手順も同じで、DV だから盗聴されやすいということはありません。
+  また、どの種類でも「そのサイトが善良であること」は保証しません（第 112 回）。フィッシングサイトも、自分で持っているドメインの DV 証明書は正当に取れます。
+</Callout>
+
+以下では、Web のほとんどを占める **DV** の発行を見ていきます。
+
+## ACME: 確認を機械に任せる
+
+DV の確認は「そのドメインを今管理している人にしかできないこと」をやってもらう、という形をとります。かつては担当者がメールで手順を受け取り、手作業で進めていました。これを HTTP の API にしたのが **ACME**（Automatic Certificate Management Environment、[RFC 8555](https://www.rfc-editor.org/rfc/rfc8555.html)）です。Let's Encrypt が作り、今は多くの CA が対応しています。
+
+流れは次のとおりです。
+
+```
+クライアント                                        CA（ACME サーバ）
+  │── GET  /directory ──────────────────────────→  各操作の URL の一覧
+  │── HEAD newNonce ────────────────────────────→  Replay-Nonce を 1 つ受け取る
+  │── POST newAccount（アカウント鍵の公開鍵）──→  アカウント作成
+  │── POST newOrder（名前の一覧）──────────────→  注文。名前ごとに authorization
+  │── POST authorization ───────────────────────→  チャレンジの候補（トークン付き）
+  │   （DNS に TXT を置く / HTTP でファイルを出す）
+  │── POST challenge「準備できた」─────────────→  CA が外から確かめに来る
+  │── POST finalize（CSR）─────────────────────→  証明書を発行
+  │── POST certificate ─────────────────────────→  証明書とチェーンの PEM
+```
+
+ACME の要求は、本文をすべて **JWS**（署名付きの JSON）で包みます（[RFC 8555 6.2](https://www.rfc-editor.org/rfc/rfc8555.html#section-6.2)）。署名に使うのは**アカウント鍵**で、証明書に載る鍵とは別の鍵です。JWS の形は第 131 回で詳しく見ます。ここで押さえておきたいのは 2 点です。
+
+- **アカウント鍵が、利用者の身元の代わり**になる。パスワードはない。authorization は「このアカウント鍵の持ち主が、このドメインを管理していると確かめた」という記録になる
+- JWS のヘッダに、サーバが払い出した使い捨ての **nonce** と宛先の URL を入れる（[RFC 8555 6.4, 6.5](https://www.rfc-editor.org/rfc/rfc8555.html#section-6.5)）。途中で拾った要求を**送り直しても通らない**（リプレイの防止）
+
+## 3 つのチャレンジ
+
+authorization に並ぶのが**チャレンジ**です。どれも、CA が渡した**トークン**と、アカウント鍵の公開鍵の thumbprint（第 110 回の RFC 7638）をつないだ **key authorization** を、決められた場所に置けるかを試します（[RFC 8555 8.1](https://www.rfc-editor.org/rfc/rfc8555.html#section-8.1)）。
+
+```
+keyAuthorization = token || '.' || base64url(Thumbprint(accountKey))
+```
+
+トークンだけでなくアカウント鍵を混ぜるのは、**そのドメインを管理している人が、このアカウントに許可した**ことまで示すためです。途中でトークンを盗み見た別人が、自分のアカウントで使うことはできません。
+
+| | HTTP-01 | DNS-01 | TLS-ALPN-01 |
+| --- | --- | --- | --- |
+| 定義 | [RFC 8555 8.3](https://www.rfc-editor.org/rfc/rfc8555.html#section-8.3) | [RFC 8555 8.4](https://www.rfc-editor.org/rfc/rfc8555.html#section-8.4) | [RFC 8737](https://www.rfc-editor.org/rfc/rfc8737.html) |
+| 置くもの | `http://名前/.well-known/acme-challenge/トークン` に key authorization | `_acme-challenge.名前` の TXT に base64url(SHA-256(key authorization)) | ALPN `acme-tls/1` で応じ、key authorization のハッシュを acmeIdentifier 拡張に入れた自己署名証明書を出す |
+| CA が来るポート | 80 のみ | DNS（53） | 443 |
+| 示すこと | その名前の Web サーバを動かしている | そのゾーンを編集できる | その名前の 443 番を握っている |
+| ワイルドカード | 不可 | **可** | 不可 |
+| 向いている場面 | 普通の Web サーバ 1 台 | 外から届かないサーバ、ワイルドカード、LB が多数ある構成 | 80 番を開けられず 443 番だけで済ませたい |
+
+ポートとワイルドカードの制約は、Let's Encrypt の説明のとおりです（[Let's Encrypt: Challenge Types](https://letsencrypt.org/docs/challenge-types/)）。ワイルドカードが DNS-01 でしか取れないのは、`*.example.com` は**配下のすべての名前**を指すので、特定の 1 台の Web サーバを管理していることでは足りず、**ゾーンそのものを管理している**ことを示す必要があるからです。
+
+DNS-01 は、第 58 回の「TXT に書かせて所有を確かめる」そのものです。DNS の API の鍵を ACME クライアントに渡すことになるので、**その鍵が漏れると、誰でも証明書を取れる**点には注意が要ります。
+
+TLS-ALPN-01 は、かつての TLS-SNI-01 の置き換えです。TLS-SNI-01 は、共用のホスティングで他人の検証用の名前に応答できてしまう問題が見つかり、使われなくなりました（[RFC 8737 1](https://www.rfc-editor.org/rfc/rfc8737.html#section-1)）。
+
+CA は外から確かめに来るので、**経路の途中で DNS や BGP を乗っ取られると、偽の検証が通るおそれ**があります。そのため CA/Browser Forum は、検証と CAA の確認を**複数のネットワーク上の地点から**行うことを求めるようになりました（[Ballot SC-067](https://cabforum.org/2024/08/05/ballot-sc067v3-require-domain-validation-and-caa-checks-to-be-performed-from-multiple-network-perspectives-corroboration/)）。
+
+## CAA: 発行してよい CA を DNS で絞る
+
+第 58 回で見た **CAA** レコードは、「このドメインの証明書は、この CA だけが出してよい」という宣言でした（[RFC 8659](https://www.rfc-editor.org/rfc/rfc8659.html)）。`dig +short CAA letsencrypt.org` を引くと、`0 issue "pki.goog"` や `0 issuewild "sectigo.com"` のように、自分以外の CA も含めて 10 行ほど並びます。`issue` は通常の証明書、`issuewild` はワイルドカードの証明書を出してよい CA です。CA は発行の前に CAA を確かめ、自分が載っていなければ発行を断ります。
+
+<Callout type="warn" title="誤解: CAA を書けば、他の CA の証明書はブラウザで使えなくなる">
+  CAA を見るのは**発行する CA だけ**です。RFC 8659 は「証明書を検証する側は、CAA を検証に使ってはならない」と明記しています（[RFC 8659 1](https://www.rfc-editor.org/rfc/rfc8659.html#section-1)）。
+  ですから、CAA を守らない CA、あるいは乗っ取られた CA が出した証明書は、ブラウザでは普通に通ります。CAA は**まともな CA がだまされる事故**を減らす仕組みで、悪意のある CA は止めません。
+  それを見つけるのが、次の Certificate Transparency です。
+</Callout>
+
+## 手元で確かめる: テスト用の CA で発行する
+
+Let's Encrypt は、自分の CA の実装（Boulder）とは別に、ACME クライアントの試験用の小さな CA **Pebble** を公開しています（[letsencrypt/pebble](https://github.com/letsencrypt/pebble)）。検証に使う DNS を差し替えるための **pebble-challtestsrv** と組み合わせると、実在しない `example.test` の証明書を手元で発行できます。ACME クライアントには Go 製の lego（5.5.2）を使います。
+
+```
+docker network create --subnet 10.93.0.0/24 ll93net
+# 検証用の DNS。どの名前も 10.93.0.4（lego のコンテナ）を指す
+docker run -d --network ll93net --ip 10.93.0.3 -p 18095:8055 \
+  ghcr.io/letsencrypt/pebble-challtestsrv -defaultIPv4 10.93.0.4 -defaultIPv6 ""
+# CA 本体。名前の解決に上の DNS を使う
+docker run -d --rm --network ll93net --ip 10.93.0.2 -p 18093:14000 \
+  ghcr.io/letsencrypt/pebble -dnsserver 10.93.0.3:8053
+```
+
+起動時のログに、CA の構成が出ます。
+
+```
+Generated issuance chain: Pebble Root CA 11c556 -> Pebble Intermediate CA 0ac727
+Loaded profile "default" with certificate validity period of 7776000 seconds (promote CN=false)
+Loaded profile "shortlived" with certificate validity period of 518400 seconds (promote CN=false)
+No CAA identities configured, using default [pebble.letsencrypt.org]
+Configured to reject 5% of good nonces
+```
+
+ルートと中間の 2 段は第 113 回の形です。有効期間は 90 日（7,776,000 秒）と 6 日（518,400 秒）の 2 つのプロファイルがあります。「正しい nonce の 5% をわざと拒否する」のは、クライアントがやり直しを正しく実装しているかを試すための意地悪です。
+
+**HTTP-01 で 1 枚発行する。** lego に 5002 番で待ち受けさせます（Pebble は 80 番の代わりに 5002 番へ確かめに来ます）。
+
+```
+$ docker run --rm --network ll93net --ip 10.93.0.4 ... goacme/lego run \
+    --server https://pebble:14000/dir -d www.example.test --http --http.address :5002 ...
+level=INFO msg="Obtaining bundled SAN certificate." domains=www.example.test
+level=INFO msg="http01: Trying to solve HTTP-01." domain=www.example.test
+level=DEBUG msg="Served key authentication." domain=www.example.test
+level=DEBUG msg="Served key authentication." domain=www.example.test
+level=DEBUG msg="Served key authentication." domain=www.example.test
+level=INFO msg="The server validated our request." domain=www.example.test
+level=INFO msg="Server responded with a certificate." domains=www.example.test
+```
+
+同じ時刻の Pebble 側のログです。
+
+```
+POST /sign-me-up          ← newAccount
+POST /order-plz           ← newOrder
+POST /chalZ/              ← 「準備できた」
+Starting 3 validations.
+Attempting to validate w/ HTTP: http://www.example.test:5002/.well-known/acme-challenge/Eyrci6z5T_B1dn...
+（同じ行があと 2 回）
+POST /finalize-order/     ← CSR を送る
+Issued certificate serial 753ba42286d8b511
+```
+
+URL の名前は、検証用の DNS で lego のコンテナを指しています。Pebble はこれを 3 回並行して取りに来て、lego は 3 回応答しました。本物の CA が複数の地点から確かめる様子に似ています。
+
+**ワイルドカードを HTTP-01 で頼むと、始まる前に止まります。**
+
+```
+$ ... run -d '*.example.test' --http ...
+level=DEBUG msg="The challenge type is not in the list of available solvers. Skipping." type=dns-persist-01
+level=DEBUG msg="The challenge type is not in the list of available solvers. Skipping." type=dns-account-01
+level=DEBUG msg="The challenge type is not in the list of available solvers. Skipping." type=dns-01
+level=ERROR msg=Error error="... could not determine solvers"
+```
+
+CA が提示したチャレンジが、**DNS を使うものだけ**だったからです（dns-account-01 と dns-persist-01 は IETF で検討中の新しい方式で、後者は Let's Encrypt が 2026 年 2 月に対応を発表しています。[Let's Encrypt: DNS-PERSIST-01](https://letsencrypt.org/2026/02/18/dns-persist-01)）。DNS-01 に替え、TXT は challtestsrv の管理 API に書かせる小さなスクリプトで置くと、通ります。
+
+```
+$ ... run -d '*.example.test' -d example.test --dns exec ...
+msg="txt.sh present _acme-challenge.example.test. ovvyFeVAPqULP7QbLDd1Me_LO83rXcH5k0Bt4SGhE_c"
+msg="The server validated our request." domain=example.test
+msg="txt.sh present _acme-challenge.example.test. egAtaR2E4cn-78xbmoGnsNTzH3y3sFbTNrdbG_qc7os"
+msg="The server validated our request." domain=*.example.test
+msg="Server responded with a certificate." domains="*.example.test, example.test"
+```
+
+`example.test` と `*.example.test` は、**同じ `_acme-challenge.example.test` に別の値**を置いて確かめています。lego は 1 つ目を片付けてから 2 つ目に進みました。
+
+**自前の CSR を送る。** 先ほどの `app.csr` を `--csr` で渡すと、lego は鍵を作らず、証明書だけを受け取ります。
+
+```
+$ openssl x509 -in app.example.test.crt -noout -subject -ext subjectAltName
+subject=
+X509v3 Subject Alternative Name: critical
+    DNS:app.example.test, DNS:api.example.test
+$ diff <(openssl x509 -in app.example.test.crt -noout -pubkey) <(openssl pkey -in csr.key -pubout) && echo SAME_KEY
+SAME_KEY
+```
+
+証明書の公開鍵は手元の `csr.key` のものと一致し、秘密鍵は一度も外に出ていません。Subject が空で SAN が critical なのは、RFC 5280 が「Subject が空なら SAN を critical にせよ」と決めているからです（[RFC 5280 4.2.1.6](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.6)）。
+
+**ACME を自分で話す。** lego が隠している中身を見るため、Python の標準ライブラリと cryptography だけで 100 行ほどのクライアントを書き、DNS-01 で 1 枚取りました（JWS の組み立て方は第 131 回で扱うので省きます）。
+
+```
+protected: {"alg": "ES256", "nonce": "zQg62iZ5vMYGurI32i-fKQ", "url": ".../sign-me-up", "jwk": {...}}
+protected: {"alg": "ES256", "nonce": "gw4LdPQzSvkReyQQ37W04Q", "url": ".../sign-me-up", "jwk": {...}}
+newAccount 201 https://localhost:18093/my-account/33676dcda1811d83
+newOrder 201 pending
+authz pending ['dns-01', 'tls-alpn-01', 'http-01', 'dns-account-01', 'dns-persist-01']
+token       difZYy_eFpou6bEOJQqa7GZ1ThoxbTRO5MvrJFDfgJY
+thumbprint  HMkise-2DWtuFqk3YN0d0MMUnyQyvqYRHhz3kzGv1uM
+TXT value   sAgfLSg1UoIW9ek1UZ5ZP1HiduXNu2Bx2XjP4wBrKSc
+authz after valid
+finalize 200 processing
+certificate 200 2 certs in chain
+```
+
+最初の newAccount は、5% の意地悪に当たって `badNonce` で断られ、新しい nonce で送り直しています。普通の名前には 5 種類のチャレンジが提示されました。TXT の値は `token.thumbprint` の SHA-256 を base64url にしたもので、表の式どおりです。最初の要求にだけ `jwk`（公開鍵そのもの）が入り、以後は `kid`（アカウントの URL）に替わります。
+
+リプレイも試せます。newAccount の JWS を 1 つ作り、**まったく同じバイト列を 2 回**送ると、2 回目は断られます。
+
+```
+1 201 valid
+2 400 urn:ietf:params:acme:error:badNonce JWS has an invalid anti-replay nonce: vpPLnmXf_zQ-JiWPgHyHUA
+```
+
+署名は正しいままです。**署名は「この鍵で作った」ことしか言わないので、いつ作ったかは nonce で縛る**わけです。
+
+なお Pebble は CAA を確かめません。`letsencrypt.org` だけを許す CAA を challtestsrv に置いても発行されました（Pebble のソースにも CAA の照会はありません）。CAA の確認は本物の CA の仕事です。
+
+## 不正な発行はどう起きたか: DigiNotar（2011）
+
+オランダの CA、DigiNotar は 2011 年 6 月から 7 月にかけて侵入を受け、**証明書を発行するサーバがすべて乗っ取られました**。調査を担当した Fox-IT の報告では、確認できただけで 531 枚の不正な証明書が作られ、その中には `*.google.com` もありました。この証明書は 2011 年 8 月、主にイランの利用者に対する中間者攻撃に使われ、その期間の DigiNotar の OCSP への問い合わせは 99% 以上がイランからでした（[Fox-IT: Black Tulip](https://roselabs.nl/files/audit_reports/Fox-IT_-_DigiNotar.pdf)）。
+
+見つかったきっかけは Chrome でした。Chrome は Gmail などの Google のサイトについて、発行してよい CA を少数に限る仕組みを組み込んでいて、DigiNotar の証明書を不正と判定できました（[Google Security Blog 2011](https://security.googleblog.com/2011/08/update-on-attempted-man-in-middle.html)）。ブラウザ各社は DigiNotar のルートを外し、DigiNotar は 2011 年 9 月 20 日に破産を宣告されました（[VASCO の発表](https://www.prnewswire.com/news-releases/vasco-announces-bankruptcy-filing-by-diginotar-bv-130181213.html)）。
+
+この事件が示したのは、第 113 回で見た Web の PKI の弱点そのものです。**トラストストアにある CA は、どれでも、どの名前の証明書でも出せる。** そして CA が黙っていれば、ドメインの持ち主には**自分の名前の証明書が出たことを知る手段がない**。Google が気づけたのは、自分のサイトについてだけ特別な仕組みを持っていたからでした。
+
+## Certificate Transparency: すべての発行を公開ログに載せる
+
+そこで作られたのが **Certificate Transparency**（CT、[RFC 6962](https://www.rfc-editor.org/rfc/rfc6962.html)）です。考え方は単純で、**発行した証明書をすべて、誰でも読める追記専用のログに載せる**。載っていない証明書は、ブラウザが受け入れない。
+
+```
+CA ──① 発行予定の証明書（プリ証明書）──→ CT ログ（複数の事業者）
+   ←─② SCT（「一定時間内にログに載せる」という署名付きの約束）──
+CA ──③ SCT を埋め込んで本物の証明書を発行──→ サーバ
+ブラウザ: SCT が足りなければ、その証明書を受け入れない
+監視者（ドメインの持ち主など）: ログを読み続け、自分の名前の証明書を探す
+```
+
+- ログは**マークル木**（葉が証明書のハッシュ木）で作られていて、過去のエントリを消したり書き換えたりすると、その後の木の根が合わなくなる。ログが「追記しかしていない」ことを、第三者が確かめられる（[RFC 6962 2.1](https://www.rfc-editor.org/rfc/rfc6962.html#section-2.1)）
+- **SCT**（Signed Certificate Timestamp）は第 112 回で見た拡張で、ログの署名付きの受領証。証明書に埋め込むほか、TLS の拡張や OCSP の応答で渡すこともできる（[RFC 6962 3.3](https://www.rfc-editor.org/rfc/rfc6962.html#section-3.3)）
+- Chrome は 2018 年 4 月 30 日より後に発行された証明書に CT への準拠を求め、Chrome 68 から実際に拒否し始めた（[ct-policy の告知 2018](https://groups.google.com/a/chromium.org/g/ct-policy/c/Qqr59r6yn1A/m/2t0bWblZBgAJ)）。執筆時点（2026 年 9 月）の [Chrome CT Policy](https://googlechrome.github.io/CertificateTransparency/ct_policy.html) では、埋め込みの SCT は有効期間 180 日以下の証明書で 2 つ以上、それより長ければ 3 つ以上、しかも別々のログ事業者から必要
+
+RFC 6962 は実験的な仕様で、改訂版の CT 2.0（[RFC 9162](https://www.rfc-editor.org/rfc/rfc9162.html)）が出ていますが、Web で実際に動いているのは今も 6962 の形式です。
+
+<Callout type="warn" title="誤解: CT は不正な証明書の発行を防ぐ">
+  CT は発行を**止めません**。止めるのではなく、**隠れて発行できなくする**仕組みです。不正な証明書がログに載れば、持ち主や研究者がそれを見つけ、CA を問い詰め、失効やルートの削除につなげられます。ログに載せなければ、ブラウザが受け入れないので使えません。
+  つまり、ドメインの持ち主が**ログを見ていなければ、何の役にも立ちません**。自分のドメインの CT の監視（crt.sh の検索や、CT の通知サービス）を仕組みとして入れておくのは、持ち主の側の仕事です。
+</Callout>
+
+## 手元で確かめる: 公開ログを引く
+
+CT のログを検索できるサービスに crt.sh があります。`rfc-editor.org` の、期限切れでないものを引きました（2026 年 9 月 28 日）。
+
+```
+$ curl -s 'https://crt.sh/?q=rfc-editor.org&output=json&exclude=expired&deduplicate=Y' | python3 -c ...
+29084534125 2026-08-24T09:44:53 2026-11-22T10:44:47 C=US, O=Google Trust Services, CN=WE1  rfc-editor.org
+29136859469 2026-08-24T09:44:40 2026-11-22T10:43:10 C=US, O=Google Trust Services, CN=WR1  rfc-editor.org
+28867235150 2026-08-15T02:55:02 2026-11-13T02:55:01 C=US, O=Let's Encrypt, CN=YE1         *.rfc-editor.org,rfc-editor.org
+28846677568 2026-08-14T21:39:55 2026-11-12T21:39:54 C=US, O=Let's Encrypt, CN=YR1         *.rfc-editor.org,rfc-editor.org
+28827951023 2026-08-14T05:39:26 2026-11-12T05:39:25 C=US, O=Let's Encrypt, CN=YE2         *.rfc-editor.org
+...
+```
+
+Google Trust Services と Let's Encrypt の 2 つの CA から、それぞれ別々の中間 CA を通した証明書が、ほぼ同じ時刻に対で出ています。**持ち主が把握していない CA や、見覚えのない名前が混ざっていないか**を見るのが、監視の基本です。証明書を取れば、ドメインの**サブドメインの名前が全部公開される**ことにもなります。社内向けの名前を公開の証明書に載せると、CT から丸見えになります。
+
+実際のサーバの証明書にも、SCT が入っています。
+
+```
+$ echo | openssl s_client -connect letsencrypt.org:443 -servername letsencrypt.org 2>/dev/null \
+    | openssl x509 -noout -ext ct_precert_scts
+CT Precertificate SCTs:
+    Signed Certificate Timestamp:
+        Log ID    : D8:09:55:3B:94:4F:7A:FF:...   Timestamp : Sep  4 15:33:02.377 2026 GMT
+    Signed Certificate Timestamp:
+        Log ID    : 46:AF:86:3D:3B:3E:E5:9F:...   Timestamp : Sep  4 15:33:02.552 2026 GMT
+```
+
+有効期間 90 日の証明書なので、2 つの別々のログの SCT が入っています。
+
+## 失効: CRL と OCSP
+
+秘密鍵が漏れた、ドメインを手放した、CA が誤って発行した。こうしたとき、期限前の証明書を無効にするのが**失効**です。第 112 回で見たとおり、証明書自体には「失効したかどうか」は書かれていないので、**外の情報**を見に行くしかありません。方法は 2 つあります。
+
+| | CRL | OCSP |
+| --- | --- | --- |
+| 定義 | [RFC 5280 5](https://www.rfc-editor.org/rfc/rfc5280.html#section-5) | [RFC 6960](https://www.rfc-editor.org/rfc/rfc6960.html) |
+| 形 | 失効した証明書のシリアル番号の一覧に、CA が署名したもの | 「この 1 枚は有効か」に、CA（の応答サーバ）が署名して答える |
+| 置き場所 | 証明書の CRL Distribution Points | 証明書の AIA の OCSP の URL |
+| 弱点 | 大きい。取得の間隔だけ遅れる | 問い合わせで**どのサイトを見ているかが CA に漏れる**。応答サーバが止まると困る |
+
+実物を見ます。letsencrypt.org の証明書が指す CRL を取ると、60 KB に 1,559 件のシリアル番号が並んでいて、次の更新は 9 日後です。
+
+```
+$ curl -s http://ye2.c.lencr.org/96.crl -o le.crl
+$ openssl crl -inform DER -in le.crl -noout -text | grep -E "Last Update|Next Update"
+    Last Update: Sep 28 10:20:59 2026 GMT
+    Next Update: Oct  7 10:20:58 2026 GMT
+```
+
+OCSP の URL を持つ www.digicert.com の証明書で、問い合わせてみます。
+
+```
+$ openssl ocsp -issuer dc2.pem -cert dc1.pem -url http://ocsp.digicert.com
+Response verify OK
+dc1.pem: good
+	This Update: Sep 27 15:33:00 2026 GMT
+	Next Update: Oct  4 14:33:00 2026 GMT
+```
+
+OCSP の応答も、**1 週間ほど有効な署名付きの文書**です。そこで、サーバが自分で OCSP の応答を取っておき、TLS のハンドシェイクで証明書と一緒に渡す **OCSP stapling** が作られました（`status_request` 拡張、[RFC 6066 8](https://www.rfc-editor.org/rfc/rfc6066.html#section-8)）。ブラウザは CA に問い合わせずに済み、プライバシーの問題も消えます。
+
+```
+$ echo | openssl s_client -connect www.digicert.com:443 -status 2>/dev/null | grep -E "OCSP|Cert Status"
+OCSP responses: number of responses: 1
+    OCSP Response Status: successful (0x0)
+    Cert Status: good
+$ echo | openssl s_client -connect letsencrypt.org:443 -status 2>/dev/null | grep OCSP
+OCSP responses: no responses sent
+```
+
+さらに、証明書に「この証明書は stapling なしで受け入れるな」と書く **Must-Staple**（[RFC 7633](https://www.rfc-editor.org/rfc/rfc7633.html)）もあります。
+
+Pebble でも失効を試せます。lego で理由コード 4（superseded、別の証明書に置き換えた）を付けて失効させると、Pebble の管理 API の状態が変わります。
+
+```
+$ ... lego certificates revoke -c www.example.test --reason 4 ...
+msg="The certificate has been revoked." cert-name=www.example.test
+$ curl -sk https://localhost:18096/cert-status-by-serial/753ba42286d8b511
+   "Status": "Revoked",  "Reason": 4,  "RevokedAt": "2026-09-28 10:48:43 ..."
+```
+
+CA の記録は瞬時に変わりました。問題は、**この事実がクライアントまで届くかどうか**です。
+
+## ブラウザは、実はほとんど見ていない
+
+OCSP には致命的な弱点がありました。応答が返ってこないとき、どうするかです。
+
+- 失敗として接続を止めれば（hard-fail）、CA の OCSP サーバが落ちるたびに世界中のサイトが見られなくなる
+- 無視して接続を続ければ（soft-fail）、中間者は**OCSP の通信を落とすだけで失効を無効にできる**。失効した証明書を悪用しようとする攻撃者は、まさに中間者の位置にいる
+
+実装は soft-fail を選び、失効の確認は攻撃に対して役に立たなくなりました。Chrome の開発者はこれを「衝突すると切れるシートベルト」と表現し、2012 年にオンラインでの失効確認をやめて、**Google が集めた重要な失効情報を、ブラウザの更新の仕組みで配る CRLSets** に切り替えると発表しました（[ImperialViolet: Revocation checking and Chrome's CRL](https://www.imperialviolet.org/2012/02/05/crlsets.html)）。
+
+Firefox は長く OCSP を使っていましたが、全 CA の失効情報を小さく圧縮して配る **CRLite** を Firefox 137（2025 年）でデスクトップの全利用者に有効にし、DV の証明書については Firefox 142 で OCSP をやめると発表しました。1 日あたりの取得量は平均 300 KB ほどです（[Mozilla Hacks 2025](https://hacks.mozilla.org/2025/08/crlite-fast-private-and-comprehensive-certificate-revocation-checking-in-firefox/)）。
+
+そして Let's Encrypt は OCSP 自体を終えました。2025 年 5 月 7 日に証明書から OCSP の URL を外して CRL の URL を入れ、Must-Staple を含む申請を断るようにし、8 月 6 日に OCSP の応答サーバを止めています。理由として、OCSP は訪問先のサイトを CA に知らせてしまうプライバシーの問題と、運用の負担を挙げています（[Let's Encrypt 2024-12-05](https://letsencrypt.org/2024/12/05/ending-ocsp/)）。上の letsencrypt.org の証明書に OCSP の URL がなく、CRL の URL だけがあったのはこのためです。
+
+<Callout type="warn" title="誤解: 失効させれば、その証明書はすぐ使えなくなる">
+  CA の記録は即座に変わりますが、クライアントがそれを知るのは、CRL を取り直したとき、CRLite や CRLSets の更新が届いたとき、あるいは次の OCSP の応答を得たときです。
+  CRLSets は Google が選んだ失効だけを載せるので、**失効がまったく届かない**こともあります。curl や各言語の HTTP ライブラリの多くは、既定では失効を確かめません。
+  秘密鍵が漏れたときの手当ては「失効させる」だけでは足りず、**鍵を替えて新しい証明書に差し替え、漏れた鍵が期限切れになるまでの期間を悪用されうるものとして扱う**ことです。
+</Callout>
+
+## 失効に頼らない: 寿命を短くする
+
+失効が当てにならないなら、**失効しなくても早く期限が来る**ようにすればよい。これがここ数年の流れです。
+
+CA/Browser Forum は 2025 年 4 月の Ballot SC-081 で、公開のサーバ証明書の最長の有効期間と、ドメインの確認結果を使い回せる期間を、段階的に短くすると決めました（[CA/B Forum: Ballot SC081v3](https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/)、日程は [Sectigo の解説](https://www.sectigo.com/resource-library/sectigo-cab-reduce-ssl-tls-certificates-lifespan-47-days)で確認）。
+
+| 適用日 | 最長の有効期間 | ドメイン確認の使い回し |
+| --- | --- | --- |
+| それまで | 398 日 | 398 日 |
+| 2026 年 3 月 15 日 | 200 日 | 200 日 |
+| 2027 年 3 月 15 日 | 100 日 | 100 日 |
+| 2029 年 3 月 15 日 | **47 日** | **10 日** |
+
+手元で見た www.digicert.com の証明書は 9 月 10 日から 10 月 26 日までの約 46 日で、すでに 47 日の側に寄せていました。
+
+Let's Encrypt はもともと 90 日で、さらに短くする計画を 2025 年 12 月に出しています。既定のプロファイルを 2027 年 2 月に 64 日、2028 年 2 月に 45 日にし、確認の使い回しも 30 日から 7 時間まで縮めます（[Let's Encrypt 2025-12-02](https://letsencrypt.org/2025/12/02/from-90-to-45)）。選んで使う **shortlived** プロファイルは 160 時間（約 6 日）で、2026 年 1 月に誰でも使えるようになりました（[Let's Encrypt 2026-01-15](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability)）。6 日の証明書について Let's Encrypt は、失効がうまく働かないことを理由に挙げ、当初は OCSP も CRL の URL も載せない方針を示していました（[Let's Encrypt 2025-01-16](https://letsencrypt.org/2025/01/16/6-day-and-ip-certs)。執筆時点では CRL の URL を載せています）。
+
+寿命を短くすると、ほかにも効き目があります。ドメインを手放した人の証明書が早く切れる、弱くなった鍵やアルゴリズムからの移行が速くなる、そして**更新が手作業では回らなくなるので、自動化が強制される**。
+
+## 自動で更新する
+
+更新の自動化は、ACME クライアントを定期的に動かすことです。
+
+- **certbot**: `certbot renew` を systemd のタイマーや cron で 1 日に 2 回ほど動かし、期限の近いものだけを更新する。`certbot renew --dry-run` は Let's Encrypt の**ステージング環境**に対して手順を試し、証明書は保存しない（[Certbot User Guide](https://eff-certbot.readthedocs.io/en/stable/using.html)）
+- **cert-manager**（Kubernetes）: Certificate リソースに欲しい名前を書き、Issuer に ACME のサーバとチャレンジの方式を書く。証明書と鍵は Secret に入る。既定では有効期間の **3 分の 2** が過ぎたところで更新する（[cert-manager: Certificate](https://cert-manager.io/docs/usage/certificate/)）
+- **ARI**（ACME Renewal Information、[RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)）: いつ更新すべきかを CA が窓の形で教える拡張。大量の失効をする前に「早めに更新して」と促せる。Pebble の directory にも `renewalInfo` がありました
+
+自動化で見落としやすいのは、**更新が成功したことと、新しい証明書が使われていることは別**だという点です。証明書のファイルを書き換えても、nginx を再読み込みしなければ古い証明書を出し続けます（lego の `--deploy-hook` などの出番です）。LB やアプリに手でコピーした証明書は、自動更新の外にあります。監視は「ファイルの期限」ではなく、**外から接続して実際に返ってくる証明書の期限**で行うのが確実です（期限切れの障害の典型は第 116 回、実際の事例は第 142 回）。
+
+## この部品は何と組み合わさるか
+
+| 段階 | 使う部品 | 保証すること | 保証しないこと |
+| --- | --- | --- | --- |
+| 申請 | CSR（署名: 第 109 回、鍵の形式: 第 110 回） | 申請者が秘密鍵を持っている | 名前の持ち主であること |
+| 確認 | ACME（JWS、nonce、TXT: 第 58 回、HTTP、TLS） | このアカウント鍵の持ち主が、今その名前を管理している | 組織の身元、サイトの善良さ |
+| 発行の制限 | CAA（第 58 回） | まともな CA が他人のドメインに出さない | 悪意のある CA を止めること |
+| 監視 | CT（署名、マークル木＝ハッシュ: 第 106 回） | 発行が隠れていない | 発行を止めること。誰かが見ていること |
+| 失効 | CRL、OCSP、CRLite（署名） | CA が取り消したという事実 | それがクライアントに届くこと |
+| 更新 | ACME クライアント、ARI、短い寿命 | 失効に頼らず期限が来る | 新しい証明書が実際に配られていること |
+
+## まとめ
+
+- CSR は「この公開鍵に、この名前で」という申請に秘密鍵で署名したもの。示すのは鍵を持っていることだけで、秘密鍵は CA に渡らない。CA は確認できた名前だけを載せる
+- DV・OV・EV の違いは CA が調べた範囲だけで、暗号の強さは同じ。EV の表示は Chrome 77 でアドレスバーから消えた
+- ACME はドメインの確認を API にした。要求はアカウント鍵で署名した JWS で、nonce でリプレイを防ぐ
+- チャレンジは key authorization を HTTP（80 番）、DNS の TXT、TLS-ALPN（443 番）のどれかに置く。ワイルドカードは DNS を使う方式だけ
+- CAA を見るのは発行する CA だけ。ブラウザは見ない
+- DigiNotar は、どの CA でも黙って証明書を出せる弱点を突かれた。CT はすべての発行を追記専用のログに載せ、隠れた発行をできなくする。見張るのは持ち主の仕事
+- 失効の CRL と OCSP は、soft-fail とプライバシーの問題でうまく働かなかった。ブラウザは CRLSets や CRLite に移り、Let's Encrypt は 2025 年に OCSP を終えた
+- その代わりに寿命が短くなる。公開の証明書は 2029 年 3 月 15 日に最長 47 日、確認の使い回しは 10 日になる。更新は自動化し、外から見た証明書で監視する
+
+ここまでで、証明書がどう生まれ、どう見張られ、どう終わるかが揃いました。次の回では、その証明書が TLS 1.3 のハンドシェイクの中でどう使われるのかを、1 メッセージずつ読みます。

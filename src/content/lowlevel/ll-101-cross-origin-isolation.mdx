@@ -1,0 +1,349 @@
+---
+title: プロセスとメモリを分けるヘッダ
+description: 他のサイトの画像は「表示できるが読めない」はずなのに、なぜそれだけでは守れないのか。Spectre の後にブラウザが足した ORB、CORP、COEP、COOP と、それをそろえたページにだけ SharedArrayBuffer と細かい時計を渡すクロスオリジン分離を、手元のヘッドレス Chrome で確かめます
+chapter: websec
+order: 8
+status: published
+topics:
+  - Spectre とブラウザ
+  - CORB / ORB
+  - Cross-Origin-Resource-Policy
+  - Cross-Origin-Embedder-Policy
+  - Cross-Origin-Opener-Policy
+  - ブラウジングコンテキストグループ
+  - クロスオリジン分離
+  - SharedArrayBuffer
+  - Document-Isolation-Policy
+requires:
+  - ll-100-security-headers
+  - ll-94-origin-site
+  - ll-87-browser-process
+  - ll-11-pipeline
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 「読めない」のに、なぜ漏れるのか
+
+第 95 回で見たとおり、ページは他のオリジンの画像を `<img>` で表示できますが、その画素を JavaScript で読み出すことはできません。第 96 回の CORS も、「読み出してよいか」をサーバが緩める仕組みでした。同一オリジンポリシーの守りは、**「読み出しの API が値を返さない」**という形をしています。
+
+ところが 2018 年に、この形の守りだけでは足りないことがはっきりしました。第 11 回で見た **Spectre** です。投機実行の痕跡をキャッシュの時間差で測ると、**同じプロセスのアドレス空間にあるデータなら、API が返さない値でも読み出せる**可能性があります。
+
+つまり問題は「API が値を返すかどうか」ではなく、**そのバイト列が、攻撃者のコードと同じプロセスのメモリに載っているかどうか**に移りました。この回は、その「載せない」ためにブラウザとサーバが足した部品を見ます。
+
+- ブラウザが自分の判断で遮る: **CORB**、その後継の **ORB**
+- 資源の持ち主が宣言する: **CORP**（`Cross-Origin-Resource-Policy`）
+- 埋め込む側のページが約束する: **COEP**（`Cross-Origin-Embedder-Policy`）
+- 開いた窓・開かれた窓を切り離す: **COOP**（`Cross-Origin-Opener-Policy`）
+- COOP と COEP をそろえた報酬: **クロスオリジン分離**（`crossOriginIsolated`）
+
+## 同じプロセスに載った時点で負け
+
+第 87 回のサイト分離は、**サイトが違えばレンダラのプロセスを分ける**ことでした。しかしサイト分離だけでは塞げない穴が 2 つ残ります。
+
+1 つ目は**埋め込み**です。`evil.example` のページが `<img src="https://bank.example/api/balance">` と書くと、ブラウザは（Cookie を付けて）取りに行き、**応答のバイト列を `evil.example` のレンダラに渡します**。画像として壊れていて表示できなくても、バイト列はそのプロセスのメモリを通ります。
+
+```
+evil.example のレンダラ（1 つのプロセス）
+┌──────────────────────────────────────────────┐
+│ 攻撃者の JavaScript                          │
+│      │ 投機実行 + キャッシュの時間差で読む   │
+│      ▼                                       │
+│ [ bank.example の応答: {"balance": 1000} ]   │  ← <img> が持ち込んだ
+└──────────────────────────────────────────────┘
+      API からは読めないが、メモリには載っている
+```
+
+2 つ目は**窓どうしの参照**です。`window.open` で開いた窓と開いた側は、互いの `window` を参照できます。参照し合う窓は、ブラウザの実装上、**同じプロセスに置かれやすくなります**（同期的にアクセスできる相手は、同じプロセスにいたほうが都合がよいからです）。
+
+Fetch Standard はこの状況を、クロスオリジンの応答を「中身の見えない応答」として扱う昔からの仕組みについて、次のように書いています（[Fetch Standard 2.2.6](https://fetch.spec.whatwg.org/#concept-filtered-response-opaque)）。
+
+> Those are legacy constructs and cannot always be adequately protected given contemporary computer architecture.
+
+**中身を見せない、という守りは、今の CPU の上では常には守り切れない**。ここからの部品は、すべてこの認識から出てきています。
+
+## 3 通りの守り方
+
+先に全体を並べます。**誰が判断するか**で分けると整理しやすくなります。
+
+| 部品 | 誰が判断するか | 何を止めるか | 何を止めないか |
+| --- | --- | --- | --- |
+| CORB / ORB | ブラウザ（応答の種類を推測） | 画像やスクリプトとして読み込まれた HTML、JSON、XML などを、レンダラに渡す前に捨てる | 本物の画像やスクリプト。要求の送信 |
+| CORP | 応答を返すサーバ | 指定より遠いオリジンやサイトに、`no-cors` の応答を渡さない | 要求の送信。CORS での読み出し。curl やサーバ間の通信 |
+| COEP | 埋め込む側のページ | 自分が、許可のない他オリジンの資源を取り込まないと約束する | 同一オリジンの資源。CORS や CORP で許された資源 |
+| COOP | トップレベルのページ | 他オリジンの窓と `window` の参照を持たない（別のグループに分ける） | リンクによる遷移、`postMessage` 以外の通信経路（Cookie など） |
+
+## ブラウザが勝手に遮る: CORB から ORB へ
+
+最初の手当ては、サーバに何も求めない方法でした。Chrome はサイト分離と合わせて **CORB**（Cross-Origin Read Blocking）を入れました。`<img>` や `<script>` で読み込まれたクロスオリジンの応答が、`Content-Type` と中身の推測から **HTML、XML、JSON だと判断できれば、中身を空にしてからレンダラに渡す**という仕組みです（[CORB for developers](https://www.chromium.org/Home/chromium-security/corb-for-developers/)）。
+
+`<img>` として正しく使われる JSON はありません。そう使われているなら、持ち込ませること自体が目的の可能性が高い、という考え方です。
+
+CORB には弱点がありました。**「遮るべきと分かったものだけを遮る」**方式なので、推測が外れた形式は素通りします。そこで後継の **ORB**（Opaque Response Blocking）は向きを逆にし、**画像、音声、動画、スクリプト、スタイルシートだと分かったものだけを通す**方式にしました（[Intent to Ship: ORB v0.1](https://groups.google.com/a/chromium.org/g/blink-dev/c/ScjhKz3Z6U4)）。止め方も変わり、CORB が空の応答を差し込んでいたのに対し、ORB v0.2 は**ネットワークエラー**にします（スクリプトからの `fetch()` は除く）（[Intent to Ship: ORB v0.2](https://groups.google.com/a/chromium.org/g/blink-dev/c/RcuAzHEI2CU/m/7PsOrCjUAAAJ)）。
+
+執筆時点（2026 年 9 月）で確認できた状況は次のとおりです。
+
+- **Chrome**: ORB v0.1 を 103 で、v0.2 を 117 で出荷（上の 2 つの告知）
+- **Firefox**: Mozilla の見解は肯定的で（[standards-positions #860](https://github.com/mozilla/standards-positions/issues/860)）、Nightly と早期ベータで有効化した記録があります（[dev-platform](https://groups.google.com/a/mozilla.org/g/dev-platform/c/BJNAZ-BxcqE)）。正式版での状況は一次ソースで確認できませんでした
+- **仕様**: ORB は Fetch Standard への取り込みの提案として進んでおり（[annevk/orb](https://github.com/annevk/orb)）、執筆時点の Fetch Standard の本文にはまだ入っていません
+
+<Callout type="warn" title="ORB は正しい Content-Type に頼っている">
+  ORB の推測は `Content-Type` と中身の先頭で行われます。
+  個人情報を返す API が `text/plain` や `application/octet-stream` を名乗っていると、
+  推測の材料が減ります。
+  **API には正しい `Content-Type` と `X-Content-Type-Options: nosniff`（第 100 回）を付ける**ことが、
+  この自動の守りを効かせる前提です。CORB の説明も同じことを勧めています。
+</Callout>
+
+## 資源の側が宣言する: CORP
+
+ORB は「画像として正しいもの」は通します。では、**利用者ごとに違う画像**（本人確認の書類の画像、社内だけの図）はどうでしょうか。これは形式としては本物の画像なので、ORB では止まりません。
+
+そこで、資源の持ち主が「この応答をどこまでの相手に渡してよいか」を宣言するのが **CORP** です（[Fetch Standard 3.7](https://fetch.spec.whatwg.org/#cross-origin-resource-policy-header)）。
+
+```http
+Cross-Origin-Resource-Policy: same-origin
+```
+
+| 値 | 渡してよい相手 |
+| --- | --- |
+| `same-origin` | 同じオリジンのページだけ |
+| `same-site` | 同じサイト（第 94 回の登録可能ドメインとスキーム）のページまで |
+| `cross-origin` | どこからでも |
+
+CORP が効くのは、**`no-cors` モードの要求**、つまり `<img>`、`<script>`、`<video>` のように CORS を使わない埋め込みです。条件に合わなければ、ブラウザは応答をネットワークエラーにして、埋め込んだページのプロセスに渡しません。
+
+CORS（第 96 回）との違いは、**向き**にあります。CORS は「読み出しを許す」方向に緩める仕組みで、ヘッダが無ければ読めません。CORP は「埋め込みを禁じる」方向に締める仕組みで、ヘッダが無ければ従来どおり埋め込めます。
+
+<Callout type="warn" title="誤解: CORP を付ければ、その資源は他人に取られない">
+  CORP を判定するのは**ブラウザ**です。要求はサーバまで届き、サーバは応答を返します。
+  curl やサーバ間の通信には何の効果もありません。
+  CORP が守るのは、「利用者のブラウザが、利用者の Cookie を付けて取ってきた応答が、
+  攻撃者のページのプロセスに入ること」だけです。
+  他人に見せてはいけない資源は、第 128 回の認可で守ります。
+</Callout>
+
+## ページの側が約束する: COEP
+
+CORP は、資源の持ち主が付けなければ効きません。世の中の大半の資源には付いていません。そこで逆側、**埋め込む側のページ**が約束する仕組みが **COEP** です（[HTML Standard 7.1.4](https://html.spec.whatwg.org/multipage/browsers.html#coep)）。
+
+```http
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+| 値 | 他オリジンの `no-cors` 資源の扱い |
+| --- | --- |
+| `unsafe-none`（既定） | 従来どおり、許可が無くても取り込む |
+| `require-corp` | CORP で許可された資源（または CORS で取った資源）しか取り込まない |
+| `credentialless` | CORP が無い資源も取り込むが、**Cookie などの資格情報を付けずに**要求する |
+
+`require-corp` は、「このページのプロセスには、持ち主が許したものしか入れない」という宣言です。**持ち主の許可が無い資源が入ってこないなら、そのプロセスで細かい時計を使われても、盗まれて困るものは無い**。この論理が、後で見るクロスオリジン分離の土台になります。
+
+`credentialless` は、`require-corp` が厳しすぎて広まらなかったことへの手当てです。資格情報を付けずに取った応答は、**誰が取っても同じ公開の中身**のはずなので、攻撃者が自分で取ってきても同じものしか手に入りません。だから CORP が無くても取り込んでよい、という理屈です（[Chrome for Developers](https://developer.chrome.com/blog/coep-credentialless-origin-trial)）。
+
+COEP にはもう 2 つ、知っておくべき点があります。
+
+- **iframe の中の文書も COEP を持っている必要があります**。HTML Standard は、グループの中の「すべての文書」が COEP を持つことを条件にしています（[HTML Standard 7.3.2.3](https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-group)）。さらに他オリジンの iframe で分離の機能を使うには、`<iframe allow="cross-origin-isolated">` が要ります（[web.dev](https://web.dev/articles/cross-origin-isolation-guide)）
+- **段階導入のための `Cross-Origin-Embedder-Policy-Report-Only`** があります。遮らずに違反だけを報告させ、何が壊れるかを先に集められます（[MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cross-Origin-Embedder-Policy)）。第 100 回の CSP の Report-Only と同じ考え方です
+
+## 窓を切り離す: COOP
+
+残るのは、窓どうしの参照です。ブラウザは、互いに `window` を参照できる窓の集まりを**ブラウジングコンテキストグループ**という単位で管理しています。`window.open` で開いた窓は、既定では開いた側と同じグループに入ります。
+
+**COOP** は、トップレベルの文書が「どのグループに入るか」を決めるヘッダです（[HTML Standard 7.1.3](https://html.spec.whatwg.org/multipage/browsers.html#cross-origin-opener-policies)）。
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+```
+
+| 値 | 振る舞い |
+| --- | --- |
+| `unsafe-none`（既定） | 従来どおり。開いた側・開かれた側と同じグループに入れる |
+| `same-origin-allow-popups` | 自分は新しいグループに入る。ただし自分が開いた COOP の無い窓とは参照を保つ |
+| `same-origin` | 同じオリジンで同じ値の文書としかグループを共有しない。他オリジンの窓からは、互いに「閉じた」ように見える |
+| `noopener-allow-popups` | 前の文書が何であれ、常に新しいグループに入る。同一オリジンの中で管理画面などを切り離す用途 |
+
+グループが別になれば、互いを同じプロセスに置く理由が無くなります。`same-origin` にすると、他オリジンから開かれたとき `window.opener` は `null` になり、開いた側からは窓が閉じたように見えます。
+
+<Callout type="warn" title="COOP: same-origin は、ポップアップを使う連携を壊す">
+  OAuth（第 132 回）には、リダイレクトではなくポップアップで認可サーバの画面を開き、
+  結果を `window.opener.postMessage` で返す実装がよくあります。決済の画面も同じ形を取りがちです。
+  `same-origin` にすると `window.opener` が `null` になるので、**この受け渡しが黙って届かなくなります**。
+  web.dev の手引きも、`same-origin` が OAuth や決済のような窓をまたぐ連携を壊すと明記しています
+  （[web.dev](https://web.dev/articles/cross-origin-isolation-guide)）。
+  こうした連携が要るページは `same-origin-allow-popups` を使いますが、その値では次節のクロスオリジン分離は得られません。
+</Callout>
+
+`noopener-allow-popups` については、HTML Standard が「同一オリジンの文書の間に**強い安全の境界は作らない**」と注意しています。同一オリジンであれば、Cookie、localStorage、`BroadcastChannel`、同一オリジンの `fetch` など、窓の参照以外の経路が全部残っているからです（[HTML Standard 7.1.3](https://html.spec.whatwg.org/multipage/browsers.html#cross-origin-opener-policies)）。**COOP が切るのは窓の参照だけ**です。
+
+## 両方そろうと: クロスオリジン分離
+
+トップレベルが `COOP: same-origin`、グループの中の全文書が `require-corp` か `credentialless` の COEP を持つとき、そのグループは**クロスオリジン分離**の状態になり、ページからは `self.crossOriginIsolated === true` として見えます。
+
+このとき成り立っているのは次の 2 つです。
+
+- **窓の参照でつながった他オリジンの文書がいない**（COOP）
+- **持ち主の許可が無い他オリジンの資源、または資格情報つきで取った資源が入っていない**（COEP）
+
+つまり、このプロセスのメモリに Spectre で読まれて困る他人のデータは無い、と言える状態です。そこでブラウザは、第 87 回で取り上げた「強い道具」をこのページにだけ渡します。
+
+| 機能 | 分離していないとき | 分離しているとき |
+| --- | --- | --- |
+| `SharedArrayBuffer` | 使えない | 使える（Wasm のスレッドにも必要） |
+| `performance.now()` の刻み | 100 マイクロ秒以上 | 5 マイクロ秒以上 |
+| `performance.measureUserAgentSpecificMemory()` | 使えない | 使える（Chrome） |
+
+時計の刻みは High Resolution Time の仕様で決まっていて、「100 マイクロ秒、または実装が決めるそれより粗い値」、分離しているときは「5 マイクロ秒、またはそれより粗い値」です（[High Resolution Time 4](https://w3c.github.io/hr-time/#dfn-coarsen-time)）。`SharedArrayBuffer` が分離の条件に入っているのは、**ワーカーで数を増やし続け、別のスレッドからそれを読むだけで、細かい時計が自作できる**からです（[Chrome for Developers](https://developer.chrome.com/blog/enabling-shared-array-buffer)）。
+
+仕様には、もう 1 つ興味深い区別があります。分離の状態には `logical` と `concrete` の 2 種類があり、**プロセスを分ける保証が難しい環境では `logical` にして、制限だけを課し、強い道具は渡さない**ことが許されています（[HTML Standard 7.3.2.3](https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-group)）。ヘッダは約束にすぎず、**実際にプロセスとメモリを分けられるブラウザだけが報酬を払う**、という作りです。
+
+<Callout type="warn" title="誤解: COOP と COEP は、安全のために全ページに付けるべき設定">
+  COOP と COEP の組は、主に **`SharedArrayBuffer` などを使いたいページのための条件**です。
+  付けると、CORP の無い広告や埋め込み、他オリジンのポップアップとの連携が壊れます。
+  強い道具が要らないページには、分離そのものの利益は大きくありません。
+  一方で **COOP 単独**は、窓の参照を悪用する攻撃（第 95 回のクロスサイトリーク）を減らすので、
+  ポップアップ連携の無いページなら単独で付ける価値があります。
+  それぞれ何のためかを分けて判断します。
+</Callout>
+
+執筆時点（2026 年 9 月）での対応を、MDN の互換性データ（[browser-compat-data](https://github.com/mdn/browser-compat-data)）で確認した範囲でまとめます。数字は各ブラウザの版です。
+
+| 機能 | Chrome | Firefox | Safari |
+| --- | --- | --- | --- |
+| CORP | 73 | 74 | 12 |
+| COOP / COEP（`require-corp`） | 83 | 79 | 15.2 |
+| COEP `credentialless` | 96 | 119 | 未対応 |
+| COOP `noopener-allow-popups` | 131 | 未対応 | 18.4 |
+| 分離を条件にした `SharedArrayBuffer` | デスクトップ 92（Android 88） | 79 | 15.2 |
+| ORB | 117（v0.2） | Nightly と早期ベータで確認 | 表明を確認できず |
+
+`SharedArrayBuffer` は 2018 年に各ブラウザで一度無効にされ、分離を条件に戻ってきました。**分離を条件にしたのは Firefox 79（2020 年 7 月）が最初**で、Chrome はそれに合わせました（[Chrome for Developers](https://developer.chrome.com/blog/enabling-shared-array-buffer)）。
+
+## 手元で確かめる: 4 通りのページで比べる
+
+Python の `http.server` で 2 つのサーバを立てます。
+
+- **A**（`127.0.0.1:18193`）: 検査用のページ。返すヘッダだけを変えた 4 枚
+- **B**（`localhost:18194`）: 埋め込まれる側。CORP の無い画像、`CORP: cross-origin` の画像、JSON、ポップアップ用のページを返し、**受けた要求と Cookie を全部表示する**
+
+`127.0.0.1` と `localhost` はホストが違うので別オリジンで、第 94 回で見たとおり別のサイトでもあります。どちらもループバックなので、HTTP でも安全なコンテキストとして扱われ、COOP と COEP が効きます。
+
+```python
+PAGES = {
+    "/plain.html": {},
+    "/coop-only.html": {"Cross-Origin-Opener-Policy": "same-origin"},
+    "/isolated.html": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+    },
+    "/credentialless.html": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "credentialless",
+    },
+}
+```
+
+各ページは、`crossOriginIsolated`、`typeof SharedArrayBuffer`、`performance.now()` の最小の刻み（200 万回呼んで、値が変わった最小の差）を調べ、B の 3 つの資源を `new Image()` で読み込みます。
+
+ブラウザは playwright-cli で起動した**独立したプロファイルのヘッドレス Chrome**（`HeadlessChrome/153.0.0.0`）です。最初に B の `/set` を開いて `sid=secret; SameSite=None; Secure` の Cookie を入れ、その後 A の 4 枚を順に開きました。
+
+```
+page            isolated  SAB        timer    img(no CORP)  img(CORP)  img(JSON)
+plain           false     undefined  100.0us  loaded        loaded     error
+coop-only       false     undefined  100.0us  loaded        loaded     error
+isolated        true      function   5.0us    error         loaded     error
+credentialless  true      function   5.0us    loaded        loaded     error
+```
+
+（出力の JSON を表の形に並べ替えています。）
+
+読み取れることを順に見ます。
+
+- **COOP だけでは分離にならない**。`coop-only` は `crossOriginIsolated` が `false` のままで、`SharedArrayBuffer` は定義すらされていません。COOP と COEP の**両方**が条件です
+- **時計の刻みが仕様どおりに変わる**。分離していないと 100 マイクロ秒、分離すると 5 マイクロ秒でした。High Resolution Time の下限がそのまま出ています
+- **`require-corp` は CORP の無い画像を拒む**。コンソールには次のエラーが出ました
+
+```
+Failed to load resource: net::ERR_BLOCKED_BY_RESPONSE.NotSameOriginAfterDefaultedToSameOriginByCoep
+  @ http://localhost:18194/img?corp=none&from=isolated
+```
+
+次に、B が受け取った要求です。
+
+```
+B /img?corp=none&from=plain                     Cookie=sid=secret
+B /img?corp=none&from=isolated                  Cookie=sid=secret
+B /img?corp=cross-origin&from=isolated          Cookie=sid=secret
+B /img?corp=none&from=credentialless            Cookie=-
+B /img?corp=cross-origin&from=credentialless    Cookie=-
+B /data.json?from=credentialless                Cookie=-
+```
+
+<Callout type="warn" title="誤解: COEP でブロックされたなら、要求はサーバに届いていない">
+  `isolated` のページで `error` になった画像の要求は、**Cookie 付きでサーバに届いています**。
+  COEP と CORP は、**戻ってきた応答をページのプロセスに渡さない**仕組みで、送ること自体は止めません。
+  第 96 回の CORS と同じく、判定は応答を受け取った後にブラウザが行います。
+  副作用のある GET を作ってはいけない理由（第 130 回の CSRF）は、ここでもそのまま残ります。
+</Callout>
+
+`credentialless` のページからの要求には **Cookie が付いていません**。CORP の無い画像が読み込めたのは、この「資格情報を外して取る」と引き換えです。利用者ごとに違う画像は、この方式では利用者のものとしては取れず、公開の中身しか返ってきません。
+
+JSON は、`CORP: cross-origin` を付けていても、どのページでも `error` でした。Playwright で失敗の理由を取ると、次のとおりです。
+
+```
+http://localhost:18194/data.json?as=img    -> net::ERR_BLOCKED_BY_ORB
+http://localhost:18194/data.json?as=script -> net::ERR_BLOCKED_BY_ORB
+```
+
+COOP も COEP も無い `plain` のページでも止まっています。**ORB はヘッダの有無に関係なく、既定で働く**ことと、CORP で `cross-origin` と宣言しても **JSON を画像やスクリプトとして持ち込むことは許されない**ことが分かります。一方、同じ JSON をスクリプトから `fetch(url, { mode: "no-cors" })` で取ると、例外にならず `type` が `opaque`、`status` が 0 の応答が返りました。ORB v0.2 の告知にあった「スクリプトからの `fetch()` はネットワークエラーにしない」の例外です（中身は空で、読めないことに変わりはありません）。
+
+最後に COOP とポップアップです。A のページから `window.open` で B のページを開き、両側から相手を見ました。
+
+```
+plain:    popup sees opener=Window, opener sees w.closed=false
+isolated: popup sees opener=null,   opener sees w.closed=true
+```
+
+`isolated`（COOP: `same-origin`）から開くと、開かれた窓の `window.opener` は `null` になり、開いた側からは窓が閉じたように見えます。窓はまだ画面に開いています。OAuth のポップアップが `window.opener.postMessage` で結果を返す実装は、ここで黙って動かなくなります。
+
+今回動かせたのは Chrome だけです。Firefox と WebKit の版ごとの違いは、上の互換性の表で補ってください。
+
+## 1 枚の文書だけを分離する: Document-Isolation-Policy
+
+COOP と COEP の組には、**グループの全員が協力しないと成り立たない**という重さがあります。トップレベルは他オリジンのポップアップとの連携を諦め、iframe の中の文書まで COEP を付ける必要があります。
+
+Chrome はこれを軽くする **Document-Isolation-Policy** を、**Chrome 137 のデスクトップ版**で出荷しました（[Chrome for Developers, 2025 年 5 月](https://developer.chrome.com/blog/document-isolation-policy)）。
+
+```http
+Document-Isolation-Policy: isolate-and-require-corp
+```
+
+値は `isolate-and-require-corp` と `isolate-and-credentialless` の 2 つで、COEP の 2 つの値に対応します。考え方は、**ブラウザが iframe を別プロセスに置けるなら（第 87 回のアウトオブプロセス iframe）、分離はその文書 1 枚で完結できる**というものです。代わりに、分離した文書は、分離していない同一オリジンの iframe に同期的に触れなくなります（`postMessage` と保存領域は使えます）。
+
+執筆時点（2026 年 9 月）で、他のブラウザが実装した記録は確認できませんでした。提案は Google の説明文書として公開されています（[explainer](https://github.com/explainers-by-googlers/document-isolation-policy)）。
+
+もう 1 つ、近い仕組みに `Origin-Agent-Cluster: ?1` があります。これは同じサイトの別オリジン（`a.example.com` と `b.example.com`）を、サイトではなく**オリジンを単位に**分けるよう頼むヘッダで、付けた文書では `document.domain` による制限の緩和が効かなくなります（[HTML Standard 7.1.2](https://html.spec.whatwg.org/multipage/browsers.html#origin-keyed-agent-clusters)）。プロセスを実際に分けるかどうかは、ブラウザに任されています。
+
+## どの部品と組み合わさっているか
+
+| やりたいこと | 組み合わせる部品 |
+| --- | --- |
+| 他のサイトのデータを、自分のメモリに載せない | サイト分離（第 87 回）＋ ORB ＋正しい `Content-Type` と `nosniff`（第 100 回） |
+| 利用者ごとの画像を、他サイトに埋め込ませない | CORP（`same-origin` か `same-site`）＋サイトの定義（第 94 回）＋認可（第 128 回） |
+| `SharedArrayBuffer` と細かい時計を使う | COOP `same-origin` ＋ COEP ＋埋め込む資源側の CORP か CORS（第 96 回）＋ iframe の `allow` 属性 |
+| 分離しても、公開の埋め込みを残す | COEP `credentialless`（資格情報を外す）、または Document-Isolation-Policy |
+| ポップアップを悪用されにくくする | COOP 単独 ＋ `rel=noopener`（第 95 回） |
+| OAuth や決済のポップアップを残す | COOP `same-origin-allow-popups`、またはリダイレクト型のフロー（第 132 回） |
+| 壊れる箇所を先に知る | `-Report-Only` のヘッダ ＋報告の受け口（第 100 回の CSP と同じ運用） |
+
+## まとめ
+
+- Spectre の後、「API が値を返さない」だけでは守れず、「他人のデータを同じプロセスのメモリに載せない」ことが必要になった
+- ORB（CORB の後継）は、画像やスクリプトとして持ち込まれた JSON や HTML を、ブラウザが既定で捨てる。通すものを決める方式に変わり、止め方もネットワークエラーになった
+- CORP は資源の持ち主が「どこまでに渡してよいか」を宣言する。要求は届き、判定はブラウザが応答を受け取った後に行う
+- COEP は埋め込む側が「許可の無いものは取り込まない」と約束する。`credentialless` は資格情報を外すことと引き換えに CORP の無い資源を許す
+- COOP は窓の参照を切り、別のブラウジングコンテキストグループに分ける。`same-origin` は OAuth や決済のポップアップを壊す
+- 両方そろうと `crossOriginIsolated` になり、`SharedArrayBuffer` と 5 マイクロ秒の時計が使える。手元の Chrome でも 100 マイクロ秒から 5 マイクロ秒に変わった
+- 1 枚の文書だけを分離する Document-Isolation-Policy は、執筆時点で Chrome のデスクトップ版だけが出荷している
+
+次は、この章の部品が一度に掛かる iframe を取り上げます。中の文書のオリジンは何で決まるのか、親と子は互いに何をできるのか、誰が誰を移動させられるのかを、1 つの iframe に集めて確かめ直します。

@@ -1,0 +1,323 @@
+---
+title: ブラウザごとの Cookie の扱い
+description: 同じ Set-Cookie を返しても、Safari、Firefox、Chrome で Cookie の寿命も送り先も違うのはなぜか。Safari の ITP の変遷、Firefox の Total Cookie Protection、Chrome の方針転換を一次ソースで追い、手元の 3 つのエンジンで同じ埋め込みを比べます
+chapter: websec
+order: 5
+status: published
+topics:
+  - Intelligent Tracking Prevention（ITP）
+  - Enhanced Tracking Protection
+  - Total Cookie Protection
+  - トラッキング防止
+  - リンクの装飾
+  - CNAME cloaking
+  - バウンストラッキング
+  - Privacy Sandbox
+  - ストレージの分割
+requires:
+  - ll-97-third-party-cookie
+  - ll-94-origin-site
+  - ll-130-session-cookie
+  - ll-58-dns-records
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 同じ Set-Cookie なのに、結果が違う
+
+第 97 回では、Cookie がファーストパーティ（第一者、いま開いているトップレベルのサイトのもの）かサードパーティ（第三者、それ以外のサイトのもの）かが、**文脈で決まる**ことを見ました。そして、第三者の文脈での Cookie をブラウザが止める流れと、そのための部品（CHIPS、Storage Access API）を扱いました。
+
+この回で見るのは、**その止め方がブラウザごとに大きく違う**ことです。サーバが同じ `Set-Cookie` を返しても、
+
+- Chrome では、埋め込まれた iframe に 1 年ものの Cookie が送られる
+- Firefox では、同じ Cookie が「埋め込み先のサイト専用の箱」に入り、よそのサイトでは見えない
+- Safari では、そもそも送られない。しかも**ファーストパーティの Cookie でも**、書き方によっては 7 日で消える
+
+ということが起こります。仕様（[RFC 6265bis 7.1](https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-22.html#section-7.1)）は、第三者の要求で Cookie を送らないことをブラウザに許している（MAY）だけで、**どこまで止めるかは各ブラウザの方針**だからです。
+
+この回では、3 つのブラウザの方針を年表で追い、何を止めていて何を止めていないかを表にします。どれも変わりやすい事実なので、**断りのない限り執筆時点（2026 年 9 月）の一次ソースに基づきます**。
+
+## 何を相手にしているのか
+
+各ブラウザが相手にしているのは「第三者 Cookie」そのものではなく、**サイトをまたいだ追跡（クロスサイトトラッキング）**です。追跡の手口は Cookie だけではありません。
+
+```
+手口                               使う道具                          主に止めている仕組み
+─────────────────────────────────────────────────────────────────────────────
+埋め込みの第三者 Cookie             ads.example の画像・iframe         第三者 Cookie の遮断・分割
+第三者のストレージ                 iframe の localStorage など        ストレージの分割（第 97 回）
+リンクの装飾                       ?gclid=... のようなクリック ID     装飾付きで着いたページの寿命制限
+                                   → 着地先がファーストパーティで保存
+CNAME cloaking                     metrics.news.example → 計測業者   サーバが書いた Cookie の寿命制限
+バウンストラッキング                一瞬だけ tracker.example を経由    リダイレクトの検出と削除
+フィンガープリント                 画面の大きさ、フォント、音声 API   API の値を揃える・ぼかす
+```
+
+第三者 Cookie を止めると、追跡する側は**ファーストパーティの側へ移ってきます**。リンクの装飾も CNAME cloaking もバウンストラッキングも、「ファーストパーティとして保存する」ための回り道です。Safari の ITP の年表は、この回り道を 1 つずつ塞いできた歴史として読むと分かりやすくなります。
+
+## Safari: Intelligent Tracking Prevention
+
+**ITP**（Intelligent Tracking Prevention）は、WebKit（Safari のエンジン）が 2017 年から入れている追跡防止の仕組みの名前です。以下の表は、WebKit の公式ブログの各記事を 1 本ずつ確かめて作りました。版は記事に書かれているものだけを載せています。
+
+| 公開 | 記事と版 | 主な変更 |
+| --- | --- | --- |
+| 2017 年 6 月 | [ITP](https://webkit.org/blog/7675/intelligent-tracking-prevention/) | 機械学習のモデルで「サイトをまたいで追跡できるドメイン」を分類。分類されたドメインの Cookie は、利用者が 24 時間以内にそのサイトを操作していれば第三者の文脈でも使え、30 日以内なら分割して保持、30 日を超えると削除 |
+| 2018 年 3 月 | [ITP 1.1](https://webkit.org/blog/8142/intelligent-tracking-prevention-1-1/) | Storage Access API を導入。分割された Cookie はセッション Cookie として扱い、ディスクに残さない |
+| 2018 年 6 月 | [ITP 2.0](https://webkit.org/blog/8311/intelligent-tracking-prevention-2-0/) | 24 時間の猶予を廃止し、分類されたドメインは即座に分割。**リダイレクトだけに使われるドメイン（バウンストラッカー）**も検出。分類されたドメインへのリファラをオリジンだけに縮める |
+| 2019 年 2 月 | [ITP 2.1](https://webkit.org/blog/8613/intelligent-tracking-prevention-2-1/)（Safari 12.1、iOS 12.2） | 分割された Cookie を廃止し、分類されたドメインは Storage Access API を使うしかなくなる。**`document.cookie` で作った永続 Cookie の期限を 7 日に制限**。Do Not Track の対応を削除 |
+| 2019 年 4 月 | [ITP 2.2](https://webkit.org/blog/8828/intelligent-tracking-prevention-2-2/) | **リンクの装飾**: 分類されたドメインから、クエリかフラグメントの付いた URL で着いたページでは、`document.cookie` の永続 Cookie を 1 日に制限 |
+| 2019 年 9 月 | [ITP 2.3](https://webkit.org/blog/9521/intelligent-tracking-prevention-2-3/)（Safari 13、iOS 13） | リンクの装飾で着いたサイトは、Cookie 以外のスクリプトで書けるデータ（localStorage など）も 7 日操作が無ければ削除。`document.referrer` を登録可能ドメインまで縮める |
+| 2020 年 3 月 | [Full Third-Party Cookie Blocking](https://webkit.org/blog/10218/full-third-party-cookie-blocking-and-more/)（Safari 13.1、iOS 13.4） | **別のサイトの資源への Cookie を、分類に関係なく既定ですべて遮断**。スクリプトで書ける保存領域（IndexedDB、localStorage、sessionStorage、Service Worker の登録など）を、Safari を使った 7 日の間にそのサイトの操作が無ければ全部削除 |
+| 2020 年 11 月 | [CNAME Cloaking and Bounce Tracking Defense](https://webkit.org/blog/11338/cname-cloaking-and-bounce-tracking-defense/)（Safari 14、iOS 14） | **CNAME cloaking**: 第三者の CNAME を経由した応答で設定された Cookie の期限を 7 日に制限。バウンストラッキングを繰り返すドメインの Cookie を SameSite=Strict に書き換える |
+| 2022 年 11 月 | [Safari Technology Preview 157](https://webkit.org/blog/13575/release-notes-for-safari-technology-preview-157/) | **第三者の IP アドレス**からの応答で設定された Cookie の期限を 7 日に制限（開発版での導入。正式版の現行の挙動は [Tracking Prevention in WebKit](https://webkit.org/tracking-prevention/) に記載） |
+| 2024 年 7 月 | [Private Browsing 2.0](https://webkit.org/blog/15697/private-browsing-2-0/) | プライベートブラウズで、サイトをまたぐ移動の前に既知の追跡用パラメータをクエリとフラグメントから取り除く |
+| 2025 年 9 月 | [Safari 26.0](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/) | 既知のフィンガープリント用スクリプトに、長寿命のスクリプトで書く保存領域（Cookie、localStorage）を作らせない。クエリや `document.referrer` も読ませない |
+
+流れを 3 つに分けると見通しが立ちます。
+
+1. **2017〜2019 年: 分類して止める**。機械学習で「追跡者」を見分け、そのドメインだけを制限していた
+2. **2020 年: 分類をやめて全部止める**。第三者 Cookie は相手を問わず遮断した。分類は、バウンストラッキングやリンクの装飾の判定には使われ続けている
+3. **2019 年から現在: ファーストパーティ側の回り道を塞ぐ**。JavaScript で書いた Cookie、装飾付きのリンクで着いたページ、CNAME や IP アドレスで偽装したサーバの Cookie、スクリプトで書ける保存領域に、寿命の上限を付けた
+
+3 つ目が、他のブラウザとの一番大きな違いです。
+
+<Callout type="warn" title="よくある誤解: 「Safari は第三者 Cookie だけを制限している」">
+  2019 年の ITP 2.1 以降、Safari は**ファーストパーティの Cookie の寿命も縛っています**。
+  `document.cookie` で書いた永続 Cookie は 7 日、装飾付きのリンクで着いたページでは 24 時間が上限です（[Tracking Prevention in WebKit](https://webkit.org/tracking-prevention/)）。
+  さらに、localStorage や IndexedDB のようなスクリプトで書ける保存領域は、Safari を使った 7 日の間にそのサイトを操作しなければ消えます（[WebKit](https://webkit.org/blog/10218/full-third-party-cookie-blocking-and-more/)）。
+  「自分のドメインの Cookie だから大丈夫」は、Safari では成り立ちません。
+</Callout>
+
+### ファーストパーティなのに、なぜ縛るのか
+
+第三者 Cookie を止めた後、計測業者が取った手口の 1 つが **CNAME cloaking** です。第 58 回で見た CNAME を使い、サイト運営者のサブドメインを計測業者のサーバへ向けます。
+
+```
+news.example のページ
+  └─ <script src="https://metrics.news.example/collect.js">
+                     │
+                     │ DNS: metrics.news.example  CNAME  news.tracker-cdn.example
+                     ↓
+                計測業者のサーバ
+                  Set-Cookie: uid=...; Domain=news.example; Max-Age=31536000
+```
+
+ブラウザから見ると、`metrics.news.example` は `news.example` と同じサイトです（第 94 回の登録可能ドメイン）。だから、そこから返った Cookie は**ファーストパーティ**で、第三者 Cookie の遮断には引っかかりません。しかし中身を書いているのは第三者です。
+
+WebKit は、ファーストパーティのサブリソースが、ファーストパーティのドメインとも、トップレベルのホストの CNAME とも異なる CNAME を経由して解決された場合を「第三者の CNAME cloaking」と定義し、その応答で設定された Cookie の期限を 7 日に縮めます（[Tracking Prevention in WebKit](https://webkit.org/tracking-prevention/)）。CNAME を使わず、A レコードで直接計測業者の IP アドレスを向ける手口にも、同じ上限を IP アドレスの近さで判定して掛けています（同ページ、[WebKit Bugzilla 246477](https://bugs.webkit.org/show_bug.cgi?id=246477)）。
+
+**名前の上では自分のサイトでも、実体が他人のサーバなら第三者として扱う**。ブラウザが DNS の結果まで見て境界を引き直している、という点で、第 94 回の「サイト」の定義だけでは捉えきれない判定です。
+
+### リンクの装飾とバウンストラッキング
+
+もう 2 つの回り道は、**移動**を使います。
+
+```
+リンクの装飾:
+  social.example のリンク
+    → https://shop.example/item?click_id=abc123      ← ID を URL に載せて運ぶ
+      shop.example のスクリプトが document.cookie に保存（ファーストパーティ）
+
+バウンストラッキング:
+  news.example のリンク
+    → https://tracker.example/r?to=shop.example      ← 一瞬だけトップレベルに来る
+      tracker.example は、このとき「ファーストパーティ」として自分の Cookie を読み書き
+    → https://shop.example/
+```
+
+どちらも、第三者 Cookie を使わずに「別のサイトにいる同じ人」を結び付けます。ITP は、分類されたドメインから装飾付きのリンクで着いたページの Cookie を 24 時間に縮め（ITP 2.2）、バウンスを繰り返すドメインを追跡者として扱ってきました（ITP 2.0、2020 年の記事）。
+
+## Firefox: Enhanced Tracking Protection と Total Cookie Protection
+
+Firefox の考え方は Safari と少し違います。Safari が「第三者 Cookie を止める」のに対し、Firefox の現在の既定は **「第三者 Cookie を分ける」** です。
+
+| 公開 | 版 | 主な変更 |
+| --- | --- | --- |
+| 2019 年 9 月 | Firefox 69 | **Enhanced Tracking Protection**（ETP）を全利用者の既定に。Disconnect のリストに載った第三者の追跡用 Cookie を遮断（[Mozilla](https://blog.mozilla.org/blog/2019/09/03/todays-firefox-blocks-third-party-tracking-cookies-and-cryptomining-by-default/)） |
+| 2020 年 8 月 | Firefox 79 | ETP 2.0。リダイレクトによる追跡への対策として、既知の追跡者の Cookie とサイトのデータを 24 時間ごとに消す。45 日以内に利用者が直接操作したものは除く（[Mozilla Security Blog](https://blog.mozilla.org/security/2020/08/04/firefox-79-includes-protections-against-redirect-tracking/)） |
+| 2021 年 2 月 | Firefox 86 | **Total Cookie Protection**（TCP）を ETP の Strict モードに導入（[Mozilla Security Blog](https://blog.mozilla.org/security/2021/02/23/total-cookie-protection/)） |
+| 2022 年 6 月 | — | TCP をデスクトップの全利用者の既定に（[Mozilla](https://blog.mozilla.org/en/mozilla/firefox-rolls-out-total-cookie-protection-by-default-to-all-users-worldwide/)） |
+
+TCP は、**訪れたサイトごとに別の Cookie の瓶（cookie jar）を用意する**仕組みです。`ads.example` の iframe は、`news.example` の中では `news.example` 用の瓶を、`shop.example` の中では `shop.example` 用の瓶を使います。どちらの瓶にも `ads.example` の Cookie は入れられますが、**瓶どうしは見えない**ので、2 つのサイトにいる同じ人を結び付けられません。
+
+```
+             Safari                          Firefox（TCP）
+news.example ┌───────────────┐              ┌───────────────┐
+  └ ads の    │ ads の Cookie  │              │ [news 用の瓶]  │
+    iframe   │   送らない      │              │  ads: uid=A   │
+             └───────────────┘              └───────────────┘
+shop.example ┌───────────────┐              ┌───────────────┐
+  └ ads の    │ ads の Cookie  │              │ [shop 用の瓶]  │
+    iframe   │   送らない      │              │  ads: uid=B   │
+             └───────────────┘              └───────────────┘
+```
+
+第 97 回の CHIPS（`Partitioned` 属性）は、この「瓶を分ける」を、**サイトが自分から選ぶ**ための属性でした。Firefox の TCP は、それを**すべての第三者 Cookie に既定で**当てはめている、と見ることができます。
+
+TCP には、サードパーティのログイン提供者のように、追跡以外の目的で第三者 Cookie が要る場合の限定的な例外があります。Mozilla の説明では、提供者を使う意図を検出したときに、**いま訪れているサイトに限って**第三者 Cookie の利用を許します（[Mozilla Security Blog](https://blog.mozilla.org/security/2021/02/23/total-cookie-protection/)）。
+
+バウンストラッキングについては、リストに載った追跡者の Cookie を定期的に消す 2020 年の方式に加えて、**移動のタイミングから短命なリダイレクトの連鎖を見つけ、リストに頼らずに消す** Bounce Tracking Protection も文書化されています。こちらも 45 日以内に直接操作したサイトは対象外です（[Firefox Source Docs](https://firefox-source-docs.mozilla.org/toolkit/components/antitracking/anti-tracking/bounce-tracking-protection/index.html)）。
+
+## Chrome: 廃止の計画から、利用者の選択へ
+
+Chrome の経緯は、ほかの 2 つと違って**計画と撤回の歴史**です。Google の一次ソースで追います。
+
+| 時期 | 出来事 |
+| --- | --- |
+| 2020 年 1 月 | Privacy Sandbox の構想とともに、第三者 Cookie の対応を段階的にやめる方針を表明。「Our intention is to do this within two years.」（[Chromium Blog](https://blog.chromium.org/2020/01/building-more-private-web-path-towards.html)） |
+| 2021 年 6 月 | 計画を延ばし、2023 年半ばから 3 か月かけて廃止し、2023 年後半に終える予定と発表（[Google](https://blog.google/products/chrome/updated-timeline-privacy-sandbox-milestones/)） |
+| 2022 年 7 月 | さらに延ばし、2024 年後半に廃止を始める予定に（[Google](https://blog.google/products/chrome/update-testing-privacy-sandbox-web/)） |
+| 2024 年 1 月 | 利用者の 1% で、第三者 Cookie を既定で制限する試験を開始（[Privacy Sandbox](https://privacysandbox.google.com/blog/cookie-countdown-2024jan)） |
+| 2024 年 4 月 | 英国の競争・市場庁（CMA）との調整のため、2024 年第 4 四半期の廃止を見送る（[Privacy Sandbox](https://privacysandbox.google.com/blog/update-on-the-plan-for-phase-out-of-third-party-cookies-on-chrome)） |
+| 2024 年 7 月 | 方針転換。「Instead of deprecating third-party cookies」、利用者が閲覧全体に適用される選択をする新しい仕組みを入れると発表（[Privacy Sandbox](https://privacysandbox.google.com/blog/privacy-sandbox-update)） |
+| 2025 年 4 月 | その新しい確認画面も出さず、**設定画面で利用者が選ぶいまのやり方を続ける**と発表。シークレットモードでは既定で第三者 Cookie を遮断（[Privacy Sandbox](https://privacysandbox.google.com/blog/privacy-sandbox-next-steps)） |
+| 2025 年 10 月 | Topics、Protected Audience、Attribution Reporting、Related Website Sets、IP Protection などの Privacy Sandbox の技術を段階的に廃止すると発表。CHIPS、FedCM、Private State Tokens は続ける（[Privacy Sandbox](https://privacysandbox.google.com/blog/update-on-plans-for-privacy-sandbox-technologies)） |
+
+つまり執筆時点の Chrome は、**通常のウィンドウでは第三者 Cookie を既定で送ります**。第三者 Cookie の代わりになるはずだった広告用の API（Topics など）は、第三者 Cookie が残ることになったため、ほとんどが役目を終える予定になりました。
+
+残った部品は、Cookie の廃止とは関係なく**プライバシーと安全の改善として使われているもの**です。[Privacy Sandbox feature status](https://privacysandbox.google.com/overview/status) によれば、CHIPS は Chrome 114 から、Storage Access API は Chrome 119 から既定で使え、FedCM は Chrome 108 で出荷されています。第 97 回で見た**ストレージの分割**（iframe の中の localStorage や IndexedDB などをトップレベルのサイトで分ける）は、Chrome 115 から全利用者で有効です（[Storage partitioning](https://privacysandbox.google.com/cookies/storage-partitioning)）。Cookie は分割の対象ではなく、CHIPS で別に扱います。
+
+バウンストラッキングへの対策も入っています。Chrome はリダイレクトの途中にだけ現れるサイトを内部で記録し、45 日以内に利用者の操作が無ければそのサイトのストレージを消します。ただし**第三者 Cookie を遮断している場合にだけ働く**とされています（[Bounce tracking mitigations](https://privacysandbox.google.com/protections/bounce-tracking-mitigations)）。
+
+<Callout type="warn" title="よくある誤解: 「Chrome も第三者 Cookie を廃止した」">
+  廃止は何度も予告されましたが、2024 年 7 月に方針を変え、2025 年 4 月に「いまのやり方を続ける」と決めました（[Privacy Sandbox](https://privacysandbox.google.com/blog/privacy-sandbox-next-steps)）。
+  執筆時点で、Chrome の通常のウィンドウは既定で第三者 Cookie を送ります。遮断されるのは、利用者が設定で選んだ場合と、シークレットモードです。
+  一方で、iframe の中の localStorage などは Chrome 115 から分割されています。「Cookie は送られるが、ストレージは分かれている」のが、いまの Chrome です。
+  **「Chrome で動いたから、第三者の文脈でも動く」は、Safari と Firefox の利用者には当てはまりません**。
+</Callout>
+
+## Edge と Brave
+
+Chromium を土台にするブラウザも、独自の追跡防止を重ねています。
+
+- **Edge** は 3 段階の「追跡防止」を持ち、既定は **Balanced** です。Disconnect のリストで追跡者に分類された資源のストレージへのアクセス（Cookie、localStorage、IndexedDB）を、分類ごとに遮断します。利用者がよく使う組織のサイトは、サイトへの関与の度合い（site engagement）が一定以上なら緩める、という例外があります（[Microsoft Learn](https://learn.microsoft.com/en-us/microsoft-edge/web-platform/tracking-prevention)）。Safari の初期の ITP に近い「分類して止める」方式です
+- **Brave** は最初の版から、第三者のストレージ（Cookie、localStorage、IndexedDB）を既定で遮断してきました。互換性のために、第三者のストレージをトップレベルのサイトごとに分け、そのサイトを閉じたら消す **ephemeral（一時的な）ストレージ**も入れています（[Brave](https://brave.com/privacy-updates/7-ephemeral-storage/)）。追跡用パラメータの除去などのバウンストラッキング対策も持っています（[Brave](https://brave.com/privacy-updates/8-grab-bag-2/)）
+
+## 比べる
+
+ここまでを 1 つの表にします（執筆時点 2026 年 9 月、各ブラウザの既定の設定）。
+
+| | Safari | Firefox | Chrome | Edge | Brave |
+| --- | --- | --- | --- | --- | --- |
+| 第三者 Cookie | すべて遮断 | サイトごとに分割（TCP） | 送る | 分類された追跡者のストレージを遮断（Balanced） | 遮断（一時的な分割） |
+| 相手を分類するか | 遮断には不要。回り道の判定に使う | Disconnect のリストで追加の遮断 | — | Disconnect のリスト | フィルタのリスト |
+| iframe のストレージ | 分割 | 分割 | 分割（115〜） | Chromium と同じ | 分割して閉じたら消す |
+| JS で書いたファーストパーティ Cookie | **7 日が上限** | — | — | — | — |
+| CNAME・IP で偽装したサーバの Cookie | **7 日が上限** | — | — | — | — |
+| バウンストラッキング | 検出して対処 | 検出して消す | 第三者 Cookie 遮断時のみ | — | 対策あり |
+| 例外を得る手段 | Storage Access API | ログイン提供者の限定的な例外 | 不要（送るので） | 関与の度合い、互換性の例外リスト | — |
+
+「—」は、この回で参照した一次ソースに記述が見つからず、既定の挙動を確かめられなかった項目です（制限が無いという意味ではありません）。Brave と Edge はこの回では深く追っていません。
+
+## 手元で確かめる: 3 つのエンジンで同じ埋め込み
+
+Python の `http.server` で 2 つのサイトを立てました。`http://127.0.0.1:18199` を「ニュースのサイト」、`http://localhost:18200` を「計測業者」とします。ホスト名が違うので、第 94 回の意味で**別のサイト**です。
+
+- 計測業者のトップ `/` を直接開くと、サーバが `srv_none`（`SameSite=None; Secure`）と `srv_default`（SameSite なし）を 1 年の期限で設定し、ページの JavaScript が `document.cookie` で `js_long`（1 年）を書き、localStorage にも値を入れる
+- ニュースのページは、計測業者の `/frame` を iframe で、`/pixel.gif` を画像で埋め込む。`/frame` は `Partitioned` 付きの `part` を設定する
+- 計測業者のトップを先に開いてから（ファーストパーティとして一度訪れる）、ニュースのページを開き、サーバに届いた Cookie と、iframe の中から見える `document.cookie` と localStorage を記録する
+
+ブラウザは Playwright のヘッドレス版で、Chromium 149、Firefox 151、WebKit 26.4 の 3 つを、作業ディレクトリに入れた独立したプロファイルで動かしました。
+
+### 最初の結果と、テスト用の設定の罠
+
+最初に何も考えずに動かすと、次の結果になりました（手元の実行結果）。
+
+```
+== chromium 149.0.7827.22
+  iframe sees: {"cookie":"srv_none=1; part=1","ls":"set-at-top-level","hasStorageAccess":true}
+== firefox 151.0
+  iframe sees: {"cookie":"srv_none=1; srv_default=1; js_long=1; part=1","ls":"set-at-top-level","hasStorageAccess":true}
+== webkit 26.4
+  iframe sees: {"cookie":"","ls":"set-at-top-level","hasStorageAccess":false}
+```
+
+Firefox がすべての Cookie を iframe に渡し、Chromium の iframe からトップレベルで書いた localStorage が見えています。これは現在のブラウザの既定と合いません。
+
+調べると、**Playwright が自分の都合で分割を切っていました**。Chromium には `--disable-features=...,ThirdPartyStoragePartitioning,...` を渡し（Playwright の [issue 32230](https://github.com/microsoft/playwright/issues/32230) への対応）、Firefox には設定ファイル `playwright.cfg` で `network.cookie.cookieBehavior` を `4`、`network.cookie.CHIPS.enabled` を `false` にしています。Firefox の設定ファイルには「first-party-based cookie partitioning を無効にする」という注記があります。
+
+<Callout type="note" title="自動テストのブラウザは、利用者のブラウザと同じではない">
+  E2E テストで使うブラウザは、テストを安定させるために既定の設定を変えていることがあります。
+  **テストで第三者の文脈の挙動が通っても、利用者の Safari や Firefox で通るとは限りません**。
+  埋め込みや SSO を扱うなら、テストの起動時の設定を確かめ、必要なら既定に戻して試してください。
+</Callout>
+
+### 既定に近づけた結果
+
+Chromium は `ThirdPartyStoragePartitioning` を外した `--disable-features` に差し替え、Firefox は `network.cookie.cookieBehavior` を Total Cookie Protection の `5` に、CHIPS を有効に戻して、もう一度動かしました。WebKit は設定を変えていないので、最初の実行の結果をそのまま並べます。出力は抜粋です。サーバのログ（iframe と画像の要求に付いた Cookie）と、iframe から見えたものです。
+
+```
+[chromium] localhost:18200  /pixel.gif   Cookie: srv_none=1
+[chromium] localhost:18200  /frame       Cookie: srv_none=1
+[firefox ] localhost:18200  /frame       Cookie: None
+[firefox ] localhost:18200  /pixel.gif   Cookie: None
+[webkit  ] localhost:18200  /pixel.gif   Cookie: None
+[webkit  ] localhost:18200  /frame       Cookie: None
+
+== chromium 149.0.7827.22 (分割を戻す)
+  iframe sees: {"cookie":"srv_none=1; part=1","ls":null,"hasStorageAccess":true}
+  jar: localhost part partitionKey=http://127.0.0.1
+== firefox 151.0 (Total Cookie Protection)
+  iframe sees: {"cookie":"part=1","ls":null,"hasStorageAccess":false}
+== webkit 26.4
+  iframe sees: {"cookie":"","ls":"set-at-top-level","hasStorageAccess":false}
+```
+
+読み取れることを並べます。
+
+- **Chromium** は、`SameSite=None` の `srv_none` を iframe にも画像にも付けた。SameSite を書いていない `srv_default` と `js_long` は Lax として扱われ（第 130 回）、付かなかった。`Partitioned` 付きの `part` は `127.0.0.1` を分割のキーとして保存された（第 97 回の CHIPS）。localStorage は分割され、トップレベルで書いた値は見えない
+- **Firefox**（TCP）は、トップレベルで設定された Cookie を**どれも**送らなかった。iframe に見えるのは、iframe の中で設定された `part` だけで、これは「ニュースのサイト用の瓶」に入っている。localStorage も分割されている
+- **WebKit** は、何も送らず、iframe に Cookie も見せなかった。`document.hasStorageAccess()` は `false` で、使うには Storage Access API で許可を求める必要がある
+
+WebKit については、正直に書いておくべき点が 2 つあります。
+
+1. **`js_long` の期限は 365 日のまま保存されました**。本物の Safari なら `document.cookie` の永続 Cookie は 7 日に縮められるはずですが、Playwright の WebKit ではこの上限を観測できませんでした。iframe から localStorage の値が見えたのも、WebKit の文書にある分割の説明（[Tracking Prevention in WebKit](https://webkit.org/tracking-prevention/)）と合いません。Playwright の WebKit は Safari そのものではないので、**ITP の寿命の上限や分割は、この環境では確かめられなかった**、というのが結果です
+2. `srv_none` は WebKit では保存すらされませんでした。`Secure` 付きの Cookie を平文の `http://localhost` で受け取らなかったためで、Chromium と Firefox は localhost を安全な文脈として受け入れています。第三者 Cookie の遮断とは別の理由です
+
+ITP の分類（どのドメインを追跡者とみなすか）は、利用者の実際の閲覧の履歴から作られる統計に依存します。ヘッドレスの新しいプロファイルでは再現できません。Chromium で第三者 Cookie を遮断した状態も、設定ファイルや DevTools プロトコルの `Network.setCookieControls` で試みましたが、この環境では遮断されませんでした。ここで確かめられたのは、**各ブラウザの既定の「送る・分ける・止める」の違い**までです。
+
+## 実務への影響
+
+この違いは、広告の業界だけの話ではありません。
+
+| 用途 | 何が起きるか | よく取られる対応 |
+| --- | --- | --- |
+| アクセス解析 | JavaScript で書いた訪問者 ID が Safari では 7 日で消え、再訪した人が新しい訪問者に数えられる | サーバが HTTP の応答で Cookie を設定する（ファーストパーティ化）。ただし CNAME や別の IP アドレスの計測サーバ経由だと、これも 7 日に縮む |
+| 広告の効果測定 | クリック ID をリンクに載せて着地先で保存する方式が、Safari の 24 時間の上限やプライベートブラウズのパラメータ除去に当たる | サーバ側での計測、ブラウザが用意する集計の仕組み（ただし Chrome の Attribution Reporting は廃止予定） |
+| 埋め込みのウィジェット | チャットや動画の iframe が、利用者のログイン状態を読めない | CHIPS で分割した Cookie を使う、Storage Access API で許可を求める（第 97 回） |
+| 埋め込み型の SSO | 隠した iframe で IdP のセッションを確かめる方式が、Safari と Firefox で動かない | トップレベルのリダイレクトに切り替える、FedCM（第 136 回） |
+| ログインの維持 | ログインを localStorage のトークンで保つと、Safari で 7 日使わなければ消える | HttpOnly の Cookie をサーバが設定する（第 130 回、第 131 回） |
+
+表の 1 行目の「ファーストパーティ化」は、Safari の側から見ると**まさに ITP が 2020 年以降に塞いできた回り道**と同じ形になりえます。自社のサーバが自社のドメインと近い IP アドレスで HTTP の応答から Cookie を設定するのと、計測業者のサーバを CNAME で自社のサブドメインに見せかけるのとでは、扱いが違います。
+
+<Callout type="warn" title="よくある誤解: 「ファーストパーティ Cookie なら制限されない」">
+  第三者 Cookie の遮断には当たらなくても、Safari では次の場合に寿命が縛られます（[Tracking Prevention in WebKit](https://webkit.org/tracking-prevention/)）。
+  JavaScript で書いた永続 Cookie（7 日）、分類されたドメインから装飾付きのリンクで着いたページで JavaScript が書いた Cookie（24 時間）、第三者の CNAME や IP アドレスを経由した応答で設定された Cookie（7 日）。
+  スクリプトで書ける保存領域も、Safari を使った 7 日の間にサイトの操作が無ければ消えます。
+  **ファーストパーティかどうかではなく、「誰が、どうやって書いたか」まで見られている**と考えてください。
+  サイトの利用者が自分で操作している限り、長く保たれる Cookie は、自社のサーバが HTTP の応答で設定した HttpOnly の Cookie です。
+</Callout>
+
+## この回の部品の組み合わせ
+
+| 組み合わせ | 何が起きるか | 回 |
+| --- | --- | --- |
+| サイトの定義 × 第三者 Cookie の遮断 | 「第三者」はトップレベルのサイトとの比較で決まる。サブドメインは同じサイト | 第 94 回、第 97 回 |
+| CNAME × ITP | 名前は同じサイトでも、CNAME の行き先が第三者なら寿命を縛る | 第 58 回 |
+| SameSite × 各ブラウザの制限 | `SameSite=None` を付けても、Safari と Firefox の第三者の文脈では届かないか分割される | 第 130 回 |
+| CHIPS / Storage Access API × 各ブラウザ | 制限の下で、埋め込みが正当に Cookie を使う手段。遮断するブラウザほど必要になる | 第 97 回 |
+| Referrer-Policy × リンクの装飾 | ITP は装飾付きの移動の後、`document.referrer` を登録可能ドメインまで縮める | 第 99 回 |
+| 第三者 Cookie の制限 × SSO | 隠した iframe でのセッション確認が壊れ、FedCM やトップレベルの移動へ | 第 136 回 |
+| 構成の型 × ブラウザの違い | 別サイトの API と Cookie は、Safari と Firefox では第三者の扱いになる | 第 104 回 |
+
+## まとめ
+
+- 仕様は第三者 Cookie の制限をブラウザに任せており、**止め方はブラウザごとの方針**で決まる。相手にしているのは第三者 Cookie そのものではなく、サイトをまたいだ追跡
+- Safari の ITP は、2017 年の分類による制限から、2020 年に第三者 Cookie の全面遮断へ進み、並行して JavaScript で書いた Cookie、リンクの装飾、CNAME・IP アドレスの偽装、スクリプトで書ける保存領域に**ファーストパーティでも寿命の上限**を付けてきた
+- Firefox は Total Cookie Protection で、第三者 Cookie を**サイトごとの瓶に分ける**のを 2022 年から既定にしている。遮断ではなく分割
+- Chrome は第三者 Cookie の廃止を何度も延ばした末に 2024 年に方針を変え、2025 年に現行の方式を続けると決めた。通常のウィンドウでは送るが、ストレージは Chrome 115 から分割している。Privacy Sandbox の広告用の API は廃止に向かい、CHIPS と FedCM などが残る
+- バウンストラッキングは「一瞬ファーストパーティになる」手口で、各ブラウザが移動を観察して消す対策を持つ
+- 自動テストのブラウザは分割や追跡防止を切っていることがある。第三者の文脈の挙動は、既定の設定に戻して確かめる
+- 実務では、JavaScript で書く ID や localStorage のトークンは Safari で長く保たれない。長く保つべき状態は、自社のサーバが HTTP の応答で設定する Cookie に置く
+
+次の回では、ブラウザがリクエストに付けて送る**文脈のヘッダ**を見ます。`Origin`、`Referer` と Referrer-Policy、そして要求が「どこから来たか」をサーバに伝える Fetch Metadata を、手元のサーバで 1 つずつ確かめます。

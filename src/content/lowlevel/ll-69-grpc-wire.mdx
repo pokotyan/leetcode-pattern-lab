@@ -84,7 +84,7 @@ DATA      <5 バイトの枠 + HelloRequest>  (END_STREAM)
 
 `grpc-timeout` は、最大 8 桁の正の整数と 1 文字の単位でできています。単位は `H`（時）、`M`（分）、`S`（秒）、`m`（ミリ秒）、`u`（マイクロ秒）、`n`（ナノ秒）です。**`M` と `m` で分とミリ秒が分かれる**ので、手で書くときは注意が要ります。
 
-`:path` は、`.proto` の `package` とサービス名とメソッド名から機械的に決まります（[PROTOCOL-HTTP2.md: Appendix A](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#appendix-a---grpc-for-protobuf)）。**URL の設計をする余地は無く、スキーマがそのまま住所になります。** 第 173 回で見たとおり Kubernetes の Service の振り分けは接続単位ですが、第 174 回のようにリクエスト単位で働く L7 のプロキシは、この `:path` を読めば、どのメソッドの呼び出しかが分かります。
+`:path` は、`.proto` の `package` とサービス名とメソッド名から機械的に決まります（[PROTOCOL-HTTP2.md: Appendix A](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#appendix-a---grpc-for-protobuf)）。**URL の設計をする余地は無く、スキーマがそのまま住所になります。** 第 176 回で見たとおり Kubernetes の Service の振り分けは接続単位ですが、第 177 回のようにリクエスト単位で働く L7 のプロキシは、この `:path` を読めば、どのメソッドの呼び出しかが分かります。
 
 ## メッセージの枠: 5 バイトの前置き
 

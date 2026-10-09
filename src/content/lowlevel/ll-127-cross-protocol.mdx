@@ -1,0 +1,470 @@
+---
+title: 混線と選び方
+description: 証明書の検証に通ったのに、話している相手は別のプロトコルのサーバだった、ということは起こるのか。1 枚の証明書を共有したサーバ同士の混線（ALPACA）、検証を切ったクライアントに何が通るかを手元で確かめ、ファイル転送・遠隔操作・DB 接続・VPN の選び方で第 18 章を締めます
+chapter: atop
+order: 8
+status: published
+topics:
+  - ALPACA
+  - クロスプロトコル攻撃
+  - ALPN の厳格な確認
+  - no_application_protocol
+  - SNI の厳格な確認
+  - 証明書の共有 / ワイルドカード証明書
+  - 証明書の検証の無効化
+  - InsecureSkipVerify / verify=False
+  - プロトコルの選び方
+requires:
+  - ll-126-infra-tls
+  - ll-116-tls-ops
+  - ll-115-tls13-handshake
+  - ll-113-pki-chain
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 検証に通った相手は、話したいプロトコルのサーバか
+
+前回の第 126 回では、802.1X や RADIUS、NTS のように、利用者の目に触れない場所で TLS が働いている例を見ました。この章ではここまで、TLS や SSH という同じ通信路の上に、HTTP、FTP、データベース、VPN といったさまざまなプロトコルが載っている様子を見てきました。
+
+載っているものが多いほど、気になる問いがあります。**TLS の検証が通ったとき、確かめられたのは何だったのか**、という問いです。
+
+第 113 回で見たとおり、クライアントが確かめるのは「信頼する CA につながる証明書で、期限内で、接続先の名前が入っている」ことと、「相手がその秘密鍵を持っている」ことです。ここには、**相手がどのプロトコルを話すサーバか**は入っていません。`*.example.com` のワイルドカード証明書を Web サーバと FTP サーバとメールサーバで使い回していれば、どのサーバにつないでも検証は通ります。
+
+この回の前半では、この隙間を突く **ALPACA** という攻撃と、その対策を手元で確かめます。後半では、もう 1 つの隙間である「**そもそも検証していないクライアント**」に何が通るかを見ます。最後に、この章で見たプロトコルを、用途ごとにどう選ぶかをまとめます。
+
+## 証明書は名前と鍵を結ぶだけ
+
+証明書の主体（SAN）に入るのは、通常は DNS の名前です。名前には、ポート番号も、プロトコルの種類も入っていません。
+
+```
+証明書が言っていること:   「*.example.com の鍵はこれである」（CA の署名つき）
+証明書が言っていないこと: 「この鍵を持つサーバは HTTPS を話す」
+                         「この鍵を持つサーバは 443 番で待っている」
+```
+
+そのため、次のような構成はよくあります。
+
+- ワイルドカード証明書 `*.example.com` を、`www`、`ftp`、`mail` の各サーバに入れている
+- 1 枚の証明書の SAN に `www.example.com` と `mail.example.com` の両方を入れ、どちらのサーバにも同じ証明書を置いている
+- 同じホストで、443 番の HTTPS と 993 番の IMAPS と 990 番の FTPS が、同じ証明書を読んでいる
+
+どれも、利用者が正しい名前の正しいサーバにつないでいる限り問題はありません。問題は、**経路の途中の誰かが、接続を別のサーバへ付け替えたとき**です。
+
+[RFC 9525](https://www.rfc-editor.org/rfc/rfc9525.html)（2023 年 11 月、TLS でのサービスの識別。RFC 6125 を置き換え）も、2 つの異なるプロトコルのサービスが同じ証明書を使うとクロスプロトコル攻撃が可能になると指摘し、対策として「用途を限った識別子を使う」か「証明書を共有しないようにサービスを配置する」ことを挙げています（[RFC 9525 2](https://www.rfc-editor.org/rfc/rfc9525.html#section-2)）。
+
+## ALPACA: HTTPS の要求を別のサーバに届ける
+
+**ALPACA**（Application Layer Protocol Confusion）は、2021 年に USENIX Security と Black Hat USA で発表された攻撃です（[alpaca-attack.com](https://alpaca-attack.com/)、[Brinkmann ほか, USENIX Security 2021](https://www.usenix.org/conference/usenixsecurity21/presentation/brinkmann)）。
+
+攻撃者は、利用者とサーバの間で TCP の接続を付け替えられる立場（第 108 回の中間者）にいるとします。
+
+```
+                                  本来の行き先
+ブラウザ ──TLS (SNI: www.example.com)──X──▶ www.example.com:443 (HTTPS)
+                    │
+                    │ 攻撃者が TCP を付け替える
+                    ▼
+            ftp.example.com:990 (FTPS)   ← 同じ *.example.com の証明書を持つ
+```
+
+ブラウザは `www.example.com` に HTTPS でつないだつもりです。ところが届いた先は FTP サーバで、その FTP サーバは同じ証明書と秘密鍵を持っています。**TLS のハンドシェイクは成功し、証明書の検証も通ります**。攻撃者は TLS を解いていませんし、解く必要もありません。
+
+その後、ブラウザは HTTP の要求を送ります。FTP サーバはそれを FTP のコマンドとして読もうとし、知らないコマンドだとエラーを返しながら、次の行、次の行と処理を続けます。研究者は、この「HTTP の要求を、別のプロトコルのサーバが黙々と処理してしまう」性質を使って、3 種類の攻撃を示しました（[alpaca-attack.com](https://alpaca-attack.com/)）。
+
+| 型 | 何が起きるか |
+| --- | --- |
+| アップロード | HTTP の要求の本文や Cookie を、FTP のアップロードとして相手のサーバに保存させ、攻撃者が後で取り出す |
+| ダウンロード | 攻撃者が先に FTP サーバに置いたファイルを、ブラウザに `www.example.com` の応答として読ませる（保存型 XSS） |
+| 反射 | エラーメッセージに要求の一部がそのまま入ることを使い、ブラウザに `www.example.com` の文脈でスクリプトを実行させる（反射型 XSS） |
+
+調査の対象は、HTTPS から SMTP、IMAP、POP3、FTP への付け替えでした。研究者は、約 140 万台の Web サーバがクロスプロトコル攻撃に一般的に弱く、そのうち約 11 万 4 千台は、悪用できるアプリケーションのサーバを通じて攻撃できると見積もっています（[alpaca-attack.com](https://alpaca-attack.com/)）。
+
+<Callout type="note" title="ブラウザのポート制限では防げない">
+  ブラウザは、FTP の 21 番や SMTP の 25 番、IMAPS の 993 番などを「悪いポート」として、そこへの HTTP(S) の要求を出しません（[Fetch Standard 2.9](https://fetch.spec.whatwg.org/#port-blocking)）。
+  これは、Web ページが別のプロトコルのサーバへ要求を送らせる攻撃への古くからの対策です。
+  しかし ALPACA では、ブラウザ自身は 443 番に送っているつもりで、**付け替えはネットワークの途中で起きます**。ブラウザ側のポートの確認には引っかかりません。
+  Fetch Standard 自身も同じ節で、新しいプロトコルは TLS の ALPN でプロトコルを取り決めればポートを塞ぐ必要がなくなり、HTTP の要求で偽装されることもない、と書いています。
+</Callout>
+
+ここで、第 120 回の分類を思い出します。ALPACA が突いているのは、**TLS の層では「どのプロトコルか」を誰も確かめていない**ことです。証明書は名前しか見ず、ポートは攻撃者が付け替えられます。プロトコルを TLS の中で確かめる手段が、第 115 回で見た ALPN でした。
+
+## 実験の環境
+
+この回の実験は、Docker を使わず、手元の macOS の上で、ループバックのアドレスだけで完結させました。サーバとクライアントは Python と Go で書いた小さなものです。
+
+| 項目 | 版 |
+| --- | --- |
+| OS | macOS（Darwin 25.2.0、arm64） |
+| Python | 3.14.0（`ssl` は OpenSSL 3.6.2） |
+| Go | 1.24.6 |
+| OpenSSL（`openssl s_client`） | 3.6.2 |
+| curl | 8.7.1（LibreSSL 3.3.6） |
+| requests / urllib3 | 2.34.1 / 2.7.0 |
+
+## 手元で確かめる: 1 枚の証明書を共有した 2 つのサーバ
+
+### 準備
+
+自前の CA を作り、`*.ll123.test` のワイルドカード証明書を 1 枚発行します。この 1 枚を、HTTPS のサーバと FTP 風のサーバの両方に読ませます。
+
+```
+$ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout ca.key -out ca.crt -days 30 -subj "/CN=ll123 Test CA" \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+$ openssl x509 -req -in shared.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out shared.crt -days 30 -extfile ext.cnf      # SAN は DNS:*.ll123.test
+$ openssl x509 -in shared.crt -noout -subject -ext subjectAltName
+subject=CN=*.ll123.test
+X509v3 Subject Alternative Name:
+    DNS:*.ll123.test
+```
+
+待ち受けは次のとおりです。FTP 風のサーバは、実際の FTP を話すわけではなく、最初に `220` の挨拶を送り、受け取った行ごとに `500 Unknown command '...'` を返すだけです。**受け取った行をエラーメッセージに含めて返す**のは、実在のサーバにもよくある作りで、ALPACA の反射型の材料になる部分です。
+
+| ポート | 中身 | ALPN の扱い |
+| --- | --- | --- |
+| 12301 | HTTPS（Python の `http.server`） | `http/1.1` を設定 |
+| 12302 | FTP 風（Python） | 設定なし |
+| 12303 | FTP 風（Python） | `set_alpn_protocols(["ftp"])` を設定 |
+| 12304 | FTP 風（Go） | `NextProtos: []string{"ftp"}` |
+| 12305 | FTP 風（Go） | 12304 に加え、SNI が `ftp.ll123.test` 以外なら拒否 |
+
+`ftp` は IANA の ALPN の登録簿に登録された FTP の識別子です（[IANA: ALPN Protocol IDs](https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids)）。
+
+### HTTPS のクライアントを FTP 風のサーバにつなぐ
+
+攻撃者が付け替えた状況を、curl の `--resolve` で作ります。curl は `www.ll123.test` に HTTPS でつないでいるつもりで、実際には FTP 風のサーバ（12302）に届きます。
+
+```
+$ curl -v --resolve www.ll123.test:12302:127.0.0.1 --cacert ca.crt https://www.ll123.test:12302/
+* ALPN: curl offers h2,http/1.1
+* (304) (IN), TLS handshake, CERT verify (15):
+* SSL connection using TLSv1.3 / AEAD-AES256-GCM-SHA384 / [blank] / UNDEF
+* ALPN: server did not agree on a protocol. Uses default.
+*  subject: CN=*.ll123.test
+*  subjectAltName: host "www.ll123.test" matched cert's "*.ll123.test"
+*  SSL certificate verify ok.
+* using HTTP/1.x
+> GET / HTTP/1.1
+* Received HTTP/0.9 when not allowed
+curl: (1) Received HTTP/0.9 when not allowed
+```
+
+読み取れることは次のとおりです。
+
+- **証明書の検証は通っています**（`SSL certificate verify ok.`）。名前の照合も、ワイルドカードで一致しています
+- curl は ALPN で `h2,http/1.1` を申し出ましたが、サーバは何も選ばず（`server did not agree on a protocol`）、curl は**既定の HTTP/1.1 で話し始めました**
+- 返ってきたのが HTTP の応答の形をしていないので、curl は HTTP/0.9 の応答と見なし、既定では受け付けずに止まりました
+
+最後の点は curl が止まってくれただけです。サーバの側では、HTTP の要求が 1 行ずつ FTP のコマンドとして処理されていました。
+
+```
+[ftp:12302] got b'GET / HTTP/1.1'
+[ftp:12302] got b'Host: www.ll123.test:12302'
+[ftp:12302] got b'User-Agent: curl/8.7.1'
+[ftp:12302] got b'Accept: */*'
+```
+
+`--http0.9` で応答を受け付けさせ、要求の URL に文字列を入れると、それがそのまま返ってきます。
+
+```
+$ curl --http0.9 --resolve www.ll123.test:12302:127.0.0.1 --cacert ca.crt -m 3 \
+    'https://www.ll123.test:12302/?q=<script>alert(1)</script>'
+220 ftp.ll123.test FTP server ready
+500 Unknown command 'GET /?q=<script>alert(1)</script> HTTP/1.1'
+500 Unknown command 'Host: www.ll123.test:12302'
+500 Unknown command 'User-Agent: curl/8.7.1'
+500 Unknown command 'Accept: */*'
+curl: (28) Operation timed out after 3005 milliseconds with 234 bytes received
+```
+
+サーバは接続を閉じないので、curl は 3 秒で打ち切っています。要求に入れた `<script>` が、**`www.ll123.test` の正しい証明書で守られた接続の中から**返ってきました。これを HTML として解釈するクライアントがあれば、反射型 XSS になります。curl は既定ではこの応答を受け付けませんでしたが、それはアプリケーションの層での判断で、**TLS の層では何も止めていない**ことが分かります。
+
+### サーバに ALPN を設定しただけでは止まらない
+
+12303 の FTP 風のサーバには、Python の `SSLContext.set_alpn_protocols(["ftp"])` を設定しました。クライアントは `h2,http/1.1` を申し出ているので、重なりはありません。
+
+```
+$ curl -v --resolve www.ll123.test:12303:127.0.0.1 --cacert ca.crt -m 3 https://www.ll123.test:12303/
+* ALPN: curl offers h2,http/1.1
+* ALPN: server did not agree on a protocol. Uses default.
+* using HTTP/1.x
+> GET / HTTP/1.1
+* Received HTTP/0.9 when not allowed
+```
+
+結果は 12302 と同じです。サーバ側で `selected_alpn_protocol()` を記録すると `None` でした。**ハンドシェイクは成功し、ALPN は「選ばれなかった」だけ**で、サーバは `GET / HTTP/1.1` 以下の行を FTP のコマンドとして受け取り続けました。
+
+ALPN の仕様である [RFC 7301 3.2](https://www.rfc-editor.org/rfc/rfc7301.html#section-3.2) は、クライアントが申し出たプロトコルをサーバが 1 つも扱えないとき、**サーバは致命的な `no_application_protocol` アラートで応じなければならない（SHALL）** と定めています。手元の Python 3.14（OpenSSL 3.6.2）のサーバ側は、この組み合わせでは拒否しませんでした。Python のドキュメントも、`set_alpn_protocols` について「選択はハンドシェイクの中で RFC 7301 に従って行われる」とだけ書いており、重なりがないときに拒否するかどうかには触れていません（[Python ssl](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.set_alpn_protocols)）。**ALPN を設定することと、ALPN の不一致で接続を拒否することは、別のこと**です。
+
+### 拒否する実装: Go の crypto/tls
+
+Go の `crypto/tls` は、1.17 からサーバ側で ALPN の重なりを強制します。`Config.NextProtos` を設定したサーバは、クライアントが ALPN を申し出ていて重なりがなければ、RFC 7301 のとおり `no_application_protocol` で接続を閉じます。リリースノートは、これが ALPACA の緩和のためだと明記しています（[Go 1.17 Release Notes](https://go.dev/doc/go1.17)）。
+
+```
+$ openssl s_client -connect 127.0.0.1:12304 -servername www.ll123.test -alpn h2,http/1.1 -CAfile ca.crt -brief
+Connecting to 127.0.0.1
+...:error:0A000460:SSL routines:ssl3_read_bytes:tlsv1 alert no application protocol:...:SSL alert number 120
+```
+
+```
+[127.0.0.1:12304] handshake failed: tls: client requested unsupported application protocols ([h2 http/1.1])
+```
+
+アラート番号 120 が `no_application_protocol` です。curl から同じサーバにつなぐと、LibreSSL の表示で `curl: (35) LibreSSL/3.3.6: error:1404B460:SSL routines:ST_CONNECT:reason(1120)` となりました（1000 にアラート番号を足した値です）。**HTTP の要求は 1 バイトも送られていません**。FTP のクライアントとして `ftp` を申し出れば、普通につながります。
+
+```
+$ openssl s_client -connect 127.0.0.1:12304 -servername ftp.ll123.test -alpn ftp -CAfile ca.crt
+ALPN protocol: ftp
+Verify return code: 0 (ok)
+220 ftp.ll123.test FTP server ready
+```
+
+ただし、**ALPN を申し出ないクライアントは通ります**。
+
+```
+[127.0.0.1:12304] ok sni="ftp.ll123.test" alpn="ftp"
+[127.0.0.1:12304] ok sni="ftp.ll123.test" alpn=""
+```
+
+2 行目は `-alpn` を付けずに接続したときのものです。RFC 7301 は ALPN を使うかどうかをクライアントに任せており（3.1 で MAY）、申し出がない場合の扱いは定めていません。古い FTP クライアントを切り捨てられない以上、サーバは ALPN なしの接続を受け入れるしかないのが普通です。ALPN による防御は、**HTTPS のクライアント（ブラウザ）が必ず ALPN を送る**ことと組み合わさって初めて働きます。
+
+### SNI で拒否する
+
+もう 1 つの手がかりは SNI です。FTP のサーバは、`ftp.ll123.test` 以外の名前で来た接続を受ける理由がありません。12305 では、Go の `GetConfigForClient` で SNI を確かめ、違えばエラーを返すようにしました。
+
+```
+$ openssl s_client -connect 127.0.0.1:12305 -servername www.ll123.test -alpn ftp -CAfile ca.crt -quiet
+...:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:...:SSL alert number 80
+```
+
+```
+[127.0.0.1:12305] handshake failed: unexpected server name "www.ll123.test"
+[127.0.0.1:12305] ok sni="ftp.ll123.test" alpn="ftp"
+```
+
+拒否はできましたが、アラートは `internal_error`（80）でした。TLS の推奨事項をまとめた [RFC 9325 3.7](https://www.rfc-editor.org/rfc/rfc9325.html#section-3.7)（BCP 195）は、ALPACA の攻撃を防ぐため、提示された名前を認識しないサーバはハンドシェイクを続けるべきでなく（SHOULD NOT）、`unrecognized_name`（112）で失敗させるべき（SHOULD）としています。手元の書き方では、拒否はできても、相手に返る理由は「内部のエラー」になりました。障害の切り分けでは、この違いが手がかりを 1 つ減らします。
+
+### クライアントの側でも確かめる
+
+RFC 9325 は、クライアントについても、サーバが ALPN の拡張に応じたのにクライアントの一覧からプロトコルを選ばなかったときは、ハンドシェイクを中断すべき（SHOULD）としています（[RFC 9325 3.8](https://www.rfc-editor.org/rfc/rfc9325.html#section-3.8)）。手元のサーバ（12302）は ALPN にそもそも応じなかったので、この規定には当たりません。それでも、**自分で書くクライアントなら、選ばれたプロトコルを確かめてから話し始める**ことができます。
+
+```python
+ctx = ssl.create_default_context(cafile="ca.crt")
+ctx.set_alpn_protocols(["http/1.1"])
+for port in (12301, 12302):
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname="www.ll123.test")
+    got = s.selected_alpn_protocol()
+    if got != "http/1.1":
+        print(f"port {port}: alpn={got!r} -> HTTP を送らずに切断")
+        ...
+```
+
+```
+port 12301: alpn='http/1.1' -> b'HTTP/1.0 200 OK'
+port 12302: alpn=None -> HTTP を送らずに切断
+```
+
+ALPN を返さないサーバとは話せなくなるので、相手のサーバがすべて ALPN に応じると分かっている場面（自社のサービス同士など）で使える方法です。
+
+## 対策を層ごとに並べる
+
+ALPACA への対策は、1 か所では完結しません。研究者自身も、ALPN と SNI を使う TLS の層の対策と、アプリケーションの層の対策の両方を挙げ、TLS の層の厳格な動作は当時ほとんど実装されていなかったと書いています（[alpaca-attack.com](https://alpaca-attack.com/)）。
+
+| 層 | 対策 | 根拠・実例 |
+| --- | --- | --- |
+| 証明書 | プロトコルごとに証明書を分ける。ワイルドカードを避ける | [RFC 9525 2](https://www.rfc-editor.org/rfc/rfc9525.html#section-2)、ワイルドカードの危険は [7.1](https://www.rfc-editor.org/rfc/rfc9525.html#section-7.1) |
+| TLS（サーバ） | ALPN の不一致で `no_application_protocol` を返す | [RFC 7301 3.2](https://www.rfc-editor.org/rfc/rfc7301.html#section-3.2)、Go 1.17 以降 |
+| TLS（サーバ） | 知らない SNI を `unrecognized_name` で拒否する | [RFC 9325 3.7](https://www.rfc-editor.org/rfc/rfc9325.html#section-3.7) |
+| TLS（クライアント） | ALPN を必ず送り、選ばれなければ中断する | [RFC 9325 3.8](https://www.rfc-editor.org/rfc/rfc9325.html#section-3.8) |
+| アプリケーション | HTTP らしい要求を見たら切る、エラーが続いたら切る | vsftpd 3.0.4、Sendmail、nginx 1.21.0 のメールのプロキシなど（[alpaca-attack.com](https://alpaca-attack.com/)） |
+| ブラウザ | 既知のポートへ要求を出さない | [Fetch Standard 2.9](https://fetch.spec.whatwg.org/#port-blocking)。途中での付け替えには効かない |
+
+いくつか補足します。
+
+**証明書を分けるのが最も確実です**。`www` と `ftp` の証明書が別で、`ftp` の証明書に `www` の名前が入っていなければ、付け替えた先でブラウザの名前の照合が失敗します。RFC 9525 は、ワイルドカードを最も左のラベル 1 つに限ることで一部の攻撃を緩和でき、アプリケーションのプロトコルの側でワイルドカードを全面的に禁じるのがより確実だとしています（[RFC 9525 7.1](https://www.rfc-editor.org/rfc/rfc9525.html#section-7.1)）。第 114 回の自動更新が普及した今、証明書を名前ごとに分ける手間は以前ほど大きくありません。
+
+**ALPN の確認を強制する方向に、TLS の側も動いてきました**。2022 年の RFC 9325 は、TLS の実装はクライアントとサーバの両方で ALPN に対応しなければならない（MUST）とし、クロスプロトコル攻撃を防ぐため、同じドメイン名で複数のサービスを提供する事業者は ALPN を配備すべき（SHOULD）としています（[RFC 9325 3.8, 3.9](https://www.rfc-editor.org/rfc/rfc9325.html#section-3.8)）。Go は 1.17 で既定の動作を変えました。nginx は 1.21.4（2021 年 11 月）で stream モジュールに `ssl_alpn` を加え、TCP をそのまま中継する構成でも ALPN を指定できるようになりました（[nginx CHANGES](https://nginx.org/en/CHANGES)）。ただし、上の実験のとおり、**ALPN を設定すれば自動で拒否してくれるとは限りません**。使っているライブラリやサーバで、不一致のときに何が起きるかを確かめる必要があります。
+
+**ALPN の識別子がないプロトコルもあります**。IANA の登録簿を 2026 年 10 月に見た時点で、`ftp`、`imap`、`pop3`、`managesieve`、`xmpp-client`、`mqtt`、`dot`、`postgresql` などは登録されていましたが、`smtp` の識別子は見当たりませんでした（[IANA: ALPN Protocol IDs](https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids)）。識別子のないプロトコルでは、証明書の分離と SNI、アプリケーションの層の対策に頼ることになります。第 124 回の PostgreSQL の `sslnegotiation=direct` も、この流れの中にある設計です。SSLRequest を使わず最初から TLS を始める方式では、プロトコルの取り違えを防ぐため、クライアントは ALPN で `postgresql` を送ることが求められています（[PostgreSQL 17: 53.2.10](https://www.postgresql.org/docs/17/protocol-flow.html#PROTOCOL-FLOW-SSL)）。
+
+<Callout type="warn" title="よくある誤解: 「証明書の検証が通ったのだから、相手は目的のサーバだ」">
+  検証が保証するのは、**その名前の秘密鍵を持つ誰か**と話していることだけです。同じ秘密鍵が 3 台のサーバに置かれていれば、そのどれと話しているかは証明書からは分かりません。
+  秘密鍵を置く場所が増えるほど、「その名前を名乗れる機械」も増えます。第 116 回の「TLS を終える機械には必ず秘密鍵がある」の裏返しで、**秘密鍵を共有することは、名乗れる相手を共有すること**です。
+</Callout>
+
+## 検証しないクライアント
+
+ALPACA は、検証が正しく行われていても起きる攻撃でした。実際の現場でもっと多いのは、その手前の問題です。**クライアントがそもそも証明書を確かめていない**ことです。
+
+### 何を切ると、何が通るか
+
+Python の `ssl` で、クライアントの設定を 4 通りに変え、3 つの相手につないでみます。
+
+- 正しいサーバ: 12301 の HTTPS。自前の CA で発行した `*.ll123.test` の証明書
+- 名前違い: 同じサーバに、`api.example.net` という別の名前でつないだつもりになる（攻撃者が、自分の正規の証明書を持つサーバに付け替えた状況の代わり）
+- 自己署名の偽サーバ: 12306 で待つ、`evil.example` の自己署名証明書を持つサーバ。届いた `Authorization` ヘッダをそのまま返す
+
+クライアントは、どの場合も `Authorization: Bearer s3cr3t-token` を付けた要求を送ります。
+
+```
+# create_default_context(cafile)
+  正しいサーバ (www.ll123.test)                  OK   -> hello from www.ll123.test
+  名前違い (api.example.net として接続)             FAIL -> SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate
+  自己署名の偽サーバ (evil.example)                 FAIL -> SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.
+# check_hostname=False
+  正しいサーバ (www.ll123.test)                  OK   -> hello from www.ll123.test
+  名前違い (api.example.net として接続)             OK   -> hello from www.ll123.test
+  自己署名の偽サーバ (evil.example)                 FAIL -> SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.
+# check_hostname=False + CERT_NONE
+  正しいサーバ (www.ll123.test)                  OK   -> hello from www.ll123.test
+  名前違い (api.example.net として接続)             OK   -> hello from www.ll123.test
+  自己署名の偽サーバ (evil.example)                 OK   -> evil server got: Bearer s3cr3t-token
+# ssl._create_unverified_context()
+  正しいサーバ (www.ll123.test)                  OK   -> hello from www.ll123.test
+  名前違い (api.example.net として接続)             OK   -> hello from www.ll123.test
+  自己署名の偽サーバ (evil.example)                 OK   -> evil server got: Bearer s3cr3t-token
+```
+
+3 つの段階が見えます。
+
+1. **既定（`create_default_context`）**は、連鎖と名前の両方を確かめます。Python のドキュメントのとおり、クライアント用の文脈は `CERT_REQUIRED` と `check_hostname` が既定で有効です（[Python ssl](https://docs.python.org/3/library/ssl.html#ssl.PROTOCOL_TLS_CLIENT)）
+2. **`check_hostname=False` だけ**では、自己署名の偽サーバは落ちますが、**名前違いは通ります**。信頼する CA が発行した証明書なら、**誰の名前の証明書でもよい**ということです。公開の CA を信頼しているクライアントなら、攻撃者は自分のドメインの証明書を普通に取得すれば足ります。「連鎖は確かめているから安全」とは言えません
+3. **`CERT_NONE` や `_create_unverified_context()`** では、何でも通ります。トークンは偽サーバに渡りました
+
+Python では、`check_hostname` が有効なまま `verify_mode` を `CERT_NONE` にはできず、先に `check_hostname` を切る必要があります（[Python ssl](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.check_hostname)）。名前の確認を切る操作が、検証を全部切る操作の手前の段階として用意されている形です。
+
+Go と requests でも、同じ偽サーバに対して同じことが起きます。
+
+```
+InsecureSkipVerify=false: Get "https://www.ll123.test/": tls: failed to verify certificate: x509: certificate is valid for evil.example, not www.ll123.test
+InsecureSkipVerify=true: 200 OK evil server got: Bearer s3cr3t-token
+```
+
+```
+$ python3 -c 'import requests; print(requests.get("https://127.0.0.1:12306/", verify=False,
+    headers={"Authorization": "Bearer s3cr3t-token"}).text)'
+.../urllib3/connectionpool.py:1110: InsecureRequestWarning: Unverified HTTPS request is being made to host '127.0.0.1'. ...
+evil server got: Bearer s3cr3t-token
+```
+
+Go のドキュメントは `InsecureSkipVerify` について、true のときサーバが出した**どんな証明書も、その中のどんなホスト名も受け入れ**、この状態の TLS は中間者攻撃に弱いと書いています（[crypto/tls Config](https://pkg.go.dev/crypto/tls#Config)）。requests は警告を出しましたが、**警告を出しただけで、トークンは送られています**。Node.js でも、環境変数 `NODE_TLS_REJECT_UNAUTHORIZED=0` で証明書の検証が無効になり、ドキュメントはこれを使わないよう強く勧めています（[Node.js CLI](https://nodejs.org/api/cli.html#node_tls_reject_unauthorizedvalue)）。
+
+### 既定値の歴史
+
+「ライブラリの既定は検証する」は、昔からの常識ではありません。
+
+2012 年の論文「The Most Dangerous Code in the World」は、ブラウザ以外のソフトウェアの証明書の検証を調べ、多くのアプリケーションやライブラリで検証が壊れていることを示しました。原因として、OpenSSL や GnuTLS、JSSE、cURL などの API が、使う側に正しい設定を求める作りになっていたことを挙げています（[Georgiev ほか, ACM CCS 2012](https://crypto.stanford.edu/~dabo/abstracts/ssl-client-bugs.html)）。
+
+Python も、標準ライブラリの HTTP クライアント（`urllib` や `http.client`）が既定で証明書と名前を確かめるようになったのは、PEP 476 で、Python 2.7.9、3.4.3 からです。それまでは**どちらも確かめていませんでした**（[PEP 476](https://peps.python.org/pep-0476/)）。古い版のまま動いている仕組みや、低い層の API を直接使っているコードでは、今でも既定が「確かめない」である可能性があります。
+
+### 自己署名を「とりあえず無効化」した先
+
+検証を切る動機の多くは、開発や社内の環境で**自己署名の証明書や社内の CA の証明書が通らない**ことです。この回の実験でも、それに近いことが起きました。最初に作った CA には `keyUsage` の拡張を付けていなかったため、Python 3.14 の既定の文脈は、正しいサーバへの接続も次のように拒否しました。
+
+```
+SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key u
+```
+
+Python 3.13 から、`create_default_context()` は既定で `VERIFY_X509_STRICT` を使い、壊れた X.509 の証明書への回避策を外しています（[Python ssl](https://docs.python.org/3/library/ssl.html#ssl.create_default_context)）。ここで `verify=False` を書けば先へ進めますが、正しい対処は **CA の証明書を作り直す**ことでした（`keyUsage=critical,keyCertSign,cRLSign` を付けて作り直したところ、既定のまま通りました）。
+
+<Callout type="warn" title="「とりあえず検証を切る」が残すもの">
+  - **開発用の設定が本番に残る**: `verify=False` や `InsecureSkipVerify: true` は、動いている限り誰も気づきません。証明書が正しくなった後も、切ったままのコードは偽のサーバにもつながり続けます
+  - **環境変数はプロセス全体に効く**: `NODE_TLS_REJECT_UNAUTHORIZED=0` は、問題の 1 か所だけでなく、そのプロセスのすべての TLS 接続から検証を外します。依存しているライブラリが外部の API や決済につなぐ接続も含みます
+  - **失敗が見えなくなる**: 検証を切ると、第 116 回で見た「期限切れ」「名前の不一致」「中間の送り忘れ」といった障害の手がかりも消えます
+
+  正しい対処は、**信頼の起点を足す**ことです。Python なら `create_default_context(cafile=...)`、Node.js なら `NODE_EXTRA_CA_CERTS` で、既定のルート CA に社内の CA を追加できます（[Node.js CLI](https://nodejs.org/api/cli.html#node_extra_ca_certsfile)）。検証そのものは切りません。
+</Callout>
+
+### 自分のコードが検証しているかを調べる
+
+調べ方は 2 つあります。
+
+1 つ目は、**検証を切る書き方を探す**ことです。代表的なものを挙げます。
+
+| 言語・道具 | 検証を切る書き方 |
+| --- | --- |
+| Python `ssl` | `verify_mode = ssl.CERT_NONE`、`check_hostname = False`、`ssl._create_unverified_context` |
+| Python requests | `verify=False` |
+| Go | `InsecureSkipVerify: true` |
+| Node.js | `rejectUnauthorized: false`、`NODE_TLS_REJECT_UNAUTHORIZED=0` |
+| curl | `-k` / `--insecure` |
+| PostgreSQL のクライアント | `sslmode` が `verify-full` 以外（第 124 回） |
+| MySQL のクライアント | `--ssl-mode` が `VERIFY_IDENTITY` 以外（第 124 回） |
+
+最後の 2 行のように、**「切る」書き方を探すだけでは見つからない**ものもあります。既定値そのものが検証しない、という場合です。第 124 回で見た PostgreSQL の既定の `prefer` がその例です。
+
+2 つ目は、**わざと間違ったサーバにつないで、失敗することを確かめる**ことです。この回の実験のように、名前の違う証明書を出すサーバと、自己署名の証明書を出すサーバを用意し、クライアントが両方で失敗することをテストに入れておきます。「正しいサーバにつながる」ことしか確かめていないテストは、検証を切ったコードでも通ってしまいます。**検証の有無は、失敗するべき場面で失敗するかでしか分かりません**。
+
+## 選び方
+
+この章では、TLS と SSH の上に載るプロトコルを数多く見ました。最後に、用途ごとの選び方を整理します。どの用途でも、共通して確かめることは次の 4 つです。
+
+1. **相手を確かめているか**: 証明書の名前、ホスト鍵、`verify-full` のような設定。暗号化だけで相手を確かめない構成は、中間者に対して何も守りません
+2. **最初から暗号化されているか**: 第 120 回で見たとおり、途中で切り替える型（STARTTLS 系）は、切り替えを消される攻撃と、切り替えの境目の実装の誤りに弱い。選べるなら最初から TLS の型を選びます
+3. **鍵を誰と共有しているか**: この回の ALPACA のとおり、証明書と秘密鍵を共有する範囲が、名乗れる相手の範囲になります
+4. **網の制約に合うか**: 接続の本数、方向、ポートの数、NAT やファイアウォールを越えられるか
+
+### ファイル転送
+
+| 方式 | 土台 | 向いている場面 | 気をつけること |
+| --- | --- | --- | --- |
+| SFTP（第 121 回） | SSH のサブシステム | サーバの運用者同士、1 本の接続でよい場面 | ホスト鍵の確認（TOFU）。転送だけの利用者には `ForceCommand internal-sftp` と chroot |
+| FTPS（第 122 回） | TLS（明示的・暗黙的） | 相手の業務システムが FTP を前提にしている場面（EDI など） | 接続が 2 本で、受動ポートの範囲を開ける必要がある。データ接続の TLS セッション再開 |
+| HTTPS と署名付き URL | TLS 上の HTTP | 不特定の相手との受け渡し、ブラウザだけで済ませたい場面 | URL を知る誰でも使える。期限を短く |
+| AS2 | HTTP 上の S/MIME | 企業間の取引文書で、送達の証明が要る場面 | 署名つきの受領通知（MDN）まで含めて取り決める |
+
+署名付き URL は、URL そのものが期限付きの権限になります。たとえば Amazon S3 では、URL を作った利用者の認証情報で、期限付きでオブジェクトの取得を許します。AWS CLI で作る場合、期限は最長 7 日です（[Amazon S3: presigned URL](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html)）。AS2 は、構造化された業務データを SMTP ではなく HTTP で安全に交換する方法を定めた規格で、S/MIME による署名と暗号化、受領通知を組み合わせます（[RFC 4130](https://www.rfc-editor.org/rfc/rfc4130.html)）。**AS2 は通信路ではなく文書そのものに署名する**ので、TLS を終えた後の中継でも改ざんを検出できる点が、他の 3 つと違います。
+
+新しく作るなら、運用者同士は SFTP、不特定の相手とは HTTPS、が出発点になります。FTPS や AS2 は、**相手がそれを求めているときに選ぶ**ものです。
+
+### 遠隔操作
+
+対話的な操作は SSH 一択と言ってよく、論点は SSH の運用のほうにあります。利用者とサーバが増えれば、第 119 回の SSH 証明書と踏み台で `known_hosts` と `authorized_keys` の配布を解きます。回線が不安定な場面では、第 123 回の Mosh が SSH で鍵を受け渡した後に UDP で話す、という選択肢があります。ポートフォワーディング（第 123 回）は便利ですが、**SSH で入れる人が、そのサーバから届く範囲すべてに手を伸ばせる**ことになるので、使わない利用者には禁じておきます。
+
+### DB 接続
+
+第 124 回で見たとおり、データベースのクライアントの既定値は、多くの場合「暗号化はするかもしれないが、相手は確かめない」です。選ぶというより、**設定を上げる**ことが仕事になります。
+
+- PostgreSQL は `sslmode=verify-full`、MySQL は `--ssl-mode=VERIFY_IDENTITY` まで上げる
+- サーバ側でも、平文や検証なしの接続を受け付けない設定（`hostssl`、`require_secure_transport`）にする
+- 途中で切り替える型を避けられるなら避ける（PostgreSQL 17 の `sslnegotiation=direct`）
+
+### VPN
+
+| 型 | 例 | 選ぶ理由 |
+| --- | --- | --- |
+| TLS を使わない | WireGuard、IPsec（IKEv2） | 速さ、構成の単純さ（WireGuard）、OS や機器の標準の対応（IPsec） |
+| TLS で鍵を決める | OpenVPN | 証明書の運用をそのまま使える。TCP の 443 番でも動かせる |
+| HTTPS に紛れる | SSTP、OpenConnect | HTTPS しか通さない網を越える |
+
+第 125 回で見たとおり、TLS の上で TCP を運ぶ構成は、TCP の上に TCP を載せる問題を抱えます。**網の制約がなければ UDP で動く型を選び、HTTPS しか通らない網を越える必要があるときに TLS の型を選ぶ**、という順で考えます。どの型を選んでも、VPN に入った後に何を許すかは別の問題で、第 141 回で扱います。
+
+## 第 18 章で見たもの
+
+| 回 | 見たもの |
+| --- | --- |
+| 第 120 回 | 上に載せる型: 最初から TLS、途中で切り替え、ALPN と SNI で振り分け、SSH のチャネル |
+| 第 121 回 | SSH でファイルを運ぶ: SCP と SFTP |
+| 第 122 回 | FTP と FTPS: 2 本の接続と、それを暗号化する難しさ |
+| 第 123 回 | SSH で穴を通す: ポートフォワーディング、Git over SSH、Mosh |
+| 第 124 回 | データベースと中間層の TLS: `sslmode` と既定値の問題 |
+| 第 125 回 | TLS で作るトンネルと VPN: stunnel、OpenVPN、SSL VPN |
+| 第 126 回 | 裏方を守る TLS: EAP-TLS、RadSec、NTS、syslog over TLS |
+| 第 127 回（この回） | 混線と選び方: ALPACA、検証しないクライアント |
+
+章全体を通して見えたのは、**TLS や SSH は通信路を守るが、その上で何を話すか、誰が話しているかは上に載るプロトコルと設定次第**だということです。切り替えを消されれば平文に戻り（第 120 回）、既定値が検証しなければ中間者に渡り（第 124 回）、鍵を共有すれば別のサーバに話しかけてしまいます（この回）。
+
+第 17 章とこの章では、第 16 章の部品を組み合わせて、**相手の鍵を確かめて話す**ところまで来ました。TLS ではサーバの鍵を CA の署名で、SSH ではホスト鍵を known_hosts や CA で確かめ、クライアント証明書や SSH の公開鍵認証で相手の鍵も確かめられます。そしてこの章では、その通信路の上にファイル転送、データベース、VPN を載せ、確かめ方を誤るとどこで崩れるかを見ました。しかし、どれほど正しく確かめても、分かったのはあくまで「**どの鍵か**」です。ALPACA が示したように、同じ鍵が別のサーバに置かれていれば、鍵だけでは相手を決めきれません。まして、**その鍵の向こうにいる人は誰で、何をしてよいのか**は、鍵からは分かりません。次の第 19 章では、第 128 回で認証と認可を分けるところから始めます。
+
+## まとめ
+
+- 証明書が結ぶのは名前と鍵だけで、ポートやプロトコルは入っていない。同じ証明書を複数のプロトコルのサーバで共有すると、接続を付け替えられても検証は通る
+- **ALPACA**（2021）は、HTTPS の要求を同じ証明書を持つ FTP や SMTP、IMAP、POP3 のサーバに届け、アップロード、ダウンロード、反射の 3 つの型で悪用する攻撃。ブラウザのポート制限は、経路の途中での付け替えには効かない
+- 手元では、ワイルドカード証明書を共有した FTP 風のサーバに curl がつながり、検証に通ったまま HTTP の要求を送り、要求の中身がエラーメッセージとして返ってきた
+- 対策は層ごとに重ねる。証明書を分ける（RFC 9525）、ALPN の不一致を `no_application_protocol` で拒否する（RFC 7301、RFC 9325）、知らない SNI を拒否する、アプリケーションの層で HTTP らしい入力を切る
+- **ALPN を設定することと、不一致で拒否することは別**。手元の Python のサーバは拒否せず、Go 1.17 以降は拒否した。ALPN を送らないクライアントはどちらでも通る
+- 検証を切ったクライアントには、自己署名の偽サーバでも何でも通り、トークンが渡る。名前の確認だけを切った場合も、信頼する CA が発行した**誰の証明書でも**通る
+- ライブラリの既定が検証するようになったのは比較的最近（Python は PEP 476）。自己署名の証明書が通らないときは、検証を切らず信頼の起点を足す。検証しているかは、わざと間違ったサーバにつないで失敗するかで確かめる
+- 選び方の共通の基準は、相手を確かめているか、最初から暗号化されているか、鍵を誰と共有しているか、網の制約に合うか
