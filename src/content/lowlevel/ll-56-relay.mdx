@@ -1,0 +1,401 @@
+---
+title: 2 本のソケットをつなぐ
+description: socat、ssh -L、kubectl port-forward、docker-proxy。片側で受けたバイトをもう片側へ流すだけのプログラムは、中で何をしているのか。strace で socat を覗き、100 行余りの C で書き直し、片側だけ閉じる、相手が遅い、コピーを減らすという 3 つの落とし穴を確かめる
+chapter: network
+order: 4
+status: published
+topics:
+  - 中継（リレー）
+  - socat
+  - half-close / shutdown
+  - 背圧
+  - splice
+  - Unix ドメインソケット
+  - 送信元アドレスの喪失
+requires:
+  - ll-45-io-multiplex
+  - ll-48-io-dma
+  - ll-53-socket-tcp
+  - ll-54-tcp-flow
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 何も解釈しないプログラム
+
+接続を受け、別の宛先へ接続を張り、両者の間でバイトを行き来させる。中身は読まない。こういうプログラムは、名前を変えてあちこちにあります。
+
+- `socat TCP-LISTEN:9000 TCP:db:5432`。手元の 9000 番を別のホストの 5432 番につなぐ
+- `ssh -L`。手元で受けた接続を、SSH のチャネルを通して向こう側の宛先へつなぐ（第 124 回）
+- `kubectl port-forward`。手元のポートを Pod の中のポートにつなぐ
+- `docker-proxy`。公開したポートへのループバック経由の接続を、コンテナへ渡す（第 169 回）
+- L4 のロードバランサ。受けた接続を後ろのどれか 1 台へつなぐ（第 74 回）
+
+どれも骨組みは同じです。**fd を 2 本持ち、片方から読めたものをもう片方へ書く**。第 45 回の多重化と、この章で見た TCP の振る舞いを組み合わせれば作れます。この回は、まず socat が実際に何をしているかをシステムコールの単位で見て、次に同じものを C で書き直します。書き直すと、短いプログラムなのに間違えやすい箇所が 3 つあることがわかります。
+
+- 片側が「送り終えた」と言ったとき、どう伝えるか
+- 宛先が遅いとき、受け取った分をどこに置くか
+- バイトをユーザ空間に持ち込まずに済ませられるか
+
+最後に、socat が TCP 以外の何と何をつなげるのか、つないだことで何が見えなくなるのかを見ます。
+
+## 実験の環境
+
+コンテナを 3 つ、同じネットワークにつなぎました。`client` から `relay` に接続し、`relay` が `back` に接続を張ります。
+
+```
+ client ─────────── relay ─────────── back
+ 192.168.155.4      192.168.155.2     192.168.155.3
+ curl / nc / 送信   socat / 自作の中継  HTTP :8080 / 各種のサーバ
+```
+
+| 項目 | バージョン |
+| --- | --- |
+| ホスト | macOS（Darwin 25.2.0、arm64）、Docker 29.4.0（OrbStack、カーネル 7.0.14） |
+| コンテナ | `alpine:3.22`（中身は 3.22.6） |
+| socat | 1.8.1.3 |
+| strace | 6.13 |
+| gcc | 14.2.0 |
+| Python | 3.12.15 |
+| netcat | OpenBSD netcat 1.229 |
+
+`back` の 8080 番では、Python の `http.server` が「接続してきた相手のアドレス」を 1 行で返します。
+
+## socat の中を覗く
+
+`relay` で socat を `strace` の下で起動し、`client` から HTTP の要求を 1 回送りました。
+
+```
+$ strace -f -tt -o socat.trace socat TCP-LISTEN:9000,reuseaddr TCP:ll56-back:8080
+$ curl -s http://ll56-relay:9000/        # client から
+hello from back, you are 192.168.155.2:51146
+```
+
+ライブラリの読み込みを除いた部分を、順に見ます。
+
+```
+socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 5
+setsockopt(5, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+bind(5, {sin_port=htons(9000), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+listen(5, 5)      = 0
+pselect6(6, [3 5], NULL, NULL, NULL, ...) = 1 (in [5])
+accept(5, {sin_port=htons(37802), sin_addr=inet_addr("192.168.155.4")}, ...) = 6
+close(5)          = 0
+  ... /etc/hosts と /etc/resolv.conf を読み、127.0.0.11 に DNS で ll56-back を問い合わせる ...
+socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 5
+connect(5, {sin_port=htons(8080), sin_addr=inet_addr("192.168.155.3")}, 16) = 0
+```
+
+ここまでがマニュアルの言う **open の段階**です。socat は 1 つ目のアドレスを開き、それが済んでから 2 つ目を開きます（[socat(1)](http://www.dest-unreach.org/socat/doc/socat.html)）。1 つ目が `TCP-LISTEN` なので、**接続が来るまで宛先の名前解決すらしません**。宛先の DNS が引けなくても、起動の時点では何も起きず、最初の接続で失敗します。`fork` を付けていないので、accept した直後に待ち受けのソケット（fd 5）を閉じています。この socat は 1 回しか接続を受けません。
+
+続きが**転送の段階**です。fd 6 が `client` 側、fd 5 が `back` 側です。
+
+```
+pselect6(7, [5 6], [5 6], [], NULL, ...) = 3 (in [6], out [5 6])
+read(6, "GET / HTTP/1.1\r\nHost: ll56-relay"..., 8192) = 79
+write(5, "GET / HTTP/1.1\r\nHost: ll56-relay"..., 79) = 79
+pselect6(7, [5 6], [5], [], NULL, ...) = 1 (out [5])
+pselect6(7, [5 6], [], [], NULL, ...) = 1 (in [5])
+read(5, "HTTP/1.0 200 OK\r\nServer: BaseHTT"..., 8192) = 158
+write(6, "HTTP/1.0 200 OK\r\nServer: BaseHTT"..., 158) = 158
+```
+
+`pselect6` で両方の fd を待ち、読めた側から `read` して、反対側へ `write` しています。1 回に読む量は 8192 バイトで、これは `-b` オプションの既定値です。マニュアルには、転送の段階について「一方でデータが読め、**かつ他方へ書ける**とき、socat はそれを読む」とあります。この「かつ書ける」が後で効いてきます。
+
+最後が**閉じる段階**です。
+
+```
+read(5, "", 8192) = 0                     # back が接続を閉じた (EOF)
+shutdown(6, SHUT_WR) = 0                  # client へは「送信の終わり」だけを伝える
+pselect6(7, [6], [], [], {tv_sec=0, tv_nsec=500000000}, ...) = 1 (in [6])
+read(6, "", 8192) = 0                     # client も送り終えた
+shutdown(5, SHUT_WR) = 0
+exit_group(0)
+```
+
+`back` から EOF を受け取っても、socat は `client` 側を `close` しません。`shutdown(SHUT_WR)` で、**こちらからは送り終えた**ことだけを伝え、逆向きはまだ受け取れる状態のまま、最大 0.5 秒待っています。0.5 秒は `-t` オプションの既定値です（[socat(1)](http://www.dest-unreach.org/socat/doc/socat.html)）。
+
+socat がしていることは、これで全部です。2 本のソケットを開き、`select` で待ち、`read` と `write` を繰り返し、片側が終わったら反対側に終わりを伝える。以下では、同じことを自分で書いてみます。
+
+## 100 行余りで書き直す
+
+骨組みだけを C で書きました。`fork` を付けた socat と同じく、接続ごとにプロセスを分けます。
+
+```c
+struct dir {
+  int from, to;
+  char *buf;
+  size_t len, cap, off;   /* buf[off..len) がまだ to に書けていない分 */
+  int eof, shut;
+};
+
+static void serve(int a, int b) {
+  struct dir d[2] = {{.from = a, .to = b}, {.from = b, .to = a}};
+  fcntl(a, F_SETFL, O_NONBLOCK);
+  fcntl(b, F_SETFL, O_NONBLOCK);
+  while (!(d[0].shut && d[1].shut)) {
+    struct pollfd p[2] = {{.fd = a}, {.fd = b}};
+    for (int i = 0; i < 2; i++) {
+      int pending = d[i].len - d[i].off;
+      if (!d[i].eof && (greedy || !pending)) p[i].events |= POLLIN;
+      if (pending) p[1 - i].events |= POLLOUT;
+    }
+    poll(p, 2, -1);
+    for (int i = 0; i < 2; i++) {
+      if (d[i].len - d[i].off && (p[1 - i].revents & (POLLOUT | POLLERR))) flush(&d[i]);
+      if (!d[i].eof && (p[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (!pump(&d[i])) {          /* read が 0 を返した */
+          d[i].eof = 1;
+          if (!halfclose) return;    /* 両方まとめて閉じる */
+        }
+      }
+      if (d[i].eof && !d[i].shut && d[i].len == d[i].off) {
+        shutdown(d[i].to, SHUT_WR);
+        d[i].shut = 1;
+      }
+    }
+  }
+}
+```
+
+`d[0]` が `client` から `back` への向き、`d[1]` がその逆です。`pump` は `from` から最大 8192 バイトを `buf` に読み、`flush` は `buf` に残っている分を `to` へ書けるだけ書きます。環境変数で 2 つの振る舞いを切り替えられるようにしました。
+
+- `HALFCLOSE`: 片側の EOF を、反対側への `shutdown(SHUT_WR)` で伝える。無ければ、その場で両方を閉じる
+- `GREEDY`: 宛先に書けていない分が残っていても、送信元から読み続ける
+
+どちらも、無いほうが素直に書いたときの形です。そして、どちらの素直な形も壊れます。
+
+## 落とし穴 1: 送り終えたことを、どう伝えるか
+
+`back` の 7000 番に、**EOF まで読んでから、受け取ったバイト数を返す**サーバを置きました。要求の終わりを「送信側が送信を閉じること」で伝えるプロトコルです。`nc -N` は、標準入力が尽きたら `shutdown(SHUT_WR)` を送ります。
+
+```
+$ printf hello | nc -N ll56-back 7000             # 直接
+got 5 bytes
+$ printf hello | nc -N ll56-relay 9100            # 自作、EOF で両方を閉じる
+                                                  # (何も返らない)
+$ printf hello | HALFCLOSE=1 ... nc -N ll56-relay 9101   # 自作、shutdown で伝える
+got 5 bytes
+$ printf hello | nc -N ll56-relay 9103            # socat
+got 5 bytes
+```
+
+EOF で両方を閉じる中継では、応答が消えました。`client` が「もう送るものは無い」と伝えた瞬間に、中継が `back` への接続ごと閉じてしまい、`back` が返そうとした応答の行き場が無くなったためです。
+
+第 53 回で見たとおり、TCP の FIN は**片方向**の終わりです。FIN を受け取った側は CLOSE_WAIT に入り、まだ送れます。中継が FIN を「接続全体の終わり」として扱うと、この片方向の性質が中継のところで失われます。
+
+<Callout type="note" title="half-close を使うプロトコルは珍しくない">
+  HTTP/1.1 の要求と応答は長さで区切るので、たいていは half-close に頼りません。
+  一方、`nc` や `ssh` で標準入出力をつなぐ使い方や、`tar` の出力をネットワーク越しに流す使い方は、送信側の EOF を「入力の終わり」として使います。
+  中継がこれを伝えられないと、相手は永遠に入力を待つか、応答を捨てられます。
+</Callout>
+
+もう 1 つ、細かいけれど大事な点があります。最初に書いたコードは、EOF を読んだ瞬間に `shutdown` していました。`GREEDY` の場合、そのときバッファにはまだ宛先に書けていないデータが残っています。`shutdown` のあとの `write` は失敗するので、**残りが黙って捨てられます**。上のコードでは、書き残しが 0 になってから `shutdown` するように直しています。
+
+## 落とし穴 2: 宛先が遅いとき
+
+`back` の 7100 番に、16KB 読むたびに 10 ミリ秒休む、遅い受け手を置きました。読める速さは毎秒 1.6MB ほどです。`client` から 2000MB の 0 を流し込み、中継の子プロセスの常駐メモリ（RSS）を 2 秒ごとに見ました。
+
+```
+$ head -c 2097152000 /dev/zero | nc -N ll56-relay 9201   # 3 本を同時に
+  9201: 自作 GREEDY   9202: 自作（宛先に渡しきるまで読まない）   socat
+
+t=2s   9201:355MB   9202:0MB  socat:1MB
+t=4s   9201:664MB   9202:0MB  socat:1MB
+t=6s   9201:969MB   9202:0MB  socat:1MB
+t=8s   9201:1280MB  9202:0MB  socat:1MB
+t=10s  9201:1603MB  9202:0MB  socat:1MB
+t=20s  9201:2000MB  9202:0MB  socat:1MB
+```
+
+`GREEDY` の中継は、送られてきた 2000MB をすべてメモリに抱え込みました。このとき `client` 側の `ss` は次のようになっていました。
+
+```
+(client)  FIN-WAIT-2  0  0         192.168.155.4:46732  192.168.155.2:9201
+(client)  ESTAB       0  2746388   192.168.155.4:38930  192.168.155.2:9202
+(relay)   ESTAB       551272  0    192.168.155.2:9202   192.168.155.4:38930
+(relay)   ESTAB       0  1450784   192.168.155.2:50112  192.168.155.3:7100
+```
+
+`GREEDY` に送った `client` は、**送り終えて FIN まで出しています**。`back` が受け取ったのはまだ 20MB ほどなのに、送信側から見れば転送は終わっています。中継が「書けるかどうか」を見ずに読み続けると、TCP のフロー制御（第 54 回）が中継のところで切れ、送信側は受け手の遅さを知る手段を失います。接続が 100 本あれば、中継は 100 本分のデータを抱え込んで落ちます。
+
+もう一方の中継（9202）と socat は、宛先に書けていない分があるあいだ、送信元から読みません。読まなければ、データはカーネルの中に溜まります。
+
+- 中継の、`back` への送信バッファ（Send-Q 1.4MB）
+- 中継の、`client` からの受信バッファ（Recv-Q 551KB）。ここが埋まると、TCP は `client` に 0 のウィンドウを通知する
+- `client` の送信バッファ（Send-Q 2.7MB）。ここが埋まると、`client` の `write` が止まる
+
+遅い受け手の事情が、カーネルのバッファを 3 つ経由して、送り手の `write` まで届いています。これが**背圧**です。中継がすべきことは、自分でバッファを持つことではなく、**読むのを止めて、カーネルのバッファとフロー制御に仕事を任せる**ことです。socat のマニュアルにある「一方でデータが読め、かつ他方へ書けるとき」という条件は、このためにあります。
+
+<Callout type="warn" title="非同期のフレームワークでも同じことが起きる">
+  Node.js の `socket.on('data', d => other.write(d))` は、`other.write` が false を返しても読み続けます。
+  `stream.pipe` や `stream.pipeline` を使えば、false が返った時点で読み手を止め、`drain` で再開します。
+  Go の `io.Copy(dst, src)` は、`dst.Write` が終わるまで次の `Read` を呼ばないので、ゴルーチン 1 本につき 1 方向で書けば自然に背圧が効きます。
+  自分でバッファを持つ書き方をしたら、上限と、上限に達したら読むのを止める処理を必ず入れます。
+</Callout>
+
+## 落とし穴 3: コピーを減らしたつもりで
+
+`read` と `write` で中継すると、データは「カーネル → 中継のバッファ → カーネル」と 2 回コピーされます。第 48 回で見た `splice` を使えば、パイプを介してカーネルの中だけで受け渡せます。
+
+```c
+ssize_t n = splice(from, NULL, pipefd[1], NULL, 1 << 16, SPLICE_F_MOVE);
+while (n > 0) {
+  ssize_t w = splice(pipefd[0], NULL, to, NULL, n, SPLICE_F_MOVE);
+  n -= w;
+}
+```
+
+`splice` はどちらか一方がパイプでなければならないので、ソケットからソケットへ直接は渡せません（[splice(2)](https://man7.org/linux/man-pages/man2/splice.2.html)）。ソケットからパイプへ、パイプからソケットへと 2 回呼びます。
+
+`client` から 8GB を流し、中継のコンテナが使った CPU 時間を cgroup の `cpu.stat` で測りました。4 回ずつ交互に走らせた結果です。
+
+| 中継 | 1 回に運ぶ量 | 速さ（GB/s） | user（秒） | sys（秒） |
+| --- | --- | --- | --- | --- |
+| 自作、`read` / `write` | 8KB | 1.00〜1.36 | 0.28〜0.49 | 5.3〜6.5 |
+| socat（既定） | 8KB | 1.16〜1.27 | 0.42〜0.56 | 5.6〜5.7 |
+| 自作、`splice` | 64KB | 2.22〜2.43 | 0.20〜0.22 | 2.8〜3.1 |
+| 自作、`read` / `write` | 64KB | 3.14〜3.77 | 0.06 | 1.9〜2.0 |
+| socat `-b 65536` | 64KB | 3.43〜3.81 | 0.06〜0.09 | 1.8〜2.0 |
+
+（参考: 中継を挟まずに直接送ると 6.73GB/s）
+
+8KB ずつの `read` / `write` に比べると、`splice` は速く、CPU の消費も半分ほどです。ところが、`read` / `write` のバッファを 64KB に広げると、`splice` より速くなりました。この環境では、**コピーの回数よりシステムコールの回数のほうが効いていた**ことになります。8GB を 8KB ずつ運ぶと、`read` と `write` で約 200 万回の呼び出しになります。64KB にすれば 8 分の 1 です。
+
+`splice` でソケットから読むとき、カーネルは受信したパケットのページをパイプにつなぐだけで済ませようとしますが、どこまで本当にコピーが省けるかは、NIC のドライバ、オフロードの設定、仮想化の層によって変わります。この結果は、OrbStack の仮想マシンの中の veth 同士という特定の条件でのものです。`splice` を入れるなら、まず 1 回に運ぶ量を見直し、それから自分の環境で比べるのが順序です。
+
+<Callout type="tip" title="socat の速さで困ったら">
+  socat の `-b` の既定値 8192 は、多くの用途では小さめです。
+  大きなファイルを流すときは `-b 65536` などを付けるだけで、この実験では 3 倍速くなりました。
+</Callout>
+
+## 何と何をつなぐか
+
+socat の両端は TCP に限りません。マニュアルには数十種類のアドレスが並んでいます（[socat(1)](http://www.dest-unreach.org/socat/doc/socat.html)）。どれも、開いた結果が fd になるという点は同じで、転送の段階は共通です。違うのは open の段階だけです。
+
+### Unix ドメインソケットを TCP で公開する
+
+`relay` の中に、Unix ドメインソケット `/run/admin.sock` で待ち受ける管理用の API を置きました。権限は `0600` で、root しか接続できません。
+
+```
+$ ls -l /run/admin.sock
+srw-------    1 root     root      0 Oct 14 01:10 /run/admin.sock
+$ curl -s http://ll56-relay:2375/status ; echo rc=$?     # client から
+rc=7
+```
+
+ここで `relay` の root が 1 行だけ実行します。
+
+```
+$ socat TCP-LISTEN:2375,reuseaddr,fork UNIX-CONNECT:/run/admin.sock
+$ curl -s http://ll56-relay:2375/status                  # client から
+{"admin": true, "note": "only local users can reach this socket"}
+```
+
+**ファイルの権限で守っていた API が、ネットワークの誰からでも届くようになりました。** Unix ドメインソケットの権限検査は `connect` のときに一度だけ行われ、そのあとソケットを通るバイトに「誰が送ったか」は付いていません。socat は root として一度 `connect` し、あとは誰から来たバイトでもそのまま流します。
+
+<Callout type="warn" title="docker.sock を TCP で開くことの意味">
+  Docker の API は `/var/run/docker.sock` で待ち受けます。これを上と同じ形で TCP に出すと、そのポートに届く人は誰でもコンテナを作れます。
+  コンテナはホストのディレクトリをマウントして起動できるので、これは**ホストの root を渡すこと**と同じです。
+  開発中の「コンテナから Docker を操作したい」という目的で、この 1 行が書かれることがあります。
+  どうしても必要なら、待ち受けをループバックに限るか、`range=` で接続元を絞るか、Docker 自身の TLS の認証を使います。
+</Callout>
+
+### プログラムの標準入出力をつなぐ
+
+`EXEC` は、プログラムを起動して、その標準入出力を片端にします。
+
+```
+$ socat TCP-LISTEN:9400,reuseaddr EXEC:"tr a-z A-Z"
+$ printf "hello relay\n" | nc -N ll56-relay 9400        # client から
+HELLO RELAY
+```
+
+`strace` で見ると、accept のあとに `socketpair` で Unix ドメインソケットの組を作り、`fork` した子が片方を標準入力と標準出力に `dup3` してから `execve` していました。
+
+```
+socketpair(AF_UNIX, SOCK_STREAM, 0, [5, 7]) = 0
+clone(child_stack=NULL, flags=SIGCHLD) = 991
+[991] dup3(7, 0, 0) = 0
+[991] dup3(7, 1, 0) = 1
+[991] execve("/usr/bin/tr", ["tr", "a-z", "A-Z"], ...) = 0
+```
+
+標準入出力で話すだけのプログラムが、そのままネットワークのサービスになります。inetd が昔からやってきたことと同じで、第 124 回の `ssh -W` や `ProxyCommand` も、向きが逆なだけで同じ構図です。同じ仕組みに `EXEC:/bin/sh` を渡せばリバースシェルになるので、攻撃の道具としてもよく使われます。外向きの通信を制限する意味は、ここにもあります。
+
+### TCP と UDP をつなぐ
+
+TCP から UDP へつなぐと、バイト列が**データグラムに切り分けられます**。どこで切れるかは、中継の `read` 1 回で読めた量で決まります。
+
+```
+(client)  sendall(b'one'); sendall(b'two'); sleep(0.2); sendall(b'three'); close()
+(back の UDP 受信側が受け取ったデータグラム)
+b'onetwo'
+b'three'
+b''
+```
+
+`one` と `two` は別々に送ったのに、中継が 1 回の `read` でまとめて読んだので、1 つのデータグラムになりました。TCP は 1 本のバイト列で、`write` の区切りを相手に伝えない（第 54 回）ので、UDP 側のプロトコルが区切りに意味を持たせているなら、このつなぎ方では壊れます。この実験では、TCP 側が閉じたときに、socat が長さ 0 のデータグラムを 1 つ送っていました。
+
+### 流れているものを見る
+
+`-x` と `-v` を付けると、socat は通したバイトを標準エラーに書き出します。
+
+```
+$ socat -x -v TCP-LISTEN:9500,reuseaddr TCP:ll56-back:8080
+> 2026/10/14 01:10:21.294042  length=79 from=0 to=78
+ 47 45 54 20 2f 20 48 54 54 50 2f 31 2e 31 0d 0a  GET / HTTP/1.1..
+ 48 6f 73 74 3a 20 6c 6c 35 36 2d 72 65 6c 61 79  Host: ll56-relay
+ ...
+< 2026/10/14 01:10:21.303247  length=158 from=0 to=157
+ 48 54 54 50 2f 31 2e 30 20 32 30 30 20 4f 4b 0d  HTTP/1.0 200 OK.
+```
+
+`>` が 1 つ目のアドレスから 2 つ目へ、`<` がその逆です。`tcpdump` と違い、TLS を終端したあとの平文や、Unix ドメインソケットの中身も見られます。裏を返せば、平文のまま中継を挟めば、中継を動かしている人には中身がすべて見えるということです。
+
+## 中継の向こうから見えるもの
+
+最初の実験で、`back` は接続元を `192.168.155.2:51146` と表示しました。これは `client` ではなく `relay` のアドレスです。中継は新しい TCP 接続を張るので、**宛先から見た接続元は中継になります**。
+
+- アクセスログ、IP アドレスによる制限、接続元ごとのレート制限が、すべて中継のアドレスで行われる
+- 中継の後ろで「内部からの接続だから信用する」と判断するサービスは、中継に届く人なら誰でも信用することになる
+
+第 169 回で見た `docker-proxy` も、同じ理由でコンテナから見た接続元を書き換えます。元の接続元を伝えたいなら、HTTP なら `X-Forwarded-For`、TCP のままなら第 74 回の PROXY protocol のように、**中継が別の手段で書き添える**しかありません。socat にはその機能が無いので、socat で中継すると元の接続元は失われます。
+
+socat の側で入口を絞るには、`range=10.0.0.0/8` で接続元のアドレスを限り、`max-children=` で同時に作る子プロセスの数を限ります（[socat(1)](http://www.dest-unreach.org/socat/doc/socat.html)）。`max-children` の既定値は「制限なし」です。`fork` を付けた socat は、接続の数だけプロセスを作ります。
+
+## 実際に動いている中継
+
+この回の中継は、身近な道具の中にも入っています。
+
+- **`kubectl port-forward`**: かつての kubelet の dockershim は、ノードの上で `nsenter` を使って Pod のネットワーク名前空間に入り、そこで socat を動かして、API サーバから届くストリームと Pod のポートをつないでいました（[OpenShift 3.6: Port Forwarding](https://docs.openshift.com/container-platform/3.6/architecture/networking/port_forwarding.html)）。ノードに socat が入っていないと `unable to do port forwarding: socat not found` で失敗しました。dockershim が削除された現在は、コンテナランタイムがこの中継を自分で行います
+- **`docker-proxy`**: 公開したポートへのループバック経由の接続や、別のネットワークのコンテナからの接続は、iptables の NAT では扱えないので、ユーザ空間の TCP / UDP 中継に任されます（[ipSpace.net: Docker Userland Proxy](https://blog.ipspace.net/kb/DockerSvc/40-userland-proxy/)）
+- **`ssh -L` / `-R`**: 第 124 回で見たとおり、2 本の TCP 接続のあいだを SSH のチャネルがつないでいます。SSH のチャネルにはチャネルごとのウィンドウがあり、この回の背圧と同じ役割を果たしています
+
+## 自分の環境で見る
+
+```bash
+# socat の転送の段階を見る
+strace -f -e trace=pselect6,read,write,shutdown socat TCP-LISTEN:9000 TCP:example.com:80
+
+# 中継の両側のバッファの溜まり方を見る（Recv-Q と Send-Q）
+ss -tn state established '( sport = :9000 or dport = :80 )'
+
+# 流れているバイトを見る
+socat -x -v TCP-LISTEN:9000,reuseaddr,fork TCP:example.com:80
+
+# half-close を伝えているかを確かめる
+printf hello | nc -N 127.0.0.1 9000
+```
+
+## まとめ
+
+- socat、`ssh -L`、`kubectl port-forward`、`docker-proxy` は、どれも「2 本の fd のあいだでバイトを運ぶ」プログラム
+- socat は 2 つのアドレスを順に開き、`select` で待ち、8192 バイトずつ `read` して反対側へ `write` する。宛先の名前解決は最初の接続が来てから
+- 片側の EOF は、反対側への `shutdown(SHUT_WR)` で伝える。両方まとめて閉じると、まだ返ってくるはずの応答が消える
+- 宛先に書けない間は、送信元から読まない。読み続けると中継がデータを抱え込み、送信側に背圧が届かなくなる
+- この環境では、`splice` より、1 回に運ぶ量を 8KB から 64KB に広げるほうが効いた
+- Unix ドメインソケットの権限は `connect` のときにしか効かない。TCP に出すと、権限で守っていたものが誰にでも届く
+- 宛先から見た接続元は中継になる。元の接続元を伝えるには、PROXY protocol などで書き添える必要がある
+
+ここまでで第 9 章は終わりです。第 8 章でデータをディスクに確実に残す方法を、この章でデータを確実に相手に届ける方法と、その途中で中継する方法を見ました。次の章では、その通信のほぼすべてが最初に行っている手順、**名前を引く**ことを見ます。

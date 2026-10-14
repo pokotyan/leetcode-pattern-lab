@@ -249,7 +249,7 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'network',
     title: '第9章　ネットワークの下',
-    summary: 'connect と send の裏で、カーネルが何を引き受けているか。TCP の接続の一生、速度の決まり方、そしてパケットが NIC からアプリに届くまで',
+    summary: 'connect と send の裏で、カーネルが何を引き受けているか。TCP の接続の一生、速度の決まり方、パケットが NIC からアプリに届くまで、そして 2 本のソケットをつなぐ中継（socat）',
   },
   {
     id: 'dns',
