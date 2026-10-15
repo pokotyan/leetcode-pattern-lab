@@ -1,0 +1,188 @@
+---
+title: スキーマの形と選び方（スター・スノーフレーク・One Big Table・Data Vault）
+description: 同じ販売データでも、ディメンションを平らに持つか、正規化するか、全部を 1 枚に広げるか、変更の履歴を保つための別の形にするかで、結合の数・改名の手間・大きさが変わる。何を優先した結果その形になるのかを実測で比べ、層ごとに使い分ける考え方を整理する
+category: dwh
+order: 43
+status: published
+topics:
+  - スタースキーマ
+  - スノーフレークスキーマ
+  - ギャラクシースキーマ
+  - バスマトリクス
+  - One Big Table
+  - Data Vault
+  - ハブ・リンク・サテライト
+  - Activity Schema
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: スターでもスノーフレークでも、ファクトとディメンションの結合は小さい側をハッシュ表にして引く形になる。結合の回数がそのままハッシュ表を引く回数になる
+---
+
+import Callout from '../../components/Callout.astro'
+import SchemaShapes from '../../components/sim/problems/SchemaShapes'
+
+## 形は「何を優先したか」の結果
+
+ここまでの回で、ファクト（出来事）とディメンション（その説明）に表を分ける考え方を見てきました。同じ考え方の上でも、表の並べ方にはいくつもの流儀があり、それぞれに名前が付いています。
+
+どれが優れているかを決める話ではありません。**結合の少なさ、更新の手軽さ、表の小ささ、変更の履歴の残しやすさのうち、どれを優先したか**で形が決まります。この回では、名前の付いた形を並べ、同じデータで実際に比べます。
+
+<SchemaShapes client:visible />
+
+## スタースキーマ
+
+真ん中にファクトを置き、周りにディメンションを 1 段だけ並べる形です。Kimball Group は、スタースキーマを関係データベースでのディメンショナルモデルの実装とし、「Star schemas characteristically consist of fact tables linked to associated dimension tables（ファクトと、それに結び付いたディメンションでできている）」と書いています（[Kimball Group: Star Schemas and OLAP Cubes](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/star-schema-olap-cube/)）。
+
+ディメンションは平らにします。商品のディメンションに、商品名だけでなく分類名や部門名まで持たせます。分類名は商品の数だけ重複しますが、前回の<a href={`${import.meta.env.BASE_URL}reading/dwh-dimension-tables/`}>ディメンションテーブルの設計</a>で見たとおり、ディメンションはファクトより桁違いに小さいので問題になりにくい、というのが標準的な判断です。どの集計も「ファクトから各ディメンションを 1 回ずつ引く」形にそろうので、問い合わせを書く人にも、BI ツールにも分かりやすくなります。
+
+## スノーフレークスキーマ
+
+ディメンションを正規化して、分類や部門を別の表に分けた形です。ファクトから見ると、ディメンションの先にさらに表がつながり、雪の結晶のように広がります。Kimball は、値の種類の少ない属性を別の表に切り出してつなぐことを snowflaking と呼び、「you should avoid snowflakes because it is difficult for business users to understand and navigate snowflakes（業務の利用者が理解しにくく、たどりにくいので避けるべき）」とし、問い合わせの性能にも悪い影響があり得る、と書いています（[Kimball Group: Snowflake Dimensions](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/snowflake-dimension/)）。
+
+Microsoft も Power BI のモデルについて、分かれた表を 1 つにまとめるほうが「Generally, the benefits of a single model table outweigh the benefits of multiple model tables（一般に、1 つの表にする利点のほうが大きい）」としています（[Microsoft Learn: Understand star schema](https://learn.microsoft.com/en-us/power-bi/guidance/star-schema)）。
+
+それでもスノーフレークを選ぶ理由はあります。Microsoft は、ディメンションが極端に大きい場合、分類の粒度で記録したファクト（分類ごとの目標など）とつなぐキーが要る場合、上位の階層で履歴を追う必要がある場合を挙げています（[Microsoft Fabric: Dimension tables](https://learn.microsoft.com/en-us/fabric/data-warehouse/dimensional-modeling-dimension-tables)）。分類名を 1 か所で管理できる点は、改名のときに効きます。
+
+## One Big Table
+
+ファクトにディメンションの属性まで全部を結合しておき、1 枚の横に広い表にした形です。結合がなくなり、分析する人は 1 枚の表だけを見ればよくなります。
+
+名前の付いた型として広く使われていますが、Kimball や Microsoft のような定義の出典があるわけではなく、実務の中で呼ばれるようになった名前です。列指向のデータウェアハウスでよく選ばれるのは、<a href={`${import.meta.env.BASE_URL}reading/row-column-store/`}>行指向と列指向</a>で見たとおり、使わない列を読まずに済み、同じ値が並ぶ列は圧縮で小さくなるので、横に広い表の不利が小さいためです。
+
+代わりに、ディメンションの値をファクトの行の数だけ複製します。分類名を変えるには、その分類の売上の行をすべて書き換えるか、表を作り直すことになります。
+
+## 実験：3 つの形で集計と改名を比べる
+
+DuckDB 1.4.3 で、分類 50・商品 2 万・販売 500 万行のデータを 3 つの形で持ちました。スターは `fct_sales` と、分類名と部門まで持つ `dim_product_star`。スノーフレークは `fct_sales`・`dim_product_snow`（分類のキーだけ）・`dim_category`。One Big Table は、販売に商品名・分類名・部門まで結合した `sales_wide` です。
+
+```text
+=== 表の大きさ（ブロック数 × 256 KiB）
+┌──────────────────┬────────┐
+│        t         │  mib   │
+├──────────────────┼────────┤
+│ dim_category     │    0.3 │
+│ dim_product_snow │    0.3 │
+│ dim_product_star │    0.3 │
+│ fct_sales        │   20.5 │
+│ sales_wide       │   35.5 │
+└──────────────────┴────────┘
+```
+
+DuckDB はストレージを 256 KiB のブロック単位で確保するので、小さなディメンションはどれも 1 ブロック（0.3 MiB）です。ファクトの 20.5 MiB に対して、名前の文字列まで持たせた `sales_wide` は 35.5 MiB でした。500 万行に分類名と部門名を複製しても 1.7 倍で済んでいるのは、同じ値が並ぶ列を辞書などで圧縮しているためです。
+
+部門別の売上を、3 つの形で出します。
+
+```sql
+-- スター（結合 1 回）
+SELECT p.department, sum(f.amount) FROM fct_sales f JOIN dim_product_star p USING (product_key) GROUP BY 1;
+-- スノーフレーク（結合 2 回）
+SELECT c.department, sum(f.amount) FROM fct_sales f
+JOIN dim_product_snow p USING (product_key) JOIN dim_category c USING (category_key) GROUP BY 1;
+-- One Big Table（結合なし）
+SELECT department, sum(amount) FROM sales_wide GROUP BY 1;
+```
+
+```text
+スター          Run Time (s): real 0.056 user 0.053460
+スノーフレーク  Run Time (s): real 0.054 user 0.053320
+One Big Table   Run Time (s): real 0.076 user 0.019736
+```
+
+答えはどれも同じ（部門0 が 5,055,211,075）でした。経過時間（real）はどれも 0.05〜0.08 秒で差がありません。CPU 時間（user）は、結合のない One Big Table が 0.020 秒と、結合する 2 つの 0.053 秒より短くなりました。ディメンションが小さいうちは、結合が 1 回か 2 回かは時間にほとんど現れません。
+
+次に「カテゴリ01」を改名したときに書き換わる行の数です。
+
+```text
+┌───────────┬───────────┬──────────┐
+│ star_rows │ snow_rows │ obt_rows │
+├───────────┼───────────┼──────────┤
+│       400 │         1 │    99489 │
+└───────────┴───────────┴──────────┘
+```
+
+スノーフレークは分類の表の 1 行、スターはその分類の商品 400 行、One Big Table はその分類の販売 99,489 行です。正規化の利点は更新に出て、非正規化の代償も更新に出ます。
+
+<Callout type="tip" title="One Big Table は作り直す前提で持つ">
+  One Big Table の改名を UPDATE で直すことはまずありません。上流のスターやスノーフレークから、表をまるごと作り直します。dbt のような道具で「ファクトとディメンションを結合して横に広げる」処理を書いておけば、作り直しは手間ではなくなります。逆に言えば、作り直せる上流の表がないまま One Big Table だけを持つのは危険です。
+</Callout>
+
+## ギャラクシー（ファクトが複数ある形）
+
+業務の処理（注文、出荷、在庫、問い合わせ）ごとにファクトを作ると、ファクトが複数になり、それらがディメンションを共有します。この形をギャラクシースキーマやファクト星座（fact constellation）と呼ぶことがあります。
+
+Kimball の流儀では、どのファクトがどのディメンションを使うかを、バスマトリクスという表で管理します。「The rows of the matrix are business processes and the columns are dimensions（行が業務の処理、列がディメンション）」で、塗った升目がその処理とディメンションの対応を示します（[Kimball Group: Enterprise Data Warehouse Bus Matrix](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/enterprise-data-warehouse-bus-matrix/)）。
+
+| 業務の処理 | 日付 | 商品 | 顧客 | 店舗 | 倉庫 |
+| --- | --- | --- | --- | --- | --- |
+| 注文 | ○ | ○ | ○ | ○ | |
+| 出荷 | ○ | ○ | ○ | | ○ |
+| 在庫 | ○ | ○ | | | ○ |
+
+列を共有するディメンションが、前回の適合ディメンションです。ファクトを足すたびに新しい日付や商品の表を作るのではなく、同じ表を使い回すことで、処理をまたいだ比較（注文と出荷の差、在庫と売上の比）ができるようになります。業務の処理が増えれば、スタースキーマは自然にギャラクシーになります。
+
+## 正規化した倉庫と Data Vault
+
+ここまでの形は、分析する人が直接読む層の形です。その上流で、複数の業務システムのデータを統合し、長く保つための層には、別の形が使われることがあります。
+
+**正規化した倉庫**は、業務システムと同じく正規化した形で全社のデータを統合し、そこから部門ごとの分析用の表（データマート）を切り出す流儀です。Bill Inmon が提唱した流儀として知られています。重複がなく整合性を保ちやすい一方、分析する人がそのまま読むには結合が多すぎるので、利用者向けには別にディメンショナルな表を作ります。
+
+**Data Vault** は、複数の業務システムから流れ込むデータの履歴を長く保つための形です。Dan Linstedt が 2000 年に公開し、「designed to provide long-term historical storage of data coming in from multiple operational systems（複数の業務システムから来るデータの長期的な履歴保存のために設計された）」とされます（[Wikipedia: Data vault modeling](https://en.wikipedia.org/wiki/Data_vault_modeling)）。表は 3 種類に分かれます（同上）。
+
+- **ハブ**：業務キーの一覧。「a list of unique business keys with low propensity to change（変わりにくい一意の業務キーの一覧）」
+- **リンク**：ハブ同士の関係。参加するハブのキーが関係の粒度を決める
+- **サテライト**：ハブやリンクに付く説明的な属性と、その履歴
+
+属性の変更はサテライトに行を足すだけで、ハブとリンクには触りません。ソースが増えてもハブやサテライトを足すだけで済み、何がいつどこから来たかを追えます。Wikipedia は Data Vault の主眼を「complete traceability and auditability of all information（すべての情報の完全な追跡可能性と監査可能性）」としています。代わりに表の数がとても多くなり、分析する人がそのまま読む形ではありません。利用者向けには、やはりスタースキーマを別に作ります。
+
+<Callout type="note" title="出典について">
+  Data Vault の定義は、提唱者 Linstedt と Olschimke の書籍『Building a Scalable Data Warehouse with Data Vault 2.0』（Elsevier, 2015）にまとまっていますが、ここでは原文を確かめられなかったため、Wikipedia の記述を引用しています。
+</Callout>
+
+## Activity Schema
+
+分析の対象を「誰が、いつ、何をしたか」の出来事に絞り、1 つの流れ（活動の記録）として持つ形です。Activity Schema の解説は、これを「models what happened, who did it, and when—in one predictable structure（何が起きたか、誰がしたか、いつかを 1 つの決まった構造で表す）」とし、各行が「when, who, what happened, and what context came with it（いつ、誰が、何が起きたか、どんな文脈か）」に答える、と説明しています（[Activity Schema](https://www.activityschema.com/)）。列はおおむね、時刻（`ts`）、誰か（`customer`）、何をしたか（`activity`）、付随する情報（`features`）です。
+
+顧客ごとの行動の順序を問う分析（「初回購入のあと 30 日以内に問い合わせたか」など）が書きやすくなる一方、商品の分類で売上を切るような問いには、やはりディメンションが要ります。
+
+## 層ごとに使い分ける
+
+形はプロジェクト全体で 1 つ選ぶものではありません。<a href={`${import.meta.env.BASE_URL}reading/dwh-layers/`}>層を分けて加工する</a>で見た層ごとに、役割に合った形を選びます。
+
+| 層 | 役割 | 向いている形 |
+| --- | --- | --- |
+| 取り込んだままの層 | 元のデータを捨てずに残す | 業務システムの形のまま |
+| 統合する層 | 複数のソースをつなぎ、履歴を長く保つ | 正規化した形、Data Vault（ソースが多く、監査の要求が強いとき） |
+| 利用者が読む層 | 絞り込み・グループ化・集計 | スタースキーマ（業務の処理が増えればギャラクシー） |
+| 特定の用途に出す層 | 1 つのダッシュボードや機械学習の入力 | One Big Table、顧客 1 人 1 行の要約表 |
+
+規模ごとの目安としては、次のように考えると無理がありません。
+
+- **小さく始めるとき**（ソースが 1〜2 個）：取り込んだままの層から、直接スタースキーマを作る。統合する層を独立させるほどの複雑さはまだない
+- **ソースが増えたとき**：顧客や商品の名寄せを、利用者の層の手前の 1 か所に集める。ここで適合ディメンションを作る
+- **監査や長期の履歴が必須のとき**：統合する層を Data Vault のような形にして、利用者の層はそこから作り直せるようにする
+
+<Callout type="warn" title="よくある失敗">
+  <ul>
+    <li><b>粒度を決めずに One Big Table を作る</b>：注文と明細を混ぜた広い表は、合計が膨らむ（<a href={`${import.meta.env.BASE_URL}reading/dwh-principles/`}>粒度の回</a>）</li>
+    <li><b>部門ごとに同じディメンションを作る</b>：「商品分類」が部門によって違う意味になり、数字が合わなくなる</li>
+    <li><b>統合の層の形を、そのまま利用者に見せる</b>：Data Vault や正規化した倉庫は、読む人のための形ではない</li>
+    <li><b>形を変えるたびに作り直せない</b>：上流の層が残っていれば、下流の形はいつでも作り直せる。上流を消すと、形を変えるたびに取り込みからやり直すことになる</li>
+  </ul>
+</Callout>
+
+## まとめ
+
+| 形 | 優先したもの | 犠牲にしたもの |
+| --- | --- | --- |
+| スター | 結合の単純さ、読みやすさ | ディメンションの中の重複 |
+| スノーフレーク | 重複のなさ、改名の手軽さ | 結合の数、読みやすさ |
+| One Big Table | 結合のなさ | 更新の手軽さ（作り直す前提）、大きさ |
+| ギャラクシー | 業務の処理をまたいだ比較 | ディメンションをそろえる手間 |
+| 正規化した倉庫 | 全社の整合性 | そのままでは読みにくい |
+| Data Vault | 履歴と追跡可能性、ソースの追加のしやすさ | 表の数、そのままでは読みにくい |
+| Activity Schema | 行動の順序を問う書きやすさ | 属性で切る分析にはディメンションが要る |
+
+実験では、500 万行の集計にかかる時間は 3 つの形でほとんど変わらず、改名で書き換わる行は 1・400・99,489 と大きく違いました。形を選ぶときに効くのは、問い合わせの速さよりも、更新の手間と読みやすさの釣り合いであることが多い、ということです。
+
+次回は、ここまでのファクトとディメンションの上に、顧客分析でよく使う集計（デシル・RFM・コホート）を組み立てます。

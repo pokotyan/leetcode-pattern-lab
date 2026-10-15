@@ -1,0 +1,270 @@
+---
+title: ファクトテーブルの 3 つの型（トランザクション・定期スナップショット・累積スナップショット）
+description: 同じ注文の流れでも、出来事ごとに 1 行足すか、毎日の状態を 1 行足すか、注文ごとの 1 行を書き換えていくかで、答えられる問いが変わる。足してよい値・いけない値の区別と、取り込むときの落とし穴まで実際に流して確かめる
+category: dwh
+order: 41
+status: published
+topics:
+  - トランザクションファクト
+  - 定期スナップショット
+  - 累積スナップショット
+  - ファクトのないファクト
+  - 加法的・準加法的・非加法的
+  - 遅れて届くファクト
+  - 重複の取り込み
+basedOn:
+  - kind: article
+    slug: prefix-sum
+    why: 定期スナップショットの残高（未出荷の金額）は、出来事（注文と出荷）の増減を日付の順に足し込んだ累積和にあたる。累積和の各点を足しても意味がないのと同じ理由で、残高は日付の方向に足せない
+---
+
+import Callout from '../../components/Callout.astro'
+import FactTypes from '../../components/sim/problems/FactTypes'
+
+## 同じ出来事を、3 通りに記録する
+
+<a href={`${import.meta.env.BASE_URL}reading/dimensional-modeling/`}>前回</a>は、表をファクトとディメンションに分け、ファクトの 1 行が何を表すか（粒度）を最初に決める、という話でした。粒度の決め方には、よく使われる型が 3 つあります。Kimball Group の定義をまとめると次のとおりです。
+
+| 型 | 1 行が表すもの | 行は書き換えるか |
+| --- | --- | --- |
+| トランザクション | 出来事 1 つ | 書き換えない（足すだけ） |
+| 定期スナップショット | 一定の期間（1 日、1 か月）の状態や合計 | 書き換えない（期間ごとに 1 行足す） |
+| 累積スナップショット | 始まりと終わりがある流れ 1 つ（注文 1 件など） | 節目のたびに書き換える |
+
+下のシミュレーターは、2 件の注文が「注文 → 支払 → 出荷 → 到着」と進む 5 日間を、3 つの型の表で同時に記録します。日が進むごとに、どの表のどの行が増え、どの行が書き換わるかを見てください。
+
+<FactTypes client:visible />
+
+## トランザクション：出来事 1 つが 1 行
+
+Kimball Group の定義では、トランザクションファクトの 1 行は「ある場所と時点での測定の出来事に対応する（"A row in a transaction fact table corresponds to a measurement event at a point in space and time."）」もので、「測定が起きたときにだけ行が存在する（"rows exist only if measurements take place"）」と書かれています（[Kimball Group: Transaction Fact Tables](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/transaction-fact-table/)）。
+
+最も細かい粒度なので、ほかの 2 つの型はここから作れます。逆に、何も起きなかった日には行がありません。「1 月 4 日の終わりに未出荷の注文はいくつあったか」を出すには、それまでの出来事をすべて読んで数え直す必要があります。この問いに毎回答えるのが重いとき、次の型を使います。
+
+## 定期スナップショット：期間ごとの状態を 1 行
+
+定期スナップショットの 1 行は「標準的な期間に起きた多数の測定の出来事をまとめたもの（"summarizes many measurement events occurring over a standard period"）」で、「粒度は期間であって、個々の取引ではない（"The grain is the period, not the individual transaction."）」とされています（[Kimball Group: Periodic Snapshot Fact Tables](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/periodic-snapshot-fact-table/)）。在庫の残高、口座の残高、毎日の未出荷件数など、「ある時点の状態」を見たいときの型です。
+
+出来事がなかった日にも行ができるのが、トランザクションとの違いです。毎日 1 行、決まった数の行が増えるので、表の大きさを見積もりやすく、日付で並べるだけで推移が見えます。
+
+## 累積スナップショット：流れ 1 つを 1 行で追う
+
+累積スナップショットは、始まりと終わりがはっきりした業務の流れ（受注から到着まで、申込から審査完了まで）を 1 行で表します。Kimball Group の説明では、行は流れが始まったときに入れられ、「進むにつれて、その行を訪れ直して更新する（"As pipeline progress occurs, the accumulating fact table row is revisited and updated."）」もので、「流れの重要な節目ごとに、日付の外部キーを 1 つずつ持つ（"There is a date foreign key in the fact table for each critical milestone in the process."）」とされています（[Kimball Group: Accumulating Snapshot Fact Tables](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/accumulating-snapshot-fact-table/)）。
+
+節目の日付が同じ行に並ぶので、「注文から出荷まで何日かかったか」が引き算 1 つで出ます。トランザクションの表で同じことをするには、注文の行と出荷の行を注文番号で結合する必要があります。その代わり、3 つの型の中でこれだけが行を書き換えます。
+
+## 実験：3 つの型を作る
+
+DuckDB 1.4.3 で、3 件の注文の 5 日間の出来事をトランザクションの表に入れ、そこから残りの 2 つの型を作りました。
+
+```sql
+CREATE TABLE fct_order_events AS SELECT * FROM (VALUES
+  (DATE '2025-01-01', 'O1', '注文', 5000),
+  (DATE '2025-01-02', 'O1', '支払', 5000),
+  (DATE '2025-01-02', 'O2', '注文', 3000),
+  (DATE '2025-01-03', 'O1', '出荷', 5000),
+  (DATE '2025-01-03', 'O3', '注文', 2000),
+  (DATE '2025-01-04', 'O2', '支払', 3000),
+  (DATE '2025-01-05', 'O1', '到着', 5000),
+  (DATE '2025-01-05', 'O2', '出荷', 3000)
+) t(day, order_id, event, amount);
+```
+
+定期スナップショットは、日付の一覧（暦）と注文を突き合わせ、その日の終わりに「注文済みで、まだ出荷されていない」ものを数えます。出来事のない 1 月 4 日にも行ができている点に注目してください。
+
+```sql
+CREATE TABLE fct_backlog_daily AS
+WITH calendar AS (SELECT CAST(d AS DATE) AS day FROM range(DATE '2025-01-01', DATE '2025-01-06', INTERVAL 1 DAY) t(d)),
+ordered AS (SELECT order_id, amount, day AS ordered_on FROM fct_order_events WHERE event = '注文'),
+shipped AS (SELECT order_id, day AS shipped_on FROM fct_order_events WHERE event = '出荷'),
+open AS (
+  SELECT c.day, o.order_id, o.amount
+  FROM calendar c JOIN ordered o ON o.ordered_on <= c.day
+  LEFT JOIN shipped s ON s.order_id = o.order_id
+  WHERE s.shipped_on IS NULL OR s.shipped_on > c.day
+)
+SELECT c.day, count(open.order_id) AS backlog_orders, coalesce(sum(open.amount), 0) AS backlog_amount
+FROM calendar c LEFT JOIN open USING (day) GROUP BY c.day ORDER BY c.day;
+```
+
+```text
+┌────────────┬────────────────┬────────────────┐
+│    day     │ backlog_orders │ backlog_amount │
+├────────────┼────────────────┼────────────────┤
+│ 2025-01-01 │              1 │           5000 │
+│ 2025-01-02 │              2 │           8000 │
+│ 2025-01-03 │              2 │           5000 │
+│ 2025-01-04 │              2 │           5000 │
+│ 2025-01-05 │              1 │           2000 │
+└────────────┴────────────────┴────────────────┘
+```
+
+累積スナップショットは、1 月 3 日の終わりまでの出来事から注文ごとの行を作り、その後の出来事で行を書き換えます。
+
+```sql
+CREATE TABLE fct_order_progress AS
+SELECT order_id,
+       min(day) FILTER (WHERE event = '注文') AS ordered_on,
+       min(day) FILTER (WHERE event = '支払') AS paid_on,
+       min(day) FILTER (WHERE event = '出荷') AS shipped_on,
+       min(day) FILTER (WHERE event = '到着') AS delivered_on,
+       any_value(amount) AS amount
+FROM fct_order_events WHERE day <= DATE '2025-01-03' GROUP BY order_id;
+
+UPDATE fct_order_progress SET paid_on = DATE '2025-01-04' WHERE order_id = 'O2';
+UPDATE fct_order_progress SET delivered_on = DATE '2025-01-05' WHERE order_id = 'O1';
+UPDATE fct_order_progress SET shipped_on = DATE '2025-01-05' WHERE order_id = 'O2';
+SELECT *, shipped_on - ordered_on AS days_to_ship FROM fct_order_progress ORDER BY order_id;
+```
+
+```text
+-- 01-03 の終わり
+┌──────────┬────────────┬────────────┬────────────┬──────────────┬────────┐
+│ order_id │ ordered_on │  paid_on   │ shipped_on │ delivered_on │ amount │
+├──────────┼────────────┼────────────┼────────────┼──────────────┼────────┤
+│ O1       │ 2025-01-01 │ 2025-01-02 │ 2025-01-03 │ NULL         │   5000 │
+│ O2       │ 2025-01-02 │ NULL       │ NULL       │ NULL         │   3000 │
+│ O3       │ 2025-01-03 │ NULL       │ NULL       │ NULL         │   2000 │
+└──────────┴────────────┴────────────┴────────────┴──────────────┴────────┘
+-- 01-05 の終わり（3 回の UPDATE の後）
+┌──────────┬────────────┬────────────┬────────────┬──────────────┬────────┬──────────────┐
+│ order_id │ ordered_on │  paid_on   │ shipped_on │ delivered_on │ amount │ days_to_ship │
+├──────────┼────────────┼────────────┼────────────┼──────────────┼────────┼──────────────┤
+│ O1       │ 2025-01-01 │ 2025-01-02 │ 2025-01-03 │ 2025-01-05   │   5000 │            2 │
+│ O2       │ 2025-01-02 │ 2025-01-04 │ 2025-01-05 │ NULL         │   3000 │            3 │
+│ O3       │ 2025-01-03 │ NULL       │ NULL       │ NULL         │   2000 │         NULL │
+└──────────┴────────────┴────────────┴────────────┴──────────────┴────────┴──────────────┘
+```
+
+NULL の欄は「まだその節目に来ていない」ことを表します。未到着の注文や、出荷までの日数の分布が、この 1 枚から読めます。
+
+<Callout type="note" title="累積スナップショットは作り直せるようにしておく">
+  累積スナップショットは行を書き換えるので、書き換えの途中で誤りが入ると、正しい状態に戻す手段が要ります。上の実験のように、トランザクションの表から毎回作り直せる形（集約の SELECT）で定義しておけば、UPDATE の積み重ねに頼らずに済みます。dbt のように表を作り直すことを前提にした道具では、この形が自然です（<a href={`${import.meta.env.BASE_URL}reading/dwh-layers/`}>層を分けて加工する</a>）。
+</Callout>
+
+## ファクトのないファクト
+
+数値の測定値を持たないファクトもあります。Kimball Group は、ある出来事が「ディメンションの実体がある時点で一緒に現れたことを記録するだけ（"the event merely records a set of dimensional entities coming together at a moment in time"）」の場合を挙げ、さらに「起きなかったことの分析にも使える（"Factless fact tables can also be used to analyze what didn't happen."）」と書いています（[Kimball Group: Factless Fact Tables](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/factless-fact-table/)）。
+
+学生の出席（日付・学生・授業の組だけ）、販促の対象（どの商品がどの期間に販促されたか）が典型です。後者を販売のファクトと突き合わせると、「販促したのに売れなかった商品」が分かります。測る値がないので、集計は行数を数える `count(*)` になります。
+
+## 足してよい値、いけない値
+
+ファクトの数値は、どの方向に足してよいかで 3 種類に分かれます。Kimball Group の定義は次のとおりです（[Kimball Group: Additive, Semi-Additive, Non-Additive Facts](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/additive-semi-additive-non-additive-fact/)）。
+
+- 加法的（additive）：「どのディメンションの方向にも足せる（"can be summed across any of the dimensions associated with the fact table"）」
+- 準加法的（semi-additive）：「一部のディメンションの方向には足せるが、すべてではない（"can be summed across some dimensions, but not all"）」
+- 非加法的（non-additive）：「比率のように、まったく足せない（"some measures are completely non-additive, such as ratios"）」
+
+同じ実験の表で確かめます。注文額は出来事の測定値なので、日付をまたいで足してよい値です。
+
+```sql
+SELECT sum(amount) AS ordered_amount FROM fct_order_events WHERE event = '注文';
+```
+
+```text
+┌────────────────┐
+│ ordered_amount │
+├────────────────┤
+│          10000 │
+└────────────────┘
+```
+
+未出荷の金額は「その日の終わりの状態」です。日付の方向に足すとどうなるか。
+
+```sql
+SELECT sum(backlog_amount) AS summed_over_days,
+       round(avg(backlog_amount)) AS avg_over_days,
+       arg_max(backlog_amount, day) AS end_of_period
+FROM fct_backlog_daily;
+```
+
+```text
+┌──────────────────┬───────────────┬───────────────┐
+│ summed_over_days │ avg_over_days │ end_of_period │
+├──────────────────┼───────────────┼───────────────┤
+│            25000 │        5000.0 │          2000 │
+└──────────────────┴───────────────┴───────────────┘
+```
+
+25,000 は、注文の総額 10,000 よりも大きく、どの日にも存在しなかった金額です。同じお金を毎日数え直しているからです。残高のような値は、店舗や商品の方向には足せても、日付の方向には足せません。日付の方向には、期間の平均（5,000）か期末の値（2,000）を使います。
+
+比率は、どの方向にも足せません。来店者数と購入者数から購入率を出すとき、店舗ごとの購入率を平均すると、規模の違いが無視されます。
+
+```sql
+-- 渋谷: 来店 1000 人・購入 50 人、梅田: 来店 10 人・購入 5 人
+SELECT round(avg(buyers * 1.0 / visitors), 4) AS avg_of_ratios,
+       round(sum(buyers) * 1.0 / sum(visitors), 4) AS ratio_of_sums
+FROM fct_store_daily;
+```
+
+```text
+┌───────────────┬───────────────┐
+│ avg_of_ratios │ ratio_of_sums │
+├───────────────┼───────────────┤
+│         0.275 │        0.0545 │
+└───────────────┴───────────────┘
+```
+
+来店者 10 人の店の 50% が、1,000 人の店の 5% と同じ重みで平均されて 27.5% になりました。全体の購入率は 5.45% です。比率はファクトに持たず、分子と分母を加法的な値として別々に持ち、集計の最後で割ります。
+
+## 取り込むときの落とし穴
+
+### 同じ出来事が 2 回届く
+
+取り込みの再実行や、送り手の再送で、同じ出来事が 2 回入ることがあります。1 月 5 日分を 2 回取り込んだ場合です。
+
+```text
+-- 重複したまま
+┌───────┬────────────────┐
+│ rows  │ shipped_amount │
+├───────┼────────────────┤
+│    10 │          11000 │
+└───────┴────────────────┘
+-- 重複を除いた後
+┌───────┬────────────────┐
+│ rows  │ shipped_amount │
+├───────┼────────────────┤
+│     8 │           8000 │
+└───────┴────────────────┘
+```
+
+出荷額が 3,000 増えています。出来事に一意な識別子（送り手が振る出来事の ID）があれば、それで重複を除けます。ない場合は、どの列の組で同じ出来事とみなすかを決めて、intermediate の層で除き、その一意性をテストで確かめます。
+
+### 遅れて届く行
+
+1 月 25 日の売上が、2 月 5 日になって届くことがあります。その間に顧客が東京から大阪へ転居し、顧客のディメンションに新しい版（SCD Type 2）ができていると、ファクトを入れるときにどの版のキーを引くかが問題になります。Kimball Group はこれを late arriving fact と呼び、「その出来事のときに有効だったディメンションのキーを探さなければならない（"the relevant dimensions must be searched to find the dimension keys that were effective"）」と書いています（[Kimball Group: Late Arriving Facts](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/late-arriving-fact/)）。
+
+```sql
+-- いまの版で引く（誤り）
+SELECT i.sold_on, i.amount, d.customer_key, d.region
+FROM incoming i JOIN dim_customer d ON d.customer_id = i.customer_id AND d.is_current;
+-- 売れた日に有効だった版で引く
+SELECT i.sold_on, i.amount, d.customer_key, d.region
+FROM incoming i JOIN dim_customer d
+  ON d.customer_id = i.customer_id
+ AND d.valid_from <= i.sold_on AND (d.valid_to IS NULL OR i.sold_on < d.valid_to);
+```
+
+```text
+== いまの版で引く（誤り）
+│ 2025-01-25 │   1500 │            3 │ 大阪    │
+== 売れた日に有効だった版で引く
+│ 2025-01-25 │   1500 │            1 │ 東京    │
+```
+
+いまの版で引くと、1 月の東京での売上が大阪に計上されます。ファクトの日付で版を引くのが正しいやり方です。版の持ち方は<a href={`${import.meta.env.BASE_URL}reading/dwh-dimension-tables/`}>ディメンションテーブルの回</a>と<a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値を残す</a>で扱います。
+
+### 粒度の混在
+
+1 つのファクトテーブルに、明細の行と、注文全体の行（送料や値引きの行）が混ざっていることがあります。どの行も同じ列を持っているので、`sum(amount)` は何事もなく実行され、粒度の違う値が足し合わされます。Microsoft の手引きも、ファクトテーブルには常に一貫した粒度でデータを入れることが重要だ（"It's also important that fact tables always load data at a consistent grain."）と書いています（[Microsoft Learn: Understand star schema](https://learn.microsoft.com/en-us/power-bi/guidance/star-schema)）。粒度の違う値は別のファクトにするか、配賦して粒度をそろえます（<a href={`${import.meta.env.BASE_URL}reading/dwh-principles/`}>分析用の表を別に作る理由</a>のシミュレーター）。
+
+## まとめ
+
+- トランザクションは出来事 1 つが 1 行で、最も細かく、ほかの型はここから作れる
+- 定期スナップショットは期間ごとの状態を 1 行で持ち、何も起きなかった期間にも行ができる
+- 累積スナップショットは流れ 1 つを 1 行で持ち、節目の日付を埋めていく。3 つのうちこれだけが行を書き換える
+- 残高のような準加法的な値は日付の方向に足せず、比率のような非加法的な値は分子と分母を別に持つ
+- 取り込みでは、重複、遅れて届く行、粒度の混在を、層とテストで防ぐ
+
+次回の<a href={`${import.meta.env.BASE_URL}reading/dwh-dimension-tables/`}>ディメンションテーブルの設計</a>では、ファクトを説明する側の表を、代理キーと履歴の持ち方から見ていきます。

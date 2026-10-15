@@ -1,0 +1,166 @@
+---
+title: イミュータブルデータモデル（更新しないことを出発点にする）
+description: 状態の列を上書きすると、前の状態もそれが変わった時刻も消える。出来事を日時 1 つだけの行として足していき、状態はそこから導く。川島義隆氏の手順に沿って、業務の表を「リソース」と「イベント」に分ける考え方を、PostgreSQL で確かめる
+category: schema
+order: 36
+status: published
+topics:
+  - イミュータブルデータモデル
+  - リソースとイベント
+  - 交差エンティティ
+  - ロングタームイベント
+  - Event Sourcing
+  - 状態の導出
+---
+
+import Callout from '../../components/Callout.astro'
+import ImmutableModel from '../../components/sim/problems/ImmutableModel'
+
+## 更新がいちばん難しい
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値を残す</a>では、上書き・論理削除・履歴の行（SCD Type 2）・期間の制約と、変わる値を残すための型を見ました。どれも「行を書き換えると過去が消える」という問題に、後から手当てをしています。
+
+この回は向きを逆にします。**そもそも行を書き換えないことを、設計の出発点にする**考え方です。日本では川島義隆氏が「イミュータブルデータモデル」として手順にまとめ、Scrapbox で公開しています（[kawasima: イミュータブルデータモデル](https://scrapbox.io/kawasima/イミュータブルデータモデル)、CC BY 3.0）。冒頭の問題意識は次の一文です。
+
+> CRUDのうちUPDATEがもっともシステムを複雑化する。更新には複雑なルールが伴うからだ。
+
+注文の状態を `status` 列で持つ表を考えます。`ordered` から `paid`、`shipped` へと書き換えていくと、どの状態からどの状態へ移ってよいか、移ったときに何を確かめるか、といった規則がすべて `UPDATE` の周りに集まります。しかも書き換えた瞬間に、前の状態と、それが変わった時刻は消えます。
+
+下のシミュレーターは、2 件の注文の「注文 → 支払 → 取消 → 出荷」を、左は `orders` の `status` 列の上書きで、右は出来事ごとの表に行を足すことで記録します。「過去の時点の状態を出す」を選ぶと、両者の差がはっきりします。
+
+<ImmutableModel client:visible />
+
+## 手順：リソースとイベントに分ける
+
+川島氏の手順は 5 段です。要点だけを並べます（引用は上記ページから）。
+
+1. **エンティティを抜き出す。** 要件の文章から 5W1H にあたる語を拾い、エンティティか属性の候補にする。
+2. **リソースとイベントに分類する。** 判断の基準は「基準は明確で属性に”日時”を持つかどうかである。」日時を持てばイベント（コト）、持たなければリソース（ヒト・モノ）。従業員や製品はリソース、注文や支払はイベントです。
+3. **イベントには日時を 1 つだけ持たせる。** 「イベントエンティティには1つの日時属性しかもたないようにする」。注文日時と出荷日時を両方持つ「注文」は、注文と出荷という 2 つの出来事が 1 行に同居しているので、分ける。
+4. **リソースに潜むイベントを見つける。** 「何かリソースエンティティにも更新日時を持たせておきたいと思ったら、それにまつわるイベントエンティティが洗い出せていない証拠である。」
+5. **依存しない関係には交差エンティティを置く。** 登録時点では決まらない関係を NULL になりうる外部キーで持つのではなく、「そういう非依存のリレーションシップの場合は、間に交差エンティティを置く。」
+
+手順 3 が中心です。イベントの日時が 1 つなら、その行は起きた時点で内容が確定し、後から書き換える理由がありません。**更新されない行が自然に増えていき、更新が残る場所が限られる**、というのが狙いです。
+
+同じページは、すべての表に一律で付ける `登録日時` / `更新日時` を「とりあえず」の習慣として退け、削除についても「「削除フラグ」や「削除日時」は悪である。」と書いています。代わりに、削除にまつわる出来事（退会、取消、廃番など）を洗い出してイベントとして持つ、という方針です。前回の論理削除（`deleted_at`）が抱えていた「すべての問い合わせに条件が要る」「外部キーが印を知らない」という弱点を、出来事の表として正面から持つことで避けることになります。
+
+## 実験：上書きする表と、出来事の表
+
+PostgreSQL 17 で、同じ 5 つの出来事を 2 つの設計で記録しました（SQL は scratchpad の `30_immutable.sql`、専用のスキーマで作って最後に消しています）。
+
+更新する設計は 1 注文 1 行で、状態を上書きします。
+
+```sql
+UPDATE orders SET status = 'paid',      updated_at = '2025-01-02 09:00' WHERE order_id = 'O1';
+UPDATE orders SET status = 'cancelled', updated_at = '2025-01-02 15:00' WHERE order_id = 'O2';
+UPDATE orders SET status = 'shipped',   updated_at = '2025-01-03 08:00' WHERE order_id = 'O1';
+```
+
+```text
+ order_id | amount |  status   |     created_at      |     updated_at
+----------+--------+-----------+---------------------+---------------------
+ O1       |   5000 | shipped   | 2025-01-01 10:00:00 | 2025-01-03 08:00:00
+ O2       |   3000 | cancelled | 2025-01-01 11:00:00 | 2025-01-02 15:00:00
+```
+
+O1 がいつ支払われたかは、もうどこにもありません。
+
+出来事ごとに表を分ける設計では、どの表も日時の列を 1 つだけ持ちます。出荷の表の外部キーを支払の表へ向けておくと、「支払っていない注文は出荷できない」という業務の規則を、`UPDATE` の周りのコードではなく表の構造で表せます。
+
+```sql
+CREATE TABLE 注文 (order_id text PRIMARY KEY, amount int NOT NULL, 注文日時 timestamp NOT NULL);
+CREATE TABLE 支払 (order_id text PRIMARY KEY REFERENCES 注文, 支払日時 timestamp NOT NULL);
+CREATE TABLE 出荷 (order_id text PRIMARY KEY REFERENCES 支払, 出荷日時 timestamp NOT NULL);
+CREATE TABLE 注文取消 (order_id text PRIMARY KEY REFERENCES 注文, 取消日時 timestamp NOT NULL);
+```
+
+```text
+--- 支払っていない注文は出荷できない（外部キーが出荷 → 支払を指す）
+ERROR:  insert or update on table "出荷" violates foreign key constraint "出荷_order_id_fkey"
+DETAIL:  Key (order_id)=(O2) is not present in table "支払".
+```
+
+状態の列はないので、出来事の有無から導きます。ビューにしておけば、読む側は列を読むのと同じ感覚で使えます。
+
+```sql
+CREATE VIEW 注文の状態 AS
+SELECT o.order_id,
+  CASE WHEN c.order_id IS NOT NULL THEN 'cancelled'
+       WHEN s.order_id IS NOT NULL THEN 'shipped'
+       WHEN p.order_id IS NOT NULL THEN 'paid'
+       ELSE 'ordered' END AS status
+FROM 注文 o
+LEFT JOIN 注文取消 c USING (order_id)
+LEFT JOIN 出荷 s USING (order_id)
+LEFT JOIN 支払 p USING (order_id);
+```
+
+```text
+ order_id |  status
+----------+-----------
+ O1       | shipped
+ O2       | cancelled
+```
+
+違いが出るのは、過去の時点を問うときです。各表の日時で絞ってから同じ導き方をすれば、その時点の状態が得られます。
+
+```text
+=== 2025-01-02 12:00 の時点の状態
+ order_id | status
+----------+---------
+ O1       | paid
+ O2       | ordered
+
+--- 更新する設計で同じことを聞くと
+ order_id |  status   |     updated_at
+----------+-----------+---------------------
+ O1       | shipped   | 2025-01-03 08:00:00
+ O2       | cancelled | 2025-01-02 15:00:00
+```
+
+更新する設計では、12 時の時点で O2 がまだ取り消されていなかったことも、O1 が出荷前だったことも分かりません。出来事の表なら、`UNION ALL` で並べるだけで時系列の記録にもなります。
+
+```text
+ order_id | 出来事 |        日時
+----------+--------+---------------------
+ O1       | 注文   | 2025-01-01 10:00:00
+ O2       | 注文   | 2025-01-01 11:00:00
+ O1       | 支払   | 2025-01-02 09:00:00
+ O2       | 取消   | 2025-01-02 15:00:00
+ O1       | 出荷   | 2025-01-03 08:00:00
+```
+
+## 更新が残る場所：ロングタームイベント
+
+すべてを出来事の表に分けきれるわけではありません。「問合せ」のように、受付・回答・再質問と状況が移り変わり、業務の担当者がそれを 1 つのものとして扱いたい対象があります。川島氏はこれをロングタームイベントと呼び、「ライフサイクルをもちイベントによって状態が更新される点において、リソースと同じふるまいをする」と説明しています（[kawasima: イベントエンティティのライフサイクル](https://scrapbox.io/kawasima/イベントエンティティのライフサイクル)）。
+
+同じページは、この種のエンティティを「実装からみればこの「問合せ」はイベントを積み重ねた結果の"キャッシュ"であり」と位置づけています。つまり、状態の列を持つ表が残ってもよいが、それは出来事の表から作り直せる**派生物**であって、正本は出来事の側にある、という整理です。上の実験の `注文の状態` ビューを、性能のために実体の表にした場合がこれにあたります。
+
+<Callout type="tip" title="更新をなくすのではなく、閉じ込める">
+  イミュータブルデータモデルは「UPDATE を一切書かない」規則ではありません。最初に挙げたページの例でも「更新が発生するのはロングタームイベントの「入会」のみになる」と書かれています。更新が必要な場所を、状態を持つと業務の側でも認識されているエンティティに限り、それ以外は確定した出来事として足していく。更新が起きる場所が少なければ、その規則を確かめるべき場所も少なくなります。
+</Callout>
+
+## Event Sourcing との関係
+
+似た考え方に Event Sourcing があります。Martin Fowler の定義は「Capture all changes to an application state as a sequence of events.」で、過去の状態は「We can determine the application state at any point in time. Notionally we do this by starting with a blank state and rerunning the events up to a particular time or event.」と説明されています（[Martin Fowler: Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html)）。
+
+| 観点 | イミュータブルデータモデル | Event Sourcing |
+| --- | --- | --- |
+| 何を記録するか | 業務の出来事を、出来事の種類ごとの表に | アプリケーションの状態の変化を、1 本のイベントの列に |
+| 表の形 | 注文・支払・出荷など、種類ごとに列が違う普通の表 | 多くは種類と中身（JSON など）を持つ追記専用の表 |
+| 状態の得方 | SQL で出来事の有無・日時から導く | イベントを順に再生して組み立てる |
+| 道具 | リレーショナル DB の制約（外部キー・一意性）をそのまま使える | イベントの保存先と再生の仕組みが別に要る |
+
+「起きたことを消さずに足していき、状態はそこから導く」という点は同じです。違いは粒度と置き場所で、イミュータブルデータモデルは**業務の出来事をリレーショナルな表としてモデル化する手順**であり、外部キーで「支払の前に出荷はない」といった規則を DB に守らせることができます。
+
+## 分析の側から見ると
+
+出来事を日時 1 つの行として足していく表は、分析用のデータウェアハウスでいう**トランザクションファクト**とほぼ同じ形をしています。Microsoft Fabric の文書は、トランザクションファクトの行について「All the data is fully known when inserted, and it never changes (except to correct errors).」と書いています（[Microsoft Learn: Modeling Fact Tables](https://learn.microsoft.com/en-us/fabric/data-warehouse/dimensional-modeling-fact-tables)）。業務の側で出来事の表を持っていれば、分析の側は取り込むだけで済み、状態を上書きする表から「いつ何が起きたか」を推測し直す必要がありません。分析用の表の作り方は、次のカテゴリの<a href={`${import.meta.env.BASE_URL}reading/row-column-store/`}>行指向と列指向、OLTP と OLAP</a>から扱います。
+
+## まとめ
+
+- 状態の列を上書きすると、前の状態と変わった時刻が消え、状態遷移の規則が `UPDATE` の周りに散らばる。
+- 日時を持つものをイベント、持たないものをリソースに分け、イベントには日時を 1 つだけ持たせる。日時が 1 つの行は、起きた時点で確定し、書き換える理由がない。
+- 状態は出来事の表から導く。過去の時点の状態も、日時で絞るだけで得られる。
+- 状態を持つ表が必要なら、出来事の表から作り直せる派生物として持つ。
+- 出来事の表は、分析用のトランザクションファクトとそのまま対応する。

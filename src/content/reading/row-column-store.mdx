@@ -1,0 +1,193 @@
+---
+title: 行指向と列指向、OLTP と OLAP
+description: 注文 1 件を登録・表示する処理と、3 年分の注文を月別に集計する処理は、同じ表を使っても求める性質が逆になる。行をページに詰める行指向と、列ごとにまとめて圧縮する列指向を、1,000 万行の注文で PostgreSQL と DuckDB に入れて比べる
+category: dwh
+order: 37
+status: published
+topics:
+  - OLTP
+  - OLAP
+  - 行指向
+  - 列指向
+  - 射影（projection）
+  - 辞書圧縮
+  - 連長圧縮
+  - ビットパッキング
+  - ベクトル化実行
+---
+
+import Callout from '../../components/Callout.astro'
+import RowColumnStore from '../../components/sim/problems/RowColumnStore'
+
+## 同じ注文の表に、2 種類の問い
+
+EC サイトの注文の表に対して、次の 2 つの問いを投げることを考えます。
+
+- 注文番号 1234567 を画面に表示する。支払が済んだら状態を書き換える。
+- 直近 3 年の売上を、月別・状態別に集計する。
+
+前者は**業務の処理**です。1 件を探し、その行の列をほぼ全部使い、ときどき書き換えます。何千人もの利用者が同時に行い、1 件あたり数ミリ秒で返す必要があり、途中で失敗したら元に戻らなければなりません。これを OLTP（Online Transaction Processing、オンライン取引処理）と呼びます。
+
+後者は**分析の処理**です。何百万・何億の行を読みますが、使う列は日付・状態・金額の 3 つだけです。書き換えはせず、結果は数行の集計になります。これを OLAP（Online Analytical Processing、オンライン分析処理）と呼びます。
+
+同じ表に対する問いでも、「少ない行の、多くの列」と「多くの行の、少ない列」という正反対の読み方をしています。DB が表をディスクにどう並べるかは、このどちらに合わせるかで決まります。これがこのカテゴリの出発点です。
+
+## 2 つの並べ方
+
+**行指向（row-oriented）** は、1 行の列の値を隣り合わせに置き、それを固定の大きさのページ（PostgreSQL では 8 KB）に詰めていきます。ページの中の構造は低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-83-db-page/`}>ページとバッファプール</a>で扱いました。1 行を取り出すには、その行が入った 1 ページを読めば済みます。
+
+**列指向（column-oriented）** は、1 つの列の値をまとめて置きます。注文番号の列、日付の列、金額の列が、それぞれ別の塊になります。BigQuery の文書は自身の保存形式を「BigQuery stores table data in columnar format, meaning it stores each column separately.」と説明し、その理由を「Often, an analytic query only needs to read a few columns from a table.」と述べています（[BigQuery: Storage overview](https://docs.cloud.google.com/bigquery/docs/storage_overview)）。
+
+下のシミュレーターは、8 行・5 列の同じ表を両方の並べ方で置き、操作ごとに触るブロックを数えます。「1 列を合計」と「1 行を丸ごと取る」で、有利な側が入れ替わることを確かめてください。
+
+<RowColumnStore client:visible />
+
+## 列指向が分析に向く 3 つの理由
+
+**読む量が、使う列の分だけになる。** `SELECT sum(amount)` なら、金額の列の塊だけを読めば済みます。行指向は、金額がすべてのページに散らばっているので、使わない列も含めて全ページを読みます。
+
+**同じ型の値が並ぶので、よく縮む。** 列の中の値は型がそろい、種類も少ないことが多いからです。代表的な方法は次の 3 つです。
+
+| 方法 | 考え方 | 向く列 |
+| --- | --- | --- |
+| 辞書圧縮（dictionary） | 値の種類に番号を振り、列には番号だけを並べる | 状態・国・カテゴリなど種類の少ない文字列 |
+| 連長圧縮（run-length） | 同じ値が続く長さを「値 × 個数」で書く | 並べ替えた後の日付、ほとんど同じ値の列 |
+| ビットパッキング（bit packing） | 値の範囲に必要な最小のビット数で詰める | 範囲の狭い整数（数量、0〜9999 の金額） |
+
+**まとめて計算できる。** 同じ型の値が連続して並んでいれば、CPU は 1 命令で複数の値を足す（SIMD）、分岐の少ないループで回す、といった処理がしやすくなります。列の塊を数千個単位で処理する方式をベクトル化実行と呼び、列指向のエンジンの多くが採っています。
+
+逆に、行指向が業務に向く理由もそのまま裏返しです。1 行を組み立てるのに列の数だけ別の塊へ行く必要がなく、1 行の書き換えはその行の入ったページ 1 枚で済みます。圧縮された列の塊の途中に 1 値を差し込む、という操作は列指向にとって高くつきます。
+
+## 実験：1,000 万行の注文で比べる
+
+同じ式で生成した 1,000 万行の注文の表（注文番号・日付・顧客・商品・数量・金額・状態・32 文字のメモの 8 列）を、行指向の PostgreSQL 17 と列指向の DuckDB 1.4.3 に入れました（SQL は scratchpad の `20_pg_orders.sql`・`21_duck_orders.sql`・`22_duck_ins.sql`・`23_duck_storage.sql`）。
+
+<Callout type="warn" title="比較の条件">
+  PostgreSQL は Docker のコンテナで、DuckDB は同じ Mac のネイティブで動かしています。並列度・メモリの設定もそれぞれの既定のままです。ここで見たいのは「何倍速いか」の正確な値ではなく、読む量と書き方の違いがどちらに効くか、という傾向です。
+</Callout>
+
+### 大きさ
+
+```text
+-- PostgreSQL
+  heap  |  idx
+--------+--------
+ 931 MB | 214 MB
+
+-- DuckDB
+┌───────────────┬────────────┬──────────────┐
+│ database_size │ block_size │ total_blocks │
+├───────────────┼────────────┼──────────────┤
+│ 252.7 MiB     │     262144 │         1011 │
+└───────────────┴────────────┴──────────────┘
+```
+
+同じ内容が、DuckDB では約 4 分の 1 に収まりました。列ごとにどの圧縮が選ばれたかは `pragma_storage_info` で見えます。
+
+```text
+┌─────────────┬─────────────┬──────────┬──────────┐
+│ column_name │ compression │ segments │    n     │
+├─────────────┼─────────────┼──────────┼──────────┤
+│ amount      │ BitPacking  │       82 │ 10000000 │
+│ customer_id │ BitPacking  │      163 │ 10000000 │
+│ note        │ FSST        │      733 │ 10000000 │
+│ order_date  │ BitPacking  │       82 │ 10000000 │
+│ order_id    │ BitPacking  │       82 │ 10000000 │
+│ product_id  │ BitPacking  │       82 │ 10000000 │
+│ quantity    │ BitPacking  │       82 │ 10000000 │
+│ status      │ Dictionary  │       82 │ 10000000 │
+└─────────────┴─────────────┴──────────┴──────────┘
+```
+
+5 種類しかない `status` には辞書圧縮、範囲の決まった整数にはビットパッキングが選ばれています。ランダムな 16 進文字列の `note` だけは縮みにくく、セグメントの数がほかの列の 9 倍近くあります（FSST は文字列の中のよく出る断片を短い符号に置き換える方式です）。DuckDB は表を行のまとまり（行グループ）に横に区切り、その中で列ごとに圧縮します。文書は「DuckDB's storage format stores the data in row groups, i.e., horizontal partitions of the data.」「DuckDB uses lightweight compression.」と説明しています（[DuckDB: Storage](https://duckdb.org/docs/current/internals/storage.html)）。
+
+### 1 列を合計する
+
+```text
+-- PostgreSQL（初回）
+ Finalize Aggregate (actual time=689.163..694.068 rows=1 loops=1)
+   Buffers: shared hit=2134 read=116970
+   ->  Gather (actual time=688.991..694.029 rows=3 loops=1)
+         Workers Planned: 2
+         ...
+               ->  Parallel Seq Scan on orders (actual time=0.048..411.692 rows=3333333 loops=3)
+ Execution Time: 695.314 ms
+
+-- PostgreSQL（2 回目）
+     sum
+-------------
+ 50494824500
+Time: 219.676 ms
+```
+
+PostgreSQL は `amount` 1 列のために、表全体の 119,104 ページ（931 MB）を読みました。2 回目はメモリに載った分だけ速くなりますが、読むページの数は変わりません。
+
+```text
+-- DuckDB
+│ 50494824500 │
+Run Time (s): real 0.006 user 0.012706 sys 0.001819
+│ 50494824500 │
+Run Time (s): real 0.002 user 0.011872 sys 0.000199
+
+┌─────────────┴─────────────┐
+│         TABLE_SCAN        │
+│    ────────────────────   │
+│       Table: orders       │
+│   Type: Sequential Scan   │
+│    Projections: amount    │
+│                           │
+│      10,000,000 rows      │
+└───────────────────────────┘
+```
+
+DuckDB は同じ合計を 2〜6 ms で返しました。実行計画の `Projections: amount` が、読んだ列が `amount` だけだったことを示しています。月別・状態別の集計（日付・状態・金額の 3 列）でも、PostgreSQL の 1,275 ms に対して DuckDB は 45 ms でした。
+
+### 1 件を取る、1 件ずつ足す
+
+```text
+-- PostgreSQL: 主キーで 1 件
+ Index Scan using orders_pkey on orders (actual time=0.111..0.111 rows=1 loops=1)
+   Index Cond: (order_id = 1234567)
+   Buffers: shared read=4
+ Execution Time: 0.125 ms
+```
+
+業務の処理では立場が逆になります。PostgreSQL は索引をたどって 4 ページを読むだけで 1 行を返します。1 行ずつの `INSERT` を 1 万回繰り返すと、PostgreSQL は 25 ms（PL/pgSQL のループ 1 本）で終わりましたが、DuckDB は同じ 1 万文を 1 つのトランザクションで流して 1.72 秒かかりました（CLI の起動を含む）。
+
+```text
+-- DuckDB: INSERT 1 万文
+real 1.72
+user 1.84
+sys 0.57
+```
+
+列指向のエンジンは、小さな書き込みを溜めてからまとめて列の塊にする作りが普通です。分析用の表は、1 行ずつではなく、まとまった単位（1 時間分、1 日分）で一括して入れることを前提に設計します。
+
+## 分析用の DB での実際
+
+列指向であることは、使い方と費用にも直接表れます。BigQuery の性能の指針は、読む列を絞ることを最初に挙げ、「Control projection by querying only the columns that you need.」「Applying a `LIMIT` clause to a `SELECT *` query does not affect the amount of data read.」と書いています（[BigQuery: Optimize query computation](https://docs.cloud.google.com/bigquery/docs/best-practices-performance-compute)）。`SELECT *` に `LIMIT 10` を付けても、読む量はすべての列の全行のままです。
+
+ファイルの形式でも同じ考え方が使われています。データレイクで標準的に使われる Parquet は、行グループの中で列ごとに値をまとめ、列ごとに符号化・圧縮する形式です（読み物<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>）。
+
+## 2 つの世界をつなぐ
+
+業務の DB は行指向のまま、分析の DB は列指向のまま、それぞれの得意な形で持ち、業務の DB から分析の DB へデータを移します。ここで「移すときに、表の形をどう変えるか」が問題になります。業務の表は、更新の不整合を避けるために正規化され、細かく分かれています。そのまま列指向の DB に移しても、分析のたびに何本もの結合が必要になり、「売上」の定義も人によって変わってしまいます。
+
+次の回から、分析のための表の形を順に見ていきます。
+
+- <a href={`${import.meta.env.BASE_URL}reading/dwh-principles/`}>分析用の表を別に作る理由と、共通する原則</a>（粒度など）
+- <a href={`${import.meta.env.BASE_URL}reading/dwh-layers/`}>層を分けて加工する</a>
+- <a href={`${import.meta.env.BASE_URL}reading/dimensional-modeling/`}>ディメンショナルモデリング</a>、<a href={`${import.meta.env.BASE_URL}reading/dwh-fact-tables/`}>ファクト</a>、<a href={`${import.meta.env.BASE_URL}reading/dwh-dimension-tables/`}>ディメンション</a>
+- <a href={`${import.meta.env.BASE_URL}reading/dwh-schema-shapes/`}>スキーマの形と選び方</a>、<a href={`${import.meta.env.BASE_URL}reading/customer-analytics/`}>顧客分析の定番の集計</a>
+
+業務の側の設計で、出来事を書き換えずに足していく考え方は、前のカテゴリの<a href={`${import.meta.env.BASE_URL}reading/immutable-data-model/`}>イミュータブルデータモデル</a>で扱いました。そうして作られた出来事の表は、分析の側にとっても扱いやすい形をしています。
+
+## まとめ
+
+| 観点 | 行指向（OLTP 向き） | 列指向（OLAP 向き） |
+| --- | --- | --- |
+| 置き方 | 1 行の値を隣り合わせにページへ | 1 列の値をまとめて塊に |
+| 得意な読み | 少ない行の、多くの列（1 件の表示） | 多くの行の、少ない列（集計） |
+| 書き込み | 1 行ずつの挿入・更新が安い | まとめて一括で入れる前提 |
+| 圧縮 | 列の型が混ざるので効きにくい | 辞書・連長・ビットパッキングがよく効く |
+| 実測（1,000 万行） | 1 列の合計 220〜695 ms、1 件 0.125 ms | 1 列の合計 2〜6 ms、大きさ約 4 分の 1 |

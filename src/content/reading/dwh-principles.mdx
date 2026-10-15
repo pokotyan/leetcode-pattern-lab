@@ -1,0 +1,138 @@
+---
+title: 分析用の表を別に作る理由と、共通する原則
+description: 業務の表をそのまま集計すると、数字が人によって食い違い、合計がいつの間にか膨らむ。1 行が何を表すか（粒度）を先に決める、粒度は粗くできても細かくは戻せない、元のデータを捨てない。流派が違っても共通している原則を、実験とともに整理する
+category: dwh
+order: 38
+status: published
+topics:
+  - 正規化と非正規化
+  - 粒度（grain）
+  - ファンアウト
+  - 配賦
+  - 適合ディメンション
+  - source-conformed / business-conformed
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 粒度を粗くする GROUP BY は、キーごとに値を足し込むハッシュ表の集計そのもの。粒度の違う表どうしの結合で行が増えるのも、ハッシュ結合で 1 つのキーに複数の行が当たるため
+---
+
+import Callout from '../../components/Callout.astro'
+import GrainFanout from '../../components/sim/problems/GrainFanout'
+
+## 業務の表は、集計のために作られていない
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/row-column-store/`}>行指向と列指向、OLTP と OLAP</a>では、業務の処理と分析の処理が、同じ表に対して正反対の読み方をすることを見ました。違いは DB の並べ方だけではありません。**表の分け方**も、業務に合わせたままでは分析に向きません。
+
+業務の DB の表は正規化されています。同じ事実を 1 か所にだけ持ち、商品名は商品の表に、顧客の住所は顧客の表に置いて、注文の表は番号で参照します。こうしておけば、商品名を直すときに 1 行を書き換えるだけで済み、書き換え漏れによる食い違いが起きません。1 件を正しく書き換えることが最優先の業務の処理には、これが合っています。
+
+分析の処理は書き換えをほとんどせず、大量の行を読み、いくつもの切り口で集計します。正規化された表のままだと、「商品カテゴリ別・地域別の月次売上」を出すたびに 5 本、6 本と結合を書くことになり、その書き方が人ごとに少しずつ違うと、同じ「売上」が人によって違う数字になります。そこで分析用には、**読む人にとって分かりやすく、集計の誤りが起きにくい形**に表を作り直します。多くの場合、それは意図的に同じ値を複数の行に持たせる非正規化の形になります。
+
+作り直すときの流派はいくつもあります（Kimball のディメンショナルモデリング、Inmon の正規化した倉庫、Data Vault、1 枚の大きな表など。<a href={`${import.meta.env.BASE_URL}reading/dwh-schema-shapes/`}>スキーマの形と選び方</a>で比べます）。ただ、流派が違っても、ほぼ共通して守られている原則があります。この回ではそれを先に整理します。
+
+## 原則 1：1 行が何を表すかを、最初に決める
+
+表を作る前に、「この表の 1 行は何を表すか」を言葉にします。これを**粒度**（grain）と呼びます。注文 1 件が 1 行なのか、注文明細 1 行が 1 行なのか、顧客 1 人の 1 日分が 1 行なのか。同じ「注文のデータ」でも、これらは別の表です。
+
+Kimball Group は、設計の手順の中で粒度の宣言を要の工程と位置づけ、「Declaring the grain is the pivotal step in a dimensional design.」「The grain declaration becomes a binding contract on the design.」と書いています（[Kimball Group: Grain](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/grain/)）。どの列を持つかを決めるのは、その後です。
+
+粒度があいまいなまま作った表で起きる典型的な誤りが、下のシミュレーターの「合計が膨らむ」現象です。注文ごとの送料と、明細ごとの金額を同じ行に並べると、明細が 3 行ある注文の送料は 3 回数えられます。SQL の書き方には誤りがなく、エラーも出ないのが厄介な点です。
+
+<GrainFanout client:visible />
+
+### 実験：10 万注文で、送料が 3 倍になる
+
+DuckDB で 10 万件の注文（送料は 3 件に 1 件が無料、それ以外は 500 円）と、注文あたり 1〜5 行の明細 30 万行を作り、送料の合計を 3 通りに出しました（`31_grain.sql`）。
+
+```sql
+-- 明細に結合してから足す
+SELECT sum(i.amount) AS 商品売上, sum(o.shipping_fee) AS 送料
+FROM order_items i JOIN orders o USING (order_id);
+```
+
+```text
+=== 送料の本当の合計（注文の粒度で足す）
+│ 33333500 │
+
+=== 明細に結合してから足す
+┌────────────┬──────────┐
+│  商品売上  │   送料   │
+├────────────┼──────────┤
+│ 1035000000 │ 99999500 │
+└────────────┴──────────┘
+
+=== 先に明細を注文の粒度へまとめてから結合する
+┌────────────┬──────────┐
+│  商品売上  │   送料   │
+├────────────┼──────────┤
+│ 1035000000 │ 33333500 │
+└────────────┴──────────┘
+```
+
+明細に結合してから足すと、送料は 3,333 万円から 1 億円へ、ちょうど明細の平均行数（3 行）の倍率で膨らみました。商品売上の側は明細の粒度の値なので、どちらの書き方でも正しく出ます。粒度の違う 2 つの値を同じ行に置いた時点で、片方の合計は意味を失います。
+
+対処は 2 つです。粒度をそろえてから結合する（明細を注文ごとにまとめてから注文に結合する）か、注文の送料を明細の金額の割合で各行に割り振って（配賦して）、明細の粒度の値に変えてから持つかです。どちらにするかは、送料を商品カテゴリ別に見たいかどうかといった、分析の要件で決まります。
+
+## 原則 2：粒度は粗くできるが、細かくは戻せない
+
+一度集計した表から、元の明細は復元できません。日別の売上だけを持っていれば、後から「家電だけの売上」を出すことはできませんが、明細を持っていれば日別にもカテゴリ別にもいつでも作れます。
+
+```text
+=== 日別の集計しか持っていないと、カテゴリ別には戻せない
+│ order_date  │ DATE        │
+│ amount      │ HUGEINT     │
+│ 日別の行 │
+│       90 │
+
+--- 明細があれば、日別にもカテゴリ別にもいつでも作れる
+│ 家電     │ 344994100 │
+│ 衣料     │ 344995400 │
+│ 食品     │ 345010500 │
+│ 日別の合計と明細の合計が一致 │
+│ true                         │
+```
+
+この原則は、立場の違う複数の資料が同じことを述べています。dbt は最初の変換層で集約を避ける理由を「if we start changing the grain of our tables by grouping in this layer, we’ll lose access to source data that we’ll likely need at some point.」と説明しています（[dbt: Staging](https://docs.getdbt.com/best-practices/how-we-structure/2-staging)）。Microsoft Fabric の文書も「While it's possible to store facts at a higher granularity, it's not easy to split out measure values to lower levels of granularity (if required).」と注意しています（[Microsoft Learn: Modeling Fact Tables](https://learn.microsoft.com/en-us/fabric/data-warehouse/dimensional-modeling-fact-tables)）。Kimball Group は、業務の処理が記録する最も細かい粒度を atomic grain と呼び、集計した粗い粒度は「rolled-up summary grains are important for performance tuning, but they pre-suppose the business’s common questions.」、つまりよく聞かれる質問を前提にしたものだと位置づけています（[Kimball Group: Grain](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/grain/)）。
+
+**上流ほど細かい粒度で持ち、必要になった段階で粗くする**。集計済みの表は速さのために作る写しであり、それしか持たない状態は避けます。明細を持ち続ける容量の費用は、まだ誰も思いついていない質問に将来答えられなくなる損失と比べれば、多くの場合小さく済みます。
+
+## 原則 3：元のデータを捨てない
+
+取り込んだ生のデータは、加工した後も手を加えずに残します。加工の途中で誤りが見つかったとき、生のデータがあれば作り直せますが、上書きしていれば作り直せません。データレイクで広く使われるメダリオン構成は、最下層（bronze）の性質を「Serves as the single source of truth, preserving the data's fidelity.」「Enables reprocessing and auditing by retaining all historical data.」と書いています（[Azure Databricks: Medallion architecture](https://learn.microsoft.com/en-us/azure/databricks/lakehouse/medallion)）。原則 2 の裏返しで、細かく持ち、かつ元のまま残す、ということです。
+
+## 原則 4・5：段階を踏み、1 つの段階には 1 つの役割
+
+生のデータから最終の形まで 1 本の SQL で変換するのではなく、途中の状態を名前のある表として残しながら進めます。同じメダリオン構成の文書は目的を「Its goal is to incrementally and progressively improve the structure and quality of data as it flows through each layer of the architecture」と述べています。
+
+段階ごとに「何をするか」だけでなく「何をしないか」も決めます。dbt の最初の変換層（staging）では、許す変換を名前の付け替え・型の変換・簡単な計算・分類に限り、結合については「In our experience, joins are almost always a bad idea here」としています（[dbt: Staging](https://docs.getdbt.com/best-practices/how-we-structure/2-staging)）。どの処理をどの段階に置くかは、次の<a href={`${import.meta.env.BASE_URL}reading/dwh-layers/`}>層を分けて加工する</a>で、実際の表の変化とともに扱います。
+
+## 原則 6：同じ言葉は、どこでも同じ意味にする
+
+顧客・商品・日付のように、複数の分析で共通して使う切り口は、定義を 1 つにそろえます。Kimball Group はこれを適合ディメンション（conformed dimension）と呼び、「Dimension tables conform when attributes in separate dimension tables have the same column names and domain contents.」「This is the essence of integration in an enterprise DW/ BI system.」と書いています（[Kimball Group: Conformed Dimensions](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/conformed-dimension/)）。
+
+会議で 2 つの部署が持ち寄った月次の売上が一致しないとき、原因は多くの場合、計算の誤りではなく「売上」を作る表と条件が部署ごとに別々に存在していることです。定義を 1 か所に置き、全員がそこから集計すれば、食い違いが生まれる経路そのものがなくなります。
+
+## 原則 7：履歴をどう扱うかを、意識して選ぶ
+
+顧客が転居したとき、過去の売上はどちらの地域で数えるべきでしょうか。いまの住所で過去を見たいなら上書きし、売れた時点の住所で見たいなら版を足して残します。どちらにも使い道があり、正解は業務の問いで決まります。注意すべきは、何も決めずに作ると、普通の `UPDATE` による**上書きの側に黙って決まってしまう**ことです。前のカテゴリの<a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値を残す</a>で見た SCD の型が、ここでそのまま使われます。分析の表での使い方は<a href={`${import.meta.env.BASE_URL}reading/dwh-dimension-tables/`}>ディメンションテーブルの設計</a>で扱います。
+
+## 原則 8：ソースの言葉から、業務の言葉へ
+
+業務システムが出すデータの形は、そのシステムの都合で決まっています。`T_ORD_HDR` のような表の名前や、`FLG_01` のような列の名前がその例です。分析する人が使う表は、業務の担当者が分かる言葉で表すべきです。dbt のプロジェクト構成の指針は、全体を貫く考え方としてこの移行を挙げ、「Source-conformed data is shaped by external systems out of our control, while business-conformed data is shaped by the needs, concepts, and definitions we create.」と説明しています（[dbt: How we structure our dbt projects](https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview)）。
+
+## まとめ
+
+| 原則 | 一言 | 守らないと |
+| --- | --- | --- |
+| 1 | 1 行が何を表すかを先に決める | 結合しただけで合計が膨らむ |
+| 2 | 粒度は粗くできるが、細かくは戻せない | 後から答えられない質問が生まれる |
+| 3 | 元のデータを捨てない | 誤りが見つかっても作り直せない |
+| 4 | 段階を踏む | どこで壊れたか分からない |
+| 5 | 1 つの段階に 1 つの役割 | 誰も手を入れられない表になる |
+| 6 | 同じ言葉は同じ意味に | 部門ごとに数字が食い違う |
+| 7 | 履歴の扱いを選ぶ | 過去の数字が知らないうちに変わる |
+| 8 | ソースの言葉から業務の言葉へ | 表を読める人が限られる |
+
+<Callout type="tip" title="原則は技法の前に置く">
+  以降の回で出てくる技法（層の分け方、ファクトとディメンション、代理キー、スタースキーマなど）は、どれもこの 8 つのどれかの現れです。技法の名前を覚えるより、「この技法はどの原則を守るためのものか」を確かめながら読むと、流派が違っても同じ判断ができるようになります。
+</Callout>

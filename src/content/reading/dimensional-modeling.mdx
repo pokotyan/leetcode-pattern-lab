@@ -1,0 +1,180 @@
+---
+title: ディメンショナルモデリング（4 つの手順とスタースキーマ）
+description: 分析用の表を「出来事を記録する表」と「出来事を説明する表」の 2 種類に分ける。業務の説明文の動詞と名詞から両者を取り出し、粒度を宣言し、スタースキーマに組み立てる手順を、500 万行の販売データで確かめる
+category: dwh
+order: 40
+status: published
+topics:
+  - ディメンショナルモデリング
+  - ファクトテーブル
+  - ディメンションテーブル
+  - スタースキーマ
+  - 粒度（グレイン）
+  - 4 ステップの設計手順
+  - バス行列
+  - 適合ディメンション
+  - スター結合
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: スター結合は、小さなディメンションの絞り込み結果でハッシュ表を作り、大きなファクトの各行をそこへ引き当てる処理になる
+---
+
+import Callout from '../../components/Callout.astro'
+import StarJoin from '../../components/sim/problems/StarJoin'
+
+## 表を 2 種類に分ける
+
+<a href={`${import.meta.env.BASE_URL}reading/dwh-layers/`}>前回</a>は、生データから分析用の表までを層に分けて作る話でした。この回は、最後の層（marts）の中で表をどう並べるかを扱います。分析用の表の並べ方として最も広く使われているのが、Ralph Kimball らが体系化したディメンショナルモデリングです。
+
+考え方は単純で、すべての表を次の 2 種類のどちらかに分けます。
+
+- **ファクトテーブル**：業務で起きた出来事や、測った値を記録する表（販売、出荷、在庫の残高など）
+- **ディメンションテーブル**：その出来事を説明する表（いつ、何を、どこで、誰が）
+
+Microsoft の Power BI の手引きは、スタースキーマを「表をディメンションかファクトのどちらかに分類することを求める（"It requires modelers to classify their model tables as either *dimension* or *fact*."）」設計と説明し、ディメンションは「業務上の実体、つまりモデル化する『もの』を記述する（"describe business entities—the *things* you model"）」、ファクトは「観測や出来事を保存する（"store observations or events"）」と書いています（[Microsoft Learn: Understand star schema](https://learn.microsoft.com/en-us/power-bi/guidance/star-schema)）。
+
+ファクトの行は数値（測定値）と、各ディメンションへのキーだけを持ちます。Kimball Group の定義でも、ファクトテーブルは「現実の業務で起きた測定の出来事が生む数値の測定値を持つ（"contains the numeric measures produced by an operational measurement event in the real world"）」もので、「関係するディメンションそれぞれへの外部キーを必ず持つ（"always contains foreign keys for each of its associated dimensions"）」とされています（[Kimball Group: Fact Table Structure](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/fact-table-structure/)）。
+
+真ん中にファクト、周りにディメンションを置いた形が星に見えるので、これをスタースキーマと呼びます。
+
+<StarJoin client:visible />
+
+使い方の分担もはっきりしています。同じ手引きは、ディメンションが**絞り込みとまとめ（filtering and grouping）**を、ファクトが**集計（summarization）**を担うと書いています。「月別・カテゴリ別の売上」なら、月とカテゴリはディメンションの列、売上はファクトの列です。分析の軸を増やしたいときは、ディメンションを足すか、ディメンションに列を足せばよく、ファクトの形は変わりません。
+
+## 4 つの手順
+
+Kimball Group は、ディメンショナルな設計で下す 4 つの決定を次の順に並べています（[Kimball Group: Four-Step Dimensional Design Process](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/four-4-step-design-process/)）。
+
+1. 業務プロセスを選ぶ（"Select the business process."）
+2. 粒度を宣言する（"Declare the grain."）
+3. ディメンションを決める（"Identify the dimensions."）
+4. ファクトを決める（"Identify the facts."）
+
+順番に意味があります。とくに、**粒度の宣言は、どの列を持つかを決めるより前**にあります。
+
+### 1. 業務プロセスを選ぶ
+
+最初に決めるのは「どの表を作るか」ではなく「どの業務の出来事を記録するか」です。受注、出荷、返品、入金はそれぞれ別の業務プロセスで、別のファクトテーブルになります。「注文データ」という 1 つの塊として捉えると、受注と出荷のように時点も数え方も違う出来事が 1 つの表に混ざります。
+
+### 2. 粒度を宣言する
+
+粒度（grain）は、ファクトテーブルの 1 行が何を表すかです。Kimball Group は「粒度の宣言はディメンショナル設計の要となる手順である（"Declaring the _grain_ is the pivotal step in a dimensional design."）」「粒度は、ファクトテーブルの 1 行が正確に何を表すかを確定させる（"The grain establishes exactly what a single fact table row represents."）」と書いています（[Kimball Group: Grain](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/grain/)）。
+
+「注文 1 件が 1 行」と「注文明細の 1 行が 1 行」は別の表です。前者なら商品別の売上は出せず、後者なら注文ごとの送料をどう持つかが問題になります（<a href={`${import.meta.env.BASE_URL}reading/dwh-principles/`}>粒度の違う値を混ぜたときに合計が膨らむ例</a>）。同じページは、業務プロセスが記録する最も細かい単位を atomic grain と呼んでいます。細かい粒度からは粗い集計をいつでも作れますが、逆はできないので、迷ったら細かい方を選びます。
+
+### 3. ディメンションを決める
+
+宣言した粒度の 1 行について、「いつ・どこで・何を・誰が」にあたるものを並べます。粒度を先に決めておけば、ディメンションはほぼ自動的に決まります。「1 回の販売の 1 商品」が 1 行なら、日付・店舗・商品・顧客が候補です。粒度に合わないディメンション（「注文 1 件」の粒度に対して「商品」）は、付けられないので、ここで粒度の誤りに気付けます。
+
+### 4. ファクトを決める
+
+最後に、その 1 行で測る数値を決めます。数量、金額、原価などです。粒度に合わない数値（明細の粒度の表に入れようとする注文全体の送料など）は、ここで弾きます。
+
+## 業務の言葉から見つける
+
+4 つの手順のうち、最初の 2 つは要件を聞く段階で決まります。そのための実用的な手掛かりが、業務を説明した文章の**動詞と名詞**です。たとえば EC の業務をこう書いたとします。
+
+> 顧客がサイトで商品をかごに入れて注文する。倉庫は注文ごとに商品を棚から集めて発送し、配送業者が届ける。届いた商品に不具合があれば、顧客は返品を申し込み、店は代金を払い戻す。
+
+- 動詞（注文する、集める、発送する、届ける、返品を申し込む、払い戻す）は**出来事**で、それぞれが業務プロセス、つまりファクトテーブルの候補になります
+- 名詞（顧客、商品、倉庫、配送業者）は出来事を説明する**もの**で、ディメンションの候補になります
+- 文章には書かれていない「いつ」は、すべての出来事に付くので、日付のディメンションは必ず要ります
+
+候補が出たら、動詞ごとに「1 回の出来事で何行できるか」を確かめて粒度を決めます。「注文する」は 1 回で複数の商品を含むので、明細の粒度にするか、注文の粒度にするかを決める必要があります。「発送する」は、1 つの注文を複数の箱に分けて送ることがあるなら、注文とは別の粒度（箱ごと）です。「集める」のように分析で問われない動詞は、候補から外してかまいません。この作業を要件定義の段階で済ませておくと、後で表を作り直さずに済みます。
+
+<Callout type="tip" title="名詞が状態を持っているときは、出来事が隠れている">
+  「注文」は名詞でもあり、状態（未払い・支払済み・出荷済み）を持ちます。状態が変わる名詞を見つけたら、その状態を変える動詞（支払う、出荷する）を探すと、ファクトの候補が見つかります。同じ考え方は、アプリケーション側の表を設計するときの<a href={`${import.meta.env.BASE_URL}reading/immutable-data-model/`}>イミュータブルデータモデル</a>にも出てきます。
+</Callout>
+
+## バス行列：ディメンションを共有する
+
+業務プロセスごとにファクトテーブルを作ると、複数のファクトが同じディメンション（日付、商品、顧客）を使うことになります。この対応を一覧にしたものがバス行列（bus matrix）です。Kimball Group の説明では、「行列の行は業務プロセス、列はディメンション（"The rows of the matrix are business processes." / "the columns are dimensions."）」で、印の付いたセルは、そのディメンションがその業務プロセスに関係することを表します（[Kimball Group: Enterprise Data Warehouse Bus Matrix](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/enterprise-data-warehouse-bus-matrix/)）。
+
+| 業務プロセス | 日付 | 顧客 | 商品 | 店舗 | 配送業者 |
+| --- | --- | --- | --- | --- | --- |
+| 受注 | ✓ | ✓ | ✓ | ✓ | |
+| 出荷 | ✓ | ✓ | ✓ | | ✓ |
+| 返品 | ✓ | ✓ | ✓ | ✓ | |
+| 入金 | ✓ | ✓ | | | |
+
+列を縦に見ると、そのディメンションを共有するファクトが分かります。共有するディメンションは、どのファクトから使っても同じ列名・同じ値でなければなりません。これを適合ディメンション（conformed dimension）と呼び、受注と返品を「商品カテゴリ別」に並べて比べられるのは、両者が同じ商品ディメンションを使っているからです。詳しくは<a href={`${import.meta.env.BASE_URL}reading/dwh-dimension-tables/`}>ディメンションテーブルの回</a>で扱います。
+
+## 実験：スター結合はディメンションから絞る
+
+DuckDB 1.4.3 で、日付 365 行・商品 2,000 行・店舗 50 行のディメンションと、500 万行の販売ファクトを作りました。
+
+```sql
+CREATE TABLE fact_sales (date_key INTEGER, product_key INTEGER, store_key INTEGER, quantity INTEGER, amount INTEGER);
+-- 500 万行を、日付・商品・店舗のキーに散らして入れる（スクリプトは省略）
+```
+
+```text
+┌───────────┬───────┬──────────┬────────┐
+│ fact_rows │ dates │ products │ stores │
+├───────────┼───────┼──────────┼────────┤
+│   5000000 │   365 │     2000 │     50 │
+└───────────┴───────┴──────────┴────────┘
+```
+
+月 × カテゴリの売上は、ファクトから日付と商品のディメンションを引いてまとめるだけです。
+
+```sql
+SELECT d.month, p.category, sum(f.amount) AS amount
+FROM fact_sales f
+JOIN dim_date d ON d.date_key = f.date_key
+JOIN dim_product p ON p.product_key = f.product_key
+GROUP BY ALL ORDER BY 1, 2 LIMIT 5;
+```
+
+```text
+┌─────────┬──────────┬───────────┐
+│  month  │ category │  amount   │
+├─────────┼──────────┼───────────┤
+│ 2025-01 │ 家電     │ 415449321 │
+│ 2025-01 │ 書籍     │ 415233993 │
+│ 2025-01 │ 衣料     │ 415121379 │
+│ 2025-01 │ 雑貨     │ 415346607 │
+│ 2025-01 │ 食品     │ 484127500 │
+└─────────┴──────────┴───────────┘
+Run Time (s): real 0.027 user 0.109701 sys 0.012384
+```
+
+条件をすべてディメンションの側にかけた問い合わせの実行計画を見ます。
+
+```sql
+EXPLAIN ANALYZE
+SELECT count(*) AS rows, sum(f.amount) AS amount
+FROM fact_sales f
+JOIN dim_date d ON d.date_key = f.date_key
+JOIN dim_product p ON p.product_key = f.product_key
+JOIN dim_store s ON s.store_key = f.store_key
+WHERE d.month = '2025-02' AND p.category = '衣料' AND s.region = '東京';
+```
+
+```text
+Total Time: 0.0068s
+HASH_JOIN  CAST(store_key AS BIGINT) = store_key      82,194 rows
+├─ HASH_JOIN  CAST(product_key AS BIGINT) = product_key  82,194 rows
+│  ├─ HASH_JOIN  date_key = date_key                  383,572 rows
+│  │  ├─ TABLE_SCAN fact_sales  Projections: date_key, product_key, store_key, amount   383,572 rows
+│  │  └─ TABLE_SCAN dim_date    Filters: month='2025-02'   28 rows
+│  └─ TABLE_SCAN dim_product    Filters: category='衣料'   400 rows
+└─ TABLE_SCAN dim_store         Filters: region='東京'     10 rows
+```
+
+（DuckDB の出力は枠で囲まれた木の図なので、行数と条件だけを抜き出して並べ直しました。）
+
+3 つのディメンションは、それぞれ自分の条件で先に絞られ（28 日、400 商品、10 店舗）、その結果でハッシュ表が作られます。ファクトの各行は、そのハッシュ表に自分のキーがあるかを引くだけです。ファクトの走査が返した行は 500 万行のうち 383,572 行で、2 月の 28 日分にあたります。日付のディメンションを絞った結果のキーの範囲が、ファクトを読む段階に渡されて、範囲外の行を早く捨てていることが行数から読み取れます。全体で 6.8 ms でした。
+
+大きなファクトを先に結合してから絞るのではなく、小さなディメンションで「当てはまるキーの集合」を作ってからファクトに当てる。これがスタースキーマの問い合わせの基本の形で、分析用のエンジンはこの形を速く処理するように作られています。読む列が限られることは、<a href={`${import.meta.env.BASE_URL}reading/row-column-store/`}>列指向</a>の回で見たとおり、ファクトの走査を安くします（`Projections` に出ているのは 4 列だけです）。
+
+## まとめ
+
+- 表を、出来事を記録するファクトと、出来事を説明するディメンションに分ける。ファクトは数値とキー、ディメンションは名前と分類を持つ
+- 設計は「業務プロセス → 粒度 → ディメンション → ファクト」の順。粒度を列より先に決める
+- 業務の説明文の動詞が出来事（ファクト）、名詞が説明（ディメンション）の候補になる
+- 複数のファクトが共有するディメンションは、バス行列で一覧にし、どこから使っても同じ意味にそろえる
+- スタースキーマの問い合わせは、小さなディメンションを先に絞り、そのキーで大きなファクトを引き当てる
+
+次回の<a href={`${import.meta.env.BASE_URL}reading/dwh-fact-tables/`}>ファクトテーブルの 3 つの型</a>では、出来事の記録の仕方そのものを、トランザクション・定期スナップショット・累積スナップショットに分けて見ます。

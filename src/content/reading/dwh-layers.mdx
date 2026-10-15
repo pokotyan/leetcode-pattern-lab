@@ -1,0 +1,237 @@
+---
+title: 層を分けて加工する（メダリオン・dbt の staging / intermediate / marts）
+description: 取り込んだ生データから集計用の表までを、1 本の巨大な SQL ではなく、名前の付いた途中の表を重ねて作る。層ごとに何をして何をしないかを決めておくと、数字が合わないときにどこを見ればよいかが分かる
+category: dwh
+order: 39
+status: published
+topics:
+  - メダリオンアーキテクチャ
+  - Bronze / Silver / Gold
+  - staging / intermediate / marts
+  - dbt
+  - ref
+  - データテスト
+  - dbt snapshot
+  - データレイクのゾーン
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 重複の検出（unique のテスト）も、最新の 1 行への絞り込みも、キーごとに件数や最大値を数える処理になる
+---
+
+import Callout from '../../components/Callout.astro'
+import LayerPipeline from '../../components/sim/problems/LayerPipeline'
+
+## 1 本の SQL で最後まで行かない
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/dwh-principles/`}>分析用の表を別に作る理由</a>では、業務システムの表と分析で使う表は求められる性質が違うので、分析用の形を別に作る、という話をしました。では、生データから分析用の表まで、どう作るのか。
+
+いちばん素朴なのは、業務システムから取り込んだ表を直接読み、型を直し、重複を除き、結合し、集計する処理を 1 本の SQL に書くことです。最初はこれで動きます。しかし、ダッシュボードの数字が業務側の感覚と合わないと言われたとき、その SQL のどこが原因なのかを調べるのは困難です。金額の文字列の変換か、重複の除き方か、結合の条件か、集計の条件か。途中の状態が残っていないので、確かめようがありません。
+
+そこで、加工を段階に分け、**段階ごとの結果を名前の付いた表（またはビュー）として残しながら**進めます。この段階のまとまりを層（レイヤー）と呼びます。層に分ける理由は 3 つです。
+
+- どこで壊れたのかを、層ごとの結果を見比べて特定できる
+- 途中の成果物（重複を除いた注文の表など）を、別の集計にも使い回せる
+- 変更の影響範囲を限定できる（業務システムの列名が変わっても、直すのは最初の層だけで済む）
+
+<LayerPipeline client:visible />
+
+## 呼び名の対応
+
+層の呼び名は流派ごとに違いますが、切っている軸は同じで、**加工の進み具合**です。
+
+| 段階 | メダリオン | dbt の推奨構成 | データレイクのゾーン（Dataplex の例） |
+| --- | --- | --- | --- |
+| 取り込んだまま | Bronze | sources（dbt の外にある取り込み済みの表） | raw |
+| 名前・型をそろえる | Silver | staging | curated |
+| 重複除去・結合 | Silver | intermediate | curated |
+| 業務の言葉で使う形 | Gold | marts | curated |
+
+メダリオンアーキテクチャは Databricks が広めた呼び方で、目的を「データがアーキテクチャの各層を流れるにつれて、その構造と品質を漸進的に改善していくこと（"incrementally and progressively improve the structure and quality of data as it flows through each layer of the architecture"）」と書いています。3 つの層はそれぞれ bronze（raw）、silver（validated）、gold（enriched）と説明され、各層で行うことは「生データの取り込み」「清掃と検証」「ディメンショナルモデリングと集計」です（[Azure Databricks: medallion](https://learn.microsoft.com/en-us/azure/databricks/lakehouse/medallion)）。
+
+データレイクの側にも同じ考え方があります。Google Cloud の Dataplex は、湖の中の区画（zone）を 2 種類に分け、RAW を「利用や分析に向けてさらに処理が要る（"needs further processing before it is considered generally ready for consumption and analytics workloads"）」、CURATED を「広く利用・分析できる状態にある（"considered to be ready for broader consumption and analytics workloads"）」と定義しています（[Dataplex: lakes.zones](https://docs.cloud.google.com/dataplex/docs/reference/rest/v1/projects.locations.lakes.zones)）。オブジェクトストレージの上にファイルを置いて表として扱う仕組みは、読み物<a href={`${import.meta.env.BASE_URL}reading/lake-map/`}>データレイクの地図</a>と<a href={`${import.meta.env.BASE_URL}reading/lake-table-format/`}>テーブル形式の中身</a>で扱いました。そこで作る表を、どの層の表として置くか、という話がこの回です。
+
+Bill Inmon の流れをくむ構成では、まず全社で共通の正規化された倉庫を作り、そこから部門ごとのデータマートを切り出します。層の名前は違っても、「生データ → 統合された中間 → 使う人向け」という順序は同じです。
+
+## 各層で何をして、何をしないか
+
+層を分けても、各層の役割があいまいなら効果は出ません。dbt のプロジェクト構成の手引き（[How we structure our dbt projects](https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview)）は、層ごとに「すること」と「しないこと」をはっきり書いています。ここではそれに沿って並べます。
+
+### raw（Bronze）：取り込んだまま残す
+
+業務システムから届いたものを、手を加えずに残します。Databricks の文書は bronze を「唯一の真実の源として、データの忠実性を保つ（"Serves as the single source of truth, preserving the data's fidelity."）」「すべての履歴を残すことで、再処理と監査を可能にする（"Enables reprocessing and auditing by retaining all historical data."）」と説明し、予期しないスキーマの変更に備えて、多くの列を文字列などのまま持つことを勧めています（[Azure Databricks: medallion](https://learn.microsoft.com/en-us/azure/databricks/lakehouse/medallion)）。下の層で誤りが見つかったとき、作り直せるのはこの層が残っているからです。
+
+### staging：1 対 1 で、名前・型・コード値だけを直す
+
+dbt の手引きは、staging のモデル（dbt では 1 つの SELECT 文が 1 つの表やビューになり、これをモデルと呼びます）について、元の表と 1 対 1 に対応させるよう求めています。「ソースシステムの表 1 つにつき staging のモデルを 1 つ置き、下流からの入口にする（"for each source system table we'll have a single staging model referencing it, acting as its entry point"）」（[dbt: Staging](https://docs.getdbt.com/best-practices/how-we-structure/2-staging)）。
+
+ここで許されるのは、列名の変更、型の変換、単純な計算（セントからドルへ、など）、条件による分類です。逆に、結合と集約はしません。理由もそれぞれ書かれています。
+
+- 結合：「ここでの結合はほぼ常に悪手である。すぐに計算の重複を生み、分かりにくい関係が下流へ波及する（"joins are almost always a bad idea here — they create immediate duplicated computation and confusing relationships that ripple downstream"）」
+- 集約：「この層でグループ化して表の粒度を変え始めると、いずれ必要になる元のデータに手が届かなくなる（"if we start changing the grain of our tables by grouping in this layer, we'll lose access to source data that we'll likely need at some point."）」
+
+命名は `stg_[source]__[entity]s`（ソースの名前と実体の名前を二重の下線で区切る）、実体はビューにするのが推奨です。ビューにしておけば、下流はいつも最新のデータを読み、分析する人が直接読まない表のために容量を使わずに済みます（同ページ）。
+
+### intermediate：重複を除き、結合する
+
+intermediate は「staging のモデルを marts のために準備する（"preparing staging models for marts"）」層で、名前は `int_[entity]s_[verb]s` のように動詞で付けます（`int_order_items_summed_to_orders` のように）。この層は分析する人には見せません（[dbt: Intermediate](https://docs.getdbt.com/best-practices/how-we-structure/3-intermediate)）。Databricks の silver の説明でも、重複の除去、欠けた値の扱い、順序の入れ替わりや遅れて届くデータの解決、結合がこの層の仕事として挙がっています。
+
+### marts（Gold）：業務の言葉で、使う人の粒度に
+
+marts は「特定の実体や概念を、その固有の粒度で表す（"represent a specific entity or concept at its unique grain"）」層です（[dbt: Marts](https://docs.getdbt.com/best-practices/how-we-structure/4-marts)）。ここで初めて「売上」「顧客」のような業務の言葉の表になります。<a href={`${import.meta.env.BASE_URL}reading/dimensional-modeling/`}>次回</a>のファクトとディメンションは、この層に置きます。
+
+同じページは、同じ概念をチームごとに作り分けること（`finance_orders` と `marketing_orders`）をアンチパターンとしています。「売上」が 2 つあれば、数字は必ず食い違います。
+
+<Callout type="note" title="marts を横に広くするか、星形にするか">
+  dbt の手引きは、セマンティックレイヤー（指標の定義を別に持つ仕組み）を使わない場合、marts を「横に広く、非正規化する（"Wide and denormalized"）」ことを勧め、その理由を「現代のデータスタックでは保存は安く、高いのは計算である」としています。一方、セマンティックレイヤーを使うなら、できるだけ正規化したままにする、とも書いています（[dbt: Marts](https://docs.getdbt.com/best-practices/how-we-structure/4-marts)）。スタースキーマと横に広い 1 枚の表のどちらを選ぶかは、<a href={`${import.meta.env.BASE_URL}reading/dwh-schema-shapes/`}>スキーマの形の回</a>で比べます。
+</Callout>
+
+## 実験：層ごとに結果を残すと、壊れた場所が見える
+
+DuckDB 1.4.3 で、シミュレーターと同じ流れを作りました。取り込んだ注文 5 行のうち、A-001 は状態が変わったので 2 回届いており、A-004 の顧客 C09 は顧客の表にいません。
+
+```sql
+CREATE VIEW stg_orders AS
+SELECT ORD_NO AS order_id, CUST_CD AS customer_id,
+       CAST(replace(AMT, ',', '') AS INTEGER) AS amount,
+       CASE STS WHEN '1' THEN 'placed' WHEN '2' THEN 'paid' WHEN '3' THEN 'shipped' WHEN '9' THEN 'cancelled' END AS status,
+       CAST(UPD_DT AS TIMESTAMP) AS updated_at, CAST(_loaded_at AS TIMESTAMP) AS loaded_at
+FROM raw_orders;
+
+CREATE VIEW int_orders_latest AS
+SELECT * FROM stg_orders
+QUALIFY row_number() OVER (PARTITION BY order_id ORDER BY updated_at DESC) = 1;
+
+CREATE VIEW fct_orders AS
+SELECT o.order_id, o.customer_id, c.region, o.amount, o.status
+FROM int_orders_latest o LEFT JOIN stg_customers c USING (customer_id)
+WHERE o.status <> 'cancelled';
+```
+
+```text
+== 各層の行数
+┌───────────────────┬───────┐
+│       model       │ rows  │
+├───────────────────┼───────┤
+│ raw_orders        │     5 │
+│ stg_orders        │     5 │
+│ int_orders_latest │     4 │
+│ fct_orders        │     3 │
+└───────────────────┴───────┘
+== fct_orders
+┌──────────┬─────────────┬─────────┬────────┬─────────┐
+│ order_id │ customer_id │ region  │ amount │ status  │
+├──────────┼─────────────┼─────────┼────────┼─────────┤
+│ A-001    │ C01         │ 東京    │   1200 │ shipped │
+│ A-002    │ C02         │ 大阪    │    800 │ placed  │
+│ A-004    │ C09         │ NULL    │    500 │ placed  │
+└──────────┴─────────────┴─────────┴────────┴─────────┘
+```
+
+行数が層ごとに残っているので、5 → 4 は重複の除去、4 → 3 は取り消しの除外だと説明できます。A-004 の地域が NULL なのは、結合した intermediate 以降の問題だとすぐ分かります。
+
+同じ取り込みを、staging の段階で日ごとに集約してしまった場合はこうなります。
+
+```sql
+SELECT CAST(UPD_DT AS DATE) AS day, sum(CAST(replace(AMT, ',', '') AS INTEGER)) AS amount
+FROM raw_orders GROUP BY 1;
+```
+
+```text
+┌────────────┬────────┐
+│    day     │ amount │
+├────────────┼────────┤
+│ 2025-01-05 │   3200 │
+│ 2025-01-06 │   3500 │
+└────────────┴────────┘
+```
+
+1 月 5 日の 3200 には A-001 の 1200 が 2 回入り、1 月 6 日の 3500 には取り消された A-003 の 3000 が入っています。しかも、注文番号を集約で捨ててしまったので、下流でこれを直す手段がありません。dbt の手引きが staging での集約を禁じる理由が、そのまま出ています。
+
+## dbt で書くとどうなるか
+
+dbt は、SELECT 文を 1 ファイル 1 モデルとして書き、それらの依存関係から実行順を決めて表やビューを作るツールです。層の考え方は、dbt の次の機能と対応します。
+
+### ref で依存関係を書く
+
+モデルの中でほかのモデルを読むときは、表の名前を直接書かずに `ref()` を使います。
+
+```sql
+-- models/intermediate/int_orders_latest.sql
+select *
+from {{ ref('stg_erp__orders') }}
+qualify row_number() over (partition by order_id order by updated_at desc) = 1
+```
+
+`ref()` は「あるモデルを別のモデルから参照する方法（"`ref()` is how you reference one model within another."）」で、dbt はこの参照から「依存関係のグラフを自動で作り、`dbt run` のときに正しい順序でモデルを作る」と説明されています（[dbt: ref](https://docs.getdbt.com/reference/dbt-jinja-functions/ref)）。層の順序は、人が実行順を管理するのではなく、参照の向きとして書かれます。
+
+### テストで各層の約束を確かめる
+
+dbt のデータテストは、モデルについての主張（assertion）で、「失敗した行の集まりを返す（"Data tests return a set of failing records."）」。返す行が 0 件なら合格です。標準で `unique`、`not_null`、`accepted_values`、`relationships`（参照整合性）の 4 つが用意されています（[dbt: Data tests](https://docs.getdbt.com/docs/build/data-tests)）。
+
+```yaml
+models:
+  - name: int_orders_latest
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+  - name: fct_orders
+    columns:
+      - name: customer_id
+        data_tests:
+          - relationships:
+              to: ref('stg_erp__customers')
+              field: customer_id
+```
+
+上の実験で、同じ検査を SQL で流した結果です。テストは「失敗した行を返す SELECT」なので、そのまま書けます。
+
+```text
+-- unique(order_id) on stg_orders
+│ A-001    │     2 │
+-- unique(order_id) on int_orders_latest
+│      0 rows      │
+-- relationships(customer_id -> stg_customers.customer_id) on fct_orders
+│ A-004    │ C09         │
+```
+
+staging では注文番号が重複していてよい（取り込んだ行と 1 対 1 だから）、intermediate では一意でなければならない。層の役割の違いが、どの層にどのテストを付けるかに表れます。
+
+### snapshot で履歴を残す
+
+業務システムの表が上書きされる場合、過去の状態は取り込むたびに失われます。dbt の snapshot は「可変の表の変化を時間とともに記録する（"records changes to a mutable table over time"）」仕組みで、SCD Type 2（変わるたびに版の行を足す方式）を実装し、`dbt_valid_from`・`dbt_valid_to`・`dbt_scd_id`・`dbt_updated_at` の列を足します。変化の検出には、`updated_at` の列を見る timestamp 戦略と、指定した列の値を比べる check 戦略があります（[dbt: Snapshots](https://docs.getdbt.com/docs/build/snapshots)）。
+
+```yaml
+snapshots:
+  - name: orders_snapshot
+    relation: source('erp', 'orders')
+    config:
+      unique_key: order_id
+      strategy: timestamp
+      updated_at: updated_at
+```
+
+snapshot は「元のデータを捨てない」ための道具で、置き場所は raw に近い側です。版を足していく表の設計そのものは<a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値を残す</a>と<a href={`${import.meta.env.BASE_URL}reading/dwh-dimension-tables/`}>ディメンションテーブルの回</a>で扱います。
+
+## どの処理を、どの層に置くか
+
+迷ったときの判断基準を、ここまでの内容から並べます。
+
+| 問い | 置く層 |
+| --- | --- |
+| 元の値に戻せなくなる処理か（集約、行の削除） | できるだけ下流（marts） |
+| ソースの都合を直す処理か（列名、型、コード値） | staging |
+| 複数のソースや行をまたぐか（結合、重複除去） | intermediate |
+| 業務の定義を含むか（「売上」は取り消しを除く、など） | marts。定義は 1 か所にする |
+| 分析する人が直接読むか | marts だけ |
+
+業務の定義（取り消しを売上に含めるか、税込か税抜か）を staging に書き込むと、別の用途で同じ staging を使う人が、その定義を知らずに引き継いでしまいます。定義は使う側の層で、1 か所にまとめて書くのが原則です。
+
+## まとめ
+
+- 生データから分析用の表までを、名前の付いた途中の表を重ねて作る。途中が残っていれば、数字が合わないときに層ごとに確かめられる
+- 呼び名（Bronze/Silver/Gold、staging/intermediate/marts、raw/curated）は違っても、軸は加工の進み具合
+- staging は 1 対 1 で名前・型・コード値だけを直し、結合と集約をしない。集約は元に戻せないので下流へ回す
+- dbt では `ref()` が層の順序を、データテストが各層の約束を、snapshot が上書きされる元データの履歴を受け持つ
+
+次回の<a href={`${import.meta.env.BASE_URL}reading/dimensional-modeling/`}>ディメンショナルモデリング</a>では、marts の中で表をどう並べるかを扱います。
