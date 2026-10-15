@@ -1,0 +1,216 @@
+---
+title: 時間とともに変わる値を残す（論理削除・SCD・期間の制約）
+description: 住所が変わる、価格が改定される、会員が退会する。上書きすれば過去は消え、消さずに印を付ければすべての問い合わせに条件が要る。変わる値を表に残す型と、その期間を DB に守らせる制約を実測で比べる
+category: schema
+order: 35
+status: published
+topics:
+  - 論理削除
+  - 部分一意索引
+  - SCD（Slowly Changing Dimension）
+  - 有効期間
+  - 排他制約
+  - WITHOUT OVERLAPS
+  - 期間付き外部キー
+  - システム版管理テーブル
+---
+
+import Callout from '../../components/Callout.astro'
+import TemporalTables from '../../components/sim/problems/TemporalTables'
+
+## 表は「いま」しか持っていない
+
+普通の表の 1 行は、ある実体の**いまの状態**です。顧客が引っ越して `UPDATE` すれば古い住所は消え、退会して `DELETE` すれば顧客がいたこと自体が消えます。これで困らない場面も多いのですが、次のような問いには答えられなくなります。
+
+- 2024 年末の時点で、この顧客はどこに住んでいたか（その時点の売上を地域別に集計したい）
+- この注文を受けたとき、商品の価格はいくらだったか
+- 退会した会員を、退会理由ごとに数えたい
+
+この回では、変わる値を残すための型を、上書きから順に見ていきます。下のシミュレーターは、1 人の顧客の「登録 → 引っ越し → 退会」を 3 つの方式で記録し、最後に「2024 年末の住所は？」と問います。
+
+<TemporalTables client:visible />
+
+## 上書き：SCD Type 1
+
+いまの値だけを持ち、変わったら上書きする、という普通の更新です。データウェアハウスの次元表（分析の切り口になる表）の設計を体系化した Ralph Kimball の一派は、時間とともにゆっくり変わる次元の扱い方を SCD（Slowly Changing Dimension）として型に分け、この上書きを Type 1 と呼んでいます。定義は「the old attribute value in the dimension row is overwritten with the new value（次元の行の古い属性値を新しい値で上書きする）」です（[Kimball Group: Type 1](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/type-1/)）。
+
+過去の値が要らないなら、これがいちばん単純で、表も小さく、問い合わせに余計な条件が付きません。過去に答える必要がある場合だけ、以下の型を考えます。
+
+## 論理削除：消さずに印を付ける
+
+行を `DELETE` する代わりに、`deleted_at` のような列に印を付けて「消えたこと」にする型です。誤操作から戻せる、退会者の数を後から数えられる、注文などから参照されていても消せる、といった理由でよく使われます。
+
+ただし、論理削除は**DB にとっては削除ではありません**。DB が行に対して守ってくれている約束は、印の付いた行にもそのまま効き続けます。PostgreSQL 18.6 で確かめました。
+
+### 一意制約が、消えたはずの行とぶつかる
+
+```sql
+CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL UNIQUE, deleted_at timestamptz);
+INSERT INTO users VALUES (1, 'a@example.com', NULL);
+UPDATE users SET deleted_at = now() WHERE id = 1;   -- 退会
+INSERT INTO users VALUES (2, 'a@example.com', NULL); -- 同じアドレスで再登録
+```
+
+```text
+ERROR:  duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(a@example.com) already exists.
+```
+
+退会した人が同じメールアドレスで登録し直せません。「生きている行の中で一意」にしたいので、一意制約を、条件付きの索引（部分一意索引）に置き換えます。
+
+```sql
+ALTER TABLE users DROP CONSTRAINT users_email_key;
+CREATE UNIQUE INDEX users_email_live ON users (email) WHERE deleted_at IS NULL;
+INSERT INTO users VALUES (2, 'a@example.com', NULL);  -- 入る
+INSERT INTO users VALUES (3, 'a@example.com', NULL);  -- 生きている行どうしは重複
+```
+
+```text
+ERROR:  duplicate key value violates unique constraint "users_email_live"
+DETAIL:  Key (email)=(a@example.com) already exists.
+```
+
+PostgreSQL の部分索引は、索引の述語を満たす行だけを対象にし、一意索引なら「述語を満たす行の中での一意性」を強制します（[PostgreSQL: Partial Indexes](https://www.postgresql.org/docs/18/indexes-partial.html)）。MySQL には部分索引がないので、生成列を使うなどの別の工夫が要ります。
+
+### 外部キーは論理削除を知らない
+
+```sql
+CREATE TABLE orders (id int PRIMARY KEY, user_id int NOT NULL REFERENCES users(id));
+INSERT INTO orders VALUES (10, 1);   -- 1 番は退会済み
+SELECT o.id, u.email, u.deleted_at IS NOT NULL AS user_deleted FROM orders o JOIN users u ON u.id = o.user_id;
+```
+
+```text
+ id |     email     | user_deleted
+----+---------------+--------------
+ 10 | a@example.com | t
+```
+
+退会済みのユーザーに新しい注文が付きました。外部キーは「行があるか」だけを見るので、印の意味は知りません。これを防ぐには、アプリで検査するか、トリガを書くか、`(id, deleted_at IS NULL)` のような列を加えて複合外部キーにする工夫が要ります。
+
+さらに、**いまのユーザーを数える問い合わせのすべてに** `WHERE deleted_at IS NULL` を書き足す必要があり、1 か所でも書き忘れると退会者が混ざります。多くの ORM が論理削除の拡張で既定の条件を自動で付けるのはこのためですが、生の SQL や分析用の複製には効きません。
+
+<Callout type="warn" title="論理削除は履歴ではない">
+  論理削除が残すのは「消えた」という事実と、消える直前の状態だけです。消える前の住所の変更は上書きされているので、シミュレーターの「論理削除」で「2024 年末の住所」を問うと、退会直前の住所（大阪）という誤った答えが返ります。過去の状態に答えたいなら、次の履歴の型が要ります。また、個人情報の削除を求められたときに「印を付けただけ」では消したことにならない点にも注意が必要です。
+</Callout>
+
+## 履歴の行を足す：SCD Type 2
+
+値が変わるたびに、古い行を書き換えるのではなく**新しい行を足し、古い行には有効期間の終わりを書く**型です。Kimball は Type 2 を「changes add a new row in the dimension with the updated attribute values」と定義し、最低限、行の有効開始日時・有効終了日時・現在の行かどうかの印の 3 列を足すとしています（[Kimball Group: Type 2](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/type-2/)）。
+
+```sql
+CREATE TABLE cust_hist (
+  sk serial PRIMARY KEY, customer_id int NOT NULL, address text NOT NULL,
+  valid_from date NOT NULL, valid_to date NOT NULL DEFAULT 'infinity', is_current boolean NOT NULL DEFAULT true);
+CREATE UNIQUE INDEX cust_current ON cust_hist (customer_id) WHERE is_current;
+
+INSERT INTO cust_hist (customer_id, address, valid_from) VALUES (1, '東京', '2024-01-01');
+BEGIN;   -- 引っ越し：いまの行を閉じ、新しい行を足す
+UPDATE cust_hist SET valid_to = '2025-04-01', is_current = false WHERE customer_id = 1 AND is_current;
+INSERT INTO cust_hist (customer_id, address, valid_from) VALUES (1, '大阪', '2025-04-01');
+COMMIT;
+```
+
+```text
+ sk | customer_id | address | valid_from |  valid_to  | is_current
+----+-------------+---------+------------+------------+------------
+  1 |           1 | 東京    | 2024-01-01 | 2025-04-01 | f
+  2 |           1 | 大阪    | 2025-04-01 | infinity   | t
+```
+
+`sk` は行ごとの番号（代理キー）で、`customer_id` は同じ顧客のすべての行に共通の番号です。期間は「開始を含み、終了を含まない」半開区間 `[valid_from, valid_to)` で持つと、隣り合う行の境目が重ならず、隙間もできません。ある時点の住所は、その時点を期間に含む行です。
+
+```sql
+SELECT address FROM cust_hist
+WHERE customer_id = 1 AND valid_from <= '2024-12-31' AND '2024-12-31' < valid_to;
+```
+
+```text
+ address
+---------
+ 東京
+```
+
+更新は「閉じる」と「足す」の 2 文になるので、同じトランザクションで行います。閉じ忘れて新しい行を足すと、現在の行が 2 つになります。上の `cust_current` はこれを止める部分一意索引です。
+
+```text
+-- 閉じずに '福岡' の行を足した
+ERROR:  duplicate key value violates unique constraint "cust_current"
+DETAIL:  Key (customer_id)=(1) already exists.
+```
+
+### ほかの SCD の型
+
+Kimball の分類には、ほかにも次のような型があります。どれも Type 1 と Type 2 の組み合わせや変形です。
+
+| 型 | 中身 | 出典 |
+| --- | --- | --- |
+| Type 3 | 古い値を残すための列を足し、本来の列は上書きする（「前の地域」と「いまの地域」の 2 列など）。両方の切り口で集計できるが、残せるのは 1 つ前まで | [Type 3](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/type-3/) |
+| Type 4 | 頻繁に変わる属性の群を、別の小さな次元（mini-dimension）に切り出す | [Type 4](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/type-4/) |
+| Type 6 | Type 2 の行に、同じ属性の「いまの値」の列も持たせ、同じ実体の全行でそれを上書きし続ける。過去の値でも、いまの値でも集計できる | [Type 6](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/type-6/) |
+
+## 期間を DB に守らせる
+
+SCD Type 2 の `is_current` の部分一意索引は「現在の行は 1 つ」を守りますが、「過去の期間どうしが重ならない」は守りません。価格表のように、期間を指定して先の予定まで登録する表では、**同じ商品の期間が重ならない**ことのほうが大事です。
+
+### PostgreSQL 17 以前：範囲型と排他制約
+
+期間を `daterange` 型の 1 列で持ち、「同じ商品で、期間が重なる（`&&`）行は 2 つあってはならない」を排他制約（EXCLUDE 制約）で書きます。整数の等値比較を GiST 索引で扱うために `btree_gist` 拡張が要ります。
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE price_x (product_id int, valid daterange, price int,
+  EXCLUDE USING gist (product_id WITH =, valid WITH &&));
+INSERT INTO price_x VALUES (1, '[2025-01-01,2025-07-01)', 100), (1, '[2025-07-01,)', 120);
+INSERT INTO price_x VALUES (1, '[2025-06-01,2025-08-01)', 110);
+```
+
+```text
+ERROR:  conflicting key value violates exclusion constraint "price_x_product_id_valid_excl"
+DETAIL:  Key (product_id, valid)=(1, [2025-06-01,2025-08-01)) conflicts with existing key (product_id, valid)=(1, [2025-01-01,2025-07-01)).
+```
+
+### PostgreSQL 18：WITHOUT OVERLAPS と PERIOD
+
+PostgreSQL 18 では、同じことを主キーとして宣言できるようになりました。主キーや一意制約の最後の列に `WITHOUT OVERLAPS` を付けると、その列は等しさではなく重なりで検査されます。文書は、これが実質的に `EXCLUDE USING GIST (id WITH =, valid_at WITH &&)` と同じように働き、列は範囲型か多重範囲型でなければならない、と説明しています（[PostgreSQL 18: CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html)）。
+
+さらに外部キーの最後の列に `PERIOD` を付けると、参照される側の「キーが一致する行の期間を合わせたもの」が、参照する側の期間を**すべて覆っている**ときだけ制約を満たします（同上）。
+
+```sql
+CREATE TABLE price (product_id int, valid daterange, price int,
+  PRIMARY KEY (product_id, valid WITHOUT OVERLAPS));
+INSERT INTO price VALUES (1, '[2025-01-01,2025-07-01)', 100), (1, '[2025-07-01,)', 120);
+INSERT INTO price VALUES (1, '[2025-06-01,2025-08-01)', 110);
+
+CREATE TABLE contract (id int PRIMARY KEY, product_id int, valid daterange,
+  FOREIGN KEY (product_id, PERIOD valid) REFERENCES price (product_id, PERIOD valid));
+INSERT INTO contract VALUES (1, 1, '[2025-03-01,2025-09-01)');   -- 2 つの価格の期間をまたぐ
+INSERT INTO contract VALUES (2, 1, '[2024-12-01,2025-02-01)');   -- 価格が未登録の 2024 年 12 月を含む
+```
+
+```text
+ERROR:  conflicting key value violates exclusion constraint "price_pkey"
+DETAIL:  Key (product_id, valid)=(1, [2025-06-01,2025-08-01)) conflicts with existing key (product_id, valid)=(1, [2025-01-01,2025-07-01)).
+ERROR:  insert or update on table "contract" violates foreign key constraint "contract_product_id_valid_fkey"
+DETAIL:  Key (product_id, valid)=(1, [2024-12-01,2025-02-01)) is not present in table "price".
+```
+
+主キーの重なりの検査は、エラー文が示すとおり内部では排他制約として実装されています。契約 1 は 2 つの価格の行の期間を合わせて覆われているので通り、契約 2 は価格のない期間を含むので拒否されました。「その期間に価格が存在しない契約」を DB が止めてくれます。
+
+## もう 1 つの時間：システム版管理テーブル
+
+ここまでの有効期間は、「現実の世界でいつからいつまでそうだったか」を利用者が書き込む時間でした（適用時間、application time と呼ばれます）。これとは別に、「DB がいつその行を記録していたか」を DB 自身に自動で残させる仕組みがあります。SQL:2011 で標準に入ったシステム版管理テーブル（system-versioned table）です。
+
+MariaDB の文書は、これを「System-versioned tables store the history of all changes, not only data which is currently applicable.」と説明し、「System-versioned tables were first introduced in the SQL:2011 standard.」と述べています。過去の時点の表は `SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP'2016-10-09 08:07:06';` のように読めます（[MariaDB: System-Versioned Tables](https://mariadb.com/docs/server/reference/sql-structure/temporal-tables/system-versioned-tables)）。行を更新・削除しても、古い版は DB が自動で取っておきます。SCD Type 2 の「閉じて足す」を DB が代わりにやってくれる形ですが、記録されるのは DB に書いた時刻なので、「4 月 1 日付けの引っ越しを 4 月 10 日に登録した」という区別はつきません。2 つの時間を両方持つ設計は、バイテンポラル（bitemporal）と呼ばれます。PostgreSQL 18 には、システム版管理テーブルの構文はまだありません。
+
+## まとめ
+
+| 型 | 過去の値 | 退会・削除の記録 | 余計に要るもの |
+| --- | --- | --- | --- |
+| 上書き（SCD Type 1） | 残らない | 物理削除なら残らない | なし |
+| 論理削除 | 残らない（消える直前の状態だけ） | 残る | 全問い合わせの条件、部分一意索引、外部キーの補い |
+| 履歴の行（SCD Type 2） | 期間つきで残る | 最後の行を閉じれば残る | 2 文の更新、現在の行と期間の重なりを守る制約 |
+| 期間の制約（排他制約・WITHOUT OVERLAPS） | 期間つきで残る | 同上 | 範囲型、GiST 索引 |
+| システム版管理テーブル | DB が自動で残す（記録した時刻で） | 残る | 対応する DB |
+
+どの型も、更新や削除で「古い事実を消す」ことを、何らかの形で避けようとしています。そこから一歩進んで、**そもそも行を書き換えず、起きた出来事を追記していく**ことを設計の出発点にする考え方があり、イミュータブルデータモデリングと呼ばれています。これは後の回で扱います。

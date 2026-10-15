@@ -1,0 +1,274 @@
+---
+title: 経路列挙（根からの道のりを文字列で持つ）
+description: 各行に「根から自分までの経路」を '/1/2/4/' のような文字列で書いておく方式。子孫は前方一致、先祖は文字列を分けるだけで取れる。その代わり、経路を値として複製しているので、途中が変われば子孫全員を書き換え、親を消しても子は気づかない
+category: schema
+order: 30
+status: published
+topics:
+  - 経路列挙
+  - Materialized Path
+  - 前方一致検索
+  - text_pattern_ops
+  - ltree
+  - hierarchyid
+  - 参照整合性
+basedOn:
+  - kind: article
+    slug: trie
+    why: 経路の文字列を辞書順に並べると、同じ接頭辞を持つもの（＝同じ部分木）が隣り合う。前方一致がトライ木の 1 本の枝をたどるのと同じ形になる
+  - kind: article
+    slug: binary-search
+    why: 前方一致を「'/1/2/' 以上、'/1/20' 未満」の範囲に置き換え、ソート済みの索引の上で両端を二分探索で見つけて間を読む
+  - kind: article
+    slug: tree-traversal
+    why: 経路を辞書順に並べた順番は、木を深さ優先の行きがけ順でたどった順番とほぼ一致する
+---
+
+import Callout from '../../components/Callout.astro'
+import PathEnumeration from '../../components/sim/problems/PathEnumeration'
+
+## 経路を、各行に書いておく
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/tree-adjacency-list/`}>隣接リスト</a>では、各行が親の id だけを持っていました。書き込みは 1 行で済む一方、「ある部門より下の全部」を取るには 1 段ずつ再帰で下りるしかありません。
+
+経路列挙（path enumeration、materialized path とも呼ばれます）は、この再帰を前もって済ませておく方式です。各行に、根から自分までの道のりを文字列で書きます。
+
+```text
+ id | path        | name
+----+-------------+--------
+  1 | /1/         | 商品
+  2 | /1/2/       | 家電
+  4 | /1/2/4/     | PC
+  7 | /1/2/4/7/   | ノート
+```
+
+`/1/2/4/7/` を見れば、ノートの先祖が 1・2・4 であることも、深さが 3 であることも、表のほかの行を読まずに分かります。子孫のほうは「path が `/1/2/` で始まる行」です。どちらの操作も再帰を必要としません。
+
+区切りの `/` を先頭と末尾にも置いているのには理由があります。末尾の `/` がないと、`/1/2` で前方一致したときに `/1/20` や `/1/21` まで拾ってしまいます。`/1/2/` で始まるかどうかを問えば、id 2 の部分木と id 20 の部分木を取り違えません。
+
+<PathEnumeration client:visible />
+
+ステップ実行の表は、path の値の順（索引の並び順）に並べてあります。「子孫を取る」を選ぶと、対象の部分木が表の上で一続きの区間になっていることが分かります。「部分木を移動」では、部分木のすべての行の path が書き換わります。
+
+## 実験の準備
+
+この回の数値は、<a href={`${import.meta.env.BASE_URL}reading/tree-tables/`}>4 つの方式の比較</a>で使ったものと同じ木で測っています。PostgreSQL 17.11 の上に、10 分岐・深さ 5 の完全な木（111,111 ノード）を作りました。経路列挙の表は次のとおりです。
+
+```sql
+CREATE TABLE pe (id int PRIMARY KEY, path text NOT NULL, name text NOT NULL);
+CREATE INDEX pe_path ON pe(path text_pattern_ops);
+```
+
+```text
+  id   |          path           |   name
+-------+-------------------------+-----------
+     1 | /1/                     | node1
+     2 | /1/2/                   | node2
+    12 | /1/2/12/                | node12
+   112 | /1/2/12/112/            | node112
+  1112 | /1/2/12/112/1112/       | node1112
+ 11112 | /1/2/12/112/1112/11112/ | node11112
+```
+
+表の大きさは索引込みで 14 MB でした。隣接リスト（9,184 kB）より大きいのは、経路の文字列が深さに比例して長くなり、それを表と索引の両方に持つためです。
+
+## 子孫：前方一致は索引の範囲になる
+
+id 2 の部分木（11,111 ノード）を数えます。
+
+```sql
+SELECT count(*) FROM pe WHERE path LIKE '/1/2/%';
+```
+
+```text
+ Aggregate (actual rows=1 loops=1)
+   ->  Index Only Scan using pe_path on pe (actual rows=11111 loops=1)
+         Index Cond: ((path ~>=~ '/1/2/'::text) AND (path ~<~ '/1/20'::text))
+   Buffers: shared hit=78
+ Execution Time: 2.082 ms
+```
+
+`Index Cond` に注目してください。PostgreSQL は `LIKE '/1/2/%'` を「`'/1/2/'` 以上、`'/1/20'` 未満」という範囲に書き換えています。`/` の次の文字コードは `0` なので、`/1/2/` で始まる文字列はすべてこの範囲に収まり、範囲の中にはそれ以外の文字列が入りません。ソート済みの B-tree の上で両端を探し、その間を読むだけです。同じ部分木を隣接リストの再帰で取ると、5 段の繰り返しで 6.9〜8.9 ms・182 ブロックでした。
+
+この書き換えが起きるには、索引の並び順がバイト順である必要があります。データベースの照合順序（collation）が `C` 以外だと、普通の B-tree 索引は言語の規則で並ぶため、前方一致に使えません。そのために `text_pattern_ops` という演算子クラスで索引を作っています（`~>=~` と `~<~` はこの演算子クラスの比較演算子です）。PostgreSQL の文書は、この演算子クラスが「ロケール固有の照合規則ではなく、厳密に 1 文字ずつ比べる」ので、データベースが C ロケールでないときの `LIKE` に使えると説明しています。C ロケールなら既定の演算子クラスの索引で前方一致を引けます。逆に `text_pattern_ops` の索引は普通の `<`・`>` の比較には使えないので、両方が要るなら索引を 2 本張ります（[PostgreSQL 17: Operator Classes and Operator Families](https://www.postgresql.org/docs/17/indexes-opclass.html)）。実験のデータベースは `en_US.utf8` でした。
+
+<Callout type="warn" title="LIKE の _ と % は文字そのものではない">
+  `LIKE` では `_` が任意の 1 文字、`%` が任意の文字列を表します。経路に id ではなく名前を使い、その名前に `_` が含まれていると、前方一致が意図しない行まで拾います。
+
+  ```text
+  SELECT '/家電/PC_周辺/' LIKE '/家電/PC_%' AS wildcard_hits,
+         '/家電/PCX周辺/' LIKE '/家電/PC_%' AS false_hit;
+   wildcard_hits | false_hit
+  ---------------+-----------
+   t             | t
+  ```
+
+  `PC_周辺` の部分木を探したつもりで、`PCX周辺` まで当たっています。区切りに `_` や `%` を使う場合も同じです。経路には記号を含まない id を使うか、`ESCAPE` で特殊文字を打ち消すか、`starts_with()` のような関数を使います。名前は変わりうるので、名前を経路に入れると改名のたびに部分木全体を書き換えることにもなります。
+</Callout>
+
+## 先祖：文字列を分けて主キーで引く
+
+先祖の id は自分の path にすべて書いてあります。id 11112 の path `/1/2/12/112/1112/11112/` を `/` で分け、主キーで引きます。
+
+```sql
+SELECT count(*) FROM pe WHERE id IN (
+  SELECT x::int FROM pe p, unnest(string_to_array(trim(both '/' from p.path), '/')) x
+  WHERE p.id = 11112);
+```
+
+```text
+         ->  HashAggregate (actual rows=6 loops=1)
+               ->  Nested Loop (actual rows=6 loops=1)
+                     ->  Index Scan using pe_pkey on pe p (actual rows=1 loops=1)
+                     ->  Function Scan on unnest x (actual rows=6 loops=1)
+         ->  Index Only Scan using pe_pkey on pe (actual rows=1 loops=6)
+   Buffers: shared hit=20
+ Execution Time: 0.049 ms
+```
+
+一方、「自分の path が、相手の path で始まる」という条件をそのまま書くと、索引が使えません。
+
+```sql
+SELECT count(*) FROM pe a, pe c WHERE c.id = 11112 AND c.path LIKE a.path || '%';
+```
+
+```text
+   ->  Nested Loop (actual rows=6 loops=1)
+         ->  Index Scan using pe_pkey on pe c (actual rows=1 loops=1)
+         ->  Seq Scan on pe a (actual rows=111111 loops=1)
+ Execution Time: 8.720 ms
+```
+
+前方一致の範囲に置き換えられるのは、パターンが定数のときだけです。ここではパターン（`a.path || '%'`）が行ごとに変わるので、全 111,111 行を順に読んで比べています。先祖は「1 本の文字列を分ける」と考えるほうが素直で、速くもあります。
+
+## 移動：部分木の全行を書き換える
+
+id 12 の部分木（1,111 ノード）を、id 11 の下へ移します。部分木の全員の path の先頭 `/1/2/` を、移動先の path `/1/11/` に付け替えます。
+
+```sql
+UPDATE pe SET path = (SELECT path FROM pe WHERE id = 11) || substr(path, length('/1/2/') + 1)
+WHERE path LIKE '/1/2/12/%';
+```
+
+```text
+UPDATE 1111
+Time: 11.964 ms
+```
+
+隣接リストでは `UPDATE 1`（親の id を 1 か所変えるだけ）で済む操作が、ここでは 1,111 行の書き換えになります。経路を値として各行に複製しているので、途中の 1 か所が変わると、その下の全員に響きます。移す部分木が大きいほど、書き込みは比例して増えます。
+
+もう 1 つ、移動先が自分の子孫かどうかを DB は確かめません。`/1/2/12/` の部分木を `/1/2/12/112/` の下に移す UPDATE を流せば、経路の中に自分を含む、木として意味をなさない文字列ができます。移動の前に「移動先の path が、移すノードの path で始まっていないか」をアプリ側で確かめる必要があります。
+
+## 参照整合性がない
+
+経路列挙の path は、ただの文字列です。`/1/2/12/` の `12` がどの行を指すかを、DB は知りません。そのため外部キーで親子関係を守れません。
+
+```sql
+BEGIN;
+DELETE FROM pe WHERE id = 12;
+SELECT count(*) AS orphans FROM pe c WHERE c.path LIKE '/1/2/12/%';
+DELETE FROM adj WHERE id = 12;
+ROLLBACK;
+```
+
+```text
+DELETE 1
+ orphans
+---------
+    1110
+(1 row)
+
+ERROR:  update or delete on table "adj" violates foreign key constraint "adj_parent_id_fkey" on table "adj"
+DETAIL:  Key (id)=(12) is still referenced from table "adj".
+```
+
+経路列挙の表では id 12 の行だけが消え、その子孫 1,110 行は「存在しない 12」を経路に含んだまま残りました。同じ操作を隣接リストの表で試すと、`parent_id` に張った外部キーが削除を拒否します。経路列挙で部分木を消すときは、前方一致でまとめて消すことを、アプリの側で必ず守る必要があります。
+
+```sql
+DELETE FROM pe WHERE path LIKE '/1/2/12/%';   -- DELETE 1111, 1.842 ms
+```
+
+Microsoft の文書も、後で見る `hierarchyid` 型について同じ注意を書いています。「hierarchyid の値で表される階層関係は、外部キーの関係のようには強制されない。A が子 B を持ち、A を消すと、存在しない行との関係を持つ B が残ることがある」（[Hierarchical Data (SQL Server)](https://learn.microsoft.com/en-us/sql/relational-databases/hierarchical-data-sql-server)）。
+
+<Callout type="tip" title="隣接リストと併せて持つ">
+  経路列挙の弱点の多くは、親の id（隣接リストの列）を併せて持つと和らぎます。親子関係は `parent_id` の外部キーで守り、path は「子孫・先祖を速く引くための索引」として扱う、という分担です。path を `parent_id` から作り直せるので、壊れたときの復旧手段にもなります。その代わり、2 つの列が食い違わないように、書き込みのたびに両方を更新する必要があります。
+</Callout>
+
+## 専用の型：PostgreSQL の ltree
+
+PostgreSQL には、経路列挙のための拡張 `ltree` があります。経路を `.` 区切りのラベル列として持ち、先祖・子孫の判定を演算子で書けます（[PostgreSQL 17: ltree](https://www.postgresql.org/docs/17/ltree.html)）。
+
+- ラベルは「英数字・アンダースコア・ハイフンの並び」で、どの文字を英数字とみなすかはデータベースのロケールに依存する。C ロケールなら `A-Za-z0-9_-`。ラベルは 1,000 文字まで
+- 経路（label path）はラベルを 0 個以上並べたもので、65,535 ラベルを超えられない
+- `@>` は「左辺が右辺の先祖（または同じ）か」、`<@` は「左辺が右辺の子孫（または同じ）か」
+- GiST 索引（`gist_ltree_ops`）が `@>`・`<@`・`~`（lquery の照合）などを支える。B-tree 索引は大小比較と等値だけ
+
+同じ 11 万ノードを ltree の表に移し、GiST 索引を張って測りました。
+
+```sql
+CREATE EXTENSION IF NOT EXISTS ltree;
+CREATE TABLE lt (id int PRIMARY KEY, path ltree NOT NULL);
+INSERT INTO lt SELECT id, text2ltree(replace(trim(both '/' from path), '/', '.')) FROM pe;
+CREATE INDEX lt_gist ON lt USING gist (path);
+```
+
+```text
+         path          | nlevel
+-----------------------+--------
+ 1.2.12.112.1112.11112 |      6
+
+=== ltree: 2 の子孫 (<@)
+   ->  Bitmap Heap Scan on lt (actual rows=11111 loops=1)
+         Recheck Cond: (path <@ '1.2'::ltree)
+         ->  Bitmap Index Scan on lt_gist (actual rows=11111 loops=1)
+               Index Cond: (path <@ '1.2'::ltree)
+   Buffers: shared hit=353
+ Execution Time: 1.981 ms
+
+=== ltree: 11112 の先祖 (@>)
+         ->  Bitmap Index Scan on lt_gist (actual rows=6 loops=1)
+               Index Cond: (path @> '1.2.12.112.1112.11112'::ltree)
+   Buffers: shared hit=9
+ Execution Time: 0.054 ms
+
+=== ltree: ちょうど 2 段下 (lquery)
+ count
+   100
+```
+
+子孫は `text` と `LIKE` の場合とほぼ同じ時間（1.98 ms）ですが、読んだブロックは 353 と多めです。GiST 索引は非可逆（lossy）で、索引で絞った候補を表の行で確かめ直す（`Recheck Cond`）ためです。先祖は `@>` の 1 つの演算子で書け、索引で 6 行を直接引けます。`'1.2.*{2}'` のような lquery で「ちょうど 2 段下」を指定できるのも、文字列の LIKE にはない利点です。
+
+ラベルに使える文字の制約も確かめました。
+
+```text
+SELECT 'a.家電'::ltree;     →  a.家電
+SELECT 'a.b c'::ltree;      →  ERROR:  ltree syntax error at character 4
+```
+
+このデータベースのロケール（`en_US.utf8`）では「家電」は英数字として受け付けられ、空白は拒否されました。どの文字が通るかがロケールに依存するので、名前ではなく id をラベルにしておくほうが安全です。
+
+## SQL Server の hierarchyid も経路列挙の一種
+
+SQL Server の `hierarchyid` 型は、`/1/2/1/` のような経路を、短い 2 進表現に詰めて持つ型です（文書の例では `/1/1/` が `0x5AC0` になります）。Microsoft の文書は性質を次のように説明しています（[Hierarchical Data (SQL Server)](https://learn.microsoft.com/en-us/sql/relational-databases/hierarchical-data-sql-server)）。
+
+- 比較は深さ優先の順。`a < b` は「深さ優先でたどったとき a が b より先に来る」ことを意味し、索引も深さ優先の順に並ぶので、ある行の子は自分のすぐ近くに格納される
+- 親子（隣接リスト）と比べると、部分木の問い合わせはかなり速く、直下の子の問い合わせはわずかに遅い。葉でないノードの移動は遅い
+- hierarchyid を使う場合、行の位置を変えると「移す部分木のノード数 n」行に影響する。隣接リストなら 1 行
+
+この記事の経路列挙で測った結果と同じ傾向です。経路を辞書順（ここでは深さ優先の順）に並べるので部分木が連続した区間になり、そのぶん移動が部分木の大きさに比例して重くなります。
+
+## 長所と短所
+
+| 観点 | 経路列挙 |
+| --- | --- |
+| 子孫を取る | 前方一致 1 回。索引の連続した区間を読む |
+| 先祖を取る | 自分の path を分けて主キーで引く。表を読む前から先祖の id が分かる |
+| 深さ | path の区切りの数。読むだけで分かる |
+| 葉の追加 | 1 行（親の path に自分の id を足す） |
+| 部分木の移動 | 部分木の全行を書き換える |
+| 参照整合性 | DB は守らない。孤児や循環を作れる |
+| 大きさ | 経路の長さが深さに比例する。列の長さ制限がある場合は深さの上限にもなる |
+
+向いているのは、読むことが多く、部分木の移動がまれな木です。ファイルやフォルダの経路、URL の階層、商品カテゴリのパンくずリスト（先祖を表示する）などは、もともと経路の形で扱われることが多く、文字列のまま持つのが自然です。逆に、組織の付け替えのように大きな部分木を頻繁に動かす木や、親子関係の正しさを DB に守らせたい木には向きません。
+
+次回の<a href={`${import.meta.env.BASE_URL}reading/tree-nested-set/`}>入れ子集合</a>は、経路の文字列の代わりに 2 つの整数で部分木を表します。読み取りはさらに単純になり、その代わり書き込みの重さが木全体に広がります。

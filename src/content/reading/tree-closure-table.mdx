@@ -1,0 +1,189 @@
+---
+title: 閉包テーブル（先祖と子孫の組をすべて持つ）
+description: 「誰が誰の先祖か」を、すべての組について別の表に書いておく方式。子孫も先祖も索引 1 回で引け、外部キーで親子関係を守れる。代わりに行数は深さに比例して膨らみ、部分木の移動は掛け算で行が増える
+category: schema
+order: 32
+status: published
+topics:
+  - 閉包テーブル
+  - Closure Table
+  - 推移閉包
+  - 直積
+  - 参照整合性
+basedOn:
+  - kind: article
+    slug: graph-bfs-dfs
+    why: 閉包テーブルは、各ノードから到達できるノードの集合（推移閉包）を前もって計算して表にしたもの。どのノードから辿れるかを毎回探索する代わりに、答えを保存しておく
+  - kind: article
+    slug: tree-traversal
+    why: 1 ノードあたりの行数は「深さ + 1」（根までの経路上のノード数）。表の総行数は、全ノードの深さの和にノード数を足したものになる
+  - kind: article
+    slug: hash-counting
+    why: 部分木の移動では「部分木に含まれる id の集合に入っているか」を引いて、切る組と残す組を分ける
+---
+
+import Callout from '../../components/Callout.astro'
+import ClosureTable from '../../components/sim/problems/ClosureTable'
+
+## 答えを全部、先に書いておく
+
+ここまでの 3 方式は、木の形をノードの行そのものに書き込んでいました。<a href={`${import.meta.env.BASE_URL}reading/tree-adjacency-list/`}>隣接リスト</a>は親の id を、<a href={`${import.meta.env.BASE_URL}reading/tree-path-enumeration/`}>経路列挙</a>は根からの道のりを、<a href={`${import.meta.env.BASE_URL}reading/tree-nested-set/`}>入れ子集合</a>は区間の番号を持ちます。
+
+閉包テーブル（closure table）は、木の形をノードの表から切り離し、別の表に持ちます。その表には「A は B の先祖である」という組を、**すべての組について**、自分自身との組も含めて 1 行ずつ書きます。
+
+```text
+category                 category_tree
+ id | name               ancestor | descendant | depth
+----+------              ---------+------------+-------
+  1 | 商品                      1 |          1 |     0
+  2 | 家電                      1 |          2 |     1
+  4 | PC                        1 |          4 |     2
+                                2 |          2 |     0
+                                2 |          4 |     1
+                                4 |          4 |     0
+```
+
+「子孫を取る」は `ancestor = X` の行を読むだけ、「先祖を取る」は `descendant = X` の行を読むだけです。どちらの答えも前もって表に書いてあるので、再帰も文字列の分解も区間の比較も要りません。グラフの言葉でいえば、各ノードから辿り着けるノードの集合（推移閉包）を、計算済みの表として持っている状態です。
+
+`depth` の列は、先祖と子孫が何段離れているかです。`ancestor = X AND depth = 1` で直下の子だけを、`descendant = X AND depth = 1` で親を取れます。隣接リスト以外の方式で手間のかかった「親」と「直下の子」が、ここでは条件 1 つで済みます。
+
+<ClosureTable client:visible />
+
+ステップ実行の表は `category_tree` を主キー `(ancestor, descendant)` の順に並べたものです。「子孫を取る」では対象の `ancestor` の行が一続きに並んでいること、「先祖を取る」では対象の `descendant` の行が表のあちこちに散らばっていることが分かります。「部分木を移動」では、消える組と足される組の数を見てください。
+
+## 実験の準備
+
+<a href={`${import.meta.env.BASE_URL}reading/tree-tables/`}>4 つの方式の比較</a>と同じ 111,111 ノードの木を、PostgreSQL 17.11 に閉包テーブルとして作りました。
+
+```sql
+CREATE TABLE ct_node (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE ct (
+  ancestor   int NOT NULL REFERENCES ct_node(id),
+  descendant int NOT NULL REFERENCES ct_node(id),
+  depth      int NOT NULL,
+  PRIMARY KEY (ancestor, descendant)
+);
+CREATE INDEX ct_desc ON ct(descendant);
+```
+
+```text
+    t    |   n    | pg_size_pretty
+---------+--------+----------------
+ ct_node | 111111 | 7296 kB
+ adj     | 111111 | 9184 kB
+ ns      | 111111 | 13 MB
+ pe      | 111111 | 14 MB
+ ct      | 654321 | 57 MB
+```
+
+ノードは 111,111 個ですが、組の表は **654,321 行・57 MB** になりました。各ノードは自分自身を含めて「深さ + 1」個の先祖を持つので、行数は全ノードの「深さ + 1」の和です。この木では深さ 0 が 1 個、1 が 10 個、…、5 が 100,000 個なので、1×1 + 10×2 + 100×3 + 1,000×4 + 10,000×5 + 100,000×6 = 654,321 です。ほかの方式が 7〜14 MB に収まっているのと比べると、4〜8 倍の大きさです。
+
+木が深くなるほど、この差は広がります。極端な場合、n 個のノードが 1 本の鎖になった木では、行数は 1 + 2 + … + n = n(n+1)/2 で、ノード数の 2 乗に比例します。閉包テーブルは、深さが限られた木（組織、カテゴリ、地域区分など、せいぜい十数段）を想定した方式です。
+
+## 子孫と先祖：どちらも索引 1 回
+
+```sql
+SELECT count(*) FROM ct WHERE ancestor = 2;      -- 子孫
+SELECT count(*) FROM ct WHERE descendant = 11112; -- 先祖
+```
+
+```text
+=== 閉包テーブル: 2 の子孫
+   ->  Index Only Scan using ct_pkey on ct (actual rows=11111 loops=1)
+         Index Cond: (ancestor = 2)
+   Buffers: shared hit=37
+ Execution Time: 0.820 ms
+
+=== 先祖: 閉包テーブル
+   ->  Index Only Scan using ct_desc on ct (actual rows=6 loops=1)
+         Index Cond: (descendant = 11112)
+   Buffers: shared hit=3
+ Execution Time: 0.027 ms
+```
+
+子孫 11,111 件は主キーの索引だけで返り（1 回目 0.950 ms、2 回目 0.820 ms、37 ブロック）、4 方式の中でもっとも少ない読み取りでした。先祖も 3 ブロックで、入れ子集合のように「木の右端だと遅い」ということもありません。主キーと `descendant` の索引の 2 本を持つことで、どちら向きの問い合わせも 1 回の索引で済みます。
+
+## 葉の追加：深さ + 1 行
+
+id 112（深さ 3）の下に葉を 1 つ足します。親の先祖はみな新しい葉の先祖なので、親の先祖の行をコピーして `depth` を 1 足し、自分自身との組を加えます。
+
+```sql
+INSERT INTO ct_node VALUES (200000, 'new');
+INSERT INTO ct SELECT ancestor, 200000, depth + 1 FROM ct WHERE descendant = 112
+  UNION ALL SELECT 200000, 200000, 0;
+```
+
+```text
+INSERT 0 1
+INSERT 0 5
+```
+
+書くのは新しい葉の「深さ + 1」行（ここでは 5 行）で、木の大きさにも、足す位置が木の左か右かにも関係しません。入れ子集合で同じ追加に 22 万回の行の書き換えが要ったのとは対照的です。
+
+## 部分木の移動：組の直積
+
+移動は 2 段階です。まず、部分木の中のノードと、部分木の**外**にいる先祖との組を消します。部分木の中どうしの組は、移動しても変わらないので残します。次に、移動先の先祖（移動先自身を含む）と、部分木のすべてのノードとの組を、直積で足します。
+
+```sql
+-- 1. 部分木の外にいる先祖とのつながりを切る
+DELETE FROM ct WHERE descendant IN (SELECT descendant FROM ct WHERE ancestor = 12)
+  AND ancestor NOT IN (SELECT descendant FROM ct WHERE ancestor = 12);
+-- 2. 移動先の先祖 × 部分木の全ノードでつなぎ直す
+INSERT INTO ct SELECT sup.ancestor, sub.descendant, sup.depth + sub.depth + 1
+  FROM ct sup CROSS JOIN ct sub WHERE sup.descendant = 11 AND sub.ancestor = 12;
+```
+
+```text
+DELETE 2222
+Time: 64.163 ms
+INSERT 0 2222
+Time: 16.683 ms
+```
+
+id 12 の部分木は 1,111 ノードで、部分木の外の先祖は 1 と 2 の 2 つなので、消える組は 2 × 1,111 = 2,222 行です。移動先 id 11 の先祖は 1 と 11 自身の 2 つなので、足す組も 2 × 1,111 = 2,222 行です。書き込みの量は「**移動先の深さ + 1**」×「**部分木の大きさ**」の掛け算で決まり、深い場所へ大きな部分木を移すほど増えます。それでも、木全体の番号を付け直す入れ子集合（111,110 行・1.4 秒）よりはずっと局所的です。
+
+移動先が自分の子孫かどうかは、`ancestor = 移すノード AND descendant = 移動先` の行があるかどうかで、1 回の索引で確かめられます。隣接リストのように循環を作ってしまう前に弾けます。
+
+## 削除と参照整合性
+
+部分木を消すには、部分木のノードを `descendant` に持つ組をすべて消し、そのあとノードの行を消します。
+
+```sql
+DELETE FROM ct WHERE descendant IN (SELECT descendant FROM ct WHERE ancestor = 12);
+```
+
+```text
+DELETE 6543
+Time: 38.638 ms
+```
+
+1,111 ノードの部分木に対して 6,543 行です。部分木の各ノードについて「深さ + 1」行ずつあるためで、id 12（深さ 2）以下では 1×3 + 10×4 + 100×5 + 1,000×6 = 6,543 になります。
+
+閉包テーブルの `ancestor` と `descendant` は、どちらもノードの表への外部キーです。経路列挙の path の文字列や、入れ子集合の番号と違って、**存在しないノードを指す組を DB が拒否します**。組の表だけが残ってノードが消える、という食い違いも起きません。ただし、「組の集合が本当に木の形をしているか」（ある組 `(A, C)` があるなら、途中の `(A, B)` と `(B, C)` もそろっているか）までは、外部キーでは守れません。組を足したり消したりする処理は、上の SQL のような決まった手順にまとめておくのが安全です。
+
+<Callout type="tip" title="親の id も併せて持つ">
+  閉包テーブルの組は、親子関係から機械的に計算できる値です。そのため、ノードの表に `parent_id`（隣接リストの列）を持たせ、閉包テーブルはそこから作る、という組み合わせがよく使われます。`parent_id` の外部キーで「親は 1 つ」「親は存在する」を守り、閉包テーブルで子孫・先祖を速く引きます。組の表が壊れても、`parent_id` から再帰で作り直せます。その代わり、書き込みのたびに 2 つの表を同じトランザクションで更新する必要があります。
+</Callout>
+
+## SQL アンチパターンとの関係
+
+Bill Karwin の『SQL Antipatterns』は、論理設計のアンチパターンの 1 つに「Naive Trees（素朴な木）」を挙げ、その解決策の節を「Use Alternative Tree Models（ほかの木のモデルを使う）」としています（[SQL Antipatterns, Volume 1](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/) の目次）。素朴な木とは、親の id だけを持ち、子孫を取るたびに結合を重ねる設計のことです。閉包テーブルは、この節で取り上げられる代替のモデルの 1 つです。
+
+ただし、隣接リストそのものが悪いわけではありません。再帰問い合わせ（`WITH RECURSIVE`）が使える今の DB では、隣接リストでも 1 文で部分木を取れます。閉包テーブルを選ぶ理由は「再帰を書きたくない」ことではなく、**深い部分木を頻繁に読み、木の変化がそれほど多くない**ときに、読み取りを索引 1 回に抑えられることです。
+
+## 長所と短所
+
+| 観点 | 閉包テーブル |
+| --- | --- |
+| 子孫を取る | `ancestor = X` の索引 1 回。4 方式で最小の読み取り |
+| 先祖を取る | `descendant = X` の索引 1 回。木のどこでも速い |
+| 親・直下の子・深さ | `depth` の列で条件 1 つ |
+| 葉の追加 | 深さ + 1 行 |
+| 部分木の移動 | （移動先の深さ + 1）×（部分木の大きさ）行を足し、ほぼ同じだけ消す |
+| 参照整合性 | 外部キーで、存在しないノードとの組を防げる |
+| 大きさ | 全ノードの（深さ + 1）の和。深い木ほど膨らむ |
+| 実装 | 表が 2 つになり、書き込みの手順が増える |
+
+向いているのは、**深さがほどほどで、読み取りが多く、ノードの追加はあっても大きな部分木の移動はまれな木**です。組織図の「この部署より下の全員」、カテゴリの「このカテゴリ以下の全商品」、権限の継承のように、子孫や先祖の集合を頻繁に問い合わせる用途に合います。一方、深さが数百段にもなる木や、書き込みが圧倒的に多い木では、行数と書き込みの量が問題になります。
+
+4 つの方式を同じ操作で並べた結果は、<a href={`${import.meta.env.BASE_URL}reading/tree-tables/`}>木を表に載せる 4 つの方式</a>にまとめてあります。

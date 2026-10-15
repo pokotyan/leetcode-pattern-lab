@@ -1,0 +1,171 @@
+---
+title: テーブル設計の型の地図
+description: 木の持ち方、列に持つか行に持つか、継承、履歴。テーブル設計には名前のついた型がいくつもあり、どれも「速くなる操作」と「DB が守ってくれる約束」を何かと引き換えにしている。このカテゴリで扱う型の一覧と、短く済む型のまとめ
+category: schema
+order: 27
+status: published
+topics:
+  - テーブル設計
+  - 中間テーブル
+  - Jaywalking
+  - 参照表
+  - ENUM
+  - 繰り返し列
+  - 楽観ロック
+  - 非正規化
+  - 集計テーブル
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 中間テーブルの主キー (post_id, tag) は「この組はもうあるか」を引く集合そのもの。重複の禁止を DB が集合の一意性として守る
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 同じデータでも、載せ方で性質が変わる
+
+テーブル設計の教科書は正規化から始まります。けれども実務で迷うのは、正規化の規則だけでは決まらない場面です。カテゴリの木をどう持つか、商品ごとに違う属性をどう持つか、カード払いと振込のように少しずつ形の違うものを 1 つの表に入れるか分けるか、住所が変わったときに古い住所を残すか。
+
+こうした場面には、繰り返し現れる解き方に名前が付いています。このカテゴリでは、それぞれの型を
+
+- どの操作が速くなり、どの操作が重くなるか
+- 外部キー・NOT NULL・一意制約といった DB の制約で、何を守れて何を守れなくなるか
+
+の 2 つの軸で比べます。どの型も、片方を得るためにもう片方を手放しています。
+
+名前の多くは、Bill Karwin『SQL Antipatterns, Volume 1』（Pragmatic Bookshelf、2022 年）の章立てと、Martin Fowler『Patterns of Enterprise Application Architecture』のパターン名から来ています。前者は論理設計の章として Jaywalking、Naive Trees、Entity-Attribute-Value、Polymorphic Associations、Multicolumn Attributes などを挙げ、物理設計の章に 31 Flavors を置いています（[Pragmatic Bookshelf: SQL Antipatterns, Volume 1](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/)）。
+
+## 詳しく扱う型
+
+| 型 | ひとことで | 回 |
+| --- | --- | --- |
+| 隣接リスト（adjacency list） | 各行が親の id を 1 つ持つ。最も素朴な木の持ち方 | <a href={`${import.meta.env.BASE_URL}reading/tree-adjacency-list/`}>隣接リスト</a> |
+| 経路列挙（path enumeration） | 根から自分までの経路を `/1/2/4/` のような文字列で持つ | <a href={`${import.meta.env.BASE_URL}reading/tree-path-enumeration/`}>経路列挙</a> |
+| 入れ子集合（nested set） | 各ノードが番号の区間 [lft, rgt] を持ち、包含で親子を表す | <a href={`${import.meta.env.BASE_URL}reading/tree-nested-set/`}>入れ子集合</a> |
+| 閉包テーブル（closure table） | すべての「先祖・子孫」の組を別の表に展開して持つ | <a href={`${import.meta.env.BASE_URL}reading/tree-closure-table/`}>閉包テーブル</a> |
+| 横持ちと縦持ち、EAV | 属性を列として持つか、(id, 属性, 値) の行として持つか | <a href={`${import.meta.env.BASE_URL}reading/wide-long/`}>縦持ちと横持ち</a> |
+| 単一テーブル継承・クラステーブル継承・具象テーブル継承 | 形の少しずつ違う種類を、1 枚の表／親子の表／種類ごとの表のどれで持つか | <a href={`${import.meta.env.BASE_URL}reading/inheritance-tables/`}>継承とポリモーフィック関連</a> |
+| ポリモーフィック関連 | 型名の列と id の列の組で、複数の表のどれかを指す | 同上 |
+| 論理削除・履歴テーブル・SCD・期間 | 変わる値や消えた行を、どこまで残すか | <a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値</a> |
+
+木の 4 方式は、まとめて比べる回<a href={`${import.meta.env.BASE_URL}reading/tree-tables/`}>木を表に載せる 4 つの方式</a>から読むと、それぞれの回の位置づけが分かります。
+
+以下では、1 回を割くほどではない型を短くまとめます。実験はすべて PostgreSQL 17.11 で行いました。
+
+## 中間テーブル（多対多）
+
+記事とタグのように、どちらの側から見ても相手が複数ある関係は、2 つの表の主キーの組だけを持つ表で表します。中間テーブル、関連テーブル、結合テーブルなどと呼ばれます。
+
+```sql
+CREATE TABLE post_tag (
+  post_id int  REFERENCES post(id),
+  tag     text REFERENCES tag(name),
+  PRIMARY KEY (post_id, tag)
+);
+```
+
+主キーが「同じ組を 2 度入れない」を、2 本の外部キーが「存在しない記事やタグを指さない」を守ります。
+
+```text
+INSERT INTO post_tag VALUES (1,'db');      -- すでにある組
+ERROR:  duplicate key value violates unique constraint "post_tag_pkey"
+DETAIL:  Key (post_id, tag)=(1, db) already exists.
+INSERT INTO post_tag VALUES (1,'dbb');     -- tag 表にない名前
+ERROR:  insert or update on table "post_tag" violates foreign key constraint "post_tag_tag_fkey"
+DETAIL:  Key (tag)=(dbb) is not present in table "tag".
+```
+
+関係そのものに属性（付けた日時、並び順、役割など）が生まれたら、この表に列を足します。中間テーブルは「関係を 1 つの実体として扱う」ための表だと考えると、列の置き場所に迷いません。
+
+## Jaywalking（1 列にカンマ区切りで並べる）
+
+中間テーブルを作らず、`tags = 'db,sql'` のように 1 つの列へ複数の値を詰める形です。Karwin の本では最初の章で扱われています。作るのは簡単ですが、DB にとってこの列は 1 つの文字列でしかありません。
+
+```text
+SELECT id, tags FROM post_jw WHERE tags LIKE '%sql%';
+ id |   tags
+----+----------
+  1 | db,sql
+  2 | nosql,db
+  3 | mysql
+```
+
+「sql」というタグを探したつもりが、`nosql` と `mysql` まで当たりました。`INSERT INTO post_jw VALUES (4, 'db,db,dbb')` のような重複や存在しないタグも、エラーなく入ります。タグ 1 つで探す、タグごとに数える、タグ名を変える、という操作のどれもが文字列処理になり、索引も効きません。上の中間テーブルに直せば、同じ問い合わせは `WHERE tag = 'sql'` で、1 件だけが返ります。
+
+<Callout type="note" title="配列型や JSON 型なら Jaywalking ではないのか">
+  PostgreSQL の配列型や JSON 型を使えば、要素の区切りを DB が理解し、GIN 索引で「この要素を含む行」を引けます。部分一致の誤りは消えます。ただし要素ごとに外部キーを張れない点は同じで、「存在しないタグ」は防げません。どこまでを DB に守らせたいかで選びます。JSON 型については<a href={`${import.meta.env.BASE_URL}reading/wide-long/`}>縦持ちと横持ち</a>でも比べます。
+</Callout>
+
+## 参照表と ENUM・CHECK（31 Flavors）
+
+注文の状態のように、取りうる値が決まっている列の守り方は 3 通りあります。
+
+| 方式 | 書き方 | 値を足す | 値を消す・名前を変える |
+| --- | --- | --- | --- |
+| CHECK 制約 | `CHECK (status IN ('draft', 'published'))` | 制約を作り直す | 制約を作り直す |
+| ENUM 型 | `CREATE TYPE status AS ENUM (...)` | `ALTER TYPE ... ADD VALUE` | 消せない（下の実験） |
+| 参照表 | `status text REFERENCES order_status(name)` | 参照表に 1 行足す | 参照表の行を更新・削除する |
+
+Karwin は、取りうる値を列の定義に埋め込む形を「31 Flavors」と呼び、物理設計のアンチパターンに数えています。値の一覧が表の定義の中に閉じ込められ、変更のたびにスキーマの変更が要るからです。
+
+PostgreSQL の ENUM 型は、値を足すことはできても、消すことはできません。
+
+```text
+CREATE TYPE status AS ENUM ('draft','published','archived');
+ALTER TYPE status ADD VALUE 'review' BEFORE 'published';
+SELECT enum_range(NULL::status);
+            enum_range
+-----------------------------------
+ {draft,review,published,archived}
+
+ALTER TYPE status DROP VALUE 'archived';
+ERROR:  dropping an enum value is not implemented
+```
+
+参照表にしておけば、値の追加・廃止はデータの更新で済み、表示名や並び順、廃止済みの印といった属性も同じ表に持てます。値が今後も増減するなら参照表、値の集合が定義上ほぼ動かない（真偽に近い 2〜3 値）なら CHECK、と使い分けるのが無難です。
+
+## 繰り返し列（tag1, tag2, tag3）
+
+複数の値を列を並べて持つ形で、Karwin の本では Multicolumn Attributes と呼ばれています。電話番号を `phone1`、`phone2`、`phone3` と持つのが典型です。
+
+- 「どれかの列がこの値」を探すには、`phone1 = ? OR phone2 = ? OR phone3 = ?` と列の数だけ条件を書く
+- 4 つ目が必要になったら列を足し、その列を読む問い合わせをすべて直す
+- 同じ値が 2 つの列に入ることを、一意制約では防げない
+
+列を並べる形は「横持ち」の一種です。行として持つ形（中間テーブルや縦持ち）との比較は<a href={`${import.meta.env.BASE_URL}reading/wide-long/`}>縦持ちと横持ち</a>で扱います。
+
+## 楽観ロックの version 列
+
+読んでから書くまでの間に、ほかの誰かが同じ行を書き換えていないかを確かめるための列です。読んだときの version を覚えておき、更新の条件に入れます。
+
+```sql
+UPDATE account SET balance = 900, version = version + 1
+WHERE id = 1 AND version = 1;   -- 読んだときの version
+```
+
+A と B がともに version = 1 の行を読み、A が先に更新した後で B が同じ文を流すと、B の更新は 0 行になります。
+
+```text
+UPDATE 1    -- A
+UPDATE 0    -- B: 読んだ後で誰かが変えた
+```
+
+アプリは「0 行だった」ことを見て、読み直してやり直すか、利用者に知らせます。行をロックして待たせる悲観ロックと違い、競合がまれな画面（管理画面の編集など）で、長い時間ロックを持たずに済みます。更新日時の列で代用することもできますが、同じ時刻に 2 回更新されると区別できないため、単調に増える整数のほうが確実です。
+
+## 集計テーブルと非正規化
+
+正規化した表から毎回集計すると重い値（日別の売上、記事ごとのコメント数など）を、別の表や列に持っておく型です。読み取りは速くなりますが、元の表と食い違わないようにする責任を、アプリかトリガか定期的な再計算のどれかが負います。
+
+- 同じトランザクションで元の表と集計を更新する。正しいが、集計の行に書き込みが集中してロックの競合が起きやすい
+- 後から非同期に再計算する。書き込みは軽いが、しばらくは古い値が見える
+- データベースのマテリアライズドビューに任せる。PostgreSQL では `REFRESH MATERIALIZED VIEW` を呼んだ時点の結果が残る
+
+どの方法でも「集計の値は、元の表から作り直せる派生データである」と決めておくと、食い違ったときにどちらを正とするかで迷いません。
+
+<Callout type="note" title="分析のための型は別の回で">
+  集計や分析のための設計には、事実の表を次元の表が囲むスタースキーマ・スノーフレークスキーマのような型があります。これらは行指向と列指向、OLTP と OLAP の違いと合わせて、別の回で扱う予定です。
+</Callout>
+
+## 読む順番
+
+木の持ち方から読む場合は、<a href={`${import.meta.env.BASE_URL}reading/tree-tables/`}>木を表に載せる 4 つの方式</a>で全体を比べてから、各方式の回に進んでください。属性の持ち方・継承・履歴の回は、それぞれ独立して読めます。

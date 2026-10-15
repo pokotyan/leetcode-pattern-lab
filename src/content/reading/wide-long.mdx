@@ -1,0 +1,213 @@
+---
+title: 縦持ちと横持ち（EAV・繰り返し列・JSON）
+description: 属性を列として持つか、行として持つか。同じ情報でも、表の形によって NULL の量、問い合わせの書きやすさ、DB が守ってくれる型と制約が変わる。設計の場面と分析の場面で意味が少し違うこの 2 語を、実測で比べる
+category: schema
+order: 33
+status: published
+topics:
+  - 縦持ち
+  - 横持ち
+  - EAV（Entity-Attribute-Value）
+  - PIVOT / UNPIVOT
+  - tidy data
+  - Multicolumn Attributes
+  - JSONB
+  - GIN
+basedOn:
+  - kind: article
+    slug: hash-counting
+    why: 縦持ちを横に戻す GROUP BY は、id をキーにした集計そのもの。縦持ちどうしの自己結合も、片方の id でハッシュ表を作り、もう片方で引く形で実行される
+---
+
+import Callout from '../../components/Callout.astro'
+import WideLong from '../../components/sim/problems/WideLong'
+
+## 2 つの「縦持ち・横持ち」
+
+「縦持ち」「横持ち」は日本の現場でよく使われる言葉ですが、2 つの少し違う場面で使われます。
+
+- **設計の場面**：ある実体（商品、顧客など）の属性を、**表の列**として持つか（横持ち）、`(id, 属性名, 値)` という**行**として持つか（縦持ち）。後者は EAV（Entity-Attribute-Value、実体・属性・値）と呼ばれる形です
+- **分析の場面**：月ごとの売上のような集計表で、月を**列**に並べるか（横長、wide）、月を 1 つの列の**値**として縦に並べるか（縦長、long）。両者を行き来する操作を PIVOT（縦 → 横）、UNPIVOT（横 → 縦）と呼びます
+
+どちらも「同じ情報を、列の名前に埋め込むか、値として持つか」という同じ選択です。違うのは、何を基準に選ぶかです。設計の場面では **DB に何を守らせたいか**、分析の場面では **どの集計を楽に書きたいか** が基準になります。
+
+## 設計の場面：属性を列に持つか、行に持つか
+
+ネットショップの商品を考えます。T シャツには色とサイズがあり、マグカップには色と容量があり、リュックには色・サイズ・重さ・容量があります。商品の種類によって、持つ属性が違います。
+
+```sql
+-- 横持ち：属性ごとに列を用意する。持たない属性は NULL
+CREATE TABLE product (
+  id int PRIMARY KEY, name text NOT NULL,
+  色 text, サイズ text, 重さ int, 容量 int
+);
+
+-- 縦持ち（EAV）：属性名も値として持つ。表の形はどの商品でも同じ
+CREATE TABLE product_attr (
+  id int, attr text, value text,
+  PRIMARY KEY (id, attr)
+);
+```
+
+横持ちでは属性が増えるたびに列が増え、どの商品も持たない属性の分だけ NULL が並びます。縦持ちでは属性がいくら増えても表の形は変わりませんが、1 つの商品の情報が何行にも分かれ、値はどの属性のものも入る `text` の列に押し込まれます。
+
+下のシミュレーターで、同じ 4 商品を 2 つの形で持ち、組み替えや検索をしてみてください。
+
+<WideLong client:visible />
+
+### 実験：10 万商品・属性 30 種で比べる
+
+PostgreSQL 17.11 で、10 万商品に 30 種類の属性を用意し、各商品にそのうち 5 つを無作為に持たせました（色 `a01` とサイズ `a02` は全商品に持たせる）。同じデータを 3 つの形で入れています。
+
+- `p_wide`：横持ち。30 列。数値の属性は `int` 列
+- `p_eav`：縦持ち。`(product_id, attr, val text)`、主キー `(product_id, attr)`、索引 `(attr, val)`
+- `p_json`：1 商品 1 行で、属性を `jsonb` の 1 列にまとめる。`jsonb_path_ops` の GIN 索引
+
+```text
+  t   | count  |  heap   |  total
+------+--------+---------+---------
+ wide | 100000 | 6760 kB | 9672 kB
+ json | 100000 | 15 MB   | 21 MB
+ eav  | 666400 | 28 MB   | 54 MB
+
+ avg_nulls_per_row
+              23.3
+```
+
+横持ちは 1 行あたり平均 23.3 列が NULL ですが、それでもいちばん小さくなりました。PostgreSQL は NULL の列について値を書かず、行の先頭のビット列（null bitmap）で「この列は NULL」と示すだけなので、使わない列が並んでいても大きな負担になりません（[PostgreSQL: Database Page Layout](https://www.postgresql.org/docs/17/storage-page.html)）。縦持ちは行数が 6.7 倍になり、行ごとの見出し（タプルヘッダ）と、属性名を毎行書くぶんが効いて、索引込みで約 5.6 倍になりました。
+
+次に「色が red かつ サイズが L」の商品を数えました。
+
+```text
+--- wide
+ Aggregate (actual rows=1 loops=1)
+   ->  Index Only Scan using p_wide_a01_a02_idx on p_wide (actual rows=5687 loops=1)
+         Index Cond: ((a01 = 'red'::text) AND (a02 = 'L'::text))
+ Execution Time: 0.453 ms
+--- eav（自己結合）
+ Aggregate (actual rows=1 loops=1)
+   ->  Hash Join (actual rows=5687 loops=1)
+         Hash Cond: (s.product_id = c.product_id)
+         ->  Bitmap Heap Scan on p_eav s (actual rows=33388 loops=1)
+               Recheck Cond: ((attr = 'a02'::text) AND (val = 'L'::text))
+         ->  Hash (actual rows=16861 loops=1)
+               ->  Bitmap Heap Scan on p_eav c (actual rows=16861 loops=1)
+                     Recheck Cond: ((attr = 'a01'::text) AND (val = 'red'::text))
+ Execution Time: 36.698 ms
+--- json
+ Aggregate (actual rows=1 loops=1)
+   ->  Bitmap Heap Scan on p_json (actual rows=5687 loops=1)
+         Recheck Cond: (attrs @> '{"a01": "red", "a02": "L"}'::jsonb)
+         ->  Bitmap Index Scan on p_json_attrs_idx (actual rows=5687 loops=1)
+ Execution Time: 12.949 ms
+```
+
+3 つとも答えは 5,687 件で一致します。横持ちは 2 列の複合索引だけで答えが出ました（Index Only Scan）。縦持ちでは「色 = red」と「サイズ = L」が別の行にあるため、1 行に対する `WHERE` では両方を同時に満たせません。条件ごとに表を読み、`product_id` で突き合わせる自己結合になります。red の 16,861 行でハッシュ表を作り、L の 33,388 行で引いて、ようやく 5,687 件に絞られます。**条件が 1 つ増えるたびに、結合も 1 つ増えます。**
+
+### 型と制約を失う
+
+縦持ちの代償は速さだけではありません。値の列は、どの属性の値も入るように `text` にするしかなく、属性ごとの型を DB が知りません。整数の属性 `a05` について「50 より大きい」を数えると、こうなります。
+
+```text
+ text_compare | int_compare
+--------------+-------------
+         8944 |        8389
+```
+
+`val > '50'` は文字列の比較なので、先頭の文字から順に比べます。`'6'` から `'9'` までの 1 桁の値は `'50'` より大きいと判定されて余分に数えられ、`'100'` は先頭の `'1'` が `'5'` より小さいので外れます。正しく数えるには `val::int > 50` と書く必要があり、その属性の値がすべて整数として読めることは、DB ではなくアプリが保証することになります。同じように、「サイズは S・M・L・XL のどれか」「重さは必須」「メーカーは maker 表に存在する」といった制約も、列であれば `CHECK`・`NOT NULL`・外部キーで書けますが、縦持ちでは属性ごとに付けられません。
+
+Bill Karwin の『SQL Antipatterns』は、この形を Entity-Attribute-Value という名前のアンチパターンとして 1 章を割き、解決策として「Model the Subtypes（下位の種類ごとに表を設計する）」を挙げています（[Pragmatic Bookshelf: SQL Antipatterns, Volume 1](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/)）。商品の種類ごとに持つ属性が違うなら、それは「種類による違い」として設計する、という考え方で、その具体的な方法は次回の<a href={`${import.meta.env.BASE_URL}reading/inheritance-tables/`}>継承とポリモーフィック関連</a>で扱います。
+
+### それでも縦持ちが選ばれる理由：属性を足すコスト
+
+縦持ちが選ばれる最大の理由は、**属性を足すのに表の形（スキーマ）を変えなくてよい**ことです。管理画面から利用者が自由に項目を増やせる、という要件では、項目を足すたびに `ALTER TABLE` を流すわけにはいきません。
+
+ただ、横持ちで列を足すこと自体は、多くの場合それほど重くありません。10 万行の `p_wide` に列を 1 本足した時間を測りました。
+
+```text
+ALTER TABLE p_wide ADD COLUMN a31 int;                                -- 1.572 ms
+ALTER TABLE p_wide ADD COLUMN a31 int NOT NULL DEFAULT 0;             -- 0.999 ms
+ALTER TABLE p_wide ADD COLUMN a31 int DEFAULT (random()*10)::int;    -- 512.657 ms
+```
+
+PostgreSQL の文書は、揮発性でない既定値（定数など）で列を足す場合、その値は文の実行時に一度だけ評価されて表のメタデータに保存され、「いずれの場合も表の書き直しは不要」と述べています。一方、`random()` のような揮発性の既定値を付けると「表全体とその索引の書き直しが必要」になります（[PostgreSQL: ALTER TABLE](https://www.postgresql.org/docs/17/sql-altertable.html)）。512 ms はこの書き直しの時間で、行数に比例して伸びます。重いのは列を足すことそのものより、**列を足すたびに必要になる手続き**（マイグレーションの作成、レビュー、デプロイ、アプリの改修）のほうだ、というのが実態に近いでしょう。
+
+<Callout type="warn" title="列追加が軽いのは、ロックが取れた後の話">
+  `ALTER TABLE` は、特に断りのない限り表に最も強いロック（ACCESS EXCLUSIVE）を取ります（[PostgreSQL: ALTER TABLE](https://www.postgresql.org/docs/17/sql-altertable.html)）。`ADD COLUMN` も、短い時間とはいえこのロックを取ります。長く走っているトランザクションがあるとロック待ちになり、その後ろに並んだ通常の SELECT や UPDATE まで止まります。本番では `lock_timeout` を短く設定して、取れなければ再試行する、という手順を組むのが普通です。
+</Callout>
+
+### 第 3 の選択肢：JSON の列
+
+属性の自由さと 1 商品 1 行を両立させる方法として、属性を `jsonb` の列にまとめる形があります。実験の `p_json` は、縦持ちの半分以下の大きさで、2 条件の検索も GIN 索引の 1 回の走査（`@>` 演算子による包含の判定）で済みました。JSON の値は数と文字列を区別して持つので、`text` 比較の誤りも起きにくくなります。
+
+ただし、制約を付けにくい点は縦持ちと同じです。「色は必須」「重さは正の整数」を守らせるには、`CHECK (attrs ? 'a01')` や `CHECK ((attrs->>'a05')::int > 0)` のような式を自分で書くことになり、外部キーは張れません。**よく使い、制約を付けたい属性は列に、それ以外を JSON に**、という併用が現実的です。
+
+## 繰り返し列：もう 1 つの横持ち
+
+横持ちには、属性が増えるのとは別の形もあります。電話番号を 3 つまで持てるように `phone1, phone2, phone3` と列を並べる形です。Karwin は同じ本でこれを「Multicolumn Attributes」というアンチパターンとして挙げています（[同上](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/)）。
+
+```sql
+CREATE TABLE contact (id int PRIMARY KEY, phone1 text, phone2 text, phone3 text);
+
+-- 「この番号を持つ人」を探すのに、列の数だけ OR が要る
+SELECT id FROM contact WHERE phone1 = $1 OR phone2 = $1 OR phone3 = $1;
+```
+
+4 つ目の番号を持ちたくなれば列を足し、検索の `OR` も全部の問い合わせで足すことになります。同じ番号を 2 つの列に入れることも防げません。値の並びは、別の表の行にするのが基本です。
+
+```sql
+CREATE TABLE contact_phone (contact_id int REFERENCES contact(id), phone text, PRIMARY KEY (contact_id, phone));
+```
+
+これは「縦持ちにする」とも言えますが、EAV とは違います。`contact_phone` の `phone` 列は電話番号だけを持つ型の決まった列で、制約も索引も普通に付けられます。**同じ種類の値の繰り返しは行に、種類の違う値は列に**、と分けて考えると整理できます。
+
+## 分析の場面：月を列に並べるか、値にするか
+
+分析で使う表の形の話に移ります。店舗ごとの月別売上を、月を 1 つの列の値として持つ縦長の表 `sales_long(store, month, amount)` で持っているとします。人が眺める集計表は、月を列に並べた横長のほうが読みやすいので、PIVOT します。PostgreSQL には `PIVOT` 構文がないので、`FILTER` 付きの集約で書きます。
+
+```sql
+SELECT store,
+  sum(amount) FILTER (WHERE month = '2025-01-01') AS m01,
+  sum(amount) FILTER (WHERE month = '2025-02-01') AS m02,
+  sum(amount) FILTER (WHERE month = '2025-03-01') AS m03
+FROM sales_long GROUP BY store ORDER BY store;
+```
+
+```text
+ store | m01 | m02 | m03
+-------+-----+-----+-----
+ 梅田  |  80 | 110 |  95
+ 渋谷  | 120 |  90 | 150
+```
+
+逆向きの UNPIVOT は、各行を `LATERAL (VALUES ...)` で展開します。
+
+```sql
+SELECT w.store, v.month, v.amount
+FROM sales_wide w
+CROSS JOIN LATERAL (VALUES ('2025-01', m01), ('2025-02', m02), ('2025-03', m03)) AS v(month, amount);
+```
+
+どちらの SQL にも、**月の名前が列名として書き込まれている**ことに注意してください。4 月が来れば SQL を書き換えます。縦長の表のままなら、「3 か月の平均がいちばん高い店」は月の数に関係なく同じ 1 行で書けます。
+
+```sql
+SELECT store, avg(amount)::int FROM sales_long GROUP BY store ORDER BY 2 DESC;
+```
+
+Hadley Wickham は、分析しやすい表の形を「tidy data（整然データ）」と呼び、その条件を「each variable is a column, each observation is a row, and each type of observational unit is a table（各変数が 1 列、各観測が 1 行、観測の単位の種類ごとに 1 つの表）」とまとめました（[Wickham, Tidy Data, Journal of Statistical Software 59(10), 2014](https://www.jstatsoft.org/article/view/v059i10)）。月別売上の例では「月」と「売上」がそれぞれ 1 つの変数なので、縦長の `sales_long` が tidy な形で、横長の表は「月という変数の値が列名に散らばった」形です。集計・絞り込み・グラフ化の道具の多くは tidy な形を前提にしているので、**保存と計算は縦長で、人に見せる最後の段階で横長に**、というのが分析の場面での定石です。
+
+<Callout type="tip" title="2 つの場面で、推奨が逆に見える理由">
+  設計の場面では「EAV（縦持ち）は避けて列にせよ」、分析の場面では「縦長（long）にせよ」と、逆のことを言っているように見えます。実際には同じ原則です。**変数（性質の違う量）は列に、観測（同じ性質の量の繰り返し）は行に**。商品の色とサイズは別々の変数なので列に、1 月と 2 月の売上は同じ「売上」という変数の別の観測なので行に置きます。EAV が問題になるのは、別々の変数を 1 つの `value` 列に押し込むからで、月別売上の縦長の表とは事情が違います。
+</Callout>
+
+## まとめ
+
+| 形 | 向いている場面 | 失うもの |
+| --- | --- | --- |
+| 横持ち（属性を列に） | 属性が事前に決まっている。属性ごとに型・必須・外部キーを守らせたい。複数の属性で絞り込む | 属性を足すたびにスキーマ変更。種類ごとに使わない列が NULL で並ぶ |
+| 縦持ち（EAV） | 利用者が項目を自由に増やす。属性の種類が多く、どれも疎 | 型と制約。複数条件の検索は自己結合が増える。表が大きくなる |
+| JSON の列 | 属性は自由だが、1 実体を 1 行で扱いたい | 外部キーと、制約の書きやすさ |
+| 繰り返し列（phone1..3） | ほぼない。別の表の行にする | 検索の単純さ、個数の上限の柔軟さ |
+| 分析の縦長（long） | 集計・絞り込み・グラフの入力。期間が伸びる | 人がそのまま眺めたときの読みやすさ |
+
+次回の<a href={`${import.meta.env.BASE_URL}reading/inheritance-tables/`}>継承とポリモーフィック関連</a>では、EAV の代わりとして挙げた「種類ごとに表を設計する」方法を、3 つの名前のついた型として比べます。

@@ -1,0 +1,215 @@
+---
+title: 隣接リスト（親の id を持つ）
+description: 各行が親の id を 1 つ持つだけの、最も素朴な木の持ち方。書き込みは常に 1 行で、外部キーが親子を守る。代わりに部分木は 1 段ずつ再帰で下りるしかない。WITH RECURSIVE の動き方と、循環という固有の壊れ方を確かめる
+category: schema
+order: 29
+status: published
+topics:
+  - 隣接リスト
+  - WITH RECURSIVE
+  - 再帰 CTE
+  - CYCLE 句
+  - SEARCH 句
+  - cte_max_recursion_depth
+  - 循環参照
+basedOn:
+  - kind: article
+    slug: graph-bfs-dfs
+    why: WITH RECURSIVE は「作業表＝いまの段のノード」を広げていく幅優先探索。循環の検出は訪問済みの集合を持つことと同じ
+  - kind: article
+    slug: tree-traversal
+    why: SEARCH DEPTH FIRST は、根からの経路を並び順のキーにして行きがけ順を作る
+---
+
+import Callout from '../../components/Callout.astro'
+import AdjacencyList from '../../components/sim/problems/AdjacencyList'
+
+## 親だけを覚える
+
+<a href={`${import.meta.env.BASE_URL}reading/tree-tables/`}>木を表に載せる 4 つの方式</a>の 1 つ目は、各行に親の id を持たせる方式です。隣接リスト（adjacency list）と呼ばれます。グラフの隣接リストを「各ノードから親への辺 1 本」に絞ったものだと考えると、名前の由来が分かります。
+
+```sql
+CREATE TABLE category (
+  id        int PRIMARY KEY,
+  parent_id int REFERENCES category(id),   -- 根は NULL
+  name      text NOT NULL
+);
+CREATE INDEX ON category (parent_id);
+```
+
+表から分かるのは「ある行の親は誰か」と、`parent_id` の索引を引けば「ある行の子は誰か」だけです。孫より下は、子をたどり、さらにその子をたどる、と段を重ねて初めて分かります。Karwin の『SQL Antipatterns』がこの形を Naive Trees（素朴な木）の章で「Always Depend on One's Parent」と呼んでいるのは、何を知るにも親をたどるしかないという性質を指しています（[Pragmatic Bookshelf: SQL Antipatterns, Volume 1](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/)）。
+
+ただし現在は、標準 SQL の再帰共通表式（WITH RECURSIVE）を主要な DB が実行でき、段を重ねる処理を 1 文で書けます。MySQL も 8.0 で対応しました（[MySQL 8.0: WITH (Common Table Expressions)](https://dev.mysql.com/doc/refman/8.0/en/with.html)）。いまの隣接リストは「素朴だから避ける形」ではなく、最初に検討する標準の形です。
+
+## 1 手ずつ見る
+
+操作と対象を選ぶと、SQL のどの行で表のどの行が読まれ書き換えられるかを 1 手ずつ追えます。「部分木を移動」で移動先に自分の子孫を選ぶと、この方式に固有の壊れ方である循環ができる様子を見られます。
+
+<AdjacencyList client:visible />
+
+## WITH RECURSIVE はどう動くか
+
+子孫を取る問い合わせは次の形です。
+
+```sql
+WITH RECURSIVE sub AS (
+  SELECT id FROM category WHERE id = 2          -- 非再帰項: 起点
+  UNION ALL
+  SELECT c.id FROM category c
+  JOIN sub ON c.parent_id = sub.id              -- 再帰項: 1 段下へ
+)
+SELECT * FROM sub;
+```
+
+名前は「再帰」ですが、実際の評価は反復です。PostgreSQL の文書は、まず非再帰項を評価して結果を作業表（working table）に入れ、その後「作業表が空でない限り次の手順を繰り返す」と説明しています。繰り返しの中身は「再帰項を、自己参照の部分に作業表の現在の内容を代入して評価する」ことで、その結果が次の作業表になります（[PostgreSQL: WITH Queries](https://www.postgresql.org/docs/17/queries-with.html)）。
+
+つまり作業表は「いまの段のノードの集合」で、1 回の反復で 1 段下りる幅優先探索です。起点の下に 4 段あれば、再帰項は 5 回評価され、5 回目の結果が空になったところで止まります。
+
+### 11 万ノードでの実行計画
+
+各ノードが 10 個の子を持つ深さ 5 の木（111,111 ノード）で、ノード 2 の子孫を取りました（PostgreSQL 17.11）。
+
+```text
+ Aggregate (actual rows=1 loops=1)
+     ->  Recursive Union (actual rows=11111 loops=1)
+           ->  Index Only Scan using adj_pkey on adj (actual rows=1 loops=1)
+                 Index Cond: (id = 2)
+           ->  Nested Loop (actual rows=2222 loops=5)
+                 ->  WorkTable Scan on sub sub_1 (actual rows=2222 loops=5)
+                 ->  Index Scan using adj_parent on adj a (actual rows=1 loops=11111)
+                       Index Cond: (parent_id = sub_1.id)
+   ->  CTE Scan on sub (actual rows=11111 loops=1)
+ Execution Time: 8.879 ms
+```
+
+読み方は次のとおりです。
+
+- `WorkTable Scan ... loops=5`: 作業表を 5 回読んだ。ノード 2 の下にある 4 段に、空を確かめる 1 回を足した反復
+- `Index Scan using adj_parent ... loops=11111`: 作業表の各行について、`parent_id` の索引を 1 回ずつ引いた。合計 11,111 回
+- `actual rows=2222`: 1 回の反復あたりの平均（11,110 ÷ 5）。段ごとに 10 → 100 → 1,000 → 10,000 と増え、5 回目は 0 行
+
+同じ問い合わせの 2 回目の実行は 6.923 ms、バッファ 182 でした。経路列挙・入れ子集合・閉包テーブルが同じ 11,111 行を索引の範囲 1 回で 1 ms 前後で返すのと比べると、ノードごとに索引を引き直すぶん数倍遅くなります。それでも 1 万行で 10 ms を切るので、たまにしか子孫を取らない用途なら十分な速さです。
+
+先祖（深さ 5 の葉 11112 から根まで 6 行）は、親の id を主キーで 6 回引くだけなので、0.037 ms でした。
+
+<Callout type="warn" title="アプリ側で 1 段ずつ問い合わせると往復が増える">
+  WITH RECURSIVE を使わずに「子を取る SELECT」をアプリのループで繰り返すと、段の数ではなくノードの数だけ問い合わせを投げる書き方になりがちです（いわゆる N+1）。1 ノードずつではなく「この段のすべての id」を IN でまとめて渡せば段数ぶんの往復で済みますが、DB が使えるなら再帰 CTE に任せるのが簡潔です。
+</Callout>
+
+### 並び順を付ける: SEARCH 句
+
+再帰 CTE の結果には決まった順番がありません。木として表示するには、行きがけ順（親の直後にその子孫が並ぶ順）か、段ごとの順に並べ替える必要があります。PostgreSQL 14 以降は `SEARCH` 句でこれを指定でき、「深さ優先か幅優先か、並べ替えに使う列、並べ替え用の値を入れる列の名前」を書きます（[PostgreSQL: WITH Queries](https://www.postgresql.org/docs/17/queries-with.html)）。
+
+```sql
+WITH RECURSIVE sub AS (
+  SELECT id, 0 AS d FROM adj WHERE id = 12
+  UNION ALL
+  SELECT a.id, d + 1 FROM adj a JOIN sub ON a.parent_id = sub.id WHERE d < 2
+) SEARCH DEPTH FIRST BY id SET ord
+SELECT id, d, ord FROM sub ORDER BY ord LIMIT 8;
+```
+
+```text
+  id  | d |         ord
+------+---+---------------------
+   12 | 0 | {(12)}
+  112 | 1 | {(12),(112)}
+ 1112 | 2 | {(12),(112),(1112)}
+ 1113 | 2 | {(12),(112),(1113)}
+ ...
+```
+
+深さ優先の並べ替え用の値 `ord` は、根から自分までの id の配列です。これは次の回の<a href={`${import.meta.env.BASE_URL}reading/tree-path-enumeration/`}>経路列挙</a>が各行に保存している経路そのものです。隣接リストは問い合わせのたびに経路を作り、経路列挙は作った経路を保存しておく、という関係になっています。`SEARCH BREADTH FIRST` にすると、12 → 112, 113, …, 121 → 1112, … と段ごとに並びます。
+
+## 隣接リストに固有の壊れ方: 循環
+
+隣接リストの書き込みは常に 1 行です。部分木の移動も、根の行の `parent_id` を書き換えるだけで、子孫は「親が誰か」しか持っていないのでそのままついてきます。
+
+ところが、この手軽さが穴にもなります。移動先として自分の子孫を指定しても、DB はそれを止めません。外部キーが確かめるのは「parent_id の値が表のどこかに存在するか」だけで、たどった先が自分に戻ってくるかまでは見ないからです。
+
+ノード 12 の親を、12 の子であるノード 112 にしてみます。
+
+```text
+UPDATE adj SET parent_id = 112 WHERE id = 12;
+UPDATE 1
+```
+
+12 → 112 → 12 → … という輪ができ、この部分木（1,111 ノード）は根からたどれなくなりました。この状態で子孫を取る再帰 CTE を流すと、作業表が空にならないので止まりません。段数の上限を 20 にして打ち切ると、次のようになります。
+
+```text
+WITH RECURSIVE sub AS (
+  SELECT id, 0 AS d FROM adj WHERE id = 12
+  UNION ALL SELECT a.id, d + 1 FROM adj a JOIN sub ON a.parent_id = sub.id WHERE d < 20
+) SELECT max(d) AS reached_depth, count(*) AS rows FROM sub;
+ reached_depth | rows
+---------------+-------
+            20 | 10111
+```
+
+木なら深さ 3 で尽きるはずの部分木が、20 段目まで行を出し続けています。
+
+### 循環を検出する: CYCLE 句
+
+PostgreSQL 14 以降の `CYCLE` 句は、文書の言葉では「循環の検出のために追う列のリスト、循環を検出したかを示す列の名前、経路を記録する列の名前」を指定するものです。標準的なやり方は「すでに訪れた値の配列を計算すること」だとも説明されています（[PostgreSQL: WITH Queries](https://www.postgresql.org/docs/17/queries-with.html)）。
+
+```text
+WITH RECURSIVE up AS (
+  SELECT id, parent_id FROM adj WHERE id = 1112
+  UNION ALL SELECT a.id, a.parent_id FROM adj a JOIN up ON a.id = up.parent_id
+) CYCLE id SET is_cycle USING path
+SELECT id, is_cycle, path FROM up;
+  id  | is_cycle |           path
+------+----------+---------------------------
+ 1112 | f        | {(1112)}
+  112 | f        | {(1112),(112)}
+   12 | f        | {(1112),(112),(12)}
+  112 | t        | {(1112),(112),(12),(112)}
+```
+
+1112 から親をたどると、112 → 12 → 112 と、一度通った 112 にもう一度着いたところで `is_cycle` が真になり、そこで止まります。
+
+MySQL には CYCLE 句がない代わりに、再帰の段数の上限 `cte_max_recursion_depth` があり、既定値は 1000 で、それを超えると CTE の実行が打ち切られます（[MySQL 8.0: WITH (Common Table Expressions)](https://dev.mysql.com/doc/refman/8.0/en/with.html)）。止まりはしますが、循環を正しく検出しているのではなく、深い木と循環の区別も付きません。
+
+<Callout type="warn" title="循環は書き込みの側で防ぐ">
+  CYCLE 句は「循環があっても止まる」ための仕組みで、循環そのものは残ります。移動のときに「移動先の先祖に自分が含まれていないか」を同じトランザクションの中で確かめるか、トリガで検査します。先祖の取得は隣接リストでも安いので、この確認は軽く済みます。
+</Callout>
+
+## 外部キーが守ってくれるもの
+
+循環は防げませんが、隣接リストは 4 つの方式の中で、親子の関係そのものを外部キーで守れる数少ない方式です。子が残っている親だけを消そうとすると、DB が拒否します。
+
+```text
+DELETE FROM adj WHERE id = 12;
+ERROR:  update or delete on table "adj" violates foreign key constraint "adj_parent_id_fkey" on table "adj"
+DETAIL:  Key (id)=(12) is still referenced from table "adj".
+```
+
+経路列挙では、同じ削除が通ってしまい、子孫 1,110 行が存在しない親を経路に含んだまま残りました（<a href={`${import.meta.env.BASE_URL}reading/tree-path-enumeration/`}>経路列挙</a>の回）。部分木ごと消したいなら、外部キーに `ON DELETE CASCADE` を付けるか、再帰 CTE で集めた id をまとめて消します。
+
+## 並行して書いても待たない
+
+書き込みが 1 行で済むことは、並行性にも効きます。2 つのトランザクションが、木の離れた場所にそれぞれ葉を 1 つ足す実験をしました。A は未コミットのまま 3 秒保持し、その間に B がロック待ちの上限 1 秒で挿入します。
+
+```text
+--- 隣接リスト
+A: INSERT INTO adj VALUES (200000, 112, 'a');   -- コミットせず保持
+B: INSERT INTO adj VALUES (200001, 11111, 'b');
+Time: 0.785 ms                                   -- B は待たずに終わる
+```
+
+同じことを入れ子集合で行うと、どちらの挿入も根の行の番号を書き換えるため、B は A の終わりを待ち、1 秒で打ち切られました（<a href={`${import.meta.env.BASE_URL}reading/tree-nested-set/`}>入れ子集合</a>の回）。
+
+## 向いている場面と、向かない場面
+
+| 長所 | 短所 |
+| --- | --- |
+| 追加・移動・削除が 1 行で済み、並行して書いても互いに待たない | 子孫の取得は深さの段数だけ反復する。ほかの方式より数倍遅い |
+| 親子の関係を外部キーで守れる。子が残る親は消せない | 循環を作れてしまい、再帰が止まらなくなる |
+| 表が最も小さい（11 万ノードで 9 MB） | 「部分木のノード数」「深さ」を求めるのにも再帰が要る |
+| ほかの方式（経路、閉包テーブル）を作り直す元にできる | 木の表示順は SEARCH 句などで問い合わせのたびに作る |
+
+**向いている**のは、木がよく変わる場面（組織変更の多い組織図、利用者が自由に並べ替えるフォルダ）、木が浅い場面、子孫の取得が頻繁ではない場面です。コメントのスレッドのように、表示のときに 1 つのスレッドを丸ごと読むだけなら、スレッドの id を別の列に持って一括で読み、木はアプリ側で組み立てる方法もあります。
+
+**向かない**のは、深い木で「この下のすべて」を頻繁に集計する場面（カテゴリ配下の全商品の売上を、画面を開くたびに数えるなど）です。その場合は、隣接リストを正としたまま、検索用に経路や閉包テーブルを併せて持つ方法を検討します。
+
+次の回は、隣接リストが問い合わせのたびに作っていた経路を、最初から各行に保存しておく<a href={`${import.meta.env.BASE_URL}reading/tree-path-enumeration/`}>経路列挙</a>です。

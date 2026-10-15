@@ -1,0 +1,246 @@
+---
+title: 継承とポリモーフィック関連（STI・CTI・具象テーブル継承）
+description: 「支払いにはカード・振込・コンビニの 3 種類がある」「コメントは課題にもプルリクエストにも付く」。種類によって中身が違うものを表に載せる 3 つの型と、複数の表を指す参照の作り方を、DB が何を守ってくれるかで比べる
+category: schema
+order: 34
+status: published
+topics:
+  - 単一テーブル継承（STI）
+  - クラステーブル継承（CTI）
+  - 具象テーブル継承
+  - ポリモーフィック関連
+  - 排他的アーク
+  - スーパータイプ / サブタイプ
+  - CHECK 制約
+  - 複合外部キー
+---
+
+import Callout from '../../components/Callout.astro'
+import InheritanceTables from '../../components/sim/problems/InheritanceTables'
+import PolymorphicAssoc from '../../components/sim/problems/PolymorphicAssoc'
+
+## 種類によって中身が違うもの
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/wide-long/`}>縦持ちと横持ち</a>では、商品の種類によって持つ属性が違う場合に、EAV（属性を行として持つ形）を選ぶと型と制約を失うことを見ました。Bill Karwin は EAV の解決策として「Model the Subtypes（下位の種類ごとに表を設計する）」を挙げています（[SQL Antipatterns, Volume 1](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/)）。
+
+アプリのコードでは、こうした「共通の性質を持ちつつ、種類ごとに違う中身を持つもの」を継承で表すことがよくあります。
+
+```text
+Payment（id, amount）
+ ├── CardPayment（last4）
+ ├── BankPayment（bank_code）
+ └── KonbiniPayment（konbini_code）
+```
+
+これを表に載せる方法には、Martin Fowler が『Patterns of Enterprise Application Architecture』（PoEAA）で名前を付けた 3 つの型があります。
+
+| 型 | Fowler の定義 |
+| --- | --- |
+| 単一テーブル継承（Single Table Inheritance、STI） | 「Represents an inheritance hierarchy of classes as a single table that has columns for all the fields of the various classes.」（[出典](https://martinfowler.com/eaaCatalog/singleTableInheritance.html)） |
+| クラステーブル継承（Class Table Inheritance、CTI） | 「Represents an inheritance hierarchy of classes with one table for each class.」（[出典](https://martinfowler.com/eaaCatalog/classTableInheritance.html)） |
+| 具象テーブル継承（Concrete Table Inheritance） | 「Represents an inheritance hierarchy of classes with one table per concrete class in the hierarchy.」（[出典](https://martinfowler.com/eaaCatalog/concreteTableInheritance.html)） |
+
+言い換えると、STI は**全種類を 1 枚の表に**、CTI は**共通部分の親の表と、種類ごとの子の表に**、具象テーブル継承は**種類ごとに独立した表に**載せます。
+
+```sql
+-- STI：全種類の列を 1 枚に並べ、kind で種類を区別する
+CREATE TABLE payment (id int PRIMARY KEY, kind text NOT NULL, amount int NOT NULL,
+                      card_last4 text, bank_code text, konbini_code text);
+
+-- CTI：共通の列は親に、種類ごとの列は子に。子の主キーは親の主キーを指す
+CREATE TABLE payment      (id int PRIMARY KEY, kind text NOT NULL, amount int NOT NULL);
+CREATE TABLE payment_card (id int PRIMARY KEY REFERENCES payment(id), last4 text NOT NULL);
+
+-- 具象：種類ごとに共通の列も含めて全部持つ。親の表はない
+CREATE TABLE payment_card (id int PRIMARY KEY, amount int NOT NULL, last4 text NOT NULL);
+CREATE TABLE payment_bank (id int PRIMARY KEY, amount int NOT NULL, bank_code text NOT NULL);
+```
+
+Ruby on Rails の ActiveRecord は STI を標準で備えていて、`type` 列にモデル名を入れて種類を区別します。Rails Guides は「the `type` field is crucial for STI as it stores the model name」と説明しています（[Rails Guides: Active Record Associations](https://guides.rubyonrails.org/association_basics.html)）。
+
+下のシミュレーターで、方式と操作を切り替えて比べてみてください。
+
+<InheritanceTables client:visible />
+
+## 実験：何を DB に守らせられるか
+
+3 つの型の違いがいちばんはっきり出るのは、**種類ごとに必須の列を、DB に守らせられるかどうか**です。PostgreSQL 17.11 で確かめました。
+
+### STI：列の NOT NULL が使えないので、CHECK で書く
+
+STI の `card_last4` は、カード払いの行では必須ですが、振込の行では NULL でなければなりません。列単位の `NOT NULL` では表せないので、種類と列の対応を `CHECK` 制約で書きます。
+
+```sql
+CREATE TABLE sti (
+  id int PRIMARY KEY, kind text NOT NULL CHECK (kind IN ('card','bank','konbini')), amount int NOT NULL,
+  card_last4 text, bank_code text, konbini_code text,
+  CHECK ((kind = 'card') = (card_last4 IS NOT NULL)),
+  CHECK ((kind = 'bank') = (bank_code IS NOT NULL)),
+  CHECK ((kind = 'konbini') = (konbini_code IS NOT NULL))
+);
+INSERT INTO sti VALUES (4,'card',500,NULL,NULL,NULL);     -- last4 のないカード払い
+INSERT INTO sti VALUES (5,'card',500,'1111','0001',NULL); -- 振込の列まで埋めたカード払い
+```
+
+```text
+ERROR:  new row for relation "sti" violates check constraint "sti_check"
+DETAIL:  Failing row contains (4, card, 500, null, null, null).
+ERROR:  new row for relation "sti" violates check constraint "sti_check1"
+DETAIL:  Failing row contains (5, card, 500, 1111, 0001, null).
+```
+
+`(kind = 'card') = (card_last4 IS NOT NULL)` は「カード払いなら last4 があり、カード払いでなければ last4 がない」を 1 行で書いたものです。守らせることはできますが、**種類が増えるたびに列と CHECK を足し、既存の CHECK も見直す**必要があります。この CHECK を書かずに運用している STI の表は珍しくありません。
+
+### CTI：子の側では普通の制約が使えるが、「子のない親」は防げない
+
+CTI では、種類ごとの列は子の表にあるので、普通に `NOT NULL` を付けられます。さらに、親の `(id, kind)` に一意制約を付け、子から `(id, kind)` の複合外部キーで参照し、子の `kind` を CHECK で固定すると、**「振込の親に、カードの子が付く」という食い違い**も DB が拒否します。
+
+```sql
+CREATE TABLE cti_payment (id int PRIMARY KEY, kind text NOT NULL, amount int NOT NULL, UNIQUE (id, kind));
+CREATE TABLE cti_card (id int PRIMARY KEY, kind text NOT NULL DEFAULT 'card' CHECK (kind = 'card'),
+  last4 text NOT NULL, FOREIGN KEY (id, kind) REFERENCES cti_payment(id, kind));
+INSERT INTO cti_payment VALUES (1,'card',1000),(2,'bank',2000);
+INSERT INTO cti_card (id, last4) VALUES (2,'9999');   -- 親 2 は bank
+INSERT INTO cti_payment VALUES (3,'card',500);         -- 子を付けない親
+```
+
+```text
+ERROR:  insert or update on table "cti_card" violates foreign key constraint "cti_card_id_kind_fkey"
+DETAIL:  Key (id, kind)=(2, card) is not present in table "cti_payment".
+
+ id | kind | last4 | bank_code
+----+------+-------+-----------
+  1 | card | 4242  |
+  2 | bank |       | 0001
+  3 | card |       |
+```
+
+ところが、親だけを入れた 3 番は通ってしまいます。外部キーは「子から親へ」の向きにしか張れないので、「カードの親には、必ずカードの子が 1 つある」は表せません。同じトランザクションで親子を必ず一緒に入れるようアプリで徹底するか、トリガや遅延制約（`DEFERRABLE INITIALLY DEFERRED`）を組み合わせた検査を書くことになります。
+
+### 具象テーブル継承：表ごとは堅いが、種類をまたぐと何も守られない
+
+具象テーブル継承では、種類ごとの表がそれぞれ完結しているので、`NOT NULL` も外部キーも普通に書けます。代わりに、**種類をまたいだ約束**は誰も守りません。
+
+```sql
+CREATE TABLE cc_card (id int PRIMARY KEY, amount int NOT NULL, last4 text NOT NULL);
+CREATE TABLE cc_bank (id int PRIMARY KEY, amount int NOT NULL, bank_code text NOT NULL);
+INSERT INTO cc_card VALUES (1,1000,'4242'); INSERT INTO cc_bank VALUES (1,2000,'0001');
+SELECT 'card' kind, id, amount FROM cc_card UNION ALL SELECT 'bank', id, amount FROM cc_bank;
+```
+
+```text
+ kind | id | amount
+------+----+--------
+ card |  1 |   1000
+ bank |  1 |   2000
+```
+
+id は表ごとの連番なので、「支払い 1 番」が 2 つあります。返金の表から「支払い」を外部キーで指そうとしても、指す先の表が 1 つに決まりません。全種類の一覧は `UNION ALL` になり、種類を足すたびにこの問い合わせをすべて探して直すことになります。共通の id が要るなら、全表で 1 つのシーケンスを共有するなどの工夫が必要です。
+
+### 3 つの比較
+
+| 観点 | STI | CTI | 具象テーブル継承 |
+| --- | --- | --- | --- |
+| 全種類の一覧 | 1 枚を読む | 親を読む（種類ごとの列は結合） | 種類の数だけ UNION ALL |
+| 1 種類だけ | kind で絞る | 親と子を結合 | 1 枚を読む |
+| 種類ごとの必須列 | CHECK を自分で書く | 子の NOT NULL | 表ごとの NOT NULL |
+| 種類の食い違い・子のない親 | CHECK で防げる | 食い違いは複合外部キーで防げる。子のない親は防げない | そもそも親がない |
+| 外から「支払い」を指す | 1 枚を指せばよい | 親を指せばよい | 指す先が決まらない |
+| 種類を足す | 列と CHECK を足す（全行に NULL の列） | 子の表を足す | 表を足し、UNION ALL をすべて直す |
+
+種類が少なく、種類ごとの列も少ないなら STI が手軽です。種類ごとの列が多い、または外部から「支払い」を指したいなら CTI が堅実です。種類をまたいで扱うことがほとんどなく、それぞれを独立に大量に読むなら具象テーブル継承が向きます。
+
+## ポリモーフィック関連：複数の表を指す 1 本の参照
+
+継承と並んでよく出てくるのが、**1 つの列で、場合によって別々の表を指したい**という要求です。課題（Issue）にもプルリクエスト（Pull Request）にもコメントが付く、という例で考えます。
+
+Rails は、これを「Polymorphic associations in Rails allow a model to belong to multiple other models through a single association.」と説明し、外部キーの列（`commentable_id`）と型の列（`commentable_type`）の 2 列で表します（[Rails Guides: Active Record Associations](https://guides.rubyonrails.org/association_basics.html)）。
+
+```sql
+CREATE TABLE comment (
+  id int PRIMARY KEY,
+  commentable_type text NOT NULL,   -- 'Issue' または 'PullRequest'
+  commentable_id   int  NOT NULL,   -- その表の id
+  body text
+);
+```
+
+Karwin は同じ本で、これを「Polymorphic Associations」というアンチパターンとして取り上げています（[SQL Antipatterns, Volume 1](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/)）。理由は、`commentable_id` が行によって `issue` を指したり `pull_request` を指したりするため、**外部キーを張れない**ことです。
+
+<PolymorphicAssoc client:visible />
+
+### 実験：外部キーがないと何が入るか
+
+```sql
+INSERT INTO comment_poly VALUES (1,'Issue',1,'ok'),(2,'PullRequest',1,'lgtm'),
+                                (3,'Issue',999,'宛先なし'),(4,'Isue',1,'型名の打ち間違い');
+SELECT c.id, c.commentable_type, c.commentable_id, coalesce(i.title, p.title) AS target
+FROM comment_poly c
+LEFT JOIN issue i ON c.commentable_type = 'Issue' AND i.id = c.commentable_id
+LEFT JOIN pr p ON c.commentable_type = 'PullRequest' AND p.id = c.commentable_id ORDER BY c.id;
+```
+
+```text
+ id | commentable_type | commentable_id | target
+----+------------------+----------------+--------
+  1 | Issue            |              1 | bug
+  2 | PullRequest      |              1 | fix
+  3 | Issue            |            999 |
+  4 | Isue             |              1 |
+(4 rows)
+```
+
+存在しない課題 999 を指すコメントも、型名を打ち間違えたコメントも、すべて入りました。読むときには型ごとに条件付きの `LEFT JOIN` を並べる必要があり、宛先が消えたときにコメントを消すのもアプリの仕事です（Rails なら `dependent: :destroy`）。SQL を直接流して課題を消せば、コメントだけが取り残されます。
+
+### 代わりの型 1：排他的アーク
+
+指す先の種類ごとに外部キーの列を分け、「どれか 1 つだけが埋まっている」を CHECK で守らせる形です。ER 図の記法で、複数の関連のうち 1 つだけが成り立つことを弧（arc）で示すことから、排他的アーク（exclusive arc）と呼ばれます。
+
+```sql
+CREATE TABLE comment_arc (id int PRIMARY KEY,
+  issue_id int REFERENCES issue(id), pr_id int REFERENCES pr(id), body text,
+  CHECK (num_nonnulls(issue_id, pr_id) = 1));
+INSERT INTO comment_arc VALUES (2,999,NULL,'宛先なし');
+INSERT INTO comment_arc VALUES (3,1,1,'両方');
+```
+
+```text
+ERROR:  insert or update on table "comment_arc" violates foreign key constraint "comment_arc_issue_id_fkey"
+DETAIL:  Key (issue_id)=(999) is not present in table "issue".
+ERROR:  new row for relation "comment_arc" violates check constraint "comment_arc_check"
+DETAIL:  Failing row contains (3, 1, 1, 両方).
+```
+
+普通の外部キーなので、宛先の存在も、`ON DELETE CASCADE` による連動した削除も DB が受け持ちます。指す先の種類が増えるたびに列と CHECK を足すのが手間ですが、種類が数個までなら素直な選択です。
+
+### 代わりの型 2：共通の親（スーパータイプ）
+
+課題とプルリクエストの上に「コメントを付けられるもの」という共通の親の表を置き、両者の主キーを親の主キーへの外部キーにします。コメントは親だけを指します。前節の CTI と同じ形を、参照される側に作ったものです。
+
+```sql
+CREATE TABLE commentable (id int PRIMARY KEY);
+CREATE TABLE issue2 (id int PRIMARY KEY REFERENCES commentable(id), title text);
+CREATE TABLE pr2    (id int PRIMARY KEY REFERENCES commentable(id), title text);
+CREATE TABLE comment_super (id int PRIMARY KEY,
+  commentable_id int NOT NULL REFERENCES commentable(id), body text);
+INSERT INTO comment_super VALUES (3,999,'宛先なし');
+```
+
+```text
+ERROR:  insert or update on table "comment_super" violates foreign key constraint "comment_super_commentable_id_fkey"
+DETAIL:  Key (commentable_id)=(999) is not present in table "commentable".
+```
+
+型名の文字列がどこにもないので、打ち間違えようがありません。種類が増えても `comment` 側は変わらず、新しい子の表を足すだけです。代わりに、課題とプルリクエストが同じ id の空間を共有することになり、作るときには先に親の行を作る手順が要ります。
+
+<Callout type="note" title="ORM の都合と、DB の都合">
+  ポリモーフィック関連が広く使われているのは、ORM が 1 行で宣言できる手軽さのためです。外部キーがないことを承知のうえで、アプリの検証と定期的な不整合の検査で補う、という運用も成り立ちます。ただ、そのデータを別のサービスやバッチが直接 SQL で読み書きするようになると、アプリの検証は通らなくなります。**誰がこの表に書き込むのか**を、選ぶときの基準にしてください。
+</Callout>
+
+## まとめ
+
+- 種類によって中身が違うものは、STI（1 枚）、CTI（親と子）、具象テーブル継承（種類ごと）のどれかに載せる。違いは「全種類をまとめて扱う操作」と「1 種類だけを扱う操作」のどちらを楽にするか、そして種類ごとの必須列を DB にどう守らせるか
+- STI では種類と列の対応を CHECK で書く。CTI は子の側の制約が素直だが「子のない親」は外部キーでは防げない。具象テーブル継承は種類をまたいだ id と参照に責任を持つ者がいない
+- 1 本の列で複数の表を指すポリモーフィック関連は外部キーを張れない。排他的アークか共通の親に置き換えると、宛先の存在と削除の連動を DB に任せられる
+
+次回の<a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値を残す</a>では、値が変わったり消えたりしたときに、何を表に残すかを扱います。

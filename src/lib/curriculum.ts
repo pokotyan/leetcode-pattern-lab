@@ -165,6 +165,11 @@ export const READING_SECTIONS: Section[] = [
     title: '大量データの計算エンジン',
     summary: 'データレイクの上で計算する側の中身。Hadoop、Spark、Flink と Beam、Trino と BigQuery、Dataproc などのマネージドサービスを系譜から読み、どのエンジンにも共通する分割・shuffle・結合・障害耐性の仕組みを整理する',
   },
+  {
+    id: 'schema',
+    title: 'テーブルの形',
+    summary: '同じデータでも、表にどう載せるかで速い操作・遅い操作・DB が守ってくれる約束が変わる。木を載せる 4 つの方式、縦持ちと横持ち、継承とポリモーフィック関連、時間とともに変わる値の残し方など、名前のついた設計の型を実測とともに比べる',
+  },
 ]
 
 export const readingSectionById = new Map(READING_SECTIONS.map((s) => [s.id, s]))

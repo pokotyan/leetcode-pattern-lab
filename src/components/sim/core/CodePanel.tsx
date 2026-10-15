@@ -8,13 +8,21 @@ const BUILTINS = new Set([
   'enumerate', 'zip', 'int', 'str', 'deque', 'defaultdict', 'Counter', 'heappush',
   'heappop', 'append', 'pop', 'popleft', 'add', 'ord', 'reversed',
 ])
+// SQL を載せる回のため。大文字だけを拾うので Python の識別子とは衝突しない
+const SQL_KEYWORDS = new Set([
+  'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL', 'AS', 'ON', 'JOIN',
+  'WITH', 'RECURSIVE', 'UNION', 'ALL', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET',
+  'DELETE', 'LIKE', 'BETWEEN', 'GROUP', 'BY', 'ORDER', 'HAVING', 'ALTER', 'TABLE',
+  'ADD', 'COLUMN', 'CROSS', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'FILTER',
+  'DISTINCT', 'BEGIN', 'COMMIT', 'CYCLE', 'USING', 'LIMIT',
+])
 
 type Tok = { t: string; k: 'kw' | 'fn' | 'num' | 'str' | 'cm' | 'txt' }
 
 /** 表示用の軽量トークナイザ。厳密な構文解析はしない */
 function tokenize(line: string): Tok[] {
   const out: Tok[] = []
-  const re = /(#.*$)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|(\s+)|([^\sA-Za-z0-9_])/g
+  const re = /(#.*$|--.*$)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|(\s+)|([^\sA-Za-z0-9_])/g
   let m: RegExpExecArray | null
   while ((m = re.exec(line))) {
     if (m[1]) out.push({ t: m[1], k: 'cm' })
@@ -22,7 +30,7 @@ function tokenize(line: string): Tok[] {
     else if (m[3]) out.push({ t: m[3], k: 'num' })
     else if (m[4]) {
       const w = m[4]
-      out.push({ t: w, k: KEYWORDS.has(w) ? 'kw' : BUILTINS.has(w) ? 'fn' : 'txt' })
+      out.push({ t: w, k: KEYWORDS.has(w) || SQL_KEYWORDS.has(w) ? 'kw' : BUILTINS.has(w) ? 'fn' : 'txt' })
     } else out.push({ t: m[0], k: 'txt' })
   }
   return out
