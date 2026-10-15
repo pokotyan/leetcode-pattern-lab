@@ -1,0 +1,271 @@
+---
+title: DDD の戦術的設計（エンティティ・値オブジェクト・集約）
+description: 業務の規則をどのオブジェクトに持たせ、どこまでを一緒に守るのか。同一性で見分けるエンティティ、値で見分けて書き換えない値オブジェクト、不変条件を守る範囲としての集約を、TypeScript のコンパイラと PostgreSQL の楽観ロックで確かめる
+category: code
+order: 50
+status: published
+topics:
+  - ドメイン駆動設計（DDD）
+  - エンティティ
+  - 値オブジェクト
+  - 集約
+  - 集約の根
+  - リポジトリ
+  - ドメインサービス
+  - ドメインイベント
+  - ファクトリ
+  - ドメインモデル貧血症
+  - 結果整合性
+---
+
+import Callout from '../../components/Callout.astro'
+import AggregateBoundary from '../../components/sim/problems/AggregateBoundary'
+
+## DDD の 2 つの面
+
+ドメイン駆動設計（Domain-Driven Design、DDD）は、Eric Evans の同名の書籍で名付けられた設計の進め方です。Evans 自身がその要点をまとめた『DDD Reference』（Creative Commons Attribution 4.0 で公開）は、DDD を次の 3 点で要約しています（[Domain Language: DDD Reference](https://www.domainlanguage.com/ddd/reference/)）。
+
+> 1. Focus on the core domain.
+> 2. Explore models in a creative collaboration of domain practitioners and software practitioners.
+> 3. Speak a ubiquitous language within an explicitly bounded context.
+
+同じ文書は「DDD addresses both tactical and strategic design.」と続けています。**戦術的設計**は、1 つのモデルの中で、規則をどのオブジェクトにどう持たせるかという設計の部品の話です。**戦略的設計**は、大きなシステムをいくつのモデルに分け、それらをどうつなぐかという話です。この回は戦術の側を扱い、戦略の側は次回の<a href={`${import.meta.env.BASE_URL}reading/ddd-strategic/`}>DDD の戦略的設計</a>で扱います。
+
+前の回までで、依存を内側へ向ける形（<a href={`${import.meta.env.BASE_URL}reading/dependency-direction/`}>依存の向き</a>）と、状態を型の形で表す方法（<a href={`${import.meta.env.BASE_URL}reading/state-as-types/`}>状態を型の形で表す</a>）を見ました。その「内側」に何をどう置くかを決めるのが、この回の部品です。
+
+## エンティティと値オブジェクト
+
+DDD Reference は、モデルの中のオブジェクトを、何によって「同じもの」と見なすかで 2 つに分けます。
+
+**エンティティ（entity）** は、属性が変わっても同じものであり続けるオブジェクトです。
+
+> Many objects represent a thread of continuity and identity, going through a lifecycle, though their attributes may change.
+
+顧客は名前を変えても、住所を変えても、同じ顧客です。逆に、同姓同名の別人を同じ人として扱えば、データが壊れます。DDD Reference は「The model must define what it means to be the same thing.」と書き、エンティティには属性とは別に、同一性を決める手段（たいていは識別子）を持たせるように求めています。
+
+**値オブジェクト（value object）** は、属性だけに意味があり、同一性を持たないオブジェクトです。金額、期間、住所、色などがこれにあたります。
+
+> When you care only about the attributes and logic of an element of the model, classify it as a value object. [...] Treat the value object as immutable.
+
+1000 円は、どの 1000 円も同じ 1000 円です。そして値オブジェクトは**書き換えない**。1000 円に 500 円を足したら、1000 円のオブジェクトを 1500 円に書き換えるのではなく、1500 円という新しい値を作ります。
+
+TypeScript で、金額を値オブジェクト、顧客をエンティティとして書きます。
+
+```ts
+type Currency = 'JPY' | 'USD'
+export class Money {
+  private constructor(readonly amount: number, readonly currency: Currency) {}
+  static of(amount: number, currency: Currency): Money {
+    if (!Number.isInteger(amount) || amount < 0) throw new Error(`金額が不正: ${amount}`)
+    return new Money(amount, currency)
+  }
+  add(other: Money): Money {
+    if (other.currency !== this.currency) throw new Error(`通貨が違う: ${this.currency} + ${other.currency}`)
+    return new Money(this.amount + other.amount, this.currency)   // 新しい値を返す
+  }
+  equals(other: Money): boolean {
+    return this.amount === other.amount && this.currency === other.currency
+  }
+}
+
+export class Customer {
+  constructor(readonly id: string, public name: string) {}
+  sameAs(other: Customer): boolean {
+    return this.id === other.id     // 名前ではなく識別子で比べる
+  }
+}
+```
+
+TypeScript 5.9.3 でコンパイルし、Node.js 20.19.0 で実行した結果です。
+
+```text
+値で等しい: true / 参照は別物: false
+通貨が違う: JPY + USD
+同じ id・違う名前: true / 違う id・同じ名前: false
+```
+
+2 つの `Money.of(1000, 'JPY')` は別のオブジェクトですが、値として等しい。顧客は、名前が違っても識別子が同じなら同じ顧客で、名前が同じでも識別子が違えば別の顧客です。円とドルを足そうとすると、`Money` 自身が拒否します。「通貨の違う金額は足せない」という規則が、金額を扱うすべての場所ではなく、`Money` の 1 か所に書かれています。
+
+値オブジェクトを書き換えようとする誤りは、実行する前にコンパイラが止めます。
+
+```ts
+export function misuse(o: Order, m: Money) {
+  m.amount = 0
+  o.lines.push({ product: '裏口', price: m })
+  o._total = m
+  return new Money(1, 'JPY')
+}
+```
+
+```text
+misuse.ts(5,5): error TS2540: Cannot assign to 'amount' because it is a read-only property.
+misuse.ts(6,11): error TS2339: Property 'push' does not exist on type 'readonly Readonly<{ product: string; price: Money; }>[]'.
+misuse.ts(7,5): error TS2341: Property '_total' is private and only accessible within class 'Order'.
+misuse.ts(8,10): error TS2673: Constructor of class 'Money' is private and only accessible within the class declaration.
+```
+
+4 行目のエラーは、コンストラクタを `private` にして `Money.of` を通させているためです。`of` の中の検査（整数で、負でない）を通らない `Money` は作れません。値オブジェクトは、作られた時点で正しく、その後も変わらないので、受け取った側は検査をやり直す必要がありません。
+
+## 集約：一緒に守る範囲
+
+注文には明細が何行も付きます。「1 件の注文の合計は 1 万円まで」「確定した注文は変更できない」という規則は、注文 1 行だけでも明細 1 行だけでも確かめられず、注文と明細のまとまり全体にかかります。
+
+DDD Reference はこのまとまりを**集約（aggregate）** と呼び、次のように定めています。
+
+> Cluster the entities and value objects into aggregates and define boundaries around each. Choose one entity to be the root of each aggregate, and allow external objects to hold references to the root only [...]. Define properties and invariants for the aggregate as a whole and give enforcement responsibility to the root [...].
+
+Martin Fowler の解説も同じ要点を短く述べています（[Fowler: DDD_Aggregate](https://martinfowler.com/bliki/DDD_Aggregate.html)）。「Any references from outside the aggregate should only go to the aggregate root.」「Transactions should not cross aggregate boundaries.」。外から触れてよいのは**根（root）** の 1 つだけで、まとまり全体の規則（不変条件）は根が守り、1 つのトランザクションは 1 つの集約の中で閉じる、ということです。
+
+下の SIM は、注文 O1（合計 9000 円）に明細を足す 3 つの場面です。「根を通して明細を足す」では規則が守られ、「明細の表へ直接書き込む」では根を迂回したせいで規則が破れ、「2 人が同時に明細を足す」では版の番号が同時の変更を止めます。
+
+<AggregateBoundary client:visible />
+
+根の `Order` を TypeScript で書きます。明細の配列は `private` にし、外へは読み取り専用の配列としてだけ見せます。
+
+```ts
+type Line = Readonly<{ product: string; price: Money }>
+export class Order {
+  private readonly _lines: Line[] = []
+  private _total = Money.of(0, 'JPY')
+  private _status: 'placed' | 'confirmed' = 'placed'
+  constructor(readonly id: string, private readonly limit: Money) {}
+  get lines(): readonly Line[] { return this._lines }
+  get total(): Money { return this._total }
+
+  addLine(product: string, price: Money): string {
+    if (this._status !== 'placed') return `拒否: 確定後は変更できない`
+    const next = this._total.add(price)
+    if (next.amount > this.limit.amount) return `拒否: 上限 ${this.limit.amount} を超える（${next.amount}）`
+    this._lines.push({ product, price })
+    this._total = next                  // 明細と合計を同じ操作の中で直す
+    return `追加: ${product}、合計 ${this._total.amount}`
+  }
+  confirm(): void { this._status = 'confirmed' }
+}
+```
+
+上限 1 万円の注文に、シャツ 3000 円、靴 6000 円、帽子 2000 円、靴下 500 円を順に足し、確定してから手袋を足した結果です。
+
+```text
+追加: シャツ、合計 3000
+追加: 靴、合計 9000
+拒否: 上限 10000 を超える（11000）
+追加: 靴下、合計 9500
+拒否: 確定後は変更できない
+```
+
+明細を足す道が `addLine` の 1 本しかないので、規則を確かめる場所も 1 か所で済みます。先ほどのコンパイルエラーの 2 行目と 3 行目は、外から明細の配列に `push` することも、合計を書き換えることも、型検査の段階で拒否されることを示しています。
+
+<Callout type="warn" title="TypeScript の private は、実行時には守らない">
+  TypeScript の `private` と `readonly` は型検査のための約束で、JavaScript に変換されると消えます。型を `any` にすれば、実行時には書き換えられます。JavaScript の `#` 付きのフィールドは、言語として外から触れません。
+
+```ts
+const o = new Order('O1', Money.of(10000, 'JPY'))
+;(o as any)._lines.push({ product: '裏口', price: Money.of(50000, 'JPY') })
+console.log('TS の private:', o.lines.length, '行、合計', o.total.amount)
+
+class Order2 {
+  #lines: string[] = []
+  get count() { return this.#lines.length }
+}
+const o2 = new Order2()
+;(o2 as any)['#lines']?.push('裏口')
+console.log('# の private:', o2.count, '行', '/ 外から見えるキー:', Object.keys(o2))
+```
+
+```text
+TS の private: 1 行、合計 0
+# の private: 0 行 / 外から見えるキー: []
+```
+
+  1 つ目は、明細が 1 行あるのに合計が 0 という、集約が守るはずの不変条件が破れた状態です。型検査を迂回するコード（`any`、型の主張、JSON をそのまま流し込む処理など）がある場所では、境界の守りは型だけに頼れません。
+</Callout>
+
+### 集約を小さく保つ
+
+集約をどこまで大きくするかについて、Vaughn Vernon は DDD コミュニティに寄せた連載「Effective Aggregate Design」（2011 年）で、4 つの目安を挙げています（[DDD Community: Effective Aggregate Design](https://www.dddcommunity.org/library/vernon_2011/)）。
+
+| 目安（原文の見出し） | 要点 |
+| --- | --- |
+| Model True Invariants In Consistency Boundaries | 本当に同時に守る必要がある規則（不変条件）だけを、1 つの集約に入れる |
+| Design Small Aggregates | 集約を大きくすると、同時の更新がぶつかりやすくなり、性能と拡張性を損なう |
+| Reference Other Aggregates By Identity | ほかの集約は、オブジェクトへの参照ではなく識別子で指す |
+| Use Eventual Consistency Outside the Boundary | 集約をまたぐ規則は、同じトランザクションではなく、後から追いつく形（結果整合性）で満たす |
+
+第 1 部には「a properly designed bounded context modifies only one aggregate instance per transaction in all cases」とあり、続けてこれを「a rule of thumb and should be the goal in most cases」と位置づけています（[Part I, PDF](https://www.dddcommunity.org/wp-content/uploads/files/pdf_articles/Vernon_2011_1.pdf)）。第 2 部は、識別子で参照する理由と、集約をまたぐ規則について DDD の原著の一文「Any rule that spans AGGREGATES will not be expected to be up-to-date at all times.」を引いています（[Part II, PDF](https://www.dddcommunity.org/wp-content/uploads/files/pdf_articles/Vernon_2011_2.pdf)）。
+
+注文の例でいえば、注文の中に「顧客」のオブジェクトをまるごと持たせるのではなく、顧客の識別子だけを持たせます。注文を確定したら顧客のポイントを増やす、という規則は、注文の集約と顧客の集約をまたぐので、同じトランザクションで両方を書き換えるのではなく、「注文が確定した」という出来事を受けて顧客の側を後から更新します。
+
+## 集約と表、楽観ロック
+
+集約を DB に保存するときは、たいてい根が 1 つの表、内側の部品がそれぞれの表になります。注文なら `orders` と `order_lines` です。集約単位で読み、集約単位で 1 つのトランザクションとして保存します。
+
+同じ集約を 2 人が同時に書き換える場合に備えて、根の行に版の番号（`version`）を持たせます。<a href={`${import.meta.env.BASE_URL}reading/schema-map/`}>テーブル設計の型の地図</a>で扱った楽観ロックの列です。SIM の 3 つ目の場面を、PostgreSQL 17 で実際に流しました。A と B が同じ O1（version 1）を読み、それぞれ 800 円の明細を足して保存します。
+
+```sql
+-- A の保存
+BEGIN;
+UPDATE orders SET total = 9800, version = version + 1 WHERE id = 'O1' AND version = 1;
+INSERT INTO order_lines VALUES ('O1', 3, 'A の品', 800);
+COMMIT;
+-- B の保存（B も version 1 を読んでいた）
+BEGIN;
+UPDATE orders SET total = 9800, version = version + 1 WHERE id = 'O1' AND version = 1;
+ROLLBACK;
+```
+
+```text
+--- A が保存する（読んだ版 = 1）
+BEGIN
+UPDATE 1
+INSERT 0 1
+COMMIT
+--- B が保存する（B も読んだ版 = 1 のまま）
+BEGIN
+UPDATE 0
+ROLLBACK
+ id | total | version 
+----+-------+---------
+ O1 |  9800 |       2
+```
+
+B の `UPDATE` は 0 行で、B のアプリケーションはこれを「ほかの誰かが先に変えた」という合図として受け取り、読み直してやり直します。読み直せば合計は 9800 円で、B の 800 円を足すと 10600 円になり、規則に反すると分かります。明細の表には版の列を付けず、根の 1 行の版で集約全体を守っている点に注目してください。集約を「同時に変更してはいけない範囲」と言い換えると、その範囲を守る鍵が根の版の番号です。
+
+## リポジトリ、ファクトリ、ドメインサービス
+
+集約を保存・取得する窓口が**リポジトリ（repository）** です。DDD Reference は、集約の種類ごとに「the illusion of an in-memory collection of all objects of that aggregate's root type」を与える窓口を作るよう求めています。リポジトリの単位は表ではなく集約で、`OrderRepository` は注文と明細をまとめて読み書きし、明細だけを取り出す窓口は作りません。外から明細を直接取り出せると、根を迂回できてしまうからです。DDD Reference はその害を「blindsiding the aggregate root and making it impossible for these objects to enforce the rules of the domain model」と書いています。リポジトリの型を内側に置き、実装を外側に置く形は、<a href={`${import.meta.env.BASE_URL}reading/dependency-direction/`}>依存の向き</a>で扱ったとおりです。
+
+**ファクトリ（factory）** は、作るのが複雑な集約や値オブジェクトを、不変条件を守った状態で丸ごと作る役です。DDD Reference は「Create an entire aggregate as a piece, enforcing its invariants.」と書いています。`Money.of` のように、検査を通らないものを作らせない入口も、小さなファクトリといえます。
+
+**ドメインサービス（domain service）** は、どのエンティティや値オブジェクトの責務とも言いにくい業務の処理を置く場所です。DDD Reference の見出しは「Sometimes, it just isn't a thing.」で、そうした処理を無理にどれかのオブジェクトに押し込むと、モデルが歪むと述べています。2 つの口座の間の振替のように、複数の集約にまたがる手続きが典型です。
+
+## ドメインイベント
+
+DDD Reference は、業務の専門家が関心を持つ出来事を**ドメインイベント（domain event）** としてモデルに含めることを勧めています。
+
+> Model information about activity in the domain as a series of discrete events. Represent each event as a domain object.
+
+そして「Domain events are ordinarily immutable, as they are a record of something in the past.」と続けます。過去に起きたことの記録なので、書き換えないということです。これは<a href={`${import.meta.env.BASE_URL}reading/immutable-data-model/`}>イミュータブルデータモデル</a>で見た「出来事の表は足すだけ」と同じ考え方です。集約をまたぐ規則（注文の確定で顧客のポイントを増やす）を結果整合性で満たすときも、集約から集約へ伝わるのはこの出来事です。出来事そのものを記録の正本にする設計は、<a href={`${import.meta.env.BASE_URL}reading/cqrs-event-sourcing/`}>CQRS と Event Sourcing</a>で扱います。
+
+## ドメインモデル貧血症
+
+戦術の部品をそろえても、規則がオブジェクトに入っていなければ意味がありません。Martin Fowler は 2003 年に、属性の取得と設定しか持たないオブジェクトと、規則を全部抱えたサービスの組み合わせを**ドメインモデル貧血症（Anemic Domain Model）** と名付けました（[Fowler: AnemicDomainModel](https://martinfowler.com/bliki/AnemicDomainModel.html)）。その症状は「there is hardly any behavior on these objects, making them little more than bags of getters and setters」で、ドメインモデルの費用だけを払い、利点を得られない、と批判しています。
+
+注文の例に当てはめると、`Order` が `lines` と `total` を公開しているだけで、「1 万円まで」の検査は `OrderService` の中にある、という形です。こうなると、別のサービスが同じ検査を書き忘れたとき、規則は破れます。SIM の「明細の表へ直接書き込む」は、その結果を DB の上で見たものです。
+
+一方で、すべての処理に豊かなモデルが要るわけではありません。規則がほとんどない画面の入出力や、単純な一覧の取得には、表をそのまま扱う素朴な書き方のほうが合います。どこに投資するかの判断は、次回の戦略的設計（中核の領域をどこに定めるか）の話につながります。
+
+## まとめ
+
+| 部品 | 何で見分けるか・何を守るか | この回で確かめたこと |
+| --- | --- | --- |
+| エンティティ | 識別子。属性が変わっても同じもの | 同じ id なら名前が違っても同じ顧客 |
+| 値オブジェクト | 属性の値。書き換えない | 通貨違いの加算を拒否、書き換えは型エラー |
+| 集約と根 | まとまり全体の不変条件を根が守る。1 トランザクション 1 集約 | 上限超えと確定後の変更を根が拒否 |
+| 楽観ロック | 根の版の番号で、集約への同時の変更を止める | 2 人目の `UPDATE` が 0 行 |
+| リポジトリ | 集約単位で読み書きする窓口 | 明細だけを取り出す窓口を作らない |
+| ドメインイベント | 起きたことの記録。書き換えない | 集約をまたぐ規則は出来事で後から追いつく |
+
+型で守れるのは、型検査を通るコードの範囲だけです。境界の外（DB に直接書く処理、型を迂回するコード）からの変更まで止めたいなら、DB の制約や、書き込みの経路を 1 本に絞る運用と組み合わせます。
+
+次回は、モデルをどこで区切るかという<a href={`${import.meta.env.BASE_URL}reading/ddd-strategic/`}>DDD の戦略的設計</a>に進みます。

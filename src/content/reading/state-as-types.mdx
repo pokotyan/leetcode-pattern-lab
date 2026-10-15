@@ -1,0 +1,244 @@
+---
+title: 状態を型の形で表す（直和型・不正な状態・Parse, don't validate）
+description: 注文の状態を真偽値の組み合わせで持つと、型は「出荷済みなのに未払い」も許してしまう。状態ごとの形の直和にし、遷移を関数の型で縛り、検査済みの値を別の型にすると、何をコンパイラに確かめさせられるのか。TypeScript 5.9.3 の実際の型エラーで確かめ、型で表しきれない所も見る
+category: code
+order: 48
+status: published
+topics:
+  - 直和型
+  - 判別できる共用体（discriminated union）
+  - Make illegal states unrepresentable
+  - Parse, don't validate
+  - 網羅性検査
+  - never 型
+  - 型状態（typestate）
+  - ブランド型
+---
+
+import Callout from '../../components/Callout.astro'
+import StateTypes from '../../components/sim/problems/StateTypes'
+
+## 型が許す値と、業務が許す値
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/functional-core/`}>計算の芯と入出力の殻</a>では、判断を値から値への関数に取り出しました。その関数が受け取る値の形を、どこまで正確に書けるかが今回の主題です。
+
+注文の状態を、次のような型で持つコードはよく見かけます。
+
+```ts
+type Order = {
+  id: string
+  isPaid: boolean
+  isShipped: boolean
+  isCancelled: boolean
+  trackingNo: string | null
+}
+```
+
+真偽値が 3 つと「追跡番号があるか」で、この型が許す組み合わせは 2 × 2 × 2 × 2 = 16 通りです。そのうち業務として意味があるのは、注文済み・支払済み・出荷済み・取消（未払い）・取消（返金あり）の 5 通りだけです。「出荷済みなのに未払い」「取消なのに追跡番号がある」といった残りの 11 通りも、型の上では正しい値として作れてしまいます。それを防ぐ役は、どこかに書かれた `if` 文が負うことになります。そしてその `if` 文は、書き忘れても誰も気づきません。
+
+<StateTypes client:visible />
+
+ビジュアライザの「真偽値の組み合わせ」で 16 通りの表を見てから、「直和型にする」に切り替えると、型が許す形が 4 つに減ることが分かります。表示している型エラーは、すべて TypeScript 5.9.3 の実際の出力です。
+
+## 直和型にする
+
+状態ごとに別の形を書き、それらの「どれか 1 つ」という型にします。どの形かは共通の項目 `kind` で見分けます。TypeScript の文書ではこれを判別できる共用体（discriminated union）と呼んでいます（[TypeScript Handbook: Narrowing](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)）。
+
+```ts
+type Order =
+  | { kind: 'placed';    id: string }
+  | { kind: 'paid';      id: string; paidAt: Date }
+  | { kind: 'shipped';   id: string; paidAt: Date; trackingNo: string }
+  | { kind: 'cancelled'; id: string; refund: number }
+```
+
+それぞれの状態は、その状態で意味のある項目だけを持ちます。支払日時は支払済みと出荷済みにしかなく、追跡番号は出荷済みにしかありません。`null` で「まだ無い」を表す必要がなくなります。
+
+この考え方は、Jane Street の Yaron Minsky が 2011 年の記事で「Make illegal states unrepresentable」（不正な状態を表せなくする）という見出しで示したものとして知られています（[Jane Street: Effective ML Revisited](https://blog.janestreet.com/effective-ml-revisited/)）。記事のその節は、接続の情報を表す OCaml の型を、状態ごとに必要な項目だけを持つ直和型へ書き直す前後のコードだけで構成されています。
+
+追跡番号のない「出荷済み」を作ろうとすると、コンパイラが止めます（実験用のファイルは `state.ts`）。
+
+```text
+state.ts(29,7): error TS2322: Type '{ kind: "shipped"; id: string; paidAt: Date; }' is not assignable to type 'Order'.
+  Property 'trackingNo' is missing in type '{ kind: "shipped"; id: string; paidAt: Date; }' but required in type '{ kind: "shipped"; id: string; paidAt: Date; trackingNo: string; }'.
+```
+
+データの側でも同じ問題がありました。<a href={`${import.meta.env.BASE_URL}reading/inheritance-tables/`}>継承とポリモーフィック関連</a>の単一テーブル継承では、種類ごとに埋まる列が違うのに列ごとの `NOT NULL` が付けられず、`CHECK` 制約で「種類と列の対応」を書きました。直和型は、その対応を型の側で書いたものです。
+
+## 遷移を関数の型で縛る
+
+状態が型になると、遷移を「ある状態の型を受け取り、別の状態の型を返す関数」として書けます。
+
+```ts
+type Paid = Extract<Order, { kind: 'paid' }>
+type Shipped = Extract<Order, { kind: 'shipped' }>
+
+function ship(order: Paid, trackingNo: string): Shipped {
+  return { ...order, kind: 'shipped', trackingNo }
+}
+
+const placed: Order = { kind: 'placed', id: 'O1' }
+ship(placed, 'T-1')
+```
+
+```text
+state.ts(15,6): error TS2345: Argument of type '{ kind: "placed"; id: string; }' is not assignable to parameter of type '{ kind: "paid"; id: string; paidAt: Date; }'.
+  Property 'paidAt' is missing in type '{ kind: "placed"; id: string; }' but required in type '{ kind: "paid"; id: string; paidAt: Date; }'.
+```
+
+「支払う前に出荷しない」という規則を、実行する前に検査できています。`placed` を `Order` 型で宣言しているのに `placed` の形として扱われているのは、代入した値から TypeScript が型を絞り込んでいるためです。実際のコードで DB から読んだ `Order` を渡すなら、`if (order.kind === 'paid')` で絞り込んでからでないと `ship` を呼べません。分岐を書かせること自体が、規則を思い出させる仕組みになります。
+
+### 型状態（typestate）
+
+同じものでも段階によって使える操作が違う、という制約にも使えます。接続を開く前と後で型を分けると、開く前の接続に送信しようとした時点で型エラーになります。
+
+```ts
+type Closed = { readonly state: 'closed'; host: string }
+type Open = { readonly state: 'open'; host: string; socket: number }
+
+function connect(c: Closed): Open { return { state: 'open', host: c.host, socket: 3 } }
+function send(c: Open, msg: string): Open { console.log(`send ${msg} via ${c.socket}`); return c }
+function disconnect(c: Open): Closed { return { state: 'closed', host: c.host } }
+
+const c0: Closed = { state: 'closed', host: 'db' }
+send(c0, 'hello')
+const c1 = connect(c0)
+const c2 = disconnect(send(c1, 'hello'))
+send(c1, 'again')   // 閉じたあとの古い値を使い続けることは、型では止められない
+```
+
+```text
+typestate.ts(10,6): error TS2345: Argument of type 'Closed' is not assignable to parameter of type 'Open'.
+  Property 'socket' is missing in type 'Closed' but required in type 'Open'.
+```
+
+ただし、最後の行は型エラーになりません。`c1` は `disconnect` に渡したあとも `Open` 型の値として手元に残っており、TypeScript には「一度使った値をもう使えなくする」仕組みがないためです。値の所有権を言語が追跡する Rust のような言語では、この最後の行も止められます。TypeScript での型状態は「段階を間違えにくくする」までで、「古い値の使い回し」までは防げない、と理解しておくのが安全です。
+
+## 網羅性検査：書き忘れた分岐を挙げさせる
+
+状態ごとに処理を分ける `switch` で、ある状態の `case` を書き忘れることがあります。TypeScript の文書は、どの値も代入できない `never` 型を使うと、`switch` の網羅性を検査できると説明しています。
+
+> The `never` type is assignable to every type; however, no type is assignable to `never` (except `never` itself). This means you can use narrowing and rely on `never` turning up to do exhaustive checking in a `switch` statement.
+> （[TypeScript Handbook: Narrowing](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)）
+
+```ts
+function label(o: Order): string {
+  switch (o.kind) {
+    case 'placed':  return '注文済み'
+    case 'paid':    return '支払済み'
+    case 'shipped': return '出荷済み'
+    default: {
+      const never: never = o   // ここに来る種類が残っていれば型エラー
+      return never
+    }
+  }
+}
+```
+
+```text
+state.ts(23,13): error TS2322: Type '{ kind: "cancelled"; id: string; refund: number; }' is not assignable to type 'never'.
+```
+
+`cancelled` を書き忘れていることを、コンパイラが名指しで教えてくれます。この検査が本当に効くのは、状態を**後から足したとき**です。たとえば「返品」を `Order` に加えると、`kind` で分岐しているすべての `switch` が一斉に型エラーになり、直すべき場所の一覧がそのまま手に入ります。真偽値の組み合わせで持っていた場合、`isReturned` を足しても、どこも型エラーにはなりません。
+
+戻り値の型を書いた関数なら、`default` を書かなくても書き漏らしに気づけます。ただし理由は「`never` に代入できない」ではなく「値を返さない経路がある」という形で出ます。次の回で使う Result の実験で、誤りの種類の `case` を 1 つ消した `switch` に対して出たエラーです。
+
+```text
+rop_missing.ts(49,40): error TS2366: Function lacks ending return statement and return type does not include 'undefined'.
+```
+
+## Parse, don't validate：検査の結果を型に残す
+
+入力を検査する関数は、ふつう「正しければ何もしない、誤っていれば例外を投げる」か「真偽値を返す」形で書かれます。Alexis King は 2019 年の記事「Parse, don't validate」で、この形は検査で分かったことを捨ててしまうと指摘しました。記事は、空でないリストを検査する関数について、型で表す側はその情報を戻り値に残すのに対し、
+
+> ...while validateNonEmpty just throws it away.
+
+と書き、構文解析器（parser）を次のように定義しています。
+
+> Really, a parser is just a function that consumes less-structured input and produces more-structured output.
+> （[Alexis King: Parse, don't validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/)）
+
+TypeScript では、検査を通った値を元の型と区別する「ブランド型」でこれを真似られます。
+
+```ts
+// 検査済みのメールアドレスを、ただの string と区別する
+type Email = string & { readonly __brand: 'Email' }
+
+function parseEmail(s: string): Email | null {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s) ? (s as Email) : null
+}
+
+function sendWelcome(to: Email): string {
+  return `send to ${to}`
+}
+
+const raw = 'a@example.com'
+sendWelcome(raw)
+
+const e = parseEmail(raw)
+if (e !== null) console.log(sendWelcome(e))
+
+// 空でない配列: 先頭があることを型が保証する
+type NonEmpty<T> = [T, ...T[]]
+function head<T>(xs: NonEmpty<T>): T { return xs[0] }
+const empty: string[] = []
+head(empty)
+```
+
+```text
+parse.ts(13,13): error TS2345: Argument of type 'string' is not assignable to parameter of type 'Email'.
+  Type 'string' is not assignable to type '{ readonly __brand: "Email"; }'.
+parse.ts(22,6): error TS2345: Argument of type 'string[]' is not assignable to parameter of type 'NonEmpty<string>'.
+  Source provides no match for required element at position 0 in target.
+```
+
+`sendWelcome` は `Email` しか受け取らないので、「送信の前にメールアドレスを検査したか」を関数の中で心配する必要がありません。検査は入口で 1 回だけ行い、その結果を型として奥まで運びます。<a href={`${import.meta.env.BASE_URL}reading/ddd-tactical/`}>DDD の戦術的設計</a>の値オブジェクトは、この「検査を通った値を専用の型にする」をクラスで行うものと読めます。
+
+## 型で表しきれないもの
+
+型は強力ですが、TypeScript の型は実行時には消えます。限界を実験で確かめておきます。
+
+```ts
+type Email = string & { readonly __brand: 'Email' }
+// 1. 型の主張（as）は検査を飛ばせる
+const fake = 'not-an-email' as Email
+
+type Order = { kind: 'paid'; paidAt: string } | { kind: 'placed' }
+// 2. 外から来た値は、型を書いても実行時には何も確かめられていない
+const fromApi = JSON.parse('{"kind":"paid"}') as Order
+if (fromApi.kind === 'paid') console.log('paidAt =', fromApi.paidAt)
+
+// 3. throw される値の型は宣言できず、catch では unknown になる
+function load(): number { throw new Error('io') }
+try { load() } catch (e) { console.log(e.message) }
+```
+
+```text
+limits.ts(12,40): error TS18046: 'e' is of type 'unknown'.
+```
+
+型エラーは 3 つ目の 1 か所だけで、1 つ目と 2 つ目はそのまま通ります。型エラーを無視して JavaScript に変換し、実行した結果が次です。
+
+```text
+paidAt = undefined
+io
+```
+
+- **`as` は検査を飛ばす。** `'not-an-email' as Email` は通ります。ブランド型の約束は「`as Email` を書いてよいのは `parseEmail` の中だけ」という、人間どうしの取り決めに支えられています。
+- **境界の外から来た値は、何も確かめられていない。** `JSON.parse` の結果に `as Order` と書いても、実行時の値は `paidAt` を持っていません。型が `paidAt: string` と言っているのに `undefined` が出ています。API の応答・DB の行・利用者の入力は、境界で実際に検査して（構文解析して）から型の付いた値にする必要があります。
+- **投げられる値の型は分からない。** `strict` で有効になる `useUnknownInCatchVariables` により、`catch` の変数は `unknown` になります（[TSConfig: useUnknownInCatchVariables](https://www.typescriptlang.org/tsconfig/#useUnknownInCatchVariables)）。関数の型には「何を投げうるか」が書けないため、失敗の種類を型で扱いたいなら、次回の Result のように戻り値で表す必要があります。
+
+<Callout type="note" title="データの側との対応">
+  <a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値を残す</a>の論理削除では「`deleted_at` が NULL かどうか」という印で状態を表し、すべての問い合わせに条件を書き足す必要がありました。真偽値の組み合わせで状態を持つコードと同じ構造です。<a href={`${import.meta.env.BASE_URL}reading/immutable-data-model/`}>イミュータブルデータモデル</a>は、状態を出来事の表に分け、状態は出来事の有無から導きました。コードで状態ごとに型を分けるのと、データで出来事ごとに表を分けるのは、同じ発想を別の層で行ったものです。
+</Callout>
+
+## まとめ
+
+- 真偽値の組み合わせで状態を持つと、型は意味のない組み合わせまで許す。16 通りのうち意味があるのは 5 通り、という差を `if` 文が埋めることになる。
+- 状態ごとの形の直和にすると、各状態はその状態で意味のある項目だけを持ち、不正な状態はそもそも作れなくなる。
+- 遷移を「ある状態の型 → 別の状態の型」の関数にすると、順序の誤りがコンパイル時に分かる。ただし TypeScript では、古い値の使い回しまでは止められない。
+- `never` を使った網羅性検査は、状態を足したときに直すべき分岐をすべて挙げてくれる。
+- 検査は真偽値を返すのでなく、検査済みの値を別の型として返す（Parse, don't validate）。
+- 型は実行時に消える。`as`、外から来た値、投げられる例外は型の外にあり、境界での実際の検査が要る。
+
+次回の<a href={`${import.meta.env.BASE_URL}reading/railway-oriented/`}>Railway Oriented Programming と Result</a>では、最後に残った「失敗の種類」を戻り値の型で運ぶ方法を扱います。

@@ -1,0 +1,210 @@
+---
+title: DDD の戦略的設計（ユビキタス言語・境界づけられたコンテキスト）
+description: 同じ「商品」でも、販売と在庫と配送では指すものが違う。1 つの大きなモデルに押し込まず、言葉の意味が変わる所でモデルを区切り、区切った同士の関係を名前のついた型で決める。ブランド型と網羅性検査で、文脈の取り違えと翻訳の漏れをコンパイラに見つけさせる
+category: code
+order: 51
+status: published
+topics:
+  - ドメイン駆動設計（DDD）
+  - ユビキタス言語
+  - 境界づけられたコンテキスト
+  - コンテキストマップ
+  - 腐敗防止層
+  - 共有カーネル
+  - 公開ホストサービス
+  - 公表された言語
+  - コアドメイン
+  - 汎用サブドメイン
+  - イベントストーミング
+  - Conway の法則
+---
+
+import Callout from '../../components/Callout.astro'
+import BoundedContext from '../../components/sim/problems/BoundedContext'
+
+## 1 つのモデルでは足りない
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/ddd-tactical/`}>DDD の戦術的設計</a>では、1 つのモデルの中で、規則をエンティティ・値オブジェクト・集約にどう持たせるかを見ました。この回は、そのモデルを**どこで区切るか**を扱います。
+
+大きな組織では、同じ言葉が部署によって違うものを指します。Martin Fowler は、電力会社で「meter（メーター）」という言葉が、送電網と場所の接続、送電網と顧客の接続、物理的な計器のどれを指すかが部署によって違っていた経験を挙げ、「Customer」や「Product」でも同じ混乱が繰り返し起きると書いています（[Fowler: BoundedContext](https://martinfowler.com/bliki/BoundedContext.html)）。
+
+EC で「商品」と言うとき、販売の担当者は「名前と説明と値段が付いた、売る物」を思い浮かべます。在庫の担当者は「どの倉庫のどの棚に何個あるか」、配送の担当者は「重さと箱の大きさ」を思い浮かべます。これを 1 つの `Product` 型と 1 つの表にまとめると、どの部署の都合で項目が増えたのかが分からなくなり、1 つの部署の変更が全員に及びます。
+
+<BoundedContext client:visible />
+
+## ユビキタス言語
+
+DDD Reference は、**ユビキタス言語（ubiquitous language）** を次のように定義しています（[Domain Language: DDD Reference](https://www.domainlanguage.com/ddd/reference/)）。
+
+> A language structured around the domain model and used by all team members within a bounded context to connect all the activities of the team with the software.
+
+業務の専門家と開発者が、会話でも文書でもコードでも同じ言葉を使い、その言葉の構造をモデルにする、ということです。同じ文書は「Recognize that a change in the language is a change to the model.」とも書いています。会議で「取消」と「返品」を言い分けるようになったら、コードにも別々の型が現れるべきだ、ということです。
+
+この定義で見落とせないのは、最後の「within a bounded context」です。ユビキタス言語は会社全体で 1 つではなく、**区切られた範囲ごとに 1 つ**です。
+
+## 境界づけられたコンテキスト
+
+DDD Reference の定義は次のとおりです。
+
+> A description of a boundary (typically a subsystem, or the work of a particular team) within which a particular model is defined and applicable.
+
+そして、その境界をはっきり決めるように求めています。
+
+> Explicitly define the context within which a model applies. Explicitly set boundaries in terms of team organization, usage within specific parts of the application, and physical manifestations such as code bases and database schemas.
+
+境界の中では言葉とモデルを厳密にそろえ、境界の外の事情には惑わされない。境界は、チーム、アプリケーションの部分、コードベース、DB のスキーマという、目に見える単位で引きます。SIM の 2 つ目の場面は、販売・在庫・配送をそれぞれのコンテキストに分け、共有するのは商品の識別子だけにした形です。「複数の倉庫に置く」という在庫の都合の変更は、在庫のコンテキストの中で閉じます。
+
+Microsoft のマイクロサービス設計の指針も、同じ例を別の言葉で述べています。ドローンの修理を扱う部分は機体の整備履歴や走行距離まで必要とするが、配達の予定を組む部分は「使えるかどうか」と到着予定しか要らない。両方を 1 つのモデルにすると不要な複雑さを持ち込むので、同じ現実の物を、2 つのコンテキストの別々のモデルで表すほうがよい、という説明です（[Microsoft Learn: Use domain analysis to model microservices](https://learn.microsoft.com/en-us/azure/architecture/microservices/model/domain-analysis)）。同じ文書は「the same word (like *account*) has different meanings in different contexts」とも書いています。
+
+<Callout type="note" title="分析の側の「同じ言葉は同じ意味」との違い">
+  分析のためのデータの形のカテゴリでは、<a href={`${import.meta.env.BASE_URL}reading/dwh-principles/`}>同じ言葉は、どこでも同じ意味にする</a>という原則を扱いました。Kimball は、別々のディメンションの属性が「the same column names and domain contents」を持つとき、それらは適合している（conform）と定義しています（[Kimball Group: Conformed Dimensions](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/conformed-dimension/)）。
+
+  一見すると、「文脈ごとに意味が違ってよい」という境界づけられたコンテキストと逆に見えます。実際には向いている先が違います。業務のシステムの側では、それぞれのチームが自分の文脈の言葉で速く正しく動けるように、モデルを分けます。分析の側では、それらのシステムから集めたデータを横に並べて比べるために、全社で共有する軸（顧客、商品、日付）の定義をそろえます。分けたモデルの間で ID だけを共有しておくと、分析の側で適合したディメンションを作るときの結合の鍵になります。
+</Callout>
+
+### 文脈の取り違えを型で止める
+
+コンテキストを分けると、識別子も文脈ごとに別のものになります。販売の商品 ID と在庫の在庫単位の ID は、どちらも中身は文字列ですが、取り違えると在庫の引き当てを誤ります。TypeScript では、文字列に印（ブランド）を付けた型で区別できます。
+
+```ts
+type Brand<T, B extends string> = T & { readonly __brand: B }
+export type CatalogItemId = Brand<string, 'CatalogItemId'>
+export type StockItemId = Brand<string, 'StockItemId'>
+
+export function reserve(id: StockItemId, qty: number): string {
+  return `在庫 ${id} から ${qty} 個を引き当て`
+}
+```
+
+```ts
+declare const catalogId: CatalogItemId
+reserve(catalogId, 2)       // 販売の文脈の ID を、在庫の文脈の関数に渡してしまう
+reserve('S-TOKYO-P1', 2)    // ただの文字列も渡せない
+```
+
+TypeScript 5.9.3 の出力です。
+
+```text
+contexts_bad.ts(3,9): error TS2345: Argument of type 'CatalogItemId' is not assignable to parameter of type 'StockItemId'.
+  Type 'CatalogItemId' is not assignable to type '{ readonly __brand: "StockItemId"; }'.
+    Types of property '__brand' are incompatible.
+      Type '"CatalogItemId"' is not assignable to type '"StockItemId"'.
+contexts_bad.ts(4,9): error TS2345: Argument of type 'string' is not assignable to parameter of type 'StockItemId'.
+  Type 'string' is not assignable to type '{ readonly __brand: "StockItemId"; }'.
+```
+
+印は型検査のときだけ存在し、実行時の値はただの文字列のままです。ブランド型の値を作る場所（`as StockItemId` を書く場所）を、DB から読み出す処理や入力を検査する処理に限っておけば、そこを通らない文字列は在庫の関数に届きません。<a href={`${import.meta.env.BASE_URL}reading/state-as-types/`}>状態を型の形で表す</a>の「検査したことを型に残す」と同じ考え方です。
+
+## コンテキストマップ：境界の間の関係
+
+境界を引いたら、境界どうしがどう付き合うかを決めます。DDD Reference は、プロジェクトにあるモデルを洗い出してそれぞれの境界に名前を付け、接点を描いた図を**コンテキストマップ（context map）** と呼びます。その指示は「Map the existing terrain. Take up transformations later.」、つまりまず今ある姿を描き、変えるのは後にする、というものです。
+
+関係にはよく現れる型があり、DDD Reference と、それを整理した ddd-crew の資料が名前を付けています（[ddd-crew: Context Mapping](https://github.com/ddd-crew/context-mapping)）。原文の要点を並べます。
+
+| 型 | 何をするか（DDD Reference の言葉から） |
+| --- | --- |
+| 共有カーネル（Shared Kernel） | 両チームが共有すると合意したモデルの一部を明示し、小さく保つ。相手と相談せずに変えない |
+| パートナーシップ（Partnership） | 一方の失敗が両方の失敗になる 2 チームが、計画と統合を協調して進める |
+| 顧客と供給者（Customer/Supplier） | 上流（供給者）と下流（顧客）の関係をはっきりさせ、下流の要求を上流の計画に組み込む |
+| 順応者（Conformist） | 下流が上流のモデルにそのまま従い、翻訳の手間をなくす。理想のモデルは諦める |
+| 腐敗防止層（Anticorruption Layer） | 下流が、上流の機能を自分のモデルの言葉で使えるように、間に翻訳の層を置く |
+| 公開ホストサービス（Open-host Service） | 上流が、統合したい相手すべてが使える取り決め（API）を公開する |
+| 公表された言語（Published Language） | 文書化された共有の言語を、やり取りの共通の媒体にする。業界のデータ交換標準など |
+| 別々の道（Separate Ways） | 関係の薄いコンテキストどうしは、つながずに切り離す |
+| 大きな泥団子（Big Ball of Mud） | モデルが混ざり境界が一貫しない部分。ほかの文脈へ広がらないように囲う |
+
+ddd-crew の資料は、これらの型をチームどうしの関係とあわせて整理しています。互いに依存する（Mutually Dependent）、上流の動きが下流に影響し逆はない（Upstream-Downstream）、互いに影響しない（Free）の 3 つです。上流のチームが下流の要求を計画に入れてくれるなら顧客と供給者、入れてくれないなら順応者か腐敗防止層、というように、型の選択は技術だけでなくチームの関係で決まります。
+
+### 腐敗防止層を書く
+
+SIM の 3 つ目の場面は、配送会社の API が返すコード値（`'01'`、`'02'`、`'09'`）を、配送のコンテキストの言葉（`pickedUp`、`delivered`、`returned`）に訳す腐敗防止層です。DDD Reference の定義は「As a downstream client, create an isolating layer to provide your system with functionality of the upstream system in terms of your own domain model.」です。
+
+```ts
+// 配送会社の API が返す形（相手の都合で決まっている）
+type CarrierStatus = { cd: '01' | '02' | '09'; ts: string }
+
+// 配送の文脈の言葉
+type ShipmentEvent =
+  | { kind: 'pickedUp'; at: Date }
+  | { kind: 'delivered'; at: Date }
+  | { kind: 'returned'; at: Date }
+
+export function toShipment(s: CarrierStatus): ShipmentEvent {
+  const at = new Date(s.ts)
+  switch (s.cd) {
+    case '01': return { kind: 'pickedUp', at }
+    case '02': return { kind: 'delivered', at }
+    case '09': return { kind: 'returned', at }
+    default: {
+      const unknown: never = s.cd     // 訳し漏れがあれば型エラー
+      throw new Error(`知らないコード: ${unknown}`)
+    }
+  }
+}
+```
+
+```text
+01 → pickedUp 2025-01-05T01:00:00.000Z
+02 → delivered 2025-01-06T05:30:00.000Z
+```
+
+配送会社が「05: 持ち戻り」というコードを足したとします。相手の型の定義に `'05'` を加えると、翻訳の関数がコンパイルできなくなります。
+
+```text
+acl_v2.ts(18,13): error TS2322: Type '"05"' is not assignable to type 'never'.
+```
+
+コンパイラが指すのは、外の言葉と内の言葉の対応を書いたこの 1 か所だけです。配送の文脈の中のコードは `ShipmentEvent` しか知らないので、相手のコード体系が変わっても影響を受けません。
+
+型の定義を直す前に、相手が実際に `'05'` を送ってきた場合は、実行時に `default` の分岐に落ちます。
+
+```text
+知らないコード: 05
+```
+
+型は相手の API の実際の振る舞いを保証しません。境界では、受け取った値を検査してから内側の型に変える必要があり、その検査に失敗したときの扱い（捨てる、保留して人が見る、など）も腐敗防止層の責務です。失敗を戻り値で運ぶ書き方は<a href={`${import.meta.env.BASE_URL}reading/railway-oriented/`}>Railway Oriented Programming</a>で扱いました。
+
+## どこに力を注ぐか：サブドメイン
+
+DDD Reference は、システムの中で最も価値があり、ほかと差がつく部分を**コアドメイン（core domain）** と呼び、「Make the core small. Apply top talent to the core domain」と書いています。逆に、事業の動機ではない部分を**汎用サブドメイン（generic subdomains）** として切り出し、「consider off-the-shelf solutions or published models」、つまり既製品や公開されたモデルの利用を考えるように勧めています。
+
+Microsoft の指針は、これに中間の型を加えた 3 分類で説明しています（[Microsoft Learn: Use domain analysis to model microservices](https://learn.microsoft.com/en-us/azure/architecture/microservices/model/domain-analysis)）。
+
+| 分類 | Microsoft の説明 | 例（同文書のドローン配送） |
+| --- | --- | --- |
+| コア（core） | 競争上の優位を生む。詳しいモデル化と大きな投資が要る | 配送、ドローンの管理 |
+| 支援（supporting） | 事業の運営に要るが、競合との差にはならない。独自の開発は要る | 請求 |
+| 汎用（generic） | 業界ですでに解かれた問題。既製品や標準の仕組みで済ませる | 利用者のアカウント、コールセンター |
+
+前回の戦術の部品（集約、値オブジェクト、ドメインイベント）を丁寧に使う価値が高いのはコアです。汎用の部分まで同じ手間をかける必要はありません。
+
+## 境界を見つける：イベントストーミング
+
+境界は机上で決めるより、業務の人と一緒に探すものです。その方法の 1 つが**イベントストーミング（EventStorming）** で、公式サイトは「a flexible workshop format for collaborative exploration of complex business domains」と説明しています（[EventStorming](https://www.eventstorming.com/)）。公式の書籍は Alberto Brandolini によるものです。よく行われる進め方では、業務で起きる出来事（「注文された」「出荷された」）を付箋に書いて時系列に並べ、出来事を起こすきっかけや、出来事の周りで使われる言葉を書き足していきます。言葉の意味が変わる所や、担当する人が変わる所が、境界の候補になります。
+
+出来事を軸に業務を洗い出すという点で、<a href={`${import.meta.env.BASE_URL}reading/immutable-data-model/`}>イミュータブルデータモデル</a>の「日時を持つものを出来事として切り出す」や、分析の側の<a href={`${import.meta.env.BASE_URL}reading/dimensional-modeling/`}>ディメンショナルモデリング</a>の「業務の動詞からファクトを見つける」と同じ方向を向いています。
+
+## チームとシステムの境界：Conway の法則
+
+Melvin Conway は 1968 年に Datamation 誌に載った論文「How Do Committees Invent?」で、システムを設計する組織は「are constrained to produce designs which are copies of the communication structures of these organizations」と述べました（[Conway: How Do Committees Invent?](https://www.melconway.com/Home/Committees_Paper.html)）。システムの構造は、それを作る組織の意思疎通の構造を写す、という観察で、後に Conway の法則と呼ばれます。
+
+境界づけられたコンテキストは、この観察を逆向きに使う道具になります。先に業務の分析からコンテキストを決め、それに合わせてチームの担当を割り当てれば、組織図の都合ではなく業務の区切りに沿ったシステムになります。Microsoft の指針もこの使い方を勧め、1 つのチームが無関係な複数のコンテキストを持っていたり、1 つのコンテキストに多くのチームの調整が要ったりするなら、境界かチームの構成を見直すように書いています（[Microsoft Learn: Use domain analysis to model microservices](https://learn.microsoft.com/en-us/azure/architecture/microservices/model/domain-analysis)）。
+
+### マイクロサービスとの関係
+
+境界づけられたコンテキストは、マイクロサービスの境界を決める手がかりとしてよく使われます。Microsoft の指針は「In general, the functionality in a microservice shouldn't span more than one bounded context.」と書き、1 つのサービスが異なるドメインモデルを混ぜているなら、ドメインの分析に戻るように勧めています（[Microsoft Learn: Identify microservice boundaries](https://learn.microsoft.com/en-us/azure/architecture/microservices/model/microservice-boundaries)）。同じ文書は、集約もサービスの良い候補になると述べたうえで、迷ったら粗い単位から始めるように書いています。2 つに分けるほうが、複数のサービスにまたがって機能を組み替えるより易しいからです。
+
+逆向きは成り立ちません。コンテキストを分けることは、ネットワーク越しに分けることを意味しません。1 つのデプロイの中で、モジュールとして境界を守ることもできます。コンテキストは「モデルと言葉の境界」で、サービスは「配置と運用の単位」です。両者をそろえると見通しがよくなりますが、別々に決めてかまいません。
+
+## まとめ
+
+| 道具 | 何を決めるか | この回で確かめたこと |
+| --- | --- | --- |
+| ユビキタス言語 | 1 つのコンテキストの中で、会話とコードに使う言葉 | 言葉の変化はモデルの変化 |
+| 境界づけられたコンテキスト | 1 つのモデルが通用する範囲 | 文脈ごとの ID の取り違えをブランド型で拒否 |
+| コンテキストマップ | 境界どうしの関係の型 | 9 つの型の名前と、チームの力関係による選び方 |
+| 腐敗防止層 | 外の言葉を内の言葉へ訳す場所 | 相手のコード追加を網羅性検査が検出、実行時は検査で止める |
+| サブドメインの分類 | どこに設計の手間をかけるか | コア・支援・汎用 |
+| Conway の法則 | チームの境界とシステムの境界の対応 | コンテキストに合わせてチームを割り当てる |
+
+次回は、書き込みと読み取りでモデルを分け、出来事を記録の正本にする<a href={`${import.meta.env.BASE_URL}reading/cqrs-event-sourcing/`}>CQRS と Event Sourcing</a>に進みます。

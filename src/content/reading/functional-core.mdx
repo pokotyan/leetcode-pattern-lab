@@ -1,0 +1,150 @@
+---
+title: 計算の芯と入出力の殻（Functional Core, Imperative Shell）
+description: DB を読み、時計を見て、判断し、課金し、書き、メールを送る。1 つの関数に入出力と判断が交互に並ぶと、規則 1 つを試すのにも偽物が 4 つ要る。判断だけを「値を受け取り、すべきことを値で返す」純粋な関数に取り出すと、規則は入力と出力の表で試せる。実際に表を流すと、月末の日付の扱いの誤りが見つかった
+category: code
+order: 47
+status: published
+topics:
+  - Functional Core, Imperative Shell
+  - 純粋な関数
+  - 副作用
+  - Impureim Sandwich
+  - 判断を値で返す
+  - テストの分担
+---
+
+import Callout from '../../components/Callout.astro'
+import FunctionalCore from '../../components/sim/problems/FunctionalCore'
+
+## 判断が、入出力の手順に埋もれる
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/dependency-direction/`}>依存の向き</a>では、モジュールの単位で「業務の規則」と「DB などの技術の詳細」を分けました。この回では、もう 1 段小さく、**1 つの処理の中**で同じ分け方をします。
+
+定期購読の更新処理を例にします。
+
+```ts
+async function renew(userId: string) {
+  const sub = await db.findSubscription(userId)
+  const now = new Date()
+  if (sub.expiresAt > now) return
+  await payment.charge(sub.cardId, sub.plan.price)
+  const next = addMonths(sub.expiresAt, 1)
+  await db.update(userId, { expiresAt: next })
+  await mailer.send(sub.email, '更新しました')
+}
+```
+
+この関数の中で、業務の判断と呼べるのは「期限前なら何もしない」と「次の期限は 1 か月後」の 2 つだけです。残りは DB を読む、時計を見る、課金する、DB に書く、メールを送る、という外の世界とのやり取り（入出力、副作用）です。判断と入出力が交互に並んでいるため、「期限前なら何もしない」という規則 1 つを試すのにも、DB・決済・メールの偽物を用意し、時計も止める必要があります。
+
+## 芯と殻に分ける
+
+Gary Bernhardt は 2012 年の screencast「Functional Core, Imperative Shell」で、純粋な関数からなる芯（functional core）を、命令的なコードの殻が取り囲む形を示しました。紹介文は「This functional core is surrounded by a shell of imperative code」とし、殻が「manipulates stdin, stdout, the database, and the network」と説明しています（[Destroy All Software: Functional Core, Imperative Shell](https://www.destroyallsoftware.com/screencasts/catalog/functional-core-imperative-shell)）。
+
+**純粋な関数**とは、同じ入力に対して必ず同じ出力を返し、外の世界を何も変えない関数です。DB を読まず、時計も見ず、ログも書きません。時計を見ない、というのが要点で、「今」が必要なら引数で受け取ります。
+
+更新処理を、この形に組み直します。
+
+```ts
+// 芯: 入出力をしない。値を受け取り、何をすべきかを値で返す
+type Decision =
+  | { kind: 'skip' }
+  | { kind: 'renew'; charge: number; nextExpiresAt: Date }
+
+function decideRenewal(sub: Subscription, now: Date): Decision {
+  if (sub.expiresAt > now) return { kind: 'skip' }
+  return { kind: 'renew', charge: sub.price, nextExpiresAt: addMonths(sub.expiresAt, 1) }
+}
+
+// 殻: 読む → 芯に決めさせる → 決まったことを実行する
+async function renew(userId: string, d: Deps) {
+  const sub = await d.findSubscription(userId)
+  const decision = decideRenewal(sub, d.now())
+  if (decision.kind === 'skip') return
+  await d.charge(sub.cardId, decision.charge)
+  await d.update(userId, decision.nextExpiresAt)
+  await d.send(sub.email, '更新しました')
+}
+```
+
+芯の `decideRenewal` は、課金や更新を**実行しません**。「更新すべきで、いくら課金し、次の期限はいつか」という**決定を値として返す**だけです。決定の型を<a href={`${import.meta.env.BASE_URL}reading/state-as-types/`}>状態を型の形で表す</a>回で扱う直和型にしておくと、「skip なのに課金額がある」といった矛盾した決定は作れません。殻の `renew` は、読む・芯を呼ぶ・決定に従って書く、を並べるだけで、分岐はほとんど持ちません。
+
+Mark Seemann は同じ形を、3 段の手順として書いています（[Impureim sandwich](https://blog.ploeh.dk/2020/03/02/impureim-sandwich/)、2020 年）。
+
+- Gather data from impure sources.
+- Call a pure function with that data.
+- Change state (including user interface) based on return value from pure function.
+
+そして「This is the impure/pure/impure sandwich.」と、純粋でない読み込みと書き込みで純粋な関数を挟む形に名前を付けています。
+
+<FunctionalCore client:visible />
+
+上の「入出力と計算が混ざった関数」では、7 つの処理のうち計算は 2 つだけで、テストには偽物が 4 つ要ることが見えます。「計算を芯に、入出力を外側に」に切り替えると、芯の試験には何も要らず、殻の試験は少数の結合テストに任せる、という分担になります。
+
+## 実験：芯は表で、殻は呼び出しの記録で試す
+
+上のコードを TypeScript 5.9.3 で書き、`tsc --strict` で JavaScript にしてから Node 20.19.0 で動かしました。芯の試験は、入力と期待する結果の表をそのまま流すだけです。
+
+```ts
+const sub = (expiresAt: string) => ({ email: 'a@example.com', cardId: 'c1', price: 980, expiresAt: new Date(expiresAt) })
+const cases: [string, string, string][] = [
+  ['2025-02-01T00:00:00Z', '2025-01-15T00:00:00Z', 'skip'],
+  ['2025-01-15T00:00:00Z', '2025-01-15T00:00:00Z', 'renew'],
+  ['2025-01-31T00:00:00Z', '2025-02-01T00:00:00Z', 'renew'],
+]
+for (const [exp, now, want] of cases) {
+  const d = decideRenewal(sub(exp), new Date(now))
+  const next = d.kind === 'renew' ? d.nextExpiresAt.toISOString().slice(0, 10) : '-'
+  console.log(`expires=${exp.slice(0, 10)} now=${now.slice(0, 10)} → ${d.kind} next=${next} ${d.kind === want ? 'OK' : 'NG'}`)
+}
+```
+
+殻の試験では、偽物の依存を渡し、外へ出ていく呼び出しの順番だけを記録します。
+
+```ts
+const deps: Deps = {
+  findSubscription: async () => sub('2025-01-15T00:00:00Z'),
+  charge: async (c, a) => { log.push(`charge(${c}, ${a})`) },
+  update: async (_u, e) => { log.push(`update(${e.toISOString().slice(0, 10)})`) },
+  send: async (m) => { log.push(`send(${m})`) },
+  now: () => new Date('2025-01-20T00:00:00Z'),
+}
+await renew('u1', deps)
+```
+
+出力です。
+
+```text
+== 芯（decideRenewal）: 偽物なしで表を流す
+expires=2025-02-01 now=2025-01-15 → skip next=- OK
+expires=2025-01-15 now=2025-01-15 → renew next=2025-02-15 OK
+expires=2025-01-31 now=2025-02-01 → renew next=2025-03-03 OK
+== 殻（renew）: 偽物を渡して呼び出しを記録
+charge(c1, 980)
+update(2025-02-15)
+send(a@example.com)
+```
+
+3 行目に注目してください。判定（renew）は期待どおりで OK と出ていますが、1 月 31 日に期限が切れた購読の次の期限が **3 月 3 日** になっています。`addMonths` を JavaScript の `Date` の `setUTCMonth` で書いたため、存在しない「2 月 31 日」が 3 日ずれた 3 月 3 日に繰り越されました。これを正しいとするか（日数で数える）、2 月 28 日に丸めるか（月末にそろえる）は業務の決めごとです。
+
+<Callout type="tip" title="芯が純粋だから、境界の値を気軽に足せる">
+  このずれは、表に「1 月 31 日」の 1 行を足しただけで見つかりました。芯が DB も時計も触らないので、境界になりそうな日付（月末、うるう年の 2 月 29 日、年末）を表に何行足しても、偽物の準備は増えません。入出力が混ざった元の関数で同じことをするには、行ごとに DB の偽物と時計を設定し直す必要があります。
+</Callout>
+
+## 分けると何が変わるか
+
+| | 混ざった関数 | 芯と殻 |
+| --- | --- | --- |
+| 規則を試すのに要るもの | DB・決済・メールの偽物と、止めた時計 | 値だけ |
+| 試せる数 | 偽物の準備が重いので少なくなりがち | 入力と出力の表で多く |
+| 殻の試験 | 規則と手順をまとめて試す | 呼び出しの順番だけを、少数の結合テストで |
+| 規則の置き場所 | 入出力の手順の間に散らばる | 芯の関数 1 つ |
+
+<Callout type="warn" title="すべてを芯に寄せられるわけではない">
+  判断の途中で DB を読み直す必要がある処理（在庫を確保してから次を決める、など）は、読む → 決める → 書く、の 1 往復に収まりません。その場合は、芯を複数に分けて殻で往復させるか、無理に分けずに入出力の偽物で試します。分け方の目安は「規則が多く、境界の値で試したいところから取り出す」です。また、芯が返す決定の値を殻が正しく実行しているかは、芯の試験では確かめられないので、殻の結合テストを省いてはいけません。
+</Callout>
+
+## 他の回とのつながり
+
+- 芯が返す決定の値は、<a href={`${import.meta.env.BASE_URL}reading/state-as-types/`}>状態を型の形で表す</a>回の直和型で書くと、決定の種類の扱い漏れをコンパイラが検出します。
+- 芯の判断が失敗しうるとき（入力が不正、規則に反する）は、例外を投げるのではなく、<a href={`${import.meta.env.BASE_URL}reading/railway-oriented/`}>Railway Oriented Programming</a> の Result で返すと、殻はそれも値として扱えます。
+- 殻の側で偽物に差し替えられるのは、依存を引数で受け取っているからです。これは<a href={`${import.meta.env.BASE_URL}reading/dependency-direction/`}>依存の向き</a>で扱った依存性の注入を、関数の単位で行っていることになります。

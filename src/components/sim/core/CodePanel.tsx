@@ -8,6 +8,12 @@ const BUILTINS = new Set([
   'enumerate', 'zip', 'int', 'str', 'deque', 'defaultdict', 'Counter', 'heappush',
   'heappop', 'append', 'pop', 'popleft', 'add', 'ord', 'reversed',
 ])
+// TypeScript を載せる回のため。Python のコードで識別子に使われても、色が付くだけで害はない
+const TS_KEYWORDS = new Set([
+  'const', 'let', 'function', 'type', 'interface', 'export', 'async', 'await', 'switch',
+  'case', 'throw', 'new', 'extends', 'implements', 'readonly', 'of', 'never', 'undefined',
+  'null', 'true', 'false', 'this', 'default',
+])
 // SQL を載せる回のため。大文字だけを拾うので Python の識別子とは衝突しない
 const SQL_KEYWORDS = new Set([
   'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL', 'AS', 'ON', 'JOIN',
@@ -17,11 +23,16 @@ const SQL_KEYWORDS = new Set([
   'DISTINCT', 'BEGIN', 'COMMIT', 'CYCLE', 'USING', 'LIMIT',
 ])
 
+type Lang = 'py' | 'ts'
+
 type Tok = { t: string; k: 'kw' | 'fn' | 'num' | 'str' | 'cm' | 'txt' }
 
 /** 表示用の軽量トークナイザ。厳密な構文解析はしない */
-function tokenize(line: string): Tok[] {
+function tokenize(line: string, lang: Lang): Tok[] {
   const out: Tok[] = []
+  // Python の // は床除算なので、TypeScript のときだけ行コメントとして扱う
+  const cm = lang === 'ts' ? line.search(/\/\/(?=[^"']*$)/) : -1
+  if (cm >= 0) return [...tokenize(line.slice(0, cm), lang), { t: line.slice(cm), k: 'cm' }]
   const re = /(#.*$|--.*$)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|(\s+)|([^\sA-Za-z0-9_])/g
   let m: RegExpExecArray | null
   while ((m = re.exec(line))) {
@@ -30,7 +41,7 @@ function tokenize(line: string): Tok[] {
     else if (m[3]) out.push({ t: m[3], k: 'num' })
     else if (m[4]) {
       const w = m[4]
-      out.push({ t: w, k: KEYWORDS.has(w) || SQL_KEYWORDS.has(w) ? 'kw' : BUILTINS.has(w) ? 'fn' : 'txt' })
+      out.push({ t: w, k: KEYWORDS.has(w) || SQL_KEYWORDS.has(w) || TS_KEYWORDS.has(w) ? 'kw' : BUILTINS.has(w) ? 'fn' : 'txt' })
     } else out.push({ t: m[0], k: 'txt' })
   }
   return out
@@ -48,9 +59,11 @@ const TONE: Record<Tok['k'], string> = {
 export function CodePanel({
   code,
   active,
+  lang = 'py',
 }: {
   code: string
   active: number | number[]
+  lang?: Lang
 }) {
   const lines = code.replace(/\n$/, '').split('\n')
   const hot = new Set(Array.isArray(active) ? active : [active])
@@ -80,7 +93,7 @@ export function CodePanel({
                 className="whitespace-pre-wrap break-words"
                 style={{ textIndent: '-2ch', paddingLeft: '2ch' }}
               >
-                {tokenize(ln).map((tk, j) => (
+                {tokenize(ln, lang).map((tk, j) => (
                   <span key={j} className={TONE[tk.k]}>
                     {tk.t}
                   </span>

@@ -53,6 +53,7 @@ export function TablesSim({
   legend,
   label = '操作',
   columns = 1,
+  lang,
 }: {
   title: string
   subtitle: string
@@ -61,6 +62,7 @@ export function TablesSim({
   label?: string
   /** 表を何列に並べるか（広い画面のとき） */
   columns?: 1 | 2
+  lang?: 'py' | 'ts'
 }) {
   const [i, setI] = useState(0)
   const s = scenarios[i]!
@@ -70,6 +72,7 @@ export function TablesSim({
       title={title}
       subtitle={subtitle}
       code={s.code}
+      lang={lang}
       frames={frames}
       controls={<PresetControl label={label} presets={scenarios.map((x, k) => ({ name: x.name, value: k }))} onPick={setI} />}
       legend={legend}

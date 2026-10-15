@@ -1,0 +1,225 @@
+---
+title: Railway Oriented Programming と Result（失敗を戻り値で運ぶ）
+description: 会員登録の処理を、成功と失敗の 2 本の線路を走る小さな関数の連なりとして組む。Result 型と andThen で失敗を戻り値として運び、誤りの種類を型に残す。例外との使い分け、誤りを全部集める検査、Rust・Go・TypeScript のライブラリでの書き方までを、実行結果で確かめる
+category: code
+order: 49
+status: published
+topics:
+  - Railway Oriented Programming
+  - Result 型
+  - Either
+  - andThen（bind）
+  - map
+  - 例外
+  - 誤りを集める検査
+  - neverthrow
+  - Effect
+---
+
+import Callout from '../../components/Callout.astro'
+import Railway from '../../components/sim/problems/Railway'
+
+## 失敗が型に現れない
+
+前回の<a href={`${import.meta.env.BASE_URL}reading/state-as-types/`}>状態を型の形で表す</a>の最後で、関数の型には「何を投げうるか」が書けないことを確かめました。もう一度、例外で書いた会員登録を見ます。
+
+```ts
+type User = { id: number; email: string }
+// 型の上では User を返すとしか書かれていない
+function registerOrThrow(body: string): User {
+  const r = JSON.parse(body)
+  if (r.age < 18) throw new Error('TooYoung')
+  return { id: 42, email: r.email }
+}
+const u = registerOrThrow('{"email":"a@example.com","age":15}')   // try を書き忘れてもコンパイルは通る
+console.log(u.id)
+```
+
+```text
+tsc: エラーなし
+file:///…/out/throw.mjs:5
+        throw new Error('TooYoung');
+              ^
+
+Error: TooYoung
+    at registerOrThrow (file:///…/out/throw.mjs:5:15)
+```
+
+（実行結果のファイルのパスは途中を `…` で省略しています。）コンパイラは何も言わず、実行して初めて落ちます。`registerOrThrow` の型は `(body: string) => User` で、「18 歳未満なら失敗する」ことはどこにも書かれていません。呼ぶ側は実装を読むか、文書を信じるしかありません。
+
+## 2 本の線路
+
+Scott Wlaschin は、失敗しうる処理の連なりを、成功と失敗の 2 本の線路に例えて説明しました。F# for Fun and Profit の解説ページは、これを「a functional approach to error handling」の講演と紹介し、関数型プログラミングの例が成功する経路（happy path）だけを書きがちなのに対して、実際のアプリケーションでは検査・ログ・ネットワークの失敗に対処する必要がある、と述べています（[F# for Fun and Profit: Railway Oriented Programming](https://fsharpforfunandprofit.com/rop/)）。
+
+考え方は単純です。
+
+- 各段は「成功なら次へ渡す値、失敗なら誤り」のどちらかを返す。この戻り値を Result（ほかの言語では Either）と呼ぶ。
+- 段と段をつなぐ部品は、受け取った値が成功なら次の段を呼び、失敗なら**次の段を呼ばずに、その失敗をそのまま流す**。
+- いったん失敗の線路に乗った値は、最後まで素通りし、呼び出し側に届く。
+
+<Railway client:visible />
+
+入力を「メールが不正」「年齢が足りない」「登録済みのメール」と切り替えると、失敗する段が変わり、その後の段が呼ばれずに灰色になります。最後に呼び出し側へ届く値には、どの段で何が起きたかが誤りの種類として残っています。
+
+## TypeScript で書く
+
+Result 型と、2 つの部品だけを用意します。
+
+```ts
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E }
+const ok = <T>(value: T): Result<T, never> => ({ ok: true, value })
+const err = <E>(error: E): Result<never, E> => ({ ok: false, error })
+
+function map<T, U, E>(r: Result<T, E>, f: (v: T) => U): Result<U, E> {
+  return r.ok ? ok(f(r.value)) : r
+}
+function andThen<T, U, E, F>(r: Result<T, E>, f: (v: T) => Result<U, F>): Result<U, E | F> {
+  return r.ok ? f(r.value) : r
+}
+```
+
+- `map` は、失敗しない変換（値から値）を成功の線路の上だけで行う。
+- `andThen` は、失敗しうる次の段（値から Result）をつなぐ。関数型の言葉では bind や flatMap と呼ばれる。
+
+Result 型そのものは、前回の直和型そのものです。`ok` が `true` か `false` かで形が分かれ、`value` と `error` は片方にしかありません。
+
+誤りの種類も直和型にします。
+
+```ts
+type RegisterError =
+  | { kind: 'InvalidJson' }
+  | { kind: 'InvalidEmail'; input: string }
+  | { kind: 'TooYoung'; age: number }
+  | { kind: 'EmailTaken' }
+```
+
+各段は `Result<…, RegisterError>` を返す関数として書き、`andThen` でつなぎます。どの段が呼ばれたかを記録しながら、5 つの入力で実行しました。
+
+```ts
+function register(body: string) {
+  calls.length = 0
+  const r = andThen(andThen(andThen(parseJson(body), validateEmail), validateAge), save)
+  return { result: JSON.stringify(map(r, (u) => u.id)), calls: calls.join(' → ') }
+}
+```
+
+```text
+{"email":"a@example.com","age":30}       {
+  result: '{"ok":true,"value":42}',
+  calls: 'parseJson → validateEmail → validateAge → save'
+}
+{"email":                                {
+  result: '{"ok":false,"error":{"kind":"InvalidJson"}}',
+  calls: 'parseJson'
+}
+{"email":"abc","age":30}                 {
+  result: '{"ok":false,"error":{"kind":"InvalidEmail","input":"abc"}}',
+  calls: 'parseJson → validateEmail'
+}
+{"email":"a@example.com","age":15}       {
+  result: '{"ok":false,"error":{"kind":"TooYoung","age":15}}',
+  calls: 'parseJson → validateEmail → validateAge'
+}
+{"email":"taken@example.com","age":30}   {
+  result: '{"ok":false,"error":{"kind":"EmailTaken"}}',
+  calls: 'parseJson → validateEmail → validateAge → save'
+}
+```
+
+失敗した段より後の段は呼ばれていません（`calls` に現れない）。`try`/`catch` も `if` の入れ子もないのに、例外で途中から抜けたのと同じ流れになっています。
+
+### 呼ぶ側は誤りを書き漏らせない
+
+`register` の戻り値の型は `Result<User, RegisterError>` です。呼ぶ側は `ok` を確かめないと `value` に触れず、失敗の種類は 4 つに決まっています。HTTP の状態コードへの対応を `switch` で書きました。
+
+```ts
+function httpStatus(e: RegisterError): number {
+  switch (e.kind) {
+    case 'InvalidJson': return 400
+    case 'InvalidEmail': return 422
+    case 'TooYoung': return 422
+    case 'EmailTaken': return 409
+  }
+}
+```
+
+```text
+EmailTaken -> 409
+```
+
+`case 'EmailTaken'` の行を消してコンパイルすると、型エラーになります。
+
+```text
+rop_missing.ts(49,40): error TS2366: Function lacks ending return statement and return type does not include 'undefined'.
+```
+
+例外の版では、`EmailTaken` を扱い忘れても誰も教えてくれませんでした。誤りの種類を足したときに直す場所が型エラーとして挙がるのは、前回の網羅性検査と同じ仕組みです。
+
+## 止めずに、誤りを全部集める
+
+`andThen` は最初の失敗で止まります。保存は検査が通ってから、通知は保存が通ってから、のように**前の結果に依存する**段にはこれが正しい振る舞いです。
+
+ところが入力の検査どうしは独立しています。メールの形式と年齢は、片方が誤っていても、もう片方を確かめられます。最初の誤りで止めると、利用者はフォームを直して送るたびに 1 つずつ誤りを知らされることになります。独立した検査は全部走らせ、誤りを集めて返します。
+
+```ts
+function validateAll(r: Raw): Result<Raw, string[]> {
+  const errors = [
+    ...(/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(r.email) ? [] : ['メールの形式が正しくない']),
+    ...(r.age >= 18 ? [] : ['18 歳以上が対象']),
+  ]
+  return errors.length > 0 ? err(errors) : ok(r)
+}
+```
+
+```text
+chain   : {"ok":false,"error":{"kind":"InvalidEmail","input":"abc"}}
+collect : {"ok":false,"error":["メールの形式が正しくない","18 歳以上が対象"]}
+```
+
+同じ入力（メールが `abc`、年齢 15）で、つなぐ形は 1 つ、集める形は 2 つの誤りを返しました。関数型の文脈では、前者を monadic、後者を applicative な組み合わせ方と呼び分けることがあります。ビジュアライザの「誤りを全部集める」がこの形です。
+
+## 例外と使い分ける
+
+Result は例外を置き換えるものではありません。Wlaschin 自身が 2019 年に「Against Railway-Oriented Programming」という記事を書き、行き過ぎた使い方に注意を促しています（[F# for Fun and Profit: Against Railway-Oriented Programming](https://fsharpforfunandprofit.com/posts/against-railway-oriented-programming/)）。要点は次のとおりです。
+
+- Result は「only for _expected_ control-flow, not for unexpected situations」。業務として予想できる失敗（年齢が足りない、登録済み）を表すためのもの。
+- 原因の調査にスタックトレースが要る場面では使わない。上の例外の実験でも、例外は `at registerOrThrow (…:5:15)` と発生場所を教えてくれた。Result の誤りは、自分で情報を入れない限り場所を持たない。
+- メモリ不足や null 参照のような異常は、「abandoning the workflow and raising an exception」が適している。
+- 入出力の失敗をすべて型にしない。「only model the bare minimum that you need for your domain, and let all the other errors become exceptions」。
+- 呼ぶ側の誰も失敗の原因を区別しないなら、Result まで要らない。
+
+まとめると、**業務の言葉で名前が付く失敗は Result で戻り値に、それ以外の想定外は例外で上へ**、という分担になります。どちらの場合も、最上位で例外を受け止める場所は必要です。
+
+<Callout type="warn" title="Result にしても、例外はなくならない">
+  `JSON.parse` は例外を投げます。上の `parseJson` は、それを `try`/`catch` で受けて `err({ kind: 'InvalidJson' })` に変えています。標準ライブラリや外部のライブラリは例外を投げるので、Result の世界との境目で変換する必要があります。境目の外で起きた想定外の例外は、Result を使っていても素通りして上がってきます。
+</Callout>
+
+## ほかの言語・ライブラリでは
+
+**Rust** は標準の型として Result を持ちます。The Rust Programming Language は定義を次のように示しています。
+
+```rust
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+```
+
+さらに `?` 演算子が `andThen` の役を言語の構文として担います。同書は `?` について「If the value is an `Err`, the `Err` will be returned from the whole function as if we had used the `return` keyword so that the error value gets propagated to the calling code.」と説明しています（[The Rust Programming Language: Recoverable Errors with Result](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html)）。失敗の線路に乗った値を、そのまま呼び出し元へ返す動きです。
+
+**Go** は、誤りを値として返します。Go のブログは「Go code uses error values to indicate an abnormal state.」と書き、`error` を `Error() string` だけを持つ interface として定義しています（[The Go Blog: Error handling and Go](https://go.dev/blog/error-handling-and-go)）。戻り値で失敗を運ぶ点は同じですが、成功の値と誤りを両方返す形なので、「どちらか一方」であることは型では保証されず、`if err != nil` を書くかどうかは書き手に委ねられます。
+
+**TypeScript** には標準の Result がないため、上のように自分で書くか、ライブラリを使います。
+
+- neverthrow は「Type-Safe Errors for JS & TypeScript」を掲げ、`map`・`mapErr`・`andThen` のほか、最初の誤りで止める `combine` と、誤りをすべて集める `combineWithAllErrors`、非同期版の `ResultAsync` を持ちます（[neverthrow](https://github.com/supermacro/neverthrow)）。上で手書きした 2 つの組み合わせ方が、そのまま名前の付いた関数になっています。
+- Effect は、予想できる誤り（expected errors）を「tracked at the type level by the `Effect` data type in the "Error" channel」とし、予想しない誤り（defects）は型では追跡しない、と 2 種類を分けています（[Effect: Two Types of Errors](https://effect.website/docs/error-management/two-error-types/)）。Wlaschin の使い分けと同じ線の引き方です。
+
+## まとめ
+
+- 例外で書くと、失敗しうることが関数の型に現れず、扱い忘れはコンパイルで見つからない。
+- Result は「成功の値か、誤りか」の直和型。`map` は成功の線路の上での変換、`andThen` は失敗しうる次の段をつなぎ、失敗はそのまま素通りさせる。
+- 誤りの種類を直和型にすると、呼ぶ側の書き漏らしが型エラーになる。
+- 前の結果に依存する段はつないで最初の失敗で止め、独立した検査は全部走らせて誤りを集める。
+- Result は業務として予想できる失敗のためのもの。想定外の異常や、誰も区別しない失敗は例外のままでよい。
+
+失敗の扱いと並んで、コードの形を決めるもう 1 つの軸が「出来事をどう記録するか」です。<a href={`${import.meta.env.BASE_URL}reading/ddd-tactical/`}>DDD の戦術的設計</a>で集約とドメインイベントを扱ったあと、<a href={`${import.meta.env.BASE_URL}reading/cqrs-event-sourcing/`}>CQRS と Event Sourcing</a>で、出来事を記録の中心に置く設計を見ます。

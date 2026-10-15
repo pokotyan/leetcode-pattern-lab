@@ -1,0 +1,83 @@
+---
+title: コードの組み立て方の地図
+description: データをどんな形の表に載せるかを考えてきた。この章では、そのデータを扱うロジックをどんな形に組むかを考える。依存の向き、計算と入出力の分け方、状態を型で表すこと、失敗を戻り値で運ぶこと、DDD、CQRS と Event Sourcing を、何のために使うのかという一本の線の上に並べる
+category: code
+order: 45
+status: published
+topics:
+  - 凝集と結合
+  - 単一責任の原則
+  - SOLID
+  - Tell Don't Ask
+  - デメテルの法則
+  - YAGNI
+---
+
+import Callout from '../../components/Callout.astro'
+
+## データの形の次は、ロジックの形
+
+ここまでの 2 つのカテゴリでは、データの形を扱いました。<a href={`${import.meta.env.BASE_URL}reading/schema-map/`}>テーブルの形</a>では、木・可変の属性・継承・時間とともに変わる値を表にどう載せるかを比べ、<a href={`${import.meta.env.BASE_URL}reading/row-column-store/`}>分析のためのデータの形</a>では、業務の表と分析の表がなぜ別の形になるのかを見ました。
+
+このカテゴリでは、そのデータを読み書きする**コードの形**を扱います。テーブルの設計と同じく、コードの組み立て方にも名前のついた型がいくつもあります。ヘキサゴナルアーキテクチャ、クリーンアーキテクチャ、DDD（ドメイン駆動設計）、Railway Oriented Programming、CQRS といった名前は、別々の時期に別々の人が言い出したものですが、目指しているところはかなり重なっています。この回では、それらを 1 本の線の上に並べ、各回の位置づけを示します。
+
+## 何のために整理するのか
+
+コードを整理する目的は、見た目を整えることではなく、**変更を安く、安全にすること**です。動くだけのコードなら、1 つの関数に全部を書いても動きます。困るのは、変えるときです。
+
+Robert C. Martin は単一責任の原則（Single Responsibility Principle）を「each software module should have one and only one reason to change.」と述べ、さらに言い換えとして次の文を挙げています（[The Single Responsibility Principle](https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html)）。
+
+> Gather together the things that change for the same reasons. Separate those things that change for different reasons.
+
+同じ理由で変わるものを近くに集め（**凝集**）、違う理由で変わるものを離す（**結合**を弱める）。このカテゴリの各回は、この 1 文をそれぞれ別の切り口で具体化したものだと読めます。
+
+| 変わる理由の違い | 分け方 | 回 |
+| --- | --- | --- |
+| 業務の規則と、DB・画面・外部サービスといった技術の詳細は、変わる理由も頻度も違う | 依存を内側（業務の規則）へ向け、技術の詳細を外側に置く | <a href={`${import.meta.env.BASE_URL}reading/dependency-direction/`}>依存の向き</a> |
+| 判断の規則と、読み書きの手順は、試し方が違う | 判断を純粋な関数にし、入出力を外側の薄い殻に寄せる | <a href={`${import.meta.env.BASE_URL}reading/functional-core/`}>計算の芯と入出力の殻</a> |
+| あり得る状態の組み合わせと、それを守る if 文は、離れているとずれる | 状態ごとの形を型で書き、あり得ない状態を作れなくする | <a href={`${import.meta.env.BASE_URL}reading/state-as-types/`}>状態を型の形で表す</a> |
+| 成功の手順と、失敗したときの扱いは、混ぜると読めなくなる | 失敗も戻り値として運び、成功の手順をまっすぐ書く | <a href={`${import.meta.env.BASE_URL}reading/railway-oriented/`}>Railway Oriented Programming</a> |
+| 一緒に守るべき規則と、別々に変わってよいものがある | 規則を守る単位（集約）を決め、その根からだけ変更させる | <a href={`${import.meta.env.BASE_URL}reading/ddd-tactical/`}>DDD の戦術的設計</a> |
+| 同じ言葉でも、部署やシステムによって意味が違う | 言葉の意味が一つに定まる範囲ごとにモデルを分ける | <a href={`${import.meta.env.BASE_URL}reading/ddd-strategic/`}>DDD の戦略的設計</a> |
+| 書き込みの規則と、読み取りの見せ方は、求める形が違う | 書き込みのモデルと読み取りのモデルを分け、出来事でつなぐ | <a href={`${import.meta.env.BASE_URL}reading/cqrs-event-sourcing/`}>CQRS と Event Sourcing</a> |
+
+## 読む順
+
+前半の 4 回は、1 つのアプリケーションの中の組み立て方です。後半の 3 回は、業務の言葉とモデルをどう切るかという、もう一段大きな単位の話になります。
+
+1. **依存の向き**：層をどう積むか、どちらへ import するか。ほかの回の土台になる。
+2. **計算の芯と入出力の殻**：1 つの処理の中で、判断と入出力をどう分けるか。
+3. **状態を型の形で表す**：判断に使う値を、どんな型で持つか。
+4. **Railway Oriented Programming**：判断の結果の「失敗」を、どう運ぶか。
+5. **DDD の戦術的設計**：エンティティ・値オブジェクト・集約・リポジトリ。3 と 4 の道具を、業務の規則のまとまりとして組む。
+6. **DDD の戦略的設計**：境界づけられたコンテキスト。5 のモデルを、どの範囲で 1 つとみなすか。
+7. **CQRS と Event Sourcing**：書き込みと読み取りを分け、状態ではなく出来事を記録する。
+
+## データの形との対応
+
+コードの形とデータの形は、別々に決めるものではありません。前の 2 つのカテゴリで見た表の設計と、このカテゴリの考え方には、はっきりした対応があります。
+
+| コードの側 | データの側 | 共通していること |
+| --- | --- | --- |
+| 状態を型の形で表す（状態ごとに持つ項目を変える） | <a href={`${import.meta.env.BASE_URL}reading/inheritance-tables/`}>継承を表に載せる 3 つの方式</a>、<a href={`${import.meta.env.BASE_URL}reading/temporal-tables/`}>時間とともに変わる値を残す</a> | 「この状態のときだけ意味のある項目」を NULL や真偽値の組み合わせで持つと、あり得ない組み合わせが作れてしまう |
+| 集約の版（version）で同時の変更を検出する | <a href={`${import.meta.env.BASE_URL}reading/schema-map/`}>楽観ロックの version 列</a> | 読んだ時点から変わっていなければ書く、という条件付きの更新 |
+| Event Sourcing（状態でなく出来事を記録する） | <a href={`${import.meta.env.BASE_URL}reading/immutable-data-model/`}>イミュータブルデータモデル</a>、<a href={`${import.meta.env.BASE_URL}reading/dwh-fact-tables/`}>トランザクションファクト</a> | 書いた行を書き換えず、出来事を足していく。状態はそこから導く |
+| CQRS の読み取りモデル | <a href={`${import.meta.env.BASE_URL}reading/dwh-layers/`}>層を分けて加工する</a>、<a href={`${import.meta.env.BASE_URL}reading/dimensional-modeling/`}>ディメンショナルモデリング</a> | 記録の形と、見せる・集計する形を分け、前者から後者を作り直せるようにする |
+| 境界づけられたコンテキスト | <a href={`${import.meta.env.BASE_URL}reading/dwh-principles/`}>同じ言葉は同じ意味にする（適合ディメンション）</a> | 言葉の意味をどの範囲で 1 つに揃えるかを、意識して決める |
+
+<Callout type="tip" title="表とコードは同じ問いに答えている">
+  テーブルの設計で「1 行が何を表すか（粒度）」を最初に決めたように、コードでも「この型の値は何を表すか」「このモジュールは何の理由で変わるか」を最初に言葉にします。名前のついた型の多くは、その答えの出し方の定石です。
+</Callout>
+
+## ほかに知っておくと役立つ名前
+
+各回で詳しく扱わないものの、同じ文脈でよく名前が出る考え方を短く挙げます。
+
+- **SOLID**：Robert C. Martin がまとめた、オブジェクト指向設計の 5 つの原則の頭文字です。上の単一責任の原則（S）と、<a href={`${import.meta.env.BASE_URL}reading/dependency-direction/`}>依存の向き</a>で扱う依存性逆転の原則（D）が、このカテゴリと特に関係します。
+- **Tell Don't Ask**：Martin Fowler は「Tell-Don't-Ask is a principle that helps people remember that object-orientation is about bundling data with the functions that operate on that data.」と書いています（[TellDontAsk](https://martinfowler.com/bliki/TellDontAsk.html)）。値を取り出して外で判断するのではなく、値を持っている側に判断させる、という考え方です。集約の根に規則を置く<a href={`${import.meta.env.BASE_URL}reading/ddd-tactical/`}>DDD の戦術的設計</a>と同じ向きを向いています。
+- **デメテルの法則（Law of Demeter）**：「Only talk to your immediate friends.」と要約される指針で、1987 年の終わりに Northeastern University の Ian Holland が提案したとされています（[Wikipedia: Law of Demeter](https://en.wikipedia.org/wiki/Law_of_Demeter)）。`order.customer.address.city` のように他人の内部を何段もたどるコードは、途中の構造が変わると壊れます。
+- **YAGNI**：「You Aren't Gonna Need It」の略で、Fowler は「some capability we presume our software needs in the future should not be built now」と説明しています（[Yagni](https://martinfowler.com/bliki/Yagni.html)）。このカテゴリの型はどれも、使いすぎると層や型が増えて変更が逆に高くつきます。各回の「向かない場面」を合わせて読んでください。
+
+<Callout type="warn" title="型の名前を目的にしない">
+  ヘキサゴナルにしたか、DDD に沿っているか、は目的ではありません。「次に起きそうな変更が、何か所の修正で済むか」「その規則を、DB を立てずに試せるか」といった問いに答えられるかどうかで判断します。各回の実験では、この問いを tsc や小さなスクリプトの実際の出力で確かめます。
+</Callout>

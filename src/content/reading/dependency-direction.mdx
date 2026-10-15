@@ -1,0 +1,241 @@
+---
+title: 依存の向き（レイヤード・ヘキサゴナル・オニオン・クリーン）
+description: 層を上から下へ積むと、いちばん下の DB の都合が上の層まで漏れてくる。依存を業務の規則の側へ向けると、DB を替えても規則のコードは変わらない。同じ注文の処理を 2 つの形で組み、DB の型を変えたときに型エラーが出るファイルを tsc で数え、依存のルール違反を dependency-cruiser で検出する
+category: code
+order: 46
+status: published
+topics:
+  - レイヤードアーキテクチャ
+  - ヘキサゴナルアーキテクチャ
+  - ポートとアダプター
+  - オニオンアーキテクチャ
+  - クリーンアーキテクチャ
+  - 依存性のルール
+  - 依存性逆転の原則
+  - 依存性の注入
+  - Composition Root
+basedOn:
+  - kind: article
+    slug: graph-bfs-dfs
+    why: ある変更が届きうる範囲は、import のグラフを逆向きにたどって到達できるモジュールの集合。依存の向きを変えることは、このグラフの形を変えること
+---
+
+import Callout from '../../components/Callout.astro'
+import DependencyDirection from '../../components/sim/problems/DependencyDirection'
+
+## import の矢印が、変更の届く範囲を決める
+
+モジュール A が B を import しているとき、B を変えると A も影響を受けえます。B の関数の引数が変われば A の呼び出しが壊れますし、B が返す型の項目名が変われば A の中でその項目を使っている箇所が壊れます。逆に、A を変えても B は何も気にしません。
+
+つまり、**ある変更が届きうる範囲は、import の矢印を逆向きにたどった先**です。コードの組み立て方を考えるとき、まず決めるべきは「どのモジュールが、どのモジュールを import してよいか」という矢印の向きです。この回では、よく知られた 4 つの形を、この矢印の向きの違いとして読みます。
+
+## 上から下へ積む形（レイヤードアーキテクチャ）
+
+もっとも素直な形は、画面に近いものを上、DB に近いものを下に置き、上から下へだけ呼ぶ形です。
+
+```text
+OrderController   （HTTP を受ける）
+      ↓ import
+OrderService      （業務の規則）
+      ↓ import
+OrderRepository   （SQL を組む）
+      ↓ import
+pg                （DB のドライバ）
+```
+
+上の層は下の層を知っていますが、下の層は上を知りません。画面の都合が DB に漏れない、という点では筋が通っています。
+
+問題は反対向きです。業務の規則を書いた OrderService が、OrderRepository を import しています。リポジトリが返すのが DB の行の形（`OrderRow` の `order_id`、`total_yen` といった列名そのまま）だと、サービスもその形でコードを書くことになり、DB の都合が業務の規則のコードに入り込みます。さらにその上の Controller まで、同じ形を受け取ります。
+
+## 依存を内側へ向ける形
+
+これに対し、2000 年代から 2010 年代にかけて、別々の人が同じ方向の解決策を出しました。
+
+### ヘキサゴナルアーキテクチャ（ポートとアダプター）
+
+Alistair Cockburn は、この形の目的を次のように書いています（[Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)、文書の日付は 2005-09-04）。
+
+> Allow an application to equally be driven by users, programs, automated test or batch scripts
+
+アプリケーションの中心は、外の世界と**ポート**を通してやり取りします。Cockburn はポートを「A port identifies a purposeful conversation.」と説明し、そのポートの向こうでは「a technology-specific adapter converts it into a usable procedure call or message」としています。HTTP、テストコード、バッチといった呼び出し元も、DB やメールといった呼び出し先も、アプリケーションから見ればすべて「ポートにつながったアダプター」の一つです。六角形の絵は、外とつながる口が複数あることを表しているだけで、6 という数に意味はありません。
+
+### オニオンアーキテクチャ
+
+Jeffrey Palermo は 2008 年に、同心円の層として描きました（[The Onion Architecture : part 1](https://jeffreypalermo.com/2008/07/the-onion-architecture-part-1/)）。決まりは 1 つで、「all code can depend on layers more central, but code cannot depend on layers further out from the core.」です。中心のすぐ外の層には「interfaces that provide object saving and retrieving behavior」、つまり保存と読み出しの**型（インターフェース）**が置かれ、「Out on the edges we see UI, Infrastructure, and Tests.」と、画面や DB の実装やテストはいちばん外に追い出されます。
+
+### クリーンアーキテクチャ
+
+Robert C. Martin は 2012 年に、これらをまとめて 1 枚の同心円の図にしました（[The Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)）。ヘキサゴナル、オニオンなどを並べて「They all have the same objective, which is the separation of concerns.」と書き、全体を貫く規則を**依存性のルール（The Dependency Rule）**として次の 1 文で示しています。
+
+> This rule says that source code dependencies can only point inwards.
+
+円の数については「No, the circles are schematic.」「There’s no rule that says you must always have just these four.」と書いており、図の 4 つの円をそのまま 4 つのディレクトリにすることは求めていません。
+
+3 つの形の違いは、主に絵と用語です。共通しているのは、**業務の規則を中心に置き、DB・画面・外部サービスを外側に置き、import の矢印を外から内へだけ向ける**ことです。
+
+## どうやって矢印を逆にするか
+
+上から下へ積む形では、サービス（内側に置きたいもの）がリポジトリ（外側に置きたいもの）を import していました。処理の流れとしては、サービスがリポジトリを呼ぶ必要があります。呼ぶ向きを変えずに、import の向きだけを逆にするのが**依存性逆転の原則（Dependency Inversion Principle）**です。Robert C. Martin が 1996 年に C++ Report で発表した原則で、2 つの文からなります（[Wikipedia: Dependency inversion principle](https://en.wikipedia.org/wiki/Dependency_inversion_principle)）。
+
+- High-level modules should not import anything from low-level modules. Both should depend on abstractions (e.g., interfaces).
+- Abstractions should not depend on details. Details (concrete implementations) should depend on abstractions.
+
+具体的には、次の 3 つを行います。
+
+1. 内側（アプリケーションの層）が、自分の必要な形で `OrderRepository` という**型**を決める。
+2. 外側の `PgOrderRepository` が、その型を import して実装する（矢印が外から内へ向く）。
+3. 内側の `PlaceOrder` は、実装を自分で `new` せず、外から受け取る。
+
+3 つめの「外から受け取る」を**依存性の注入（Dependency Injection）**と呼びます。Martin Fowler は 2004 年の記事で、もともと「Inversion of Control」と呼ばれていたものについて「Inversion of Control is too generic a term, and thus people find it confusing.」と書き、議論の末に「we settled on the name Dependency Injection」と名付けの経緯を説明しています（[Inversion of Control Containers and the Dependency Injection pattern](https://martinfowler.com/articles/injection.html)）。DI コンテナという道具は必須ではなく、コンストラクタの引数で渡すだけでも依存性の注入です。
+
+では、具体的な実装を選んで渡すのは誰か。Mark Seemann はその場所を **Composition Root** と名付け、「A Composition Root is a (preferably) unique location in an application where modules are composed together.」と定義しています（[Composition Root](https://blog.ploeh.dk/2011/07/28/CompositionRoot/)）。アプリケーションの入り口（`main.ts` など）の 1 か所だけが、すべての具体的な実装を知っていればよい、ということです。
+
+<DependencyDirection client:visible />
+
+上の図で「形」を切り替え、3 つの操作を比べてみてください。「DB を替える」では、上から下の形だと Controller まで影響が届き、内側へ向ける形だと PgOrderRepository と main で止まります。「規則を単体テストする」では、内側へ向ける形なら DB なしで規則を試せます。「業務の規則を変える」では、内側へ向ける形でも、内側の変更は使う側すべてに届きうることが見えます。だから内側には、変わりにくい業務の概念を置きます。
+
+## 実験 1：DB の型を変えたとき、型エラーはどこに出るか
+
+同じ注文の処理を、上から下へ積む形（`layered/`）と、依存を内側へ向ける形（`clean/`）で TypeScript で書きました。どちらも業務の規則は「1 件 1 万円まで」の 1 つだけです。
+
+```text
+layered/                         clean/
+  controller.ts                    web/controller.ts
+  service.ts                       application/place-order.ts
+  repository.ts                    application/ports.ts      （OrderRepository の型）
+  db/pg.ts                         domain/order.ts           （Order と規則）
+                                   infrastructure/pg-order-repository.ts
+                                   db/pg.ts
+                                   main.ts                    （Composition Root）
+```
+
+`layered/service.ts` は、リポジトリが返す DB の行の型をそのまま使っています。
+
+```ts
+import { OrderRepository } from './repository'
+import { OrderRow } from './db/pg'
+export class OrderService {
+  constructor(private repo = new OrderRepository()) {}
+  async place(id: string, total: number): Promise<OrderRow> {
+    if (total > 10000) throw new Error('与信枠を超えています')
+    const row = await this.repo.insert(id, total)
+    console.log('placed', row.order_id, row.total_yen)
+    return row
+  }
+}
+```
+
+`clean/application/place-order.ts` は、自分で決めた型だけを知っています。
+
+```ts
+import { placeOrder, Order } from '../domain/order'
+import { OrderRepository } from './ports'
+export class PlaceOrder {
+  constructor(private repo: OrderRepository) {}
+  async run(id: string, total: number): Promise<Order | Error> {
+    const o = placeOrder(id, total)
+    if (o instanceof Error) return o
+    await this.repo.save(o)
+    return o
+  }
+}
+```
+
+両方とも `tsc --strict`（TypeScript 5.9.3）でエラーなく通る状態から始め、DB を別のものに替えたことにして、`db/pg.ts` の型と関数を差し替えました。
+
+```ts
+// DB を替えた: 行の形が変わる
+export type OrderItem = { pk: string; amount: number }
+export async function putItem(item: OrderItem): Promise<OrderItem> { return item }
+```
+
+差し替えた直後の tsc の出力です。
+
+```text
+== layered（DB の型を変えた後）
+repository.ts(1,10): error TS2305: Module '"./db/pg"' has no exported member 'insertRow'.
+repository.ts(1,21): error TS2305: Module '"./db/pg"' has no exported member 'OrderRow'.
+service.ts(2,10): error TS2305: Module '"./db/pg"' has no exported member 'OrderRow'.
+-- エラーのあるファイル:
+   2 repository.ts
+   1 service.ts
+== clean（DB の型を変えた後）
+infrastructure/pg-order-repository.ts(1,10): error TS2305: Module '"../db/pg"' has no exported member 'insertRow'.
+-- エラーのあるファイル:
+   1 infrastructure/pg-order-repository.ts
+```
+
+上から下の形では、まだ見えていないエラーがあります。import に失敗した型は中身が分からなくなり、その先の使い方を tsc が検査できないためです。そこで、**DB に直接触れるファイルだけ**を新しい DB に合わせて直し、もう一度 tsc を流しました（`layered/repository.ts` と `clean/infrastructure/pg-order-repository.ts` を直し、`layered/service.ts` は import する型の名前だけを替えました）。
+
+```text
+== layered（DB に直接触れるファイルだけ直した後）
+controller.ts(4,41): error TS2339: Property 'order_id' does not exist on type 'OrderItem'.
+controller.ts(4,62): error TS2339: Property 'total_yen' does not exist on type 'OrderItem'.
+service.ts(8,31): error TS2339: Property 'order_id' does not exist on type 'OrderItem'.
+service.ts(8,45): error TS2339: Property 'total_yen' does not exist on type 'OrderItem'.
+exit 2
+== clean（DB に直接触れるファイルだけ直した後）
+exit 0
+```
+
+上から下の形では、DB の列名が業務の規則のサービスと、HTTP を返すコントローラーまで漏れていたため、そこも直す必要があります。内側へ向ける形では、DB の形から業務の型（`Order`）への詰め替えを `PgOrderRepository` の中で済ませているので、それより内側は何も変わりませんでした。
+
+<Callout type="note" title="詰め替えの手間との交換">
+  内側へ向ける形では、DB の行と業務の型の間で値を詰め替えるコードが必ず要ります。この例では `{ order_id: o.id, total_yen: o.total }` の 1 行ですが、項目が多い表では詰め替えが大きなコードになります。DB の形が業務の形とほぼ同じで、DB を替える見込みもないなら、この手間の分だけ損をします。
+</Callout>
+
+## 実験 2：内側から外側を import したら、機械に止めさせる
+
+依存性のルールは、人の注意だけでは守れません。急いでいるときに、ドメインのコードから DB のドライバを 1 行 import するのは簡単です。そこで、import の向きを検査する道具を使います。ここでは [dependency-cruiser](https://github.com/sverweij/dependency-cruiser)（16.10.4）に、次の 2 つの規則を書きました。
+
+```js
+module.exports = {
+  forbidden: [
+    { name: 'domain-is-innermost', severity: 'error',
+      comment: 'domain は何も import しない（自分より外を知らない）',
+      from: { path: '^domain/' }, to: { pathNot: '^domain/' } },
+    { name: 'application-not-outward', severity: 'error',
+      comment: 'application は domain と自分だけを使う',
+      from: { path: '^application/' }, to: { path: '^(infrastructure|web|db)/' } },
+  ],
+  options: { tsPreCompilationDeps: true },
+}
+```
+
+規則を守っている状態では、次のとおり違反なしです。
+
+```text
+== ルールを守っている状態
+✔ no dependency violations found (7 modules, 10 dependencies cruised)
+```
+
+`domain/order.ts` の先頭に `import { putItem } from '../db/pg'` を 1 行足すと、終了コード 1 で止まります。
+
+```text
+== domain から db を import した状態
+exit 1
+
+  error domain-is-innermost: domain/order.ts → db/pg.ts
+
+x 1 dependency violations (1 errors, 0 warnings). 7 modules, 11 dependencies cruised.
+```
+
+この検査を CI で動かせば、依存性のルールは文書の上の約束から、破ると merge できない規則になります。
+
+<Callout type="warn" title="TypeScript を一緒に入れないと、黙って通る">
+  最初に `npx dependency-cruiser@16` だけで動かしたとき、違反を入れても「no dependency violations found (4 modules, 3 dependencies cruised)」と表示され、TypeScript のファイルの import をたどれていませんでした。`npx -p dependency-cruiser@16 -p typescript@5.9 depcruise ...` と TypeScript を同じ環境に入れ、`--ts-config` を渡すと、上のとおり 7 モジュール・10 本の依存を読みました。検査の道具を入れたら、わざと違反を 1 つ作って本当に止まるかを確かめておくべきです。
+</Callout>
+
+## どこまでやるか
+
+依存を内側へ向ける形は、層の数とファイルの数を増やします。この実験の小さな例でも、上から下の形の 4 ファイルに対して、内側へ向ける形は 7 ファイルになりました。次のような場面では、その手間が見合わないことがあります。
+
+- 業務の規則がほとんどなく、DB の行をそのまま画面に出すだけのもの（管理画面の一覧と編集など）。
+- 寿命が短いもの、試作。
+- DB やフレームワークを替える見込みがなく、規則を DB なしで試す必要も薄いもの。
+
+逆に、業務の規則が多く、それを速く確かめたい、外部サービスや DB を差し替える・偽物にしてテストしたい、という場面では、内側へ向ける効果が大きくなります。全体を一度に作り替える必要はなく、規則の多いところから「規則を純粋な関数に取り出す」（次回の<a href={`${import.meta.env.BASE_URL}reading/functional-core/`}>計算の芯と入出力の殻</a>）、「リポジトリの型を内側に置く」と、少しずつ矢印を逆にしていけます。
+
+<Callout type="tip" title="ディレクトリの名前より矢印">
+  `domain/` `application/` `infrastructure/` というディレクトリを作っても、domain から infrastructure を import していれば、上から下の形と変わりません。確かめるべきはディレクトリの並びではなく、import の矢印の向きです。上の実験 2 のような検査は、その矢印を機械に見張らせる方法です。
+</Callout>

@@ -1,0 +1,198 @@
+---
+title: CQRS と Event Sourcing（書き込みは出来事の追記、読み取りは画面ごとの表）
+description: 更新と読み取りに別のモデルを使う CQRS と、状態ではなく変更の出来事を記録の中心に置く Event Sourcing。小さなイベントストアと投影を TypeScript で実装し、版の衝突、読み取りの表の作り直し、後から足す投影、スナップショット、出来事の形の変更を実行して確かめる。向いていない場面も見る
+category: code
+order: 52
+status: published
+topics:
+  - CQRS
+  - CQS
+  - Event Sourcing
+  - イベントストア
+  - 投影（projection）
+  - 読み取りモデル
+  - スナップショット
+  - 結果整合性
+  - 楽観的並行性制御
+  - 出来事の版の変更（upcast）
+basedOn:
+  - kind: article
+    slug: prefix-sum
+    why: ある時点の状態は、最初の出来事からその時点までを畳み込んだ値。累積和で区間の先頭からの和を求めるのと同じく、状態を「出来事の列の接頭辞の集計」として読める。スナップショットは途中までの累積を保存しておくことにあたる
+---
+
+import Callout from '../../components/Callout.astro'
+import CqrsEventSourcing from '../../components/sim/problems/CqrsEventSourcing'
+
+## 2 つの考え方は別物
+
+CQRS と Event Sourcing は一緒に語られることが多いのですが、別々の考え方です。
+
+**CQRS（Command Query Responsibility Segregation）** について、Martin Fowler は「a pattern that I first heard described by Greg Young」と紹介し、中心にある考えを「At its heart is the notion that you can use a different model to update information than the model you use to read information.」とまとめています（[Martin Fowler: CQRS](https://martinfowler.com/bliki/CQRS.html)）。**更新に使うモデルと読み取りに使うモデルを分ける**、というのが全てです。
+
+名前は、Bertrand Meyer の CQS（Command Query Separation）から来ています。Fowler の要約では、CQS の問い合わせ（query）は「Return a result and do not change the observable state of the system (are free of side effects).」、命令（command）は「Change the state of a system but do not return a value.」です（[Martin Fowler: CommandQuerySeparation](https://martinfowler.com/bliki/CommandQuerySeparation.html)）。CQS が**メソッドの単位**で「変える」と「読む」を分けるのに対し、CQRS はそれを**モデルの単位**、つまり表や型や時にはデータベースそのものの単位まで広げます。
+
+**Event Sourcing** について、Fowler は「Capture all changes to an application state as a sequence of events.」と定義し、「The fundamental idea of Event Sourcing is that of ensuring every change to the state of an application is captured in an event object, and that these event objects are themselves stored in the sequence they were applied…」と書いています（[Martin Fowler: Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html)）。状態を上書きするのでなく、**変更の出来事を順に記録し、状態はそこから導く**考え方です。
+
+CQRS は Event Sourcing なしでも使えます（同じ DB の上で、書き込み用の正規化された表と、読み取り用に非正規化した表を分けるだけでもよい）。逆に Event Sourcing を採ると、出来事の列はそのままでは画面に出しにくいので、読み取り用の表を別に作る必要が生まれ、自然に CQRS の形になります。この回では、2 つを組み合わせた形を扱います。
+
+<CqrsEventSourcing client:visible />
+
+「コマンドを処理する」で、出来事が 1 行ずつ追記されるたびに、2 つの読み取りの表がそれぞれの都合で更新される様子を見られます。
+
+## 小さなイベントストアを作る
+
+TypeScript で、出来事を追記するだけのストアを書きました。注文 1 件の出来事の並びを「流れ（stream）」と呼び、流れごとに版を数えます。
+
+```ts
+type Event =
+  | { type: 'OrderPlaced'; orderId: string; at: string; total: number }
+  | { type: 'OrderPaid'; orderId: string; at: string; amount: number }
+  | { type: 'OrderCancelled'; orderId: string; at: string }
+type Stored = { seq: number; stream: string; version: number; event: Event }
+
+// イベントストア: 追記だけ。同じ流れ（注文）の版が想定どおりでなければ拒否する
+const log: Stored[] = []
+function append(stream: string, expectedVersion: number, events: Event[]) {
+  const current = log.filter((s) => s.stream === stream).length
+  if (current !== expectedVersion) throw new Error(`版の衝突: ${stream} は ${current}、想定は ${expectedVersion}`)
+  events.forEach((event, i) => log.push({ seq: log.length + 1, stream, version: current + i + 1, event }))
+}
+```
+
+書き込み側（コマンドを処理する側）は、過去の出来事を畳み込んで今の状態を復元し、規則を確かめ、新しい出来事を追記します。
+
+```ts
+function apply(s: State, e: Event): State {
+  switch (e.type) {
+    case 'OrderPlaced': return { status: 'placed', total: e.total }
+    case 'OrderPaid': return { ...s, status: 'paid' }
+    case 'OrderCancelled': return { ...s, status: 'cancelled' }
+  }
+}
+function pay(orderId: string, at: string) {
+  const history = readStream(orderId)
+  const state = history.reduce((s, h) => apply(s, h.event), { status: 'none', total: 0 } as State)
+  if (state.status !== 'placed') throw new Error(`${orderId} は ${state.status} なので支払えない`)
+  append(orderId, history.length, [{ type: 'OrderPaid', orderId, at, amount: state.total }])
+}
+```
+
+3 件の注文を流し、取り消し済みの注文への支払いと、古い版を前提にした追記を試しました。
+
+```text
+拒否: O2 は cancelled なので支払えない
+拒否: 版の衝突: O1 は 2、想定は 1
+イベントストア:
+  1 O1 v1 OrderPlaced 01-01
+  2 O2 v1 OrderPlaced 01-01
+  3 O1 v2 OrderPaid 01-02
+  4 O2 v2 OrderCancelled 01-02
+  5 O3 v1 OrderPlaced 01-03
+  6 O3 v2 OrderPaid 01-03
+```
+
+1 つ目の拒否は業務の規則です。2 つ目は、O1 を版 1 の時点で読んだ誰かが、その間に支払が追記されて版 2 になったことを知らずに取消を書こうとしたものです。「読んだときの版と一致するときだけ書く」は、<a href={`${import.meta.env.BASE_URL}reading/schema-map/`}>テーブル設計の型の地図</a>の楽観ロックの version 列、<a href={`${import.meta.env.BASE_URL}reading/ddd-tactical/`}>DDD の戦術的設計</a>の集約を守る仕組みと同じです。流れ（注文 1 件）が、集約と同じ「一緒に守る範囲」になっています。
+
+## 読み取りの表は、出来事から作る派生物
+
+読み取り側は、出来事を順に流して画面ごとの表を作ります。出来事から表を作る関数を投影（projection）と呼びます。
+
+```ts
+type Projection<T> = { init: () => T; on: (t: T, e: Event) => T }
+const orderList: Projection<Record<string, string>> = {
+  init: () => ({}),
+  on: (t, e) => ({ ...t, [e.orderId]: e.type === 'OrderPlaced' ? 'placed' : e.type === 'OrderPaid' ? 'paid' : 'cancelled' }),
+}
+const dailySales: Projection<Record<string, number>> = {
+  init: () => ({}),
+  on: (t, e) => (e.type === 'OrderPaid' ? { ...t, [e.at]: (t[e.at] ?? 0) + e.amount } : t),
+}
+const run = <T>(p: Projection<T>, upTo = Infinity) => log.filter((s) => s.seq <= upTo).reduce((t, s) => p.on(t, s.event), p.init())
+```
+
+```text
+order_list : { O1: 'paid', O2: 'cancelled', O3: 'paid' }
+daily_sales: { '01-02': 5000, '01-03': 7000 }
+01-02 時点 (seq<=4) の order_list: { O1: 'paid', O2: 'cancelled' }
+```
+
+ここから 3 つのことが言えます。
+
+- **読み取りの表は捨ててよい。** 正しい記録はイベントストアにあり、表は流し直せば同じものが作れます。Fowler は「Complete Rebuild」として「We can discard the application state completely and rebuild it by re-running the events from the event log on an empty application.」と書いています。ビジュアライザの「読み取りの表を作り直す」がこれです。
+- **過去の時点の状態が分かる。** `seq <= 4` で止めれば 01-02 の時点の一覧になります。Fowler の「Temporal Query」です。
+- **画面ごとに都合のよい形にしてよい。** 一覧画面は注文ごとの状態、売上の画面は日ごとの合計。書き込み側のモデルに合わせる必要はありません。これが CQRS の「読み取りに別のモデルを使う」の中身です。
+
+### 後から新しい見方を足す
+
+「取り消された注文の数を日ごとに見たい」と後から言われたとします。
+
+```ts
+const cancelCount: Projection<Record<string, number>> = {
+  init: () => ({}),
+  on: (t, e) => (e.type === 'OrderCancelled' ? { ...t, [e.at]: (t[e.at] ?? 0) + 1 } : t),
+}
+```
+
+```text
+cancel_count（新設）: { '01-02': 1 }
+```
+
+新しい投影を全履歴に流すだけで、**過去の分まで**揃った表ができます。状態を上書きする設計では、取消がいつ起きたかが残っていなければ、今日から数え始めるしかありません。
+
+## スナップショットと、出来事の形の変更
+
+出来事が増えると、毎回最初から流すのは遅くなります。途中までの結果を保存しておき、その後の出来事だけを流すのがスナップショットです。
+
+```ts
+const snapshot = { seq: 4, state: run(orderList, 4) }
+const fromSnap = log.filter((s) => s.seq > snapshot.seq).reduce((t, s) => orderList.on(t, s.event), snapshot.state)
+```
+
+```text
+スナップショットから: { O1: 'paid', O2: 'cancelled', O3: 'paid' } 流した出来事: 2 / 6
+```
+
+6 件のうち 2 件を流すだけで、全件を流したときと同じ表になりました。スナップショットも派生物なので、壊れたら捨てて作り直せます。
+
+出来事は一度書いたら書き換えないので、**出来事の形を変えたくなったときが難所**です。古い形の出来事はストアに残り続けます。よく使われるのは、読むときに古い形を新しい形へ変換する方法（upcast）です。合計の項目名を `amount` から `total` に変えた場合を試しました。
+
+```ts
+type PlacedV1 = { type: 'OrderPlaced'; schema: 1; orderId: string; at: string; amount: number }
+const upcast = (e: PlacedV1): Event => ({ type: 'OrderPlaced', orderId: e.orderId, at: e.at, total: e.amount })
+```
+
+```text
+upcast: { type: 'OrderPlaced', orderId: 'O0', at: '2024-12-31', total: 1200 }
+```
+
+変換の関数は、古い形が 1 件でもストアに残る限り消せません。出来事の名前と項目は、業務の言葉として慎重に決める必要があります。
+
+## 結果整合性
+
+この実験では、投影を同じプロセスの中で同期的に流しました。実際のシステムでは、イベントストアへの追記と読み取りの表の更新は別々に動くことが多く、その間は**書いた直後に読んでも、まだ反映されていない**ことがあります。読み取りの表はいずれ追いつく、という結果整合性を受け入れることになります。
+
+「支払ボタンを押した直後の画面に、まだ未払いと出る」は典型的な問題で、書き込み側の結果をそのまま画面に返す、読み取りの表の更新を待ってから返す、などの手当てが要ります。
+
+## 向いていない場面
+
+Fowler は CQRS について「for most systems CQRS adds risky complexity」と警告しています（[Martin Fowler: CQRS](https://martinfowler.com/bliki/CQRS.html)）。上の実験だけでも、普通の表 1 枚で済む注文管理に、イベントストア・投影・版の衝突・スナップショット・形の変換が加わりました。
+
+- 画面の大半が、書いたものをそのまま読む CRUD である。
+- 「いつ何が起きたか」を後から問われることがない。
+- 結果整合性を利用者に説明できない。
+
+こうした場合は、普通の表で十分です。逆に、監査や法令で全変更の記録が要る、読み方が多様で後から増える、書き込みと読み取りの負荷が大きく違う、といった場合に効いてきます。
+
+<Callout type="note" title="データの側との対応">
+  出来事を追記するだけで書き換えない、という形は<a href={`${import.meta.env.BASE_URL}reading/immutable-data-model/`}>イミュータブルデータモデル</a>と同じ発想です。違いは置き場所で、イミュータブルデータモデルは出来事の種類ごとにリレーショナルな表を作り、外部キーで規則を DB に守らせます。Event Sourcing は 1 本のイベントストアに型付きの出来事を並べ、規則は書き込み側のコードが守ります。また、イベントストアの 1 行は、分析の側の<a href={`${import.meta.env.BASE_URL}reading/dwh-fact-tables/`}>トランザクションファクト</a>の 1 行とほぼ同じ粒度です。投影で作る日次の売上は、定期スナップショットのファクトにあたります。
+</Callout>
+
+## まとめ
+
+- CQRS は更新と読み取りに別のモデルを使うこと。CQS をメソッドからモデルの単位へ広げたもの。
+- Event Sourcing は状態でなく変更の出来事を記録し、状態は出来事を畳み込んで導くこと。2 つは独立だが、組み合わせることが多い。
+- 書き込み側は、流れの版で同時更新を防ぎ、過去の出来事から状態を復元して規則を確かめる。
+- 読み取りの表は投影で作る派生物で、捨てて作り直せる。過去の時点の状態も、新しい見方も、全履歴から作れる。
+- スナップショットで流す量を減らし、出来事の形の変更は読むときの変換で吸収する。
+- 結果整合性と仕組みの複雑さを払う価値があるかを、先に見極める。

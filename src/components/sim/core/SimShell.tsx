@@ -8,6 +8,8 @@ type Props<V> = {
   subtitle?: string
   /** 疑似コード（Python）。行番号は Frame.line と対応させる */
   code: string
+  /** code の言語。TypeScript なら // を行コメントとして色付けする */
+  lang?: 'py' | 'ts'
   frames: Frame<V>[]
   /** 入力を変えるUI。ここを操作したら frames を作り直す */
   controls?: ReactNode
@@ -26,6 +28,7 @@ export function SimShell<V>({
   title,
   subtitle,
   code,
+  lang,
   frames,
   controls,
   legend,
@@ -102,7 +105,7 @@ export function SimShell<V>({
         </div>
 
         <div className="min-w-0">
-          <CodePanel code={code} active={frame.line} />
+          <CodePanel code={code} active={frame.line} lang={lang} />
           {frame.vars && Object.keys(frame.vars).length > 0 && (
             <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[12px] sm:grid-cols-3">
               {Object.entries(frame.vars).map(([k, v]) => (

@@ -175,6 +175,11 @@ export const READING_SECTIONS: Section[] = [
     title: '分析のためのデータの形',
     summary: '1 件を速く正しく扱う業務の表と、大量の行をまとめて集計する分析の表は、求められる性質が違う。行指向と列指向、OLTP と OLAP から始め、粒度、層の分け方、ファクトとディメンション、スタースキーマとその仲間、顧客分析の定番の集計までを、実際に動かして確かめる',
   },
+  {
+    id: 'code',
+    title: 'コードの組み立て方',
+    summary: 'データの形の次は、ロジックの形。依存の向き（レイヤード・ヘキサゴナル・クリーン）、計算と入出力の分け方、状態を型で表すこと、失敗を戻り値で運ぶ Railway Oriented Programming、DDD の戦術と戦略、CQRS と Event Sourcing を、TypeScript のコードとコンパイラの実際の出力で確かめる',
+  },
 ]
 
 export const readingSectionById = new Map(READING_SECTIONS.map((s) => [s.id, s]))
