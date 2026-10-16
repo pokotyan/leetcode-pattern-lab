@@ -1,0 +1,395 @@
+---
+title: WebGL
+description: GPU に三角形を描かせる。頂点シェーダとフラグメントシェーダ、状態を切り替えてから命令する API の形、そして呼び出しが GPU プロセスと ANGLE を通って Metal や Direct3D に届くまでを、ヘッドレスの Chrome で測ります
+chapter: graphics
+order: 3
+status: published
+topics:
+  - WebGL
+  - GPU
+  - グラフィックスパイプライン
+  - 頂点シェーダ / フラグメントシェーダ
+  - GLSL ES
+  - 状態機械
+  - ドローコール
+  - インスタンシング
+  - コマンドバッファ
+  - ANGLE
+  - 同期呼び出し
+  - コンテキストロスト
+requires:
+  - ll-96-canvas-2d
+  - ll-91-compositing
+  - ll-12-ooo-simd
+---
+
+import Callout from '../../components/Callout.astro'
+
+## Canvas 2D では足りなくなるところ
+
+前回の Canvas 2D は、`fillRect` や `arc` を 1 回呼ぶごとに、ブラウザが図形をピクセルにしていました。図形が数千個までなら十分速いのですが、数十万個の点を毎フレーム動かす、3 次元の物体に光を当てる、画素ごとに違う計算をする、となると、1 回の呼び出しで 1 つの図形という形そのものが重くなります。
+
+そこで、**図形をピクセルにする計算を、こちらが書いたプログラムで GPU に直接やらせる**のが WebGL です。この回では、GPU が何を得意とするのか、WebGL がそれをどういう API で見せているのか、そして呼び出しが実際にどこを通って GPU に届くのかを見ます。最後の点が、WebGL を速く書けるかどうかを決めます。
+
+## GPU は何が得意なのか
+
+第 12 回で、1 つの命令で 4 つや 8 つの値をまとめて計算する SIMD を見ました。GPU は、その考え方を極端に進めた装置です。
+
+```
+CPU のコア                         GPU
+┌────────────────────┐            ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+│ 大きな分岐予測        │            │  │  │  │  │  │  │  │  │  │  │  │  │
+│ 大きなキャッシュ       │            ├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+│ 順番を入れ替える仕組み  │            │  │  │  │  │  │  │  │  │  │  │  │  │
+│ 演算器（少数）         │            ├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+└────────────────────┘            │  │  │  │  │  │  │  │  │  │  │  │  │
+1 本の流れを、できるだけ速く            └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+                                  小さな演算器を大量に並べ、同じ処理を一斉に
+```
+
+CPU は、分岐の多い 1 本の命令の流れを速く進めるための部品（第 11 回の分岐予測、第 12 回の順番の入れ替え）にトランジスタを使います。GPU は、それを削って**演算器の数**に回しています。その代わり、得意なのは「**同じプログラムを、互いに独立した大量のデータに対して実行する**」仕事に限られます。
+
+画面の描画は、ちょうどその形をしています。1920 × 1080 の画面には約 200 万の画素があり、「この画素は何色か」という計算は、画素ごとにほぼ独立しています。頂点の座標の変換も、頂点ごとに独立しています。
+
+## グラフィックスパイプライン
+
+GPU で三角形を描くときの流れは、決まった段の並びになっています。WebGL で書くのは、このうち 2 つの段のプログラムです。
+
+```
+ 頂点のデータ（座標、色など）
+      │
+      ▼
+ ┌────────────────┐
+ │ 頂点シェーダ       │ ← 自分で書く。頂点 1 つにつき 1 回動く。画面上の位置を決める
+ └────────────────┘
+      │
+      ▼
+ ┌────────────────┐
+ │ 図形の組み立て     │   3 つの頂点を 1 つの三角形にまとめる
+ │ ラスタライズ       │   三角形が覆う画素を列挙し、頂点の値を画素ごとに補間する
+ └────────────────┘
+      │
+      ▼
+ ┌────────────────┐
+ │ フラグメントシェーダ │ ← 自分で書く。画素 1 つにつき 1 回動く。色を決める
+ └────────────────┘
+      │
+      ▼
+ ┌────────────────┐
+ │ 深度テスト・合成    │   手前の物体だけを残す、半透明を重ねる
+ └────────────────┘
+      │
+      ▼
+ 描画バッファ（canvas）
+```
+
+**シェーダ**とは、GPU の上で動く小さなプログラムのことです。WebGL では GLSL ES という C に似た言語で書き、実行時にブラウザに渡してコンパイルさせます。第 32 回で見た JIT と同じく、機械語は実行する機械の上で作られます。どの GPU で動くかは、ページを書いた時点では分からないからです。
+
+ラスタライズの段は固定の機能で、プログラムは書けません。ここが、頂点ごとの計算を画素ごとの計算に**増やす**場所です。3 つの頂点から、数千、数万の画素の仕事が生まれます。
+
+## WebGL は OpenGL ES を Web に持ち込んだもの
+
+WebGL の API は、組み込み機器向けの OpenGL ES をほぼそのまま JavaScript に写したものです。仕様は、WebGL 1.0 を「OpenGL ES 2.0 から派生した」もの（[WebGL 1.0 Specification](https://registry.khronos.org/webgl/specs/latest/1.0/)）、WebGL 2.0 を「OpenGL ES 3.0 から派生した」ものと書いています（[WebGL 2.0 Specification](https://registry.khronos.org/webgl/specs/latest/2.0/)）。
+
+| | 元になった API | シェーダの言語 | 主な追加 |
+| --- | --- | --- | --- |
+| WebGL 1.0 | OpenGL ES 2.0 | GLSL ES 1.00 | |
+| WebGL 2.0 | OpenGL ES 3.0 | GLSL ES 3.00 | インスタンシングが標準、VAO、3D テクスチャ、整数の演算など |
+
+この出自のために、WebGL の API は JavaScript らしくない形をしています。その代表が、次の「状態機械」です。
+
+## 選んでから命令する
+
+OpenGL の系統の API は、**大きな 1 つの状態**を持っています。命令は「いま選ばれているもの」に対して働くので、まず対象を選び（bind）、それから操作します。
+
+```js
+const buf = gl.createBuffer()
+gl.bindBuffer(gl.ARRAY_BUFFER, buf)            // 「いまの ARRAY_BUFFER」を buf にする
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW)  // 「いまの ARRAY_BUFFER」にデータを送る
+```
+
+`bufferData` の引数には `buf` が出てきません。どのバッファに書くかは、直前の `bindBuffer` が決めています。仕様も「OpenGL ES 2.0 は描画に使う状態の値を保持する」と書いています（[WebGL 1.0 Specification](https://registry.khronos.org/webgl/specs/latest/1.0/)）。
+
+この形には、分かりにくい落とし穴があります。
+
+- ある関数が別の関数の選んだ状態を**黙って使う**。どこかで `bindBuffer` を変えると、離れた場所の描画が壊れる
+- ライブラリと自分のコードが同じ状態を共有するので、互いに相手の状態を元に戻す約束が要る
+- 描画の結果は、命令の引数ではなく**その時点の状態の全体**で決まる
+
+GPU に渡すものは、大きく 4 種類です。
+
+| 種類 | 何か | 例 |
+| --- | --- | --- |
+| バッファ | GPU のメモリに置いたバイト列 | 頂点の座標の並び |
+| 属性（attribute） | バッファのどこを、どの型で、頂点ごとに読むかの指定 | 「8 バイトごとに float を 2 つ」 |
+| ユニフォーム（uniform） | 1 回の描画の間、全頂点・全画素で共通の値 | 変換行列、時刻 |
+| テクスチャ | シェーダから座標で読める画像 | 写真、文字の画像 |
+
+## 三角形を 1 枚描く
+
+最小の例です。WebGL 2.0 で、頂点ごとに赤・緑・青を持つ三角形を描きます。
+
+```js
+const gl = canvas.getContext('webgl2')
+
+const vs = `#version 300 es
+in vec2 pos; in vec3 col; out vec3 vcol;
+void main() { vcol = col; gl_Position = vec4(pos, 0.0, 1.0); }`
+
+const fs = `#version 300 es
+precision mediump float; in vec3 vcol; out vec4 outColor;
+void main() { outColor = vec4(vcol, 1.0); }`
+
+function compile(type, src) {
+  const s = gl.createShader(type)
+  gl.shaderSource(s, src)
+  gl.compileShader(s)
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s)
+  return s
+}
+const prog = gl.createProgram()
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs))
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs))
+gl.linkProgram(prog)
+
+// x, y, r, g, b を 3 頂点分。1 頂点 = 5 個の float = 20 バイト
+const data = new Float32Array([
+  -1, -1,  1, 0, 0,
+   1, -1,  0, 1, 0,
+   0,  1,  0, 0, 1,
+])
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer())
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW)
+
+const pos = gl.getAttribLocation(prog, 'pos')
+gl.enableVertexAttribArray(pos)
+gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 20, 0)   // 先頭から float 2 つ
+const col = gl.getAttribLocation(prog, 'col')
+gl.enableVertexAttribArray(col)
+gl.vertexAttribPointer(col, 3, gl.FLOAT, false, 20, 8)   // 8 バイト目から float 3 つ
+
+gl.useProgram(prog)
+gl.drawArrays(gl.TRIANGLES, 0, 3)
+```
+
+座標は、画面の中央を原点とし、左右と上下の端を -1 と 1 とする座標系（クリップ座標）で書いています。`vertexAttribPointer` の 20 と 8 は、第 6 回で見たアラインメントと同じく、**バイトの並びを自分で説明している**部分です。
+
+フラグメントシェーダには、色を計算する式がありません。頂点シェーダが出した `vcol` を、ラスタライズの段が画素ごとに**補間して**渡してくれるからです。
+
+### 手元で確かめる（1）: 描けた画素と、裏で動いている GPU
+
+64 × 64 の canvas に上のコードで描き、`readPixels` で画素を読みました。環境はヘッドレスの Chrome 155、Apple M1 Pro の Mac です。
+
+```
+位置               RGBA
+左下の頂点の近く      242,   7,   6, 255
+右下の頂点の近く        7, 242,   6, 255
+上の頂点の近く          5,   9, 241, 255
+中央付近              85,  89,  82, 255
+三角形の外（左上）       0,   0,   0, 255
+```
+
+頂点の近くはほぼその頂点の色、中央付近は 3 色がほぼ等分に混ざった灰色です。補間がそのまま見えています。
+
+同じページで、拡張機能 `WEBGL_debug_renderer_info` から実際の描画先を読むと、次の値でした。
+
+```
+UNMASKED_RENDERER_WEBGL = ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)
+VERSION                 = WebGL 2.0 (OpenGL ES 3.0 Chromium)
+```
+
+ページから見えるのは OpenGL ES 3.0 ですが、**実際に GPU を動かしているのは Apple の Metal** です。間に ANGLE という層が入っています。これが次の節の主題です。
+
+## 呼び出しは、どこを通って GPU に届くのか
+
+`gl.drawArrays` を呼んだとき、GPU が同じスレッドの中で動き出すわけではありません。第 88 回で見たとおり、GPU のドライバを触れるのは、サンドボックスの外にある **GPU プロセス**だけです。
+
+```
+レンダラのプロセス（サンドボックスの中）            GPU プロセス
+┌───────────────────────┐                   ┌──────────────────────────┐
+│ JavaScript               │                   │ コマンドを読む               │
+│  gl.bindBuffer(...)      │                   │ 引数を検証する              │
+│  gl.drawArrays(...)      │   共有メモリ       │      │                     │
+│        │                 │  ┌──────────┐    │      ▼                     │
+│        ▼                 │  │コマンドの列 │──▶│ ANGLE                      │
+│ コマンドバッファに書く      │──▶│ bind      │    │  OpenGL ES の呼び出しを       │
+│ （ここではすぐ戻る）        │  │ draw      │    │  Metal / D3D11 / Vulkan に    │
+└───────────────────────┘  │ ……        │    │  翻訳する                   │
+                             └──────────┘    │      │                     │
+                                               │      ▼                     │
+                                               │ OS のグラフィックス API → GPU │
+                                               └──────────────────────────┘
+```
+
+Chromium の設計文書は、この仕組みを **GPU コマンドバッファ**と呼んでいます。レンダラなどのクライアントが共有メモリにコマンドを書き、GPU プロセスがそれを読み、コマンドと引数を 1 つずつ検証してから OS のグラフィックス API を呼びます。目的の第一は安全で、乗っ取られたレンダラが自分でコマンドを書いても、GPU プロセスに危険な呼び出しをさせられないようにすることだとしています（[GPU Command Buffer](https://www.chromium.org/developers/design-documents/gpu-command-buffer/)）。同じ文書は、OpenGL ES の関数ごとに IPC を 1 回使う実装は遅すぎるだろうとも書いています。だからコマンドは**溜めてまとめて送る**のです。
+
+その先の ANGLE は、OpenGL ES の呼び出しを、そのプラットフォームで使えるグラフィックス API に翻訳するライブラリです。README は、OpenGL ES 2.0・3.0・3.1 から Vulkan、デスクトップの OpenGL、OpenGL ES、Direct3D 9 と 11 への翻訳を提供していると書き、表には Metal のバックエンドも並んでいます（[ANGLE README](https://chromium.googlesource.com/angle/angle/+/main/README.md)）。Windows の Chrome はすべての描画に ANGLE を使い、Chrome と Firefox の WebGL の既定のバックエンドでもある、とも書いています。
+
+<Callout type="note" title="なぜ OpenGL のまま渡さないのか">
+  GPU のドライバは、OS の中でも特に不具合の多い部品です。
+  Web のページが書いた任意の命令やシェーダを、そのままドライバに渡すのは危険です。
+  コマンドバッファで引数を検証し、ANGLE でシェーダを一度解析して書き直すことで、
+  ドライバに届くものを**ブラウザが中身を理解できているもの**だけに絞っています。
+  OS ごとにドライバの品質が違っても同じ動きにそろえられる、という利点もあります。
+</Callout>
+
+### 手元で確かめる（2）: シェーダは Metal の言語に書き直されている
+
+拡張機能 `WEBGL_debug_shaders` の `getTranslatedShaderSource` を使うと、ANGLE が翻訳した後のシェーダを読めます。上の 3 行のフラグメントシェーダを渡すと、返ってきたのは**空行を除いて 201 行の Metal Shading Language** でした。抜粋します。
+
+```
+#include <metal_stdlib>
+...
+struct ANGLE_FragmentIn
+{
+  metal::float3 _uvcol;
+};
+...
+  ANGLE_fragmentOut._uoutColor = ANGLE_sbcb(ANGLE_fragmentIn._uvcol, 1.0f);
+...
+fragment ANGLE_FragmentOut main0(ANGLE_FragmentIn ANGLE_fragmentIn [[stage_in]],
+    constant ANGLEUniformBlock & ANGLE_angleUniforms [[buffer(17)]], ...)
+```
+
+元の `outColor = vec4(vcol, 1.0)` が、名前に `_u` を付けた変数への代入として残っています。残りの行の大半は、OpenGL と Metal の違い（上下の向き、マルチサンプルの扱いなど）を埋めるために ANGLE が足したものです。
+
+### 手元で確かめる（3）: 検証が止めるもの
+
+検証の様子も見えます。WebGL 1.0 のコンテキストで、頂点 3 つ分しかないバッファに対して 300 万頂点の描画を命じると、描画は実行されず、`getError()` が `INVALID_OPERATION`（1282）を返し、コンソールに次の行が出ました。
+
+```
+GL_INVALID_OPERATION: glDrawArrays: Vertex buffer is not big enough for the draw call.
+```
+
+範囲外の添字に定数で書き込むシェーダは、コンパイルの段階で拒否されます。
+
+```
+ERROR: 0:1: '[]' : array index out of range
+```
+
+仕様は、シェーダがアプリケーション自身のデータの外にある配列の要素を読み書きできてはならないと定めています（[WebGL 1.0 Specification](https://registry.khronos.org/webgl/specs/latest/1.0/)）。ネイティブの OpenGL なら、ドライバによっては隣のメモリを読んでしまう操作です。
+
+## 速さを決める 2 つのこと
+
+コマンドバッファの構造から、WebGL の速さについて 2 つのことが言えます。
+
+1. **命令を書く**だけなら速い。共有メモリに数バイトを足して戻るだけだからです
+2. **答えを待つ**命令は遅い。GPU プロセスに届き、それまでに溜まった命令が実行され、答えが返るまで JavaScript が止まるからです
+
+MDN の WebGL のベストプラクティスも、`getError` と `getParameter` などは呼び出したスレッドを同期的に止め、単純な問い合わせでも 1ms かかることがあり、GPU の仕事を全部待つ必要があればもっとかかる、と書いています。`getError()` は「フラッシュと GPU プロセスとの往復」、CPU への `readPixels()` は「完了待ちと往復」を起こす、という整理です（[WebGL best practices](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices)）。第 41 回のシステムコールと同じで、**境界を越える回数**が速さを決めます。
+
+### 手元で確かめる（4）: ドローコールの数と、待つ命令の値段
+
+512 × 512 の canvas に、小さな四角形を 10,000 枚描きました。四角形は 100 × 100 の格子に並べ、合計の画素数がどちらでも 65,536 で同じになることを確かめてあります。比べたのは次の書き方です。
+
+- **1 枚ずつ**: 四角形ごとに `uniform2f` で位置を変えて `drawArrays` を呼ぶ。ドローコールは 10,000 回
+- **インスタンシング**: 位置を属性のバッファに並べ、`vertexAttribDivisor(loc, 1)` で「インスタンスごとに 1 つ進む」と指定して、`drawArraysInstanced` を 1 回だけ呼ぶ
+
+インスタンシングは、同じ形を位置や色だけ変えて何度も描くための仕組みで、WebGL 2.0 では標準の関数（`drawArraysInstanced`、`vertexAttribDivisor`）です（[WebGL 2.0 Specification](https://registry.khronos.org/webgl/specs/latest/2.0/)）。WebGL 1.0 では拡張機能 `ANGLE_instanced_arrays` で使えます。
+
+それぞれ 12 回描き、最初の 2 回を捨てた残りの中央値を取りました。「呼び出しの時間」は描画の関数を呼び終えるまで、「完了まで」は 1 画素の `readPixels` で GPU の完了を待つまでです。ヘッドレスの Chrome 155、Apple M1 Pro で 3 回走らせた範囲を示します。
+
+```
+書き方                                  呼び出しの時間     完了まで
+1 枚ずつ（10,000 回の drawArrays）         0.5〜0.6ms        3.2〜4.0ms
+インスタンシング（1 回）                     0.0ms             0.5〜1.0ms
+1 枚ずつ ＋ 毎回 getParameter(VIEWPORT)     5.0〜5.3ms        7.2〜7.4ms
+1 枚ずつ ＋ 毎回 getError()               479〜511ms        481〜514ms
+1,000 回の drawArrays                     0.0〜0.1ms        0.8〜0.9ms
+1,000 回の drawArrays ＋ 毎回 readPixels   401〜451ms        401〜452ms
+```
+
+`performance.now()` は、クロスオリジン分離されていない文書では 100 マイクロ秒の単位に丸められます（[MDN](https://developer.mozilla.org/en-US/docs/Web/API/Performance/now)、第 108 回）。0.0ms は「0.1ms より短い」という意味で、小さな値の比較はおおまかに読んでください。
+
+読み取れることは 3 つです。
+
+- **10,000 回の `drawArrays` を書くこと自体は 0.5ms 程度**で終わる。1 回あたり 50 ナノ秒ほどで、コマンドバッファに溜めているだけ。ただし GPU プロセスの側で 10,000 回の検証と翻訳が走るので、完了までは 3〜4ms かかる。インスタンシングにすると完了まで 1ms 以下になった
+- **`getError()` を毎回呼ぶと、同じ描画が約 500ms になる**。1 回あたり約 50 マイクロ秒で、そのたびに溜まった命令を流して答えを待っている。`readPixels` も 1 回あたり 400 マイクロ秒ほどかかった
+- `getParameter(gl.VIEWPORT)` は 10,000 回で約 4.5ms 増えただけだった。1 回あたり 0.5 マイクロ秒で、往復していない。**手元で値を覚えておける問い合わせ**は、レンダラの側で答えていると考えられる。ただ、どの問い合わせが往復するかは実装しだいで、仕様は何も約束していない
+
+60Hz の 1 フレームは 16.7ms でした（第 91 回）。デバッグのつもりで描画のたびに `getError()` を残しておくと、それだけでフレームの予算を何十倍も超えます。MDN が本番では避けるよう勧めるのはこのためです。
+
+<Callout type="warn" title="よくある誤解: 「WebGL の関数は呼んだ時点で GPU が実行している」">
+  呼んだ時点では、命令がコマンドバッファに積まれただけです。
+  JavaScript の側で測る時間には、GPU の仕事はほとんど含まれていません。
+  逆に、`getError`、`readPixels`、`finish` のように答えを要求する命令を 1 つ挟むと、
+  それまでに積んだ仕事の完了をまとめて待つことになり、その命令が突然重く見えます。
+  GPU の時間を測るなら、`EXT_disjoint_timer_query_webgl2` のような GPU 側のタイマを使います。
+</Callout>
+
+## 精度は機械によって違う
+
+シェーダの浮動小数点数には、`highp`、`mediump`、`lowp` の精度の指定があります。WebGL 1.0 では、フラグメントシェーダで `highp float` を使えるかどうかが任意です。MDN は、`highp` を無条件に使うと古い携帯端末で動かず、かといって `mediump` にすると、主に携帯端末では精度不足で描画が崩れることが多く、しかもその崩れは一般的なデスクトップでは見えない、と注意しています（[WebGL best practices](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices)）。
+
+手元の M1 Pro で `getShaderPrecisionFormat` を呼ぶと、フラグメントシェーダの `highp` も `mediump` も、仮数部の精度が 23 ビットでした。つまりこの機械では、`mediump` と書いても `highp` と同じ精度で計算されています。**開発機で崩れないことは、どの機械でも崩れないことの証明になりません**。第 4 回で見た浮動小数点数の誤差が、機械によって違う大きさで現れます。
+
+## GPU は取り上げられることがある
+
+CPU のメモリと違い、WebGL のコンテキストは**ブラウザの都合で失われることがあります**。GPU プロセスがクラッシュしたとき、ドライバが更新されたとき、ブラウザがメモリを空けるために古いコンテキストを捨てたときなどです。仕様はこれを「コンテキストロスト」と呼び、`webglcontextlost` イベントで知らせます。
+
+失われた後の規則は、仕様の中でかなり細かく決まっています。
+
+- `getError()` は、失われた後の最初の 1 回だけ `CONTEXT_LOST_WEBGL` を返す
+- `webglcontextlost` イベントで `preventDefault()` を呼んだ場合だけ、復帰を待って `webglcontextrestored` が届く。呼ばなければ、そこで処理は打ち切られる
+- 復帰しても、それ以前に作ったテクスチャやバッファは無効のまま。有効にした拡張機能も戻らない
+
+（[WebGL 1.0 Specification](https://registry.khronos.org/webgl/specs/latest/1.0/)、「The Context Lost Event」「The Context Restored Event」）
+
+### 手元で確かめる（5）: わざと失わせる、GPU プロセスを落とす
+
+まず、拡張機能 `WEBGL_lose_context` の `loseContext()` で、ページの側から失わせます。この拡張機能だけは、コンテキストが失われても有効なまま残ると仕様が定めています。
+
+```
+loseContext() の直後   isContextLost=true  getError=37442（CONTEXT_LOST_WEBGL）  もう一度 getError=0
+                       作っておいたテクスチャの isTexture=false
+webglcontextlost       （約 6ms 後、別のタスクとして届く）
+restoreContext()
+webglcontextrestored   isContextLost=false  古いテクスチャの isTexture=false
+                       新しく作ったテクスチャは isTexture=true
+```
+
+仕様のとおり、`CONTEXT_LOST_WEBGL` は 1 回だけ返り、復帰しても古いテクスチャは戻りません。**復帰したら、シェーダのコンパイルからテクスチャの読み込みまで、全部を作り直す**必要があります。
+
+次に、本物の障害を起こします。Chrome DevTools Protocol の `Browser.crashGpuProcess` で GPU プロセスそのものを落とすと、ページには次の順でイベントが届きました。
+
+```
+  70ms   ページの準備が終わる
+ 501ms   webglcontextlost
+1507ms   webglcontextrestored（getParameter(VERSION) も正常に返る）
+```
+
+GPU プロセスが再起動し、約 1 秒後に新しいコンテキストが用意されました。レンダラのプロセスは落ちていません。第 88 回でプロセスを分けた理由が、そのまま見えています。ただし、ページが自分で作り直さなければ、canvas は黒いままです。
+
+<Callout type="tip" title="コンテキストを作るのも安くない">
+  同じ測定で、`getContext('webgl2')` は 1 つ目が 31〜41ms、2 つ目が約 20ms かかりました。
+  `getContext('2d')` は 1ms 未満です。
+  同時に持てるコンテキストの数にも上限があります。手元の Chrome 155 で 1 ページに 40 個作ると、
+  「Too many active WebGL contexts. Oldest context will be lost.」という警告が 24 回出て、
+  古い順に 24 個が失われ、生きていたのは新しい 16 個でした。この上限は仕様ではなく実装の値です。
+  小さな canvas を何十個も並べて、それぞれに WebGL を使う設計は避け、
+  1 つの大きな canvas に描き分けるのが普通です。
+</Callout>
+
+## なぜライブラリを使うのか
+
+ここまでで、三角形 1 枚に 30 行ほどかかりました。実際のアプリケーションには、さらに次のものが要ります。
+
+- 行列の計算（カメラ、物体の移動・回転・拡大縮小）
+- 3D モデルや画像の読み込みと、テクスチャへの変換
+- 光や影、材質を表すシェーダの組み合わせ
+- 状態の切り替えを減らすための、描画の順番の並べ替え
+- コンテキストロストからの作り直し
+
+[Three.js](https://threejs.org/) のようなライブラリは、これらを「シーンにメッシュを足す」という形に包み、その下で WebGL（新しい版では WebGPU も）を呼んでいます。第 95 回の言い方で言えば、即時モードの WebGL の上に**保持モードの層を作り直している**わけです。ライブラリを使っても、この回で見たコストの構造は変わりません。ドローコールの数と、答えを待つ命令の数は、ライブラリの中でも速さを決めています。
+
+## まとめ
+
+- GPU は、同じプログラムを独立した大量のデータに一斉に適用する装置。描画は頂点ごと・画素ごとに独立しているので、その形に合う
+- グラフィックスパイプラインは、頂点シェーダ → 組み立てとラスタライズ → フラグメントシェーダ → 深度テストと合成。自分で書くのは 2 つのシェーダで、ラスタライズが頂点の値を画素ごとに補間する
+- WebGL 1.0 は OpenGL ES 2.0、WebGL 2.0 は OpenGL ES 3.0 から派生した API。対象を bind してから操作する、大きな状態機械の形をしている
+- 呼び出しは、レンダラのコマンドバッファに積まれ、GPU プロセスで検証され、ANGLE で Metal や Direct3D、Vulkan に翻訳される。手元の Mac では 3 行のシェーダが 201 行の Metal Shading Language になっていた
+- 命令を書くのは速く、答えを待つのは遅い。手元では 10,000 回の `drawArrays` を書くのに 0.5ms、毎回 `getError()` を挟むと約 500ms。ドローコールはインスタンシングでまとめる
+- 精度は機械によって違う。開発機で `mediump` が崩れなくても、他の機械で崩れないとは限らない
+- コンテキストは失われることがある。`preventDefault()` で復帰を待ち、復帰したら全部作り直す。GPU プロセスを落としても、ページは約 1 秒後に新しいコンテキストを受け取った
+
+WebGL の状態機械は、1990 年代の OpenGL の設計を受け継いでいます。いまの GPU と、Metal、Direct3D 12、Vulkan といった新しい API は、もっと違う形をしています。状態をあらかじめ固めたパイプラインのオブジェクトにまとめ、命令をまとめて記録してから送り、描画だけでなく汎用の計算もできます。次の第 98 回では、その形を Web に持ち込んだ WebGPU を見ます。

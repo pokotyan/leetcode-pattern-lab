@@ -26,9 +26,9 @@ import Callout from '../../components/Callout.astro'
 接続を受け、別の宛先へ接続を張り、両者の間でバイトを行き来させる。中身は読まない。こういうプログラムは、名前を変えてあちこちにあります。
 
 - `socat TCP-LISTEN:9000 TCP:db:5432`。手元の 9000 番を別のホストの 5432 番につなぐ
-- `ssh -L`。手元で受けた接続を、SSH のチャネルを通して向こう側の宛先へつなぐ（第 124 回）
+- `ssh -L`。手元で受けた接続を、SSH のチャネルを通して向こう側の宛先へつなぐ（第 130 回）
 - `kubectl port-forward`。手元のポートを Pod の中のポートにつなぐ
-- `docker-proxy`。公開したポートへのループバック経由の接続を、コンテナへ渡す（第 169 回）
+- `docker-proxy`。公開したポートへのループバック経由の接続を、コンテナへ渡す（第 175 回）
 - L4 のロードバランサ。受けた接続を後ろのどれか 1 台へつなぐ（第 74 回）
 
 どれも骨組みは同じです。**fd を 2 本持ち、片方から読めたものをもう片方へ書く**。第 45 回の多重化と、この章で見た TCP の振る舞いを組み合わせれば作れます。この回は、まず socat が実際に何をしているかをシステムコールの単位で見て、次に同じものを C で書き直します。書き直すと、短いプログラムなのに間違えやすい箇所が 3 つあることがわかります。
@@ -321,7 +321,7 @@ clone(child_stack=NULL, flags=SIGCHLD) = 991
 [991] execve("/usr/bin/tr", ["tr", "a-z", "A-Z"], ...) = 0
 ```
 
-標準入出力で話すだけのプログラムが、そのままネットワークのサービスになります。inetd が昔からやってきたことと同じで、第 124 回の `ssh -W` や `ProxyCommand` も、向きが逆なだけで同じ構図です。同じ仕組みに `EXEC:/bin/sh` を渡せばリバースシェルになるので、攻撃の道具としてもよく使われます。外向きの通信を制限する意味は、ここにもあります。
+標準入出力で話すだけのプログラムが、そのままネットワークのサービスになります。inetd が昔からやってきたことと同じで、第 130 回の `ssh -W` や `ProxyCommand` も、向きが逆なだけで同じ構図です。同じ仕組みに `EXEC:/bin/sh` を渡せばリバースシェルになるので、攻撃の道具としてもよく使われます。外向きの通信を制限する意味は、ここにもあります。
 
 ### TCP と UDP をつなぐ
 
@@ -360,7 +360,7 @@ $ socat -x -v TCP-LISTEN:9500,reuseaddr TCP:ll56-back:8080
 - アクセスログ、IP アドレスによる制限、接続元ごとのレート制限が、すべて中継のアドレスで行われる
 - 中継の後ろで「内部からの接続だから信用する」と判断するサービスは、中継に届く人なら誰でも信用することになる
 
-第 169 回で見た `docker-proxy` も、同じ理由でコンテナから見た接続元を書き換えます。元の接続元を伝えたいなら、HTTP なら `X-Forwarded-For`、TCP のままなら第 74 回の PROXY protocol のように、**中継が別の手段で書き添える**しかありません。socat にはその機能が無いので、socat で中継すると元の接続元は失われます。
+第 175 回で見た `docker-proxy` も、同じ理由でコンテナから見た接続元を書き換えます。元の接続元を伝えたいなら、HTTP なら `X-Forwarded-For`、TCP のままなら第 74 回の PROXY protocol のように、**中継が別の手段で書き添える**しかありません。socat にはその機能が無いので、socat で中継すると元の接続元は失われます。
 
 socat の側で入口を絞るには、`range=10.0.0.0/8` で接続元のアドレスを限り、`max-children=` で同時に作る子プロセスの数を限ります（[socat(1)](http://www.dest-unreach.org/socat/doc/socat.html)）。`max-children` の既定値は「制限なし」です。`fork` を付けた socat は、接続の数だけプロセスを作ります。
 
@@ -370,7 +370,7 @@ socat の側で入口を絞るには、`range=10.0.0.0/8` で接続元のアド�
 
 - **`kubectl port-forward`**: かつての kubelet の dockershim は、ノードの上で `nsenter` を使って Pod のネットワーク名前空間に入り、そこで socat を動かして、API サーバから届くストリームと Pod のポートをつないでいました（[OpenShift 3.6: Port Forwarding](https://docs.openshift.com/container-platform/3.6/architecture/networking/port_forwarding.html)）。ノードに socat が入っていないと `unable to do port forwarding: socat not found` で失敗しました。dockershim が削除された現在は、コンテナランタイムがこの中継を自分で行います
 - **`docker-proxy`**: 公開したポートへのループバック経由の接続や、別のネットワークのコンテナからの接続は、iptables の NAT では扱えないので、ユーザ空間の TCP / UDP 中継に任されます（[ipSpace.net: Docker Userland Proxy](https://blog.ipspace.net/kb/DockerSvc/40-userland-proxy/)）
-- **`ssh -L` / `-R`**: 第 124 回で見たとおり、2 本の TCP 接続のあいだを SSH のチャネルがつないでいます。SSH のチャネルにはチャネルごとのウィンドウがあり、この回の背圧と同じ役割を果たしています
+- **`ssh -L` / `-R`**: 第 130 回で見たとおり、2 本の TCP 接続のあいだを SSH のチャネルがつないでいます。SSH のチャネルにはチャネルごとのウィンドウがあり、この回の背圧と同じ役割を果たしています
 
 ## 自分の環境で見る
 
