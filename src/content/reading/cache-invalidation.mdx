@@ -1,0 +1,321 @@
+---
+title: キャッシュを捨てるとき（TTL・削除か更新か・Thundering Herd）
+description: 写しはいつか捨てなければならない。時間で捨てる TTL、満杯で捨てる追い出し、書き込みを合図に捨てる無効化。そして捨てた瞬間に人気のキーへ要求が殺到する Thundering Herd を、ロック、リース、確率的早期再計算で抑える方法を Redis の実測で比べる
+category: performance
+order: 54
+status: published
+topics:
+  - TTL
+  - 受動的な期限切れ / 能動的な期限切れ
+  - maxmemory と追い出し方針
+  - キャッシュの無効化
+  - 遅延二重削除
+  - リース（memcache）
+  - 版番号つきの書き込み
+  - Thundering Herd / Cache Stampede
+  - 確率的早期再計算（XFetch）
+  - ネガティブキャッシュ
+  - TTL のゆらぎ（jitter）
+  - stale-while-revalidate
+basedOn:
+  - kind: article
+    slug: design-cache
+    why: 満杯になったときに何を追い出すか（LRU・LFU）。Redis はこれを近似で実装している
+  - kind: math
+    slug: probability-expectation
+    why: 確率的早期再計算は、指数分布の乱数で「少し先の時刻」を引く。何回くらい早めの作り直しが起きるかは、確率と期待値の見積もりで説明できる
+problems:
+  - name: LRU Cache
+    url: https://leetcode.com/problems/lru-cache/
+    level: Medium
+    importance: 中
+    technique: 辞書 + 双方向連結リスト
+  - name: LFU Cache
+    url: https://leetcode.com/problems/lfu-cache/
+    level: Hard
+    importance: 低
+    technique: 頻度ごとのリスト + 最小頻度の追跡
+---
+
+import Callout from '../../components/Callout.astro'
+import CacheStampede from '../../components/sim/problems/CacheStampede'
+
+## 写しは、いつか捨てる
+
+前の回の<a href={`${import.meta.env.BASE_URL}reading/cache-patterns/`}>キャッシュをどこに挟むか</a>では、DB の値の写しをキャッシュに置く 5 つの経路を見ました。最後に見たとおり、どの経路でも、読みと書きが交差すればキャッシュに古い値が残りえます。
+
+写しを置いた以上、いつか捨てなければなりません。捨て方は 3 つあります。
+
+| 捨て方 | 合図 | 何を守るか |
+| --- | --- | --- |
+| 時間で捨てる（TTL） | 書いてから一定時間たった | 古い値が残る時間の上限 |
+| 満杯で捨てる（追い出し） | メモリの上限に達した | キャッシュ自体が落ちないこと |
+| 書き込みを合図に捨てる（無効化） | DB の値が変わった | 新しい値をすぐ読めること |
+
+そして、捨てたあとには別の問題が待っています。人気のあるキーが消えた瞬間、それを読みに来た要求が一斉にミスし、同じ値を作り直すために DB へ殺到します。この回では、3 つの捨て方と、捨てた瞬間の殺到への対策を、Redis 7.4.11（Docker の公式イメージ `redis:7.4`）と Python 3.14 の redis-py 8.1.0 で確かめます。実行したのは Apple M1 Pro の macOS 26.2 です。
+
+## 時間で捨てる：TTL
+
+### Redis は期限切れのキーをいつ消すのか
+
+`SET key value EX 60` のように期限を付けたキーは、60 秒たつと消えます。ただし、60 秒ちょうどに Redis がそのキーを探して消しに行くわけではありません。Redis の文書は消し方を 2 つに分けて説明しています（[Redis: EXPIRE](https://redis.io/docs/latest/commands/expire/)）。
+
+> Redis keys are expired in two ways: a passive way and an active way.
+
+1 つ目の受動的な期限切れ（passive）は、「A key is passively expired when a client tries to access it and the key is timed out.」、つまり読まれた時点で期限を過ぎていれば、その場で消して「無い」と答えるものです。これだけでは二度と読まれないキーが残り続けるので、2 つ目の能動的な期限切れ（active）として「periodically, Redis tests a few keys at random amongst the set of keys with an expiration」、期限付きのキーを定期的に少しずつ抜き取って調べ、切れていれば消します。
+
+この 2 つを見分けるため、TTL 1 秒のキーを 10 万件書き、誰も読まずに件数を数えました。`DEBUG SET-ACTIVE-EXPIRE 0` で能動的な期限切れを止めた場合も並べます（`DEBUG` は既定で無効なので、`--enable-debug-command yes` で起動した別のコンテナで実行しています）。
+
+```text
+== 能動的な期限切れ: 有効（既定）
+errors: 0, replies: 100000
+t=0.1s db0:keys=100000 expired_keys:0
+t=0.7s db0:keys=100000 expired_keys:0
+t=1.3s db0:keys=21 expired_keys:99979
+t=1.9s  expired_keys:100000
+== 能動的な期限切れ: 無効（DEBUG SET-ACTIVE-EXPIRE 0）
+OK
+errors: 0, replies: 100000
+3 秒後 dbsize=100000 expired_keys:0
+GET k:1 -> ''
+読んだ後 dbsize=99999 expired_keys:1
+```
+
+既定のままなら、誰も読まなくても 1.3 秒の時点でほぼ消えています。能動的な期限切れを止めると、3 秒たっても 10 万件がメモリに残り、`GET` した 1 件だけがその場で消えました。読み手から見ればどちらも「期限を過ぎたキーは無い」ので結果は同じですが、メモリが空くかどうかが違います。
+
+期限は、キーごとに絶対時刻（Unix 時刻のミリ秒）で記録されています。文書は精度を「Since Redis 2.6 the expire error is from 0 to 1 milliseconds.」と書き、同時に、時計を進めれば期限も早く来ることを注意しています。期限が来たかどうかは、Redis が動いている計算機の時計で決まります。
+
+### TTL は「古くてよい時間」の上限
+
+TTL の長さを決めるときに考えるべきなのは、「どれだけの時間なら古い値を見せてよいか」です。前の回で見たとおり、無効化には取りこぼしがありえます。そのとき古い値が残る時間の上限を決めるのが TTL です。
+
+ここで 1 つ落とし穴があります。Redis の `SET` は、それまで付いていた期限を消します。
+
+> The timeout will only be cleared by commands that delete or overwrite the contents of the key, including DEL, SET, GETSET and all the *STORE commands.
+
+キャッシュに書き戻すコードのどこか 1 か所で `EX` を付け忘れると、そのキーは期限のない永続のキーになります。後で見る実験では、TTL を付けずに書き戻された古い値が `TTL=-1`（期限なし）のまま残り、二度と自然には消えませんでした。キャッシュに書くすべての経路で TTL を付けることは、取りこぼしに対する最後の防波堤です。
+
+## 満杯で捨てる：maxmemory と追い出し方針
+
+キャッシュのメモリには上限があります。Redis では `maxmemory` で上限を決め、超えたときに何を捨てるかを `maxmemory-policy` で選びます。文書は、64 ビットの環境では上限を設けないのが既定だと書いています（「Set maxmemory to zero to specify that you don't want to limit the memory for the dataset. This is the default behavior for 64-bit systems」、[Redis: Key eviction](https://redis.io/docs/latest/develop/reference/eviction/)）。
+
+| 方針 | 何を捨てるか |
+| --- | --- |
+| `noeviction` | 捨てない。新しく書き込む命令をエラーにする |
+| `allkeys-lru` | すべてのキーから、最後に使われてから最も時間がたったもの |
+| `allkeys-lfu` | すべてのキーから、使われる頻度が最も低いもの |
+| `allkeys-random` | すべてのキーから無作為に |
+| `volatile-lru` / `volatile-lfu` / `volatile-random` | 期限付きのキーだけを対象に、それぞれの基準で |
+| `volatile-ttl` | 期限付きのキーのうち、残りの TTL が最も短いもの |
+
+（Redis 8.6 からは、最後に書き換えられた時刻で選ぶ `allkeys-lrm` と `volatile-lrm` も加わっています。）`volatile-*` は「behave like noeviction if no keys have an associated expiration」、つまり期限付きのキーが 1 つもなければ `noeviction` と同じ動きになります。
+
+手元の `redis:7.4` で `CONFIG GET maxmemory-policy` を実行すると、既定は `noeviction` でした。キャッシュとして使うのに、上限だけ設定して方針を変えないと、満杯になった時点で書き込みが失敗し始めます。上限を 4MB にして 1KB の値を 2 万件（約 20MB）書き、その合間に特定の 10 件だけを読み続けました。
+
+```text
+noeviction      書けた= 2852 残った= 2852 evicted_keys=    0 よく読む10件のうち残った=10
+                エラー: command not allowed when used memory > 'maxmemory'.
+allkeys-lru     書けた=20000 残った= 2831 evicted_keys=17169 よく読む10件のうち残った=10
+allkeys-lfu     書けた=20000 残った= 2833 evicted_keys=17167 よく読む10件のうち残った=10
+allkeys-random  書けた=20000 残った= 2832 evicted_keys=17168 よく読む10件のうち残った= 0
+```
+
+`noeviction` は 2,852 件目の次の書き込みでエラーになりました。LRU と LFU は、よく読む 10 件をすべて残し、無作為に捨てる方針では 10 件とも消えています。
+
+Redis の LRU は、すべてのキーを使われた順に並べているわけではありません。「It samples a small number of keys at random and then evicts the ones with the longest time since last access.」、少数のキーを無作為に抜き出し、その中で最も長く使われていないものを捨てる近似です。正確な LRU が持つ連結リスト（<a href={`${import.meta.env.BASE_URL}articles/design-cache/`}>LRU Cache</a>の回で組んだもの）を全キーぶん持つとメモリを食うためで、抜き出す数は `maxmemory-samples` で変えられます。
+
+<Callout type="tip" title="キャッシュと永続データを同じ Redis に置かない">
+  文書は、`volatile-*` の方針が主に役立つのは、1 つの Redis にキャッシュと消えては困るデータを同居させる場合だとしたうえで、できるなら Redis を 2 つに分けることを勧めています。キャッシュだけを置く Redis なら、`allkeys-lru` を選べば期限を付け忘れたキーも追い出しの対象になります。
+</Callout>
+
+## 書き込みを合図に捨てる：消すか、書き換えるか
+
+DB の値が変わったら、キャッシュの写しも何とかしなければなりません。選択肢は、写しを**消す**か、新しい値で**書き換える**かです。
+
+Facebook が memcache の運用をまとめた論文は、消すほうを選んだ理由を次のように書いています（[Nishtala et al., Scaling Memcache at Facebook, NSDI '13](https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf)、2 節）。
+
+> We choose to delete cached data instead of updating it because deletes are idempotent.
+
+冪等（idempotent）とは、同じ操作を何度繰り返しても結果が変わらないことです。削除は、2 回届いても、遅れて届いても、「無い」という同じ状態に落ち着きます。書き換えはそうではありません。2 つの書き手の書き換えが入れ替わって届けば、後から届いた古い値が残ります。
+
+ただし、消す方式にも隙間があります。前の回で再現した「読み手が DB から古い値を読む → その間に書き手が DB を更新してキャッシュを消す → 読み手が古い値を書き戻す」という交差です。この順序を `threading.Event` で固定し、対策ごとに結果を見ました。DB は値と版番号を持つ辞書で代用し、キャッシュは本物の Redis です。
+
+```text
+削除（TTL なし）                   DB=120円  キャッシュ=100円         TTL=-1
+削除（TTL 300 秒）                DB=120円  キャッシュ=100円         TTL=300
+二重削除 0.5 秒・書き戻し 0.1 秒後       DB=120円  キャッシュ=None         TTL=-2
+二重削除 0.5 秒・書き戻し 0.8 秒後       DB=120円  キャッシュ=100円         TTL=-1
+リース                          DB=120円  キャッシュ=None         TTL=-2
+                             書き戻しの結果=0（0 = リースが無効なので捨てた）
+書き換え（そのまま SET）               DB=150円(版3) キャッシュ=120円(版2)
+書き換え（版で比較）                   DB=150円(版3) キャッシュ=150円(版3)
+```
+
+1 行目は、TTL を付けずに書き戻した場合です。古い 100 円が期限なしで残り、次の更新が来るまで消えません。2 行目は TTL 300 秒を付けた場合で、古い値は残りますが、最長 300 秒で消えることが保証されます。以下、残りの行を順に見ていきます。
+
+### 遅延二重削除：少し待ってもう一度消す
+
+書き手が、削除のあと少し時間を置いてもう一度消す方法です。読み手の書き戻しが 2 回目の削除より前に起きれば、2 回目の削除がそれを消してくれます（3 行目）。
+
+しかし、待つ時間より読み手の書き戻しのほうが遅ければ、効きません（4 行目）。読み手は GC の停止や遅いネットワークで、いくらでも遅れうるからです。待ち時間を長くすれば取りこぼしは減りますが、ゼロにはなりません。書き手の側に「あとでもう一度消す」仕事を残すので、それを確実に実行するための遅延キューなども要ります。
+
+### リース：取りこぼした人だけに書き戻す権利を渡す
+
+memcache の論文は、この交差を stale set（古い値の書き込み）と呼び、リース（lease）という仕組みで防いでいます（3.2.1 節）。
+
+> Intuitively, a memcached instance gives a lease to a client to set data back into the cache when that client experiences a cache miss. The lease is a 64-bit token bound to the specific key the client originally requested.
+
+ミスした読み手は、キャッシュから 64 ビットの札（トークン）を受け取ります。書き戻すときはその札を添え、キャッシュは札がまだ有効かを確かめてから受け入れます。そして「Verification can fail if memcached has invalidated the lease token due to receiving a delete request for that item.」、その間に削除が届いていれば札は無効になり、書き戻しは捨てられます。
+
+Redis にはこの機能がないので、`SET NX` で札を置き、削除のときに札も一緒に消し、書き戻しは札が一致したときだけ行う Lua スクリプトで真似しました。
+
+```lua
+if redis.call('GET', KEYS[2]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2])
+  redis.call('DEL', KEYS[2])
+  return 1
+end
+return 0
+```
+
+結果は 5 行目のとおりで、書き戻しは 0（拒否）を返し、古い値は入りませんでした。読み手がどれだけ遅れても、削除が後に来たという事実は札の消失として残るので、遅延二重削除のような時間の賭けがありません。
+
+### 書き換えるなら、版で比べる
+
+書き換える方式を選ぶなら、値に DB の版番号を添え、キャッシュにある版より新しいときだけ上書きします。実験の最後の 2 行は、書き手 1 が 120 円（版 2）、書き手 2 が 150 円（版 3）を DB に書き、キャッシュへの反映だけが逆順に届いた場合です。そのまま `SET` すると版 2 の 120 円が残り、版を比べる Lua スクリプトを通すと版 3 の 150 円が残りました。
+
+この方式が成り立つには、DB の側に単調に増える版が必要です。行に版番号の列を持たせる、更新時刻を使う（同じ時刻の更新が並ぶと区別できない）、DB の変更ログの位置を使う、などの方法があります。
+
+<Callout type="warn" title="どの対策も、TTL を外す理由にはならない">
+  リースも版番号も、キャッシュへの書き込みが自分の管理するコードを通ることが前提です。運用中に手で入れた値、別のサービスが書いた値、移行の途中の値は、その網をくぐります。前の回で引いた Azure の構成例も、版番号と並べて、取りこぼしの最後の防波堤として TTL を付けることを勧めていました。
+</Callout>
+
+## 捨てた瞬間に殺到する：Thundering Herd
+
+ここまでは「古い値が残る」問題でした。ここからは逆に、「値が無くなった瞬間」の問題です。
+
+XFetch の論文は、この現象を次のように定義しています（[Vattani, Chierichetti, Lowenstein, Optimal Probabilistic Cache Stampede Prevention, VLDB 2015](https://www.vldb.org/pvldb/vol8/p886-vattani.pdf)）。
+
+> The cache stampede problem (also called dog-piling, cache miss storm, or cache choking) is a situation that occurs when a popular cache item expires, leading to multiple requests seeing a cache miss and regenerating that same item at the same time.
+
+殺到する件数は、要求の頻度と作り直しにかかる時間の掛け算で決まります。論文の例では「if the cache item is accessed 10 times per second, and the recomputation of the item takes 3 seconds, then 30 requests will recompute the item.」です。作り直しに時間がかかるのは、たいてい重い集計や外部の API 呼び出しなので、それが一度に 30 本走れば、DB や外部サービスが倒れかねません。memcache の論文は、同じ問題を thundering herd と呼び、書き込みが多いキーで無効化が繰り返されるたびに読みが DB に流れる状況として説明しています。
+
+下のシミュレーターは、1 刻み 100ms に 3 件の要求が来る人気のキーで、TTL が切れる前後に誰が DB へ行くかを 4 つの方式で比べます。
+
+<CacheStampede client:visible />
+
+「対策なし」では、期限が切れた 1.2 秒から作り直しが終わるまでの 2 刻みに来た 6 件が、全員 DB へ行きます。
+
+これを本物の Redis で確かめました。100 本のスレッドが 1 つのキーを 5〜15ms おきに読み続け、TTL は 2 秒、作り直し（DB 呼び出しの代わりの 200ms の待ち）を 7 秒間数えます。3 回試した DB 呼び出しの回数と、同時に走った作り直しの最大数です。
+
+| 方式 | DB 呼び出し（3 回の試行） | 同時に走った最大数 |
+| --- | --- | --- |
+| 対策なし | 283 / 300 / 300 | 100 / 100 / 100 |
+| ロック | 6 / 5 / 4 | 1 / 1 / 1 |
+| ロック + 取得後の再確認 | 3 / 3 / 3 | 1 / 1 / 1 |
+| XFetch（β = 1） | 23 / 28 / 32 | 6 / 5 / 8 |
+| XFetch + ロック | 12 / 11 / 9 | 1 / 1 / 1 |
+
+7 秒間の要求は 1 万 7 千〜4 万 9 千件でした。この実験を走らせている間、同じ計算機でほかの重い処理が動いていて、ロードアベレージは 100 を超えていました。そのため要求の件数や応答時間の分布は試行ごとに大きくぶれたので、表には負荷に左右されにくい DB 呼び出しの数だけを載せています。
+
+対策なしでは、期限が切れるたびに 100 本のスレッドがほぼ全員ミスし、2 秒ごとに 100 本の作り直しが同時に走りました（7 秒間に 3 回の期限切れ × 100 本）。
+
+### ロック：1 人だけが作り直す
+
+いちばん素直な対策は、ミスした人のうち 1 人だけに作り直させ、ほかの人は待たせることです。Redis では `SET key:lock 1 NX PX 1000` で「無ければ置く」ロックを取ります。ロックに期限を付けるのは、作り直しの途中でプロセスが落ちてもロックが永遠に残らないようにするためです。
+
+表の「ロック」が 4〜6 回で、理想の 3 回（7 秒間の期限切れの回数）より多いのには理由があります。ロックが取れずに待っていた人が、前の持ち主がロックを外した直後にロックを取ると、もう値はあるのに作り直してしまいます。**ロックを取ったらもう一度キャッシュを読み、それでも無いときだけ作り直す**ようにすると、3 回ちょうどになりました。
+
+ロックの弱点は、待たせることです。作り直しが終わるまで、待っている人の応答は止まります。シミュレーターの「ロック」で、灰色の「待つ」が並ぶのがそれです。
+
+### memcache のリースによる待たせ方
+
+memcache の論文では、さきほどのリースがそのまま殺到の対策も兼ねています。札を発行する頻度に上限があり、「By default, we configure these servers to return a token only once every 10 seconds per key.」、1 つのキーにつき 10 秒に 1 回しか札を出しません。札をもらえなかった人は、少し待って読み直すよう指示されます。「Typically, the client with the lease will have successfully set the data within a few milliseconds.」とあり、読み直したときにはたいてい値が入っています。
+
+論文は、殺到の起きやすいキーの集まりを 1 週間観測した結果を載せています。
+
+> Without leases, all of the cache misses resulted in a peak database query rate of 17K/s. With leases, the peak database query rate was 1.3K/s.
+
+DB は最大の負荷に合わせて用意するので、最大値が 10 分の 1 以下になったことがそのまま効率になった、と書かれています。
+
+さらに論文は、少し古い値を返してよい場面を使って、待ち時間も減らしています。削除された値をすぐには捨てずに短い間だけ取っておき、「A get request can return a lease token or data that is marked as stale.」、札の代わりに「古い」と印を付けた値を返すことがあります。古い値で処理を進められるアプリは、新しい値を待たずに済みます。
+
+### 期限の前に、確率的に作り直す：XFetch
+
+ロックは「期限が切れてから 1 人が作り直し、ほかは待つ」方式でした。待たせないためには、**期限が切れる前に誰かが作り直しておけばよい**ことになります。ただ、全員が期限の 10 秒前に作り直せば、10 秒前に殺到が起きるだけです。
+
+そこで、それぞれの要求が乱数で「自分は少し先の時刻に来たことにする」と決め、その時刻にはもう期限が切れているなら作り直す、という方式があります。論文はこれを「this probabilistic choice can be interpreted as each process pretending to be sent sometime in the future and checking if at that time the item would be expired.」と説明しています。どれだけ先の時刻にするか（ずらし幅）の分布の選び方が問題で、論文は、一様分布より指数分布のほうがよく、最適に近いことを示し、その実装を XFetch と名付けました。疑似コードは次のとおりです（論文の Figure 3）。
+
+```text
+function XFetch(key, ttl; β = 1)
+  value, Δ, expiry ← CacheRead(key)
+  if !value or Time() − Δ·β·log(rand()) ≥ expiry then
+    start ← Time()
+    value ← RecomputeValue()
+    Δ ← Time() – start
+    CacheWrite(key, (value, Δ), ttl)
+  end
+  return value
+end
+```
+
+- `rand()` は 0 から 1 の一様な乱数で、`log(rand())` は負になります。`−log(rand())` は平均 1 の指数分布に従う乱数です。
+- それに前回の作り直しにかかった時間 `Δ` を掛けて、ずらし幅にします。作り直しに時間がかかる値ほど、早めに作り直す必要があるからです。
+- `β` は早さの調整で、論文は既定の 1 で十分に効き、大きくすると殺到をさらに抑えられる代わりに、より早く作り直すようになると書いています。
+
+ずらし幅が残り時間 τ を超える確率は e^(−τ/Δ) です。期限まで遠いうちはこの確率がほぼ 0 で、期限に近づくにつれ急に上がります。1 秒に λ 件の要求が来るなら、最初に誰かが作り直しを始めるのは、だいたい λ·Δ·e^(−τ/Δ) が 1 になるあたり、つまり期限の Δ·ln(λΔ) 前です。
+
+この見積もりで、表の XFetch の数字が説明できます。実験の XFetch の行は 1 秒に 4,600〜6,600 件、Δ は 0.2 秒でした。Δ·ln(λΔ) は λ が 5,000 なら 0.2 × ln(1,000) ≈ 1.4 秒なので、TTL 2 秒のうち最初の 0.6 秒ほどで早めの作り直しが始まります。そのため作り直しの回数は、期限切れの回数（3 回）より多くなりました。さらに、作り直しの 0.2 秒の間にも次の要求が同じ判定をくぐるので、同時に 5〜8 本が走っています。要求の頻度が高いほど早く、何本も重なって作り直すのが、XFetch だけで使うときの代償です。
+
+一方、XFetch では、誰もミスしません。早めの作り直しが走っている間も、キャッシュにはまだ期限内の値があり、ほかの要求はそれを読みます。
+
+### 組み合わせる
+
+XFetch で「期限前に作り直す」と決めた人がさらにロックを取り、取れなかった人はまだ有効な値をそのまま返す、と組み合わせたのが表の最後の行です。同時に走る作り直しは常に 1 本になり、待たされる人もいません。作り直しの回数（9〜12 回）は XFetch の見積もりどおり期限切れの回数より多いので、作り直しが重い値では、`β` や TTL の長さで調整します。
+
+シミュレーターでは、「XFetch」で 1.0 秒と 1.1 秒に 3 件が早めの作り直しを始めて 3 本重なるのに対し、「XFetch + ロック」では 1 本だけが走り、ほかは期限内の値を返しています。どちらも、1.2 秒の期限の時点にはもう新しい値が入っています。
+
+### HTTP のキャッシュにも同じ考え方がある
+
+古い値を返しながら裏で作り直す、という考え方は HTTP のキャッシュにもあります。`Cache-Control: max-age=600, stale-while-revalidate=30` は、RFC 5861 の言葉で「the stale-while-revalidate Cache-Control extension indicates that caches MAY serve the response in which it appears after it becomes stale, up to the indicated number of seconds.」です（[RFC 5861](https://www.rfc-editor.org/rfc/rfc5861)）。期限切れから 30 秒の間は、古い応答を返しつつ裏で取り直してよい、という意味になります。低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-110-http-cache-cdn/`}>他人の応答を配るキャッシュ</a>の回では、Varnish がこれを grace という仕組みで既定で行っていることを実測しました。
+
+## 無いことも覚える：ネガティブキャッシュ
+
+Cache-Aside では、DB に**存在しない**キーを読まれると、毎回ミスして DB に問い合わせます。キャッシュに入れる値が無いからです。存在しない ID を大量に送りつけられると、キャッシュを素通りして DB に負荷がかかります。
+
+対策は、「無い」という結果もキャッシュすることです。DB に無かったら、「無い」を表す印を短い TTL でキャッシュに入れます。TTL を短くするのは、あとでその ID のデータが作られたときに、「無い」がいつまでも残らないようにするためです。作成のときに印を消すなら、TTL はもっと長くできます。
+
+DNS は、この考え方を標準として持っています。存在しない名前の答えにも期限を付けて覚えておく仕組みで、低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-61-dns-cache/`}>DNS のキャッシュ</a>の回で扱いました。存在しうるキーの集合があらかじめ分かっているなら、読み物の<a href={`${import.meta.env.BASE_URL}reading/bloom-filter/`}>Bloom Filter</a>で「確実に無い」キーを DB の手前ではじく方法もあります。
+
+## 一斉に切れないようにする：TTL のゆらぎ
+
+起動直後やキャッシュを空にした直後に、多くのキーを一斉に温めると、同じ TTL を付けたキーは期限も一斉に来ます。1 つのキーへの殺到ではなく、多くのキーのミスが同じ瞬間に重なって DB に押し寄せます。
+
+1 万件のキーに TTL 3 秒を付けて一度に書き、それぞれの期限の時刻を `PEXPIRETIME` で読んで、書き終えた時刻から 0.25 秒ごとに数えました。TTL に ±20% の乱数を足した場合と比べます。
+
+```text
+ゆらぎなし  2.75s〜:10000
+±20%   2.25s〜:1083  2.50s〜:2034  2.75s〜:2078  3.00s〜:2131  3.25s〜:2073  3.50s〜:601
+```
+
+ゆらぎがなければ 1 万件の期限が同じ 0.25 秒に集まり、±20% のゆらぎを足すと 1.2 秒の幅に散らばって、1 区間あたり 2 千件ほどに下がりました。TTL にゆらぎを足すのは 1 行の変更で、温め直しのたびに DB が受ける最大の負荷を下げられます。
+
+## まとめ
+
+| 問題 | 対策 | 残る弱点 |
+| --- | --- | --- |
+| 無効化の取りこぼしで古い値が残る | すべての書き込みに TTL | TTL の間は古いまま |
+| 読み手の古い書き戻し（stale set） | 遅延二重削除 | 読み手が待ち時間より遅れると効かない |
+| 同上 | リース（ミスした人だけが札付きで書き戻す） | キャッシュ側の仕組みか、Lua などでの再現が要る |
+| 書き換えの入れ替わり | 版番号で比べて上書き | DB に単調に増える版が要る |
+| 人気キーの期限切れで DB に殺到 | ロック + 取得後の再確認 | 作り直しの間、ほかの人が待つ |
+| 同上 | XFetch（期限前の確率的な作り直し） | 要求が多いほど早く、重ねて作り直す |
+| 同上 | XFetch + ロック | 作り直しの回数は期限切れの回数より多い |
+| 存在しないキーで DB に素通り | ネガティブキャッシュ | 作成時に印を消すか、短い TTL |
+| 多くのキーが一斉に切れる | TTL のゆらぎ | なし（1 行で済む） |
+
+- Redis の期限切れは、読まれた時点で消す受動的なものと、定期的に抜き取って消す能動的なものの 2 つで動く
+- `SET` は期限を消す。キャッシュに書くすべての経路で TTL を付けることが、取りこぼしへの最後の防波堤になる
+- Redis の既定の追い出し方針は `noeviction`。キャッシュとして使うなら `allkeys-lru` などを明示する
+- 書き込みでは、冪等な削除のほうが書き換えより安全。それでも残る古い書き戻しは、リースか版番号で防ぐ
+- 人気キーの殺到は、1 人に作り直させるか（ロック）、期限前に確率的に作り直させるか（XFetch）で抑える。両方を組み合わせると、同時に走る作り直しは 1 本、待つ人は 0 人になった

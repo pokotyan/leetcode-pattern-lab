@@ -1,0 +1,301 @@
+---
+title: キャッシュをどこに挟むか（Cache-Aside・Read-Through・Write-Through・Write-Behind・Write-Around）
+description: アプリ、キャッシュ、DB の 3 者のうち、ミスを埋めるのは誰か、書き込みはいつ DB に届くのか。5 つの経路を、往復の回数、キャッシュと DB が食い違う時間帯、落ちたときに失うものの 3 点で、Redis と PostgreSQL の実測とともに比べる
+category: performance
+order: 53
+status: published
+topics:
+  - Cache-Aside
+  - Lazy Loading
+  - Read-Through
+  - Write-Through
+  - Write-Behind（Write-Back）
+  - Write-Around
+  - Refresh-Ahead
+  - 書き込みのまとめ（write-coalescing）
+  - キャッシュの食い違い
+basedOn:
+  - kind: article
+    slug: design-cache
+    why: キャッシュの中で何を残し何を追い出すか（LRU）の話。この回はその外側、キャッシュと DB のあいだで値をどう運ぶかを扱う
+problems:
+  - name: LRU Cache
+    url: https://leetcode.com/problems/lru-cache/
+    level: Medium
+    importance: 中
+    technique: 辞書 + 双方向連結リスト
+---
+
+import Callout from '../../components/Callout.astro'
+import CachePatterns from '../../components/sim/problems/CachePatterns'
+
+## 同じ値が 2 か所にある
+
+キャッシュを入れると、同じデータが DB とキャッシュの 2 か所に置かれます。読みは速くなりますが、引き換えに次の 2 つを決めなければなりません。
+
+- **読みでキャッシュに無かったとき、誰が DB を読んで埋めるのか。** アプリのコードか、キャッシュの側の仕組みか。
+- **書き込みは、いつ DB に届くのか。** 書き込みの処理の中で同期して届けるのか、後でまとめて届けるのか、そもそもキャッシュを通さないのか。
+
+よく名前の挙がる 5 つの経路は、この 2 つの問いへの答えの組み合わせです。
+
+| 経路 | ミスを埋めるのは | 書き込みが DB に届くのは | 書いた値はキャッシュに |
+| --- | --- | --- | --- |
+| Cache-Aside | アプリ | アプリが DB に直接書く | 載せない（古い写しを消す） |
+| Read-Through | キャッシュ | （読みの経路の名前。書きは別に決める） | − |
+| Write-Through | − | キャッシュが同期して書く | 載せる |
+| Write-Behind | − | キャッシュが後でまとめて書く | 載せる |
+| Write-Around | − | DB に直接書く | 載せない |
+
+Read-Through は読みの経路、Write-Through・Write-Behind・Write-Around は書きの経路の名前なので、実際のシステムでは「Read-Through と Write-Through」のように読みと書きを 1 つずつ組み合わせて使います。Cache-Aside だけは、読みも書きもアプリが受け持つ形をまとめて指す名前です。
+
+下のシミュレーターは、1 つのキー `user:1` を読み書きしながら、アプリの手元・キャッシュ・DB の値を並べて表示します。経路を切り替えて、どの時点で値が食い違うかを見てください。
+
+<CachePatterns client:visible />
+
+## Cache-Aside：アプリがキャッシュを横に置いて使う
+
+いちばん広く使われている形です。キャッシュは DB の存在を知らず、アプリが両方に話しかけます。AWS の ElastiCache の文書では lazy loading（遅延読み込み）と呼ばれ、「a caching strategy that loads data into the cache only when necessary」（必要になったときだけキャッシュにデータを載せる戦略）と定義されています（[Amazon ElastiCache: Caching strategies](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html)）。
+
+読みは次の順に進みます。
+
+1. キャッシュに聞く。あればそれを返す（ヒット）
+2. 無ければ（ミス）、アプリが DB を読む
+3. 読んだ値をキャッシュに入れてから返す
+
+ミスしたときは、キャッシュへの問い合わせ、DB の読み、キャッシュへの書き込みの 3 往復になります。AWS の文書も欠点として「Each cache miss results in three trips」と書いています。
+
+書きは、**DB を更新してから、キャッシュの写しを消します**。上書きではなく削除にするのは、次に読まれたときに DB から正しい値を入れ直させるためです。Microsoft の Azure Architecture Center は、この順序を守るよう明記しています。
+
+> The order of the steps is important. Update the data store *before* removing the item from the cache. If you remove the cached item first, there's a small window of time when a client might fetch the item before the data store is updated.
+>
+> （手順の順序が重要です。キャッシュから削除する*前に*データストアを更新してください。先にキャッシュを消すと、データストアが更新される前にクライアントが読んでしまう短い時間ができます。）
+>
+> — [Azure Architecture Center: Cache-Aside pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside)
+
+消した写しは、次の読みのミスで入れ直されます。そのため、書いた直後の読みは必ずミスになり、遅くなります。同じ文書は「Between the write and the next read, a reader can experience a cache miss or briefly see stale data.」（書き込みから次の読みまでのあいだ、読み手はミスするか、一時的に古いデータを見ることがある）と書いています。
+
+### キャッシュが落ちても動き続ける
+
+Cache-Aside の強みは、キャッシュが単なる「あれば速い」場所でしかないことです。キャッシュのノードが落ちて空のノードに置き換わっても、すべての読みがミスになって DB に行くだけで、アプリは動き続けます。AWS の文書は利点として「Node failures aren't fatal for your application.」を挙げ、遅くはなるがそのまま動き続けると説明しています。
+
+ただし、キャッシュが空になった瞬間に、それまでキャッシュが受け止めていた読みがすべて DB に向かいます。DB がその量に耐えられるかどうかは、別に確かめておく必要があります。
+
+## Read-Through：ミスを埋める仕事をキャッシュに移す
+
+Read-Through では、アプリはキャッシュにだけ話しかけます。キャッシュに無ければ、キャッシュ自身が DB を読みに行きます。Oracle Coherence の文書は次のように説明しています。
+
+> When an application asks the cache for an entry, for example the key X, and X is not in the cache, Coherence automatically delegates to the CacheStore and asks it to load X from the underlying data source. [...] This is called Read-Through caching.
+>
+> （アプリがキャッシュにエントリ、たとえばキー X を求め、X がキャッシュに無いとき、Coherence は自動的に CacheStore に処理を委ね、背後のデータソースから X を読み込ませます。[...] これを Read-Through キャッシュと呼びます。）
+>
+> — [Oracle Coherence: Caching Data Sources](https://docs.oracle.com/en/middleware/standalone/coherence/14.1.1.2206/develop-applications/caching-data-sources.html)
+
+往復の数は Cache-Aside と同じです。変わるのは、**「ミスしたら DB を読んで入れる」というコードがどこにあるか**です。Cache-Aside ではアプリのあちこちに同じ処理が散らばりますが、Read-Through ではキャッシュの側に 1 か所だけあります。
+
+単体で動かす Redis や Memcached は、ミスしたときに DB を読みに行く機能を持っていません。その場合は Cache-Aside を使うことになります。Azure の文書も「For caches that don't provide this functionality, the applications that use the cache must maintain the data.」（この機能を持たないキャッシュでは、使う側のアプリがデータを管理しなければならない）と書き、Cache-Aside を Read-Through の代わりにアプリで実現する方法として位置づけています。実務では、アプリの中のキャッシュ用ライブラリが Read-Through の役を担い、その裏で Redis を使う、という形もよくあります。
+
+## Write-Through：書き込みのたびに両方を新しくする
+
+Write-Through では、書き込みもキャッシュに渡し、キャッシュが DB に書いてから戻ります。Coherence の文書の言い方では、アプリがキャッシュの値を更新したとき「the operation does not complete (that is, the put does not return) until Coherence has gone through the cache store and successfully stored the data to the underlying data source」（キャッシュストアを通して背後のデータソースに保存し終えるまで、操作は完了しない。つまり put は戻らない）となります。
+
+書いた直後から、キャッシュも DB も新しい値を持っています。AWS の文書は利点に「Data in the cache is never stale.」を挙げています。シミュレーターの Write-Through で、書いた直後の読みがミスせずに新しい値を返すのを確かめてください。Cache-Aside との違いはここです。
+
+代わりに、次の 2 つを払います。
+
+- **書き込みが遅くなる。** 毎回キャッシュと DB の両方に書くからです。AWS の文書はこれを「Write penalty vs. read penalty」と呼び、読みの遅さより書きの遅さのほうが利用者に受け入れられやすい、と説明しています。
+- **読まれない値でキャッシュが埋まる。** 書いたものはすべてキャッシュに載るからです。同じ文書は「Most data is never read, which is a waste of resources.」と書き、TTL（有効期限）を付けて無駄を抑えるよう勧めています。
+
+キャッシュのノードを新しく足したときに中身が空であることは、Write-Through でも変わりません。書かれるまで載らないので、AWS の文書は Write-Through と lazy loading の併用を勧めています。
+
+## Write-Behind：書き込みを後でまとめて届ける
+
+Write-Behind（Write-Back とも呼ばれます）では、書き込みはキャッシュに入れた時点で戻り、DB への反映は後で行います。Coherence の文書の定義は次のとおりです。
+
+> In the Write-Behind scenario, modified cache entries are asynchronously written to the data source after a configured delay, whether after 10 seconds, 20 minutes, a day, a week or even longer.
+>
+> （Write-Behind では、変更されたキャッシュのエントリは、設定した遅延のあとで非同期にデータソースへ書かれます。遅延は 10 秒、20 分、1 日、1 週間、あるいはそれ以上でもかまいません。）
+
+利点は書き込みが速くなることと、DB への書き込みが減ることです。同じキーを短い間に何度も書いた場合、最後の値を 1 回書けば済みます。同じ文書は、遅延の間の同じオブジェクトへの複数の変更が「"coalesced" and only written once to the underlying data source ("write-coalescing")」（まとめられ、データソースには 1 回だけ書かれる）と説明しています。シミュレーターの Write-Behind で、3 回の書き込みが 1 回の DB への書き込みになるのを見てください。
+
+### 書き戻すまでは、キャッシュが唯一の記録になる
+
+代わりに、**書き戻しが終わるまで、その値はキャッシュの中にしかありません**。Coherence の文書は、この性質をはっきり書いています。
+
+> Because write-behind effectively makes the cache the system-of-record (until the write-behind queue has been written to disk), business regulations must allow cluster-durable (rather than disk-durable) storage of data and transactions.
+>
+> （Write-Behind は、書き戻しの待ち行列がディスクに書かれるまで、実質的にキャッシュを正本にするので、データと取引を（ディスクではなく）クラスタの中に保持するだけで永続とみなすことが、業務上の規則で許されている必要があります。）
+
+同じ文書は、DB への書き込みがキャッシュの処理の外で起きるので「the database transactions must never fail」（DB のトランザクションは決して失敗してはならない）とも述べています。アプリには「書けた」と返したあとで DB への書き込みが制約違反で失敗しても、もうアプリに伝える手段がないからです。
+
+キャッシュと DB のあいだで食い違う向きも、ほかの経路と逆になります。Cache-Aside で古くなるのはキャッシュの側でしたが、Write-Behind で古いのは DB の側です。DB を直接読む集計のバッチや別のサービスは、書き戻しが済むまで古い値を見ます。
+
+## Write-Around：書いた値をキャッシュに載せない
+
+Write-Around は、書き込みを DB にだけ届け、キャッシュには載せない経路です。キャッシュに入るのは、読まれてミスしたものだけになります。もともとは CPU キャッシュの用語で、書き込み先がキャッシュに無いときにキャッシュへ読み込まずに直接メモリに書く方式（no-write-allocate）の別名として使われてきました。
+
+アプリのキャッシュでは、Write-Around の書き込みは Cache-Aside の書き込みと同じ手順になります（DB に書き、古い写しがあれば消す）。名前を分けて呼ぶのは、**Write-Through と比べるとき**です。ログや監査記録のように、書いたきりほとんど読まれないデータを Write-Through で書くと、キャッシュが読まれない値で埋まり、本当に読まれる値を追い出してしまいます。Write-Around ならそれが起きません。代わりに、書いた直後の読みは必ずミスします。
+
+## 同じ操作列を流して数える
+
+ここまでの違いを、実際に Redis と PostgreSQL で確かめます。どちらも Docker のコンテナで動かし、Python から 4 つの経路を実装して同じ操作列を流しました。
+
+- 環境: Apple M1 Pro / macOS 26.2、Docker Desktop の Linux コンテナで Redis 7.4.11 と PostgreSQL 17.11。PostgreSQL のデータディレクトリはメモリ上の tmpfs に置いた。クライアントは Python 3.14.0、redis-py 8.1.0、psycopg 3.3.6
+- 表 `item` に 1,000 行を用意し、5,000 回の操作を流す。キーはパレート分布で選び、一部のキーに読み書きが集中するようにした
+- Write-Through と Write-Behind は、Azure の文書の例と同じく、アプリの中のコードとして実装した（読みはどれも Cache-Aside と同じ遅延読み込み）。Write-Behind は 500 操作ごとに、未反映の印が付いたキーをまとめて DB に書く
+- TTL は 300 秒。この実験の間には切れない
+
+読みが 9 割の場合と、読み書きが半々の場合の結果です。
+
+```text
+ops=5000 reads=4501 writes=499 keys=1000
+pattern           DB読み    DB書き   cache命令     読み平均ms     書き平均ms     残ったキー
+CacheAside         528     499      5528      0.448      0.800        82
+WriteThrough        88     499      5088      0.302      0.661        90
+WriteBehind         88      93      5691      0.310      0.628        90
+```
+
+```text
+ops=5000 reads=2537 writes=2463 keys=1000
+pattern           DB読み    DB書き   cache命令     読み平均ms     書き平均ms     残ったキー
+CacheAside        1253    2463      6253      0.672      0.714        46
+WriteThrough        45    2463      5045      0.324      0.745        90
+WriteBehind         45     216      7735      0.219      0.418        90
+```
+
+読み方は次のとおりです。
+
+- **Cache-Aside の DB 読みが多い。** 書くたびに写しを消すので、その直後の読みがミスして DB に行きます。読み書きが半々だと、Write-Through の 45 回に対して 1,253 回でした。90 種類ほどのキーに集中するアクセスなので、Write-Through では最初の 1 回ずつのミスしか DB に行っていません。
+- **Write-Behind の DB 書き込みが少ない。** 499 回、2,463 回の書き込みが、それぞれ 93 回、216 回になりました。書き戻しの間に同じキーへ何度も書かれた分が、1 回にまとまっています。
+- **時間の差は小さい。** すべて同じマシンの中で、DB もメモリ上に置いているので、DB の往復が 1 ミリ秒を切っています。DB が別のマシンにあり、ディスクへの同期書き込みを待つ環境では、DB に行く回数の差がそのまま時間の差として大きく出ます。この実験から読み取るべきなのは、時間よりも回数のほうです。
+
+### 書いたきりのデータ
+
+次に、ログのように新しいキーへ 3,000 回書き、その中から 300 回だけ読む操作列を、Write-Through と Write-Around で流しました。
+
+```text
+書いたきりのデータ: 新しいキーに 3000 回書き、そのうちから 300 回読む
+pattern           DB読み    DB書き   cache命令     残ったキー
+WriteThrough         0    3000      3300      3000
+WriteAround        278    3000      3578       278
+```
+
+Write-Through は読みで一度も DB に行かない代わりに、3,000 個すべてをキャッシュに載せました。実際に読まれたのは 278 種類（300 回の読みのうち重複を除いた数）だけです。Write-Around は読まれたものだけを載せ、そのぶん 278 回のミスを払っています。キャッシュの容量が限られていれば、Write-Through で載った 2,700 個あまりの読まれない値が、ほかの読まれる値を追い出すことになります。
+
+## 落ちたときに失うもの
+
+Write-Behind で、書き戻しの前に止まったら何件失うかを確かめます。書き手は Redis に値を書き、書き込みを受け付けるたびにファイルへ 1 行記録します。書き戻しは 1 秒ごとです。2.5 秒動かしたところで止め、受け付けた件数と DB にある行数を比べました。
+
+未反映の分をアプリのプロセスのメモリに持つ実装で、プロセスを `SIGKILL` で止めた場合です。
+
+```text
+memory 試行1（書き戻し 2 回: [805, 1635]）: 受け付けた書き込み 2440 件 / DB にある行 2440 件 / 失ったもの 0 件
+memory 試行2（書き戻し 1 回: [475]）: 受け付けた書き込み 604 件 / DB にある行 475 件 / 失ったもの 129 件
+memory 試行3（書き戻し 2 回: [535, 111]）: 受け付けた書き込み 647 件 / DB にある行 646 件 / 失ったもの 1 件
+```
+
+未反映の印を Redis の集合に持つ実装で、Redis のコンテナを `SIGKILL` で止め、作り直した場合です。
+
+```text
+redis 試行1（書き戻し 1 回: [323]）: 受け付けた書き込み 692 件 / DB にある行 323 件 / 失ったもの 369 件
+  作り直した Redis のキー数: 0
+redis 試行2（書き戻し 1 回: [781]）: 受け付けた書き込み 1447 件 / DB にある行 781 件 / 失ったもの 666 件
+  作り直した Redis のキー数: 0
+redis 試行3（書き戻し 1 回: [765]）: 受け付けた書き込み 1399 件 / DB にある行 765 件 / 失ったもの 634 件
+  作り直した Redis のキー数: 0
+```
+
+失う件数は 0 件から数百件まで揺れています。**失うのは「最後の書き戻しから止まるまで」に受け付けた分**で、止まった瞬間が書き戻しの直後なら 0 件、直前なら 1 秒ぶんすべてです。書き戻しの間隔を短くすれば失う量の上限は下がりますが、まとめ書きの効果も減ります。Write-Behind を使うなら、この上限を業務として受け入れられるかどうかを先に決める必要があります。
+
+同じ止め方を Cache-Aside と Write-Through にしても、受け付けた書き込みは DB に書き終えてから返しているので、失うものはありません。キャッシュが空になり、しばらく DB への読みが増えるだけです。
+
+<Callout type="warn" title="Redis の永続化を有効にしても「書けた」の意味は変わらない">
+  この実験の Redis は、公式のコンテナイメージの既定の設定（追記ログ `appendonly` が無効）で動かし、止めたあとはコンテナごと作り直しているので、ディスクに残したものも引き継いでいません。追記ログを有効にすれば、Redis のプロセスが落ちても再起動時に復元できる範囲は広がります。
+
+  それでも、Redis のディスクに書いたことと、正本である DB に書いたことは別です。DB のトランザクションの制約や、DB を前提にしたバックアップと復旧の手順は、Write-Behind の待ち行列にある値を知りません。Coherence の文書が「業務上の規則で許されている必要がある」と書いているのは、この点です。
+</Callout>
+
+## 食い違いが生まれる時間帯
+
+Cache-Aside で「更新してから消す」順序を守れば、古い値は残らないのでしょうか。シミュレーターの「Cache-Aside の交差」は、そうならない手順を示しています。
+
+1. 読み手 R がミスし、DB から v1 を読む
+2. R が止まっている間に、書き手 W が DB を v2 に更新し、キャッシュを消す（消すものはまだ無い）
+3. R が再開し、手元の v1 をキャッシュに入れる
+
+これで、キャッシュは v1、DB は v2 のまま、TTL が切れるまで全員が古い値を読みます。この手順を Redis と PostgreSQL で固定して実行しました。比べるため、逆の順序（消してから更新）と、Write-Through で 2 つの書き手が交差する場合も並べています。
+
+```text
+更新→削除、の間に読みが割り込む : cache=v1 db=v2 残り TTL=300 秒
+削除→更新、の間に読みが割り込む : cache=v1 db=v2
+Write-Through で書き手 2 つが交差 : cache=A db=B
+```
+
+3 つとも食い違ったまま終わりました。Write-Through でも、書き手 1 が DB に A を書いたあと、書き手 2 が DB とキャッシュに B を書き、最後に書き手 1 がキャッシュに A を書けば、キャッシュだけが古くなります。
+
+では、どれくらい起きやすいのか。読み手と書き手を 2 つのスレッドで同時に走らせ、それぞれ 200 回試しました。書き手は動き出す前に 0〜2 ミリ秒の乱数の時間だけ待ちます。「削除→更新」の書き手は、削除と更新の間にもう一度同じだけ待ちます。読み手の側は、DB を読んでからキャッシュに入れるまでの間に止まる場合（GC やスケジューリングの遅れを、0〜2 ミリ秒の待ちとしてわざと入れたもの）と、止まらない場合の 2 通りです。
+
+読み手がその間に止まる場合です。
+
+```text
+Cache-Aside（更新→削除）           200 回中  72 回、キャッシュが DB と食い違ったまま終わった
+Cache-Aside（削除→更新）           200 回中 131 回、キャッシュが DB と食い違ったまま終わった
+Write-Through（更新→上書き）        200 回中  86 回、キャッシュが DB と食い違ったまま終わった
+```
+
+読み手が止まらない場合です。
+
+```text
+Cache-Aside（更新→削除）           200 回中   0 回、キャッシュが DB と食い違ったまま終わった
+Cache-Aside（削除→更新）           200 回中  45 回、キャッシュが DB と食い違ったまま終わった
+Write-Through（更新→上書き）        200 回中   0 回、キャッシュが DB と食い違ったまま終わった
+```
+
+止まる時間をわざと入れているので、回数そのものは本番での起きやすさを表しません。読み取れるのは、それぞれの食い違いが**どの隙間で起きるか**です。
+
+- 「更新→削除」が食い違うには、読み手が DB を読んでからキャッシュに入れるまでの短い隙間に、書き手の更新と削除が両方とも収まる必要があります。読み手が止まらなければ、200 回中 0 回でした。
+- 「削除→更新」は、書き手の削除と更新の間という、書き手の側の隙間に読みが 1 回入るだけで食い違います。読み手が止まらなくても 200 回中 45 回起きました。Azure の文書が順序を指定しているのは、この差のためです。
+- どの順序でも、食い違いの可能性はゼロになりません。キャッシュと DB を 1 つのトランザクションで更新する手段がないからです。Azure の Write-Through の構成例も「It doesn't provide atomic distributed transactions across SQL Database and Azure Managed Redis.」と明記し、キャッシュの値に版番号を持たせて古い書き込みが新しい値を上書きしないようにすること、取りこぼしの最後の防波堤として TTL を付けることを勧めています（[Azure Architecture Center: Write-through caching](https://learn.microsoft.com/en-us/azure/architecture/databases/architecture/write-through-caching-azure-sql-managed-redis)）。
+
+食い違いを避ける手段（TTL の決め方、版番号、削除を遅らせてもう一度行う方法など）は、次の回で扱います。
+
+## CPU のキャッシュとの対応
+
+ライトスルーとライトバックという言葉は、もともと CPU キャッシュの書き込み方式の名前です（低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-15-cache/`}>キャッシュの仕組み</a>の回）。対応を並べると次のようになります。
+
+| アプリのキャッシュ | CPU キャッシュ | 共通すること |
+| --- | --- | --- |
+| Write-Through | ライトスルー | 書くたびに下の層にも書く。常に一致する |
+| Write-Behind | ライトバック | 印（ダーティビット）を付け、後で書き戻す。同じ場所への書き込みがまとまる |
+| Write-Around | ノーライトアロケート | 書き込みでキャッシュに載せない |
+| Read-Through | 読み込みのミスでラインを埋める動作 | プログラムはキャッシュの存在を意識しない |
+| Cache-Aside | （対応するものがない） | − |
+
+似ているのは書き込みの方式までで、大きく違う点が 2 つあります。
+
+- **CPU のキャッシュは、プログラムから見えません。** 読みのミスは常にハードウェアが埋めます。キャッシュを横に置いてアプリが自分で出し入れする Cache-Aside にあたるものは、CPU にはありません。
+- **CPU には一致を保つ仕組みがあります。** 複数のコアがそれぞれ同じアドレスの写しを持っても、コヒーレンスのプロトコルが、あるコアの書き込みでほかのコアの写しを無効にします。アプリのキャッシュと DB の間にはそうした仕組みがなく、前の節で見た食い違いを、アプリの設計で抑えるしかありません。
+
+CPU がライトバックを選べるのは、電源が落ちればキャッシュもメモリも同時に消えるからです。アプリの Write-Behind では、キャッシュだけが落ちて DB は残る、という止まり方がありえます。前の節で失った数百件は、その止まり方の結果です。
+
+## どれを選ぶか
+
+| 状況 | 選ぶもの | 理由 |
+| --- | --- | --- |
+| キャッシュは Redis や Memcached で、まず入れたい | Cache-Aside | 単体のキャッシュサーバーでそのまま使える。キャッシュが落ちても動く |
+| 書いた直後の読みも速く、新しい値を返したい | Write-Through（読みは遅延読み込み） | 書いた時点でキャッシュも新しくなる |
+| 書いたきり読まれないデータが多い | Write-Around | 読まれないものでキャッシュを埋めない |
+| 同じキーへの書き込みが多く、DB の書き込みを減らしたい | Write-Behind | まとめ書きが効く。ただし落ちたときに未反映の分を失う |
+| ミスを埋めるコードをアプリから消したい | Read-Through | その処理をキャッシュの側に 1 か所だけ置く |
+
+迷ったら Cache-Aside から始めるのが無難です。キャッシュが無くても正しく動き、キャッシュはあくまで速くするための写しにとどまります。Write-Behind は、キャッシュを正本として扱ってよいかという業務上の判断が要るので、性能の都合だけで選ぶものではありません。
+
+## まとめ
+
+- キャッシュの経路は、「ミスを誰が埋めるか」と「書き込みがいつ DB に届くか」の組み合わせで決まる
+- Cache-Aside はアプリが両方を受け持つ。書くと写しを消すので、書いた直後の読みがミスして DB に行く。実測では読み書きが半々のとき、DB の読みが Write-Through の約 28 倍になった
+- Write-Through は書くたびに両方を新しくする。書き込みは遅くなり、読まれない値でキャッシュが埋まりうる
+- Write-Behind は書き込みをまとめて DB の負荷を減らすが、書き戻すまでキャッシュが唯一の記録になる。実測では止まり方しだいで 0 件から数百件を失った
+- Write-Around は書いた値をキャッシュに載せない。書いたきりのデータで Write-Through のような無駄が出ない
+- どの経路でも、読みと書きが交差すればキャッシュに古い値が残りうる。順序で隙間を狭め、TTL と版番号で残る時間を限る
+
+次の回<a href={`${import.meta.env.BASE_URL}reading/cache-invalidation/`}>キャッシュを捨てるとき</a>では、この食い違いをどう抑えるか、つまりキャッシュをいつ、どう捨てるかを扱います。TTL の決め方、更新と削除の競合への対策、キャッシュが切れた瞬間に読みが DB へ殺到する現象と、その防ぎ方です。
