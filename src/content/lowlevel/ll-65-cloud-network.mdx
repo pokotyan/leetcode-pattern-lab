@@ -1,0 +1,397 @@
+---
+title: クラウドのネットワークは物理の何を置き換えたのか
+description: VPC、サブネット、ルートテーブル、インターネットゲートウェイ、NAT ゲートウェイ、セキュリティグループ、ネットワーク ACL、ピアリング、Transit Gateway、PrivateLink。名前は新しくても、中身はこの章で見たスイッチ・VLAN・ルーター・NAT・BGP の仕事です。何が箱からソフトウェアに移り、何が消え、何が新しく要るようになったのかを、Linux の上に 2 つの VPC を組んで確かめます
+chapter: link
+order: 6
+status: published
+topics:
+  - VPC
+  - オーバーレイネットワーク
+  - VXLAN / Geneve
+  - サブネットとアベイラビリティゾーン
+  - ルートテーブル
+  - インターネットゲートウェイ
+  - NAT ゲートウェイ / Cloud NAT
+  - セキュリティグループ
+  - ネットワーク ACL
+  - 一時ポート
+  - VPC ピアリング
+  - Transit Gateway
+  - PrivateLink / Private Service Connect
+  - Direct Connect / Cloud Interconnect
+requires:
+  - ll-60-switch
+  - ll-62-router
+---
+
+import Callout from '../../components/Callout.astro'
+import VpcPacketPath from '../../components/sim/problems/VpcPacketPath'
+
+## 箱は消えたが、仕事は残った
+
+この章では、物理の箱を下から順に見てきました。第 60 回のスイッチは MAC アドレスを覚えてフレームを渡し、第 61 回の VLAN は 1 台のスイッチを論理的に分け、第 62 回のルーターは宛先を見て次の渡し先を決め、家庭の NAPT は内側のアドレスを書き換えて外に出しました。第 63 回の BGP は組織と組織の間で経路を交換し、第 64 回では IPv6 と日本の接続方式を見ました。
+
+クラウドの管理画面を開くと、こうした箱は 1 つも見当たりません。代わりに、VPC、サブネット、ルートテーブル、インターネットゲートウェイ、NAT ゲートウェイ、セキュリティグループといった名前が並びます。名前は新しいのですが、**していることは、この章で見た箱の仕事とほぼ同じ**です。違うのは、それを専用の機器ではなく、各サーバの上のソフトウェアやネットワークカードが分担している点です。
+
+この回では、クラウドのネットワークの部品を 1 つずつ、物理の何に当たるのかと対応づけていきます。対応づけると、クラウド固有の制約（ブロードキャストが使えない、MTU が 1500 ではない、ピアリングが推移しない）にも、それぞれ理由があることが見えてきます。
+
+## 対応表
+
+先に全体を並べます。以下の節で 1 行ずつ見ていきます。
+
+| 物理の網 | AWS | Google Cloud | 仕事 |
+| --- | --- | --- | --- |
+| 建物の中の LAN 一式 | VPC | VPC ネットワーク | 他の利用者から切り離された、自分だけの網 |
+| VLAN による分離（第 61 回） | VPC の境界（中では包んで運ぶ） | 同左 | 同じ物理の網の上で、利用者ごとの網を分ける |
+| 1 つのセグメント（ブロードキャストの届く範囲） | サブネット（1 つの AZ の中） | サブネット（1 つのリージョンの中） | アドレスの範囲と、置き場所の単位 |
+| ルーターの経路表（第 62 回） | ルートテーブル | ルート | 宛先ごとに次の渡し先を決める |
+| 家庭のルーターの NAPT（第 62 回） | NAT ゲートウェイ | Cloud NAT | 内側の多数のアドレスを、少数の外のアドレスに書き換える |
+| 外とつなぐルーター | インターネットゲートウェイ | 既定のインターネットゲートウェイ（次の渡し先の名前） | インターネットへの出入口 |
+| ホストのファイアウォール | セキュリティグループ | VPC ファイアウォールルール | 状態を持つ通信の許可 |
+| ルーターのアクセスリスト | ネットワーク ACL | （同じ位置づけの部品は無い） | 状態を持たない、サブネット境界での許可と拒否 |
+| ロードバランサの機器（第 87 回） | ELB（GWLB・NLB・ALB） | Cloud Load Balancing | 振り分け |
+| 拠点間の専用線と BGP（第 63 回） | Direct Connect | Cloud Interconnect と Cloud Router | 自前の網とつなぐ |
+| 網と網の接続 | VPC ピアリング、Transit Gateway | VPC ネットワーク ピアリング、Network Connectivity Center | VPC 同士をつなぐ |
+
+## VPC：物理の網の上に、包んで作る網
+
+### VLAN では足りない
+
+クラウドの事業者は、数えきれない利用者の網を、同じ物理の網の上に載せなければなりません。第 61 回で見たとおり、VLAN の識別子は 12 ビットで、4094 個までしか作れません。そこで、元の Ethernet フレームを丸ごと UDP に包み、24 ビットの VNI を付けて物理の網（下の網、アンダーレイ）の上を運ぶ VXLAN が使われます。第 61 回では VXLAN を「足りない番号を増やす仕組み」として見ましたが、クラウドにとって同じくらい大事なのは、RFC 7348 の次の一文です（[RFC 7348 4](https://www.rfc-editor.org/rfc/rfc7348.html#section-4)）。
+
+> Thus, you could have overlapping MAC addresses across segments but never have traffic "cross over" since the traffic is isolated using the VNI.
+
+VNI が違えば、中身の MAC アドレスや IP アドレスが重なっていても混ざりません。利用者は、隣の利用者が何を使っているかを気にせずに、自分の VPC のアドレスを決められます。
+
+包む形式は VXLAN だけではありません。IETF で標準化された Geneve は、可変長のオプションを足せる形にして、包み方そのものの進化に備えています（[RFC 8926](https://www.rfc-editor.org/rfc/rfc8926.html)）。
+
+> Therefore, flexibility is the most important aspect of a tunneling protocol if it is to keep pace with the evolution of technology.
+
+AWS の Gateway Load Balancer は、背後の機器にパケットを渡すときに Geneve で包み、UDP の 6081 番を使うと文書に書いています（[AWS: Target groups for your Gateway Load Balancers](https://docs.aws.amazon.com/elasticloadbalancing/latest/gateway/target-groups.html)）。
+
+> The Gateway Load Balancer encapsulates the original packets using GENEVE.
+
+### 包むのは、各サーバの上のソフトウェアとカード
+
+VPC そのものの中で使っている包み方の詳細は、AWS も Google も公式文書では詳しく書いていません。それでも、**誰が包んでいるのか**は公開されています。
+
+Google Cloud の網を作っているソフトウェア Andromeda の論文は、各ホストに Open vSwitch を元にした仮想スイッチがあり、そのホスト上のすべての VM の通信を扱うと述べています（[Dalton et al., Andromeda, NSDI 2018](https://www.usenix.org/conference/nsdi18/presentation/dalton)）。
+
+> Each VM host has a virtual switch based on Open vSwitch [33], which handles traffic for all VMs on the host.
+
+物理のスイッチがしていた「この宛先はどのポートへ」という判断を、**各ホストの中の仮想スイッチ**が、制御側から書き込まれた規則で行います。論文はさらに、ホストに規則が無いパケットを、Hoverboard と呼ぶ専用のゲートウェイに送ると説明しています。どの VM 同士が実際に通信しているかを見て、よく使う組み合わせの規則だけを各ホストに配ることで、すべてのホストに網全体の転送情報を持たせずに済ませています。
+
+AWS では、この仕事の多くがサーバに挿さった専用のカードに移っています。Nitro System の文書は、そのカードがソフトウェアで定義されたネットワークのための入出力を担い、VPC 専用のカードがあると書いています（[AWS: The components of the Nitro System](https://docs.aws.amazon.com/whitepapers/latest/security-design-of-aws-nitro-system/the-components-of-the-nitro-system.html)）。
+
+> They also provide all I/O interfaces, such as those needed to provide software-defined networking, Amazon EBS storage, and instance storage.
+
+つまり、クラウドの VPC は「スイッチが無い網」ではありません。**スイッチが、全サーバに 1 台ずつ散らばった網**です。
+
+### 手元で確かめる：同じ 10.0.0.0/24 を、2 つの VPC で使う
+
+これを Linux の上で小さく組んでみます。Docker の Linux コンテナ（OrbStack の VM、カーネル 7.0.14、Debian bookworm）の中に、Network 名前空間で 2 台のホスト hA と hB を作り、192.168.100.0/24 の下の網でつなぎます。その上に VNI 100 と VNI 200 の 2 つの VPC を作り、**どちらにも 10.0.0.10 と 10.0.0.20 という同じアドレスの VM を置きます**。各ホストの VPC ごとのブリッジが、第 60 回のスイッチの代わりです。
+
+```text
+ hA（192.168.100.1）                       hB（192.168.100.2）
+ ┌───────────────────────────┐            ┌───────────────────────────┐
+ │ VPC100: 10.0.0.10 ─ br100 ─ vx100 ════ VNI 100 ════ vx100 ─ br100 ─ 10.0.0.20 │
+ │ VPC200: 10.0.0.10 ─ br200 ─ vx200 ════ VNI 200 ════ vx200 ─ br200 ─ 10.0.0.20 │
+ └───────────────────────────┘            └───────────────────────────┘
+```
+
+hB の各 VPC の 10.0.0.20 に、自分の VNI を名乗って答えるだけの TCP サーバを置き、hA 側の 10.0.0.10 から接続します。
+
+```text
+-- VNI 100 の 10.0.0.10 から 10.0.0.20:8080 へ
+reply from 10.0.0.20 in VNI 100
+-- VNI 200 の 10.0.0.10 から 10.0.0.20:8080 へ
+reply from 10.0.0.20 in VNI 200
+```
+
+同じアドレスに接続して、それぞれ自分の VPC の相手に届きました。下の網を流れたパケットを tcpdump で見ると、外側は 2 台のホストの間の UDP の 4789 番で、その中に VNI と、元の TCP のパケットが入っています。
+
+```text
+IP 192.168.100.1.47531 > 192.168.100.2.4789: VXLAN, flags [I] (0x08), vni 100
+IP 10.0.0.10.42960 > 10.0.0.20.8080: Flags [S], seq 493942388, win 64240, options [mss 1460,sackOK,TS val 700263472 ecr 0,nop,wscale 10], length 0
+```
+
+下の網のルーターやスイッチが見ているのは外側の 192.168.100.x だけで、中の 10.0.0.x は見ていません。だから、利用者がどんなアドレスを選んでも、物理の網の設定には何の影響もありません。
+
+## ブロードキャストの無い網
+
+### VPC はブロードキャストを通さない
+
+第 60 回で見たとおり、物理の LAN では、相手の MAC アドレスを知るために ARP の問い合わせを全員に撒きます。ところが VPC は、この全員宛ての送信を通しません。AWS は、サブネットの最後のアドレスを予約する理由として、こう書いています（[AWS: Subnet CIDR blocks](https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html)）。
+
+> 10.0.0.255: Network broadcast address. We do not support broadcast in a VPC, therefore we reserve this address.
+
+同じ文書は、先頭の 4 つのアドレスも使えないとしています。.0 はネットワークアドレス、.1 は VPC のルーター、.2 は DNS サーバ、.3 は将来のための予約です。Google Cloud も、VPC ネットワークではブロードキャストとマルチキャストのアドレスを使えないと明記しています（[Google Cloud: VPC networks](https://cloud.google.com/vpc/docs/vpc)）。
+
+> VPC networks do not support broadcast or multicast addresses within the network.
+
+ブロードキャストを撒けば、数万台のホストに散らばった仮想スイッチ全部に包んで配ることになります。それを避けるには、**誰がどの MAC アドレスとどの IP アドレスを持ち、どのホストにいるのか**を、制御側が先に知っていて、各ホストに配っておけばよいことになります。VM は自分でアドレスを名乗るのではなく、クラウドに割り当てられたアドレスを受け取るだけなので、制御側は全部を知っています。
+
+### 手元で確かめる：撒く網と、配っておく網
+
+先ほどの 2 つの VPC を、2 通りの設定で組み直して比べます。
+
+- **撒く**：宛先の分からないフレームを、相手のホストへすべて包んで送る（物理のスイッチのフラッディングと同じ）
+- **配っておく**：「この MAC アドレスはこのホストにいる」と「この IP アドレスはこの MAC アドレス」を先に書き込み、学習を止める。Linux の VXLAN の `proxy` という設定で、ARP の問い合わせにはホストの中で答える
+
+```text
+== MODE=flood
+-- 下の網（ulA）を流れた VXLAN パケット: 41 個、うち中身が ARP: 4
+ARP, Request who-has 10.0.0.20 tell 10.0.0.10, length 28
+ARP, Reply 10.0.0.20 is-at 02:00:00:00:01:14, length 28
+ARP, Request who-has 10.0.0.20 tell 10.0.0.10, length 28
+ARP, Reply 10.0.0.20 is-at 02:00:00:00:02:14, length 28
+== MODE=mapped
+-- 下の網（ulA）を流れた VXLAN パケット: 33 個、うち中身が ARP: 0
+-- v100A の近隣表
+10.0.0.20 dev eth0 lladdr 02:00:00:00:01:14 REACHABLE
+```
+
+撒く設定では、ARP の問い合わせが下の網を越えて相手のホストまで運ばれました。ここではホストが 2 台なので 1 回ずつですが、ホストが 1 万台あれば、1 回の問い合わせを 1 万か所へ包んで送ることになります。配っておく設定では、下の網に ARP は 1 つも流れず、それでも VM の近隣表には正しい相手の MAC アドレスが入っています。問い合わせは同じホストの中で答えられ、下の網には本来の通信だけが流れました。
+
+VM の中では ARP は普通に動いているので、アプリケーションからは何も変わって見えません。ただし、ブロードキャストやマルチキャストに頼る仕組み（一部のクラスタソフトの死活監視や、VRRP のような仮想 IP の引き継ぎ）は、そのままでは VPC の中で動きません。
+
+### MTU は 1500 とは限らない
+
+包むと、外側にヘッダが増えます。IPv4 の上の VXLAN では、外側の Ethernet、IP、UDP、VXLAN のヘッダで 50 バイトです。手元の構成で、Linux が VXLAN の装置に自動で付けた MTU は 1450 でした。ところが VM の側の eth0 は 1500 のままです。
+
+```text
+-- MTU: VM の eth0 は mtu 1500、包む側は mtu 1450
+ping -M do -s 1472（IP で 1500 バイト）:
+2 packets transmitted, 0 received, 100% packet loss, time 1007ms
+ping -M do -s 1422（IP で 1450 バイト）:
+2 packets transmitted, 2 received, 0% packet loss, time 1028ms
+VM の eth0 を mtu 1450 にしてから -s 1472:
+ping: local error: message too long, mtu=1450
+```
+
+1450 バイトまでは届き、1500 バイトは**何のエラーも返らずに消えました**。ブリッジは、出口の MTU を超えるフレームを黙って捨てます。VM の MTU を包む側に合わせると、大きすぎるパケットは送る前に VM の中でエラーになり、TCP はそれを見て小さく分けられるようになります。
+
+クラウドは、この調整を利用者の代わりに済ませています。Google Cloud の VPC ネットワークの MTU は既定で 1460 バイトで、VM の NIC の MTU を VPC の MTU に合わせるよう勧めています（[Google Cloud: Maximum transmission unit](https://cloud.google.com/vpc/docs/mtu)）。
+
+> Virtual Private Cloud (VPC) networks use a default MTU of 1,460 bytes.
+
+AWS では、同じ VPC の中は 9001 バイトのジャンボフレームを使える一方、インターネットゲートウェイを通る通信や VPN は 1500 バイトに制限されると書かれています（[AWS: Network MTU for your EC2 instance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/network_mtu.html)）。経路の途中で MTU が変わるので、大きすぎたことを ICMP で送り手に知らせる経路 MTU 探索（第 68 回）が届かない構成では、大きなパケットだけが消える障害が起きます。
+
+## サブネット：アドレスの範囲と、置き場所の単位
+
+物理の網では、サブネットはおおむね「1 つのセグメント」、つまりブロードキャストが届く範囲と一致していました。ブロードキャストの無い VPC では、サブネットの意味が変わります。**アドレスの範囲と、どこに置くかの単位**です。
+
+AWS では、サブネットは 1 つのアベイラビリティゾーン（AZ。独立した電源と網を持つデータセンターの集まり）の中に収まります（[AWS: Subnets for your VPC](https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html)）。
+
+> Each subnet must reside entirely within one Availability Zone and cannot span zones.
+
+Google Cloud では単位が 1 段大きく、VPC ネットワークはリージョンをまたぐ全体の資源で、サブネットがリージョンごとの資源です（[Google Cloud: VPC networks](https://cloud.google.com/vpc/docs/vpc)）。
+
+> VPC networks, including their associated routes and firewall rules, are global resources. They are not associated with any particular region or zone.
+>
+> Subnets are regional resources.
+
+AWS は、サブネットを「public」と「private」に呼び分けます。この区別は、サブネット自体の性質ではなく、**経路表の 1 行**で決まります（同上）。
+
+> Public subnet – The subnet has a direct route to an internet gateway. Resources in a public subnet can access the public internet.
+>
+> Private subnet – The subnet does not have a direct route to an internet gateway. Resources in a private subnet require a NAT device to access the public internet.
+
+## ルートテーブル：第 62 回の経路表そのもの
+
+各サブネットには 1 つのルートテーブルが関連づけられます。中身は第 62 回の経路表と同じで、宛先のプレフィックスと次の渡し先の組です。VPC を作ると、VPC 全体のアドレス範囲を中で届ける `local` の経路が必ず入ります。
+
+選び方も第 62 回と同じ最長一致です（[AWS: How route priority works](https://docs.aws.amazon.com/vpc/latest/userguide/route-tables-priority.html)）。
+
+> In general, we direct traffic using the most specific route that matches the traffic. This is known as the longest prefix match.
+
+同じ長さの経路が重なったときは、静的な経路、プレフィックスリストの経路、伝搬された経路、Direct Connect の BGP の経路の順で優先する、と続きます。物理のルーターが、同じ宛先への経路を静的な設定と動的な経路制御の両方から受け取ったときに、どちらを信じるかを決めているのと同じ問題です。
+
+## 出口：インターネットゲートウェイと NAT ゲートウェイ
+
+### インターネットゲートウェイは 1 対 1 の NAT
+
+インスタンスに public な IPv4 アドレスを付けても、インスタンス自身の OS に見えているのは private なアドレスだけです。書き換えはインターネットゲートウェイ（IGW）がしています（[AWS: Enable VPC internet access using internet gateways](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html)）。
+
+> The internet gateway logically provides the one-to-one NAT on behalf of your instance, so that when traffic leaves your VPC subnet and goes to the internet, the reply address field is set to the public IPv4 address or Elastic IP address of your instance, and not its private IP address.
+
+同じ文書は、IGW を「horizontally scaled, redundant, and highly available VPC component」と説明し、帯域の制約にならないとしています。1 台の箱として存在しているのではなく、経路表の次の渡し先として名前があるだけの部品です。
+
+### NAT ゲートウェイは、第 62 回の NAPT
+
+private サブネットのインスタンスは public なアドレスを持ちません。外へ出るには、第 62 回の家庭のルーターと同じ NAPT が要ります。NAT ゲートウェイは public サブネットに置かれ、インスタンスのアドレスを自分の private アドレスに書き換え、そのあと IGW が自分の Elastic IP に書き換えます（[AWS: NAT gateways](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)）。
+
+> Both private and public NAT gateways map the source private IPv4 address of the instances to the private IPv4 address of the NAT gateway. For a public NAT gateway, the internet gateway then maps the private IPv4 address of the public NAT gateway to the Elastic IP address associated with the NAT gateway.
+
+Google Cloud の Cloud NAT は、さらに箱らしさがありません。NAT のための VM や機器は無く、各 VM のホストの上のソフトウェアが変換をしていると書かれています（[Google Cloud: Cloud NAT overview](https://cloud.google.com/nat/docs/overview)）。
+
+> Cloud NAT is a distributed, software-defined managed service. It's not based on proxy VMs or appliances. Cloud NAT configures the Andromeda software that powers your Virtual Private Cloud (VPC) network so that it provides source network address translation (source NAT or SNAT) for resources.
+
+家庭のルーターでは、NAPT の表は 1 台の箱の中にありました。Cloud NAT では、各 VM に外のアドレスとポートの範囲を前もって割り当てておき、変換はその VM が載っているホストの中で行います。表が 1 か所に集まらないので、NAT が通信全体の詰まる点になりません。
+
+## 門番：セキュリティグループとネットワーク ACL
+
+### 状態を持つか、持たないか
+
+AWS には、通信を許可する部品が 2 つあります。インスタンス（正確にはネットワークインタフェース）ごとのセキュリティグループ（SG）と、サブネットごとのネットワーク ACL（NACL）です。AWS 自身の比較表から、違いを抜き出します（[AWS: Infrastructure security in Amazon VPC](https://docs.aws.amazon.com/vpc/latest/userguide/infrastructure-security.html)）。
+
+| | セキュリティグループ | ネットワーク ACL |
+| --- | --- | --- |
+| 効く単位 | Instance level | Subnet level |
+| 規則の種類 | Allow rules only | Allow and deny rules |
+| 評価の仕方 | Evaluates all rules before deciding whether to allow traffic | Evaluates rules in ascending order until a match for the traffic is found |
+| 戻りの通信 | Automatically allowed (stateful) | Must be explicitly allowed (stateless) |
+
+最後の行が、運用でいちばん効いてくる違いです。NACL の文書は、こう説明しています（[AWS: Control subnet traffic with network access control lists](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html)）。
+
+> NACLs are stateless, which means that information about previously sent or received traffic is not saved. If, for example, you create a NACL rule to allow specific inbound traffic to a subnet, responses to that traffic are not automatically allowed.
+
+SG は、第 202 回で見る Linux の conntrack と同じように、通した接続を覚えておき、その戻りを規則に関係なく通します。NACL は、物理のルーターに書くアクセスリストと同じで、1 つ 1 つのパケットを、その場で番号順の規則に照らすだけです。Google Cloud の VPC ファイアウォールルールは SG と同じく状態を持ち、接続の追跡表で戻りを対応づけると書かれています（[Google Cloud: VPC firewall rules](https://cloud.google.com/firewall/docs/firewalls)）。
+
+> When a connection is allowed through the firewall in either direction, return traffic matching this connection is also allowed. You cannot configure a firewall rule to deny associated response traffic.
+
+### 戻りの宛先ポートは、相手の OS が決める
+
+状態を持たない NACL で戻りを通すには、**戻りのパケットの宛先ポート**を許可する必要があります。それは、接続を始めた側の OS が選んだ一時ポート（エフェメラルポート）で、範囲は OS によって違います。AWS の文書は、代表的な範囲を並べています（[AWS: Ephemeral ports](https://docs.aws.amazon.com/vpc/latest/userguide/custom-network-acl.html#nacl-ephemeral-ports)）。
+
+> Many Linux kernels (including the Amazon Linux kernel) use ports 32768-61000.
+>
+> Windows Server 2008 and later versions use ports 49152-65535.
+>
+> A NAT gateway uses ports 1024-65535.
+
+そのうえで、インターネットに公開するインスタンスの前では 1024-65535 を開けるのが実際的だ、としています。
+
+### 手元で確かめる：同じ規則を、状態の有無だけ変えて
+
+Linux の Network 名前空間で、サブネット A（10.0.1.0/24）のクライアント、間のルーター、サブネット B（10.0.2.0/24）の Web サーバを作ります。ルーターの FORWARD チェインを「サブネット B の NACL」に、サーバ自身の INPUT と OUTPUT を「SG」に見立て、iptables で規則を書きます。NACL の側は接続を追跡しない規則だけ、SG の側は conntrack を使う規則にします。
+
+```text
+クライアントの一時ポートの範囲: 32768	60999
+== NACL（状態を持たない。router の FORWARD で、サブネット B に出入りするものを番号順に判定）
+  入り 80 番・出 80 番だけ → 失敗（3 秒で打ち切り。000 local_port=0）
+  出に 32768-60999 を追加 → 成功 (200 local_port=59552)
+  クライアントの一時ポートを 61000-65535 に変えると → 失敗（3 秒で打ち切り。000 local_port=0）
+  router の FORWARD の計数:
+    pkts=14   ACCEPT * rB tcp dpt:80
+    pkts=0    ACCEPT rB * tcp dpt:80
+    pkts=6    ACCEPT rB * tcp dpts:32768:60999
+== SG（状態を持つ。サーバ自身の INPUT / OUTPUT）
+  接続を追跡しない規則だけ → 失敗（3 秒で打ち切り。000 local_port=0）
+  出に「既にある接続の戻り」を足す → 成功 (200 local_port=56932)
+  conntrack が覚えている接続:
+    tcp      6 119 TIME_WAIT src=10.0.1.10 dst=10.0.2.20 sport=56932 dport=80 src=10.0.2.20 dst=10.0.1.10 sport=80 dport=56932 [ASSURED] mark=0 use=1
+```
+
+読み取れることは 3 つあります。
+
+- 「入りの 80 番」と同じ形で「出の 80 番」を書いても、何も一致しません（計数が 0）。戻りのパケットは宛先が 80 番ではなく、クライアントの一時ポートだからです。入りの規則は 14 回一致しているので、SYN は再送されながら届き続け、応答だけが消えています
+- 戻りの宛先ポートの範囲を足すと通ります。ところが、クライアントが別の範囲（ここでは 61000-65535）を使うと、また通らなくなります。NACL の正しさは、**相手の OS の設定**に依存します
+- 状態を持つ側では、出の規則を 1 つも書かなくても、「既にある接続の戻り」を通す 1 行だけで足ります。conntrack の表には、行きと戻りの 2 つの向きの組が 1 行に記録されています
+
+この Debian の範囲は 32768-60999 で、AWS の文書の「32768-61000」とは端が 1 つずれていました。範囲を正確に合わせる設計は壊れやすく、AWS が 1024-65535 を開けるよう勧めている理由がここにあります。
+
+<Callout type="tip" title="通らないとき、送った側には何も返らない">
+  SG も NACL も、拒否したパケットを黙って捨てます。送った側には RST も ICMP も返らず、接続は時間切れを待つことになります。上の実験で「3 秒で打ち切り」となっているのはこのためで、ふつうの TCP の接続なら、SYN の再送を繰り返して 1 分以上待たされます。「拒否された」とすぐ分からないので、時間切れは経路か、SG か、NACL か、相手のサービスか、を 1 つずつ切り分けることになります。
+</Callout>
+
+下のシミュレーターで、private サブネットのインスタンスがインターネットのサーバに接続するときの道のりを追います。行きでは SG・NACL・ルートテーブル・NAT ゲートウェイ・IGW の順に通り、戻りでは書き換えが元に戻されたあと、NACL と SG で改めて判定されます。
+
+<VpcPacketPath client:visible />
+
+## ロードバランサ：層ごとに分かれた製品
+
+物理の世界では、ロードバランサは 1 台の機器でした。AWS は、見ている層ごとに製品を分けています。第 87 回で見た L4 と L7 の違いが、そのまま製品の違いになっています。
+
+| 製品 | 文書の説明 |
+| --- | --- |
+| Gateway Load Balancer | 「operates at the third layer of the Open Systems Interconnection (OSI) model, the network layer」（[AWS](https://docs.aws.amazon.com/elasticloadbalancing/latest/gateway/introduction.html)） |
+| Network Load Balancer | 「functions at the fourth layer of the Open Systems Interconnection (OSI) model」（[AWS](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/introduction.html)） |
+| Application Load Balancer | 「functions at the application layer, the seventh layer of the Open Systems Interconnection (OSI) model」（[AWS](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)） |
+
+Gateway Load Balancer は、ファイアウォールなどの検査機器の前に置き、パケットを Geneve で包んで機器に渡します。物理の網で、経路の途中に検査機器を挟むために経路を曲げていたのと同じ仕事を、包むことで実現しています。
+
+Google の L4 ロードバランサ Maglev（第 87 回）も、同じ考え方の上にあります。Andromeda の論文は、VM のホストを書き換える制御器とは別に、ロードバランサを書き換える制御器があると述べ、その参照先として Maglev の論文を挙げています。
+
+## VPC 同士をつなぐ
+
+### ピアリングは推移しない
+
+2 つの VPC は、ピアリングで直接つなげます。AWS の文書は、これが別の機器を経由する接続ではないことを強調しています（[AWS: What is VPC peering?](https://docs.aws.amazon.com/vpc/latest/peering/what-is-vpc-peering.html)）。
+
+> AWS uses the existing infrastructure of a VPC to create a VPC peering connection; it is neither a gateway nor a VPN connection, and does not rely on a separate piece of physical hardware.
+
+各ホストの仮想スイッチに「あちらの VPC のこのアドレスは、このホストにいる」と書き足すだけなので、間に箱が要りません。その代わり、2 つの制約が付きます（[AWS: VPC peering limitations](https://docs.aws.amazon.com/vpc/latest/peering/vpc-peering-basics.html)）。
+
+> You cannot create a VPC peering connection between VPCs that have matching or overlapping IPv4 or IPv6 CIDR blocks.
+>
+> VPC peering does not support transitive peering relationships. For example, if there are VPC peering connections between VPC A and VPC B, and between VPC A and VPC C, you can't route traffic from VPC B to VPC C through VPC A.
+
+アドレスの重なりが許されないのは、先ほどの実験の逆の理由です。別々の VNI に閉じている限り同じ 10.0.0.0/24 を使えましたが、2 つの VPC の間で経路表を共有すると、宛先 10.0.0.20 がどちらの VPC の相手なのかが決められなくなります。推移しないのは、ピアリングが「相手の VPC のアドレスを直接届ける」という 1 対 1 の約束で、間の VPC がパケットを中継するルーターとして振る舞うわけではないからです。Google Cloud の VPC ネットワーク ピアリングも推移しないと明記しています（[Google Cloud: VPC Network Peering](https://cloud.google.com/vpc/docs/vpc-peering)）。
+
+### たくさんつなぐなら、ハブを置く
+
+VPC が 10 個あると、すべての組をピアリングでつなぐには 45 本が要ります。物理の網で、拠点が増えたら拠点同士を全部つなぐのをやめて中心にルーターを置くのと同じく、クラウドにもハブがあります。AWS の Transit Gateway です（[AWS: What is a transit gateway?](https://docs.aws.amazon.com/vpc/latest/tgw/what-is-transit-gateway.html)）。
+
+> AWS Transit Gateway is a network transit hub used to interconnect virtual private clouds (VPCs) and on-premises networks.
+
+Transit Gateway は自分の経路表を持ち、つないだ VPC や拠点の間で経路を中継します。ピアリングでは推移しなかった経路が、ここでは中継されます。Google Cloud では Network Connectivity Center が、ハブとスポークの形でつなぐ枠組みとして用意されています（[Google Cloud: Network Connectivity Center overview](https://cloud.google.com/network-connectivity/docs/network-connectivity-center/concepts/overview)）。
+
+### 網ごとではなく、サービスだけを見せる
+
+ピアリングや Transit Gateway は、網と網を丸ごとつなぎます。相手の VPC のすべてのアドレスに経路が通り、アドレスの重なりも許されません。**特定のサービスだけを使わせたい**ときには、別の部品があります。AWS の PrivateLink は、相手のサービスへの入口を、自分の VPC の中のネットワークインタフェースとして作ります（[AWS: What is AWS PrivateLink?](https://docs.aws.amazon.com/vpc/latest/privatelink/what-is-privatelink.html)）。
+
+> AWS PrivateLink is a highly available, scalable technology that you can use to privately connect your VPC to services and resources as if they were in your VPC.
+
+利用者の VPC から見ると、自分のサブネットの中にあるアドレスへ接続するだけで、相手の網の構成は見えません。アドレスが重なっていてもかまいません。AWS は、PrivateLink が Hyperplane という内部の網の仮想化の基盤の上に作られていると説明しています（[AWS Compute Blog: Understanding VPC links in Amazon API Gateway private integrations](https://aws.amazon.com/blogs/compute/understanding-vpc-links-in-amazon-api-gateway-private-integrations/)）。
+
+> This is an internal network virtualization platform, which supports inter-VPC connectivity and routing between VPCs.
+
+Google Cloud の Private Service Connect も、同じく利用者の VPC の中から、別の VPC にあるサービスへ非公開でつなぐための機能です（[Google Cloud: Private Service Connect](https://cloud.google.com/vpc/docs/private-service-connect)）。
+
+## 自前の網とつなぐ：専用線と BGP
+
+クラウドの網と、自社のデータセンターや拠点の網をつなぐときには、物理の線が再び現れます。AWS の Direct Connect は、利用者の機器に次の 2 つを求めています（[AWS: What is Direct Connect?](https://docs.aws.amazon.com/directconnect/latest/UserGuide/Welcome.html)）。
+
+> 802.1Q VLAN encapsulation must be supported across the entire connection, including intermediate devices.
+>
+> Your device must support Border Gateway Protocol (BGP) and BGP MD5 authentication.
+
+1 本の物理の線の上に、第 61 回の VLAN のタグで複数の論理的な接続を分けて載せ、それぞれで第 63 回の BGP を話して経路を交換します。どのアドレスがクラウドの側にあり、どのアドレスが自社の側にあるかを、BGP で互いに広告し合うわけです。Google Cloud でも、Cloud Router が Cloud VPN と Interconnect のための BGP による動的な経路制御を担うと書かれています（[Google Cloud: Cloud Interconnect overview](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/overview)）。先ほど見た AWS の経路の優先順位に「Direct Connect BGP routes」があったのは、この経路のことです。
+
+## AWS と Google Cloud の違い
+
+同じ仕事を、2 社は少し違う切り方で部品にしています。
+
+| 仕事 | AWS | Google Cloud |
+| --- | --- | --- |
+| VPC の範囲 | 1 つのリージョンの中（AZ ごとにサブネットを置く） | 全リージョンにまたがる |
+| サブネットの範囲 | 1 つの AZ | 1 つのリージョン |
+| インターネットへの出口 | IGW をつなぎ、経路で指す | 既定の経路の次の渡し先として、既定のインターネットゲートウェイがある |
+| private からの外向き通信 | NAT ゲートウェイ（public サブネットに置く） | Cloud NAT（Cloud Router に設定する。置き場所の VM は無い） |
+| 状態を持つ許可 | セキュリティグループ | VPC ファイアウォールルール |
+| 状態を持たない許可 | ネットワーク ACL | 同じ位置づけの部品は無い |
+| VPC 同士のハブ | Transit Gateway | Network Connectivity Center |
+| サービスだけを見せる | PrivateLink | Private Service Connect |
+| 専用線 | Direct Connect | Cloud Interconnect |
+| MTU の既定 | VPC の中は 9001 まで、IGW 経由は 1500 | 1460（1300〜8896 で変更可） |
+
+Google Cloud の VPC がリージョンをまたぐのは、Andromeda の論文が示すように、網が各ホストの上のソフトウェアで作られていて、物理の場所に縛られる理由が小さいからだと読めます。一方で AWS がサブネットを AZ に縛るのは、AZ が障害の単位であり、「どの AZ に置くか」をアドレスの範囲で表せるようにしているからです。どちらも、物理の網では「場所」と「アドレスの範囲」が一致していたものを、目的に合わせて切り離し直しています。
+
+## まとめ
+
+- VPC は、物理の網の上に、利用者ごとの網を包んで作るオーバーレイ。VLAN の 4094 個では足りないので、VXLAN の 24 ビットの VNI や Geneve で包む。同じ 10.0.0.0/24 を 2 つの VPC で使っても、VNI が違えば混ざらなかった
+- スイッチが消えたのではなく、全ホストの仮想スイッチ（Andromeda）や専用のカード（Nitro）に散らばった
+- VPC はブロードキャストを通さない。誰がどこにいるかを制御側が知っているので、ARP には各ホストで答えられる。配っておく設定では、下の網に ARP が 1 つも流れなかった
+- 包むと MTU が減る。VM の MTU が合わないと、大きなパケットだけが黙って消えた。Google Cloud の既定は 1460、AWS は VPC の中で 9001、IGW 経由で 1500
+- サブネットは、アドレスの範囲と置き場所の単位。public と private の違いは、経路表に IGW への行があるかどうかだけ
+- ルートテーブルは第 62 回の経路表、IGW は 1 対 1 の NAT、NAT ゲートウェイは第 62 回の NAPT。Cloud NAT には箱すら無い
+- SG は状態を持ち、NACL は持たない。NACL では戻りの宛先である相手の一時ポートを許可しないと通らず、その範囲は相手の OS で変わった
+- ピアリングは 1 対 1 で推移せず、アドレスの重なりも許さない。たくさんつなぐなら Transit Gateway のようなハブ、サービスだけを見せるなら PrivateLink
+- 自前の網とは、VLAN と BGP でつなぐ。物理の線は、端でまた現れる
+
+## この章を終えて
+
+第 10 章では、届いたフレームとパケットを、どの箱がどこへ送るのかを見てきました。スイッチが MAC アドレスを覚え、VLAN が網を分け、ルーターが経路表を引き、BGP が組織の間で経路を交換し、IPv6 と日本の接続方式がその上で家庭まで届けていました。そしてクラウドでは、それらの箱の仕事がソフトウェアとカードに移り、名前を変えて残っていました。
+
+ここまでで、パケットは目的のマシンの NIC まで届くようになりました。次の第 11 章「ネットワークの下」では、届いたパケットを受け取る側、つまり OS のカーネルが TCP の接続をどう作り、どう速さを決め、アプリケーションの `read` までどう渡すのかを、第 66 回「接続の一生」から見ていきます。

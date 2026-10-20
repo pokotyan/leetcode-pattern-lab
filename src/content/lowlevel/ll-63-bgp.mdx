@@ -1,0 +1,404 @@
+---
+title: BGP：インターネットは経路の約束でつながる
+description: 1 つの組織の中なら、ルーターは同じ方針で経路を計算できる。では、方針もお金の流れも違う数万の組織は、どうやって互いの宛先を知るのか。AS と BGP の UPDATE、AS_PATH によるループの防止、最良経路の選び方、経路のハイジャックと RPKI による起源の検証を、5 台の FRR で実際に動かして確かめる
+chapter: link
+order: 4
+status: published
+topics:
+  - AS（自律システム）
+  - AS 番号
+  - トランジット / ピアリング
+  - IX（インターネットエクスチェンジ）
+  - eBGP / iBGP
+  - BGP の UPDATE
+  - AS_PATH
+  - LOCAL_PREF
+  - MED
+  - BGP コミュニティ
+  - 最良経路の選択
+  - 経路のハイジャック
+  - 経路のリーク
+  - RPKI / ROA
+  - 起源の検証（ROV）
+  - ASPA
+  - エニーキャスト
+requires:
+  - ll-62-router
+---
+
+import Callout from '../../components/Callout.astro'
+import BgpPropagation from '../../components/sim/problems/BgpPropagation'
+
+## 1 つの組織の外側
+
+第 62 回では、ルーターが経路表を引いてパケットの次の行き先を決めること、そして 1 つの組織の中なら OSPF のような仕組みで、全員が同じ地図から最短の経路を計算できることを見ました。
+
+インターネットは、この「1 つの組織」が数万個つながったものです。プロバイダ、クラウド事業者、大学、企業。それぞれが自分のネットワークを持ち、自分の都合で運用しています。全員が同じ地図を共有して最短経路を計算する、というやり方はここでは成り立ちません。組織ごとに、**どの経路を使いたいか、どの経路を他人に見せたいか**が違うからです。
+
+組織同士が「このアドレスの範囲には、うちを通れば届く」と伝え合う仕組みが BGP（Border Gateway Protocol）です。この回では、BGP が何を伝え、受け取った側がどう選ぶのかを、手元のコンテナで小さなインターネットを組んで確かめます。
+
+## AS：経路の方針を 1 つに持つまとまり
+
+BGP がやりとりする単位は、ルーター 1 台ではなく **AS（Autonomous System、自律システム）** です。BGP-4 の仕様は、古典的な定義として次のように書いています（[RFC 4271 1.1](https://www.rfc-editor.org/rfc/rfc4271.html#section-1.1)）。
+
+> The classic definition of an Autonomous System is a set of routers under a single technical administration, using an interior gateway protocol (IGP) and common metrics to determine how to route packets within the AS, and using an inter-AS routing protocol to determine how to route packets to other ASes.
+
+AS 番号の割り当ての指針である RFC 1930 は、もっと端的に「方針が 1 つであること」を定義の中心に置いています（[RFC 1930](https://www.rfc-editor.org/rfc/rfc1930.html)）。
+
+> An AS is a connected group of one or more IP prefixes run by one or more network operators which has a SINGLE and CLEARLY DEFINED routing policy.
+
+AS には番号が振られます。もともとは 2 バイト（0〜65535）でしたが、足りなくなることが見込まれたため、4 バイトに広げる拡張が定められました（[RFC 6793](https://www.rfc-editor.org/rfc/rfc6793.html)）。
+
+> The Autonomous System number is encoded as a two-octet entity in the base BGP specification. This document describes extensions to BGP to carry the Autonomous System numbers as four-octet entities.
+
+古い実装との間では、4 バイトの番号を 2 バイトに収められないので、代わりに予約された番号 23456（AS_TRANS）を入れて運びます。また IP アドレスに私用の範囲があるのと同じように、AS 番号にも私用の範囲があります。2 バイトなら 64512〜65534、4 バイトなら 4200000000〜4294967294 です（[RFC 6996](https://www.rfc-editor.org/rfc/rfc6996.html)）。この回の実験では、この私用の範囲から 65001 などを使います。
+
+## つながり方とお金の流れ
+
+AS 同士のつながりには、大きく 2 種類あります。
+
+| 関係 | 何をするか | お金 |
+| --- | --- | --- |
+| トランジット（顧客と上流） | 上流は顧客に「インターネット全体への経路」を渡し、顧客の経路を世界に広める | 顧客が上流に払う |
+| ピアリング（対等） | 互いの顧客の経路だけを交換する。相手を経由して第三者へは運ばない | 原則として払わない |
+
+多くの AS が 1 か所に集まって、物理的なスイッチを共有しながらピアリングする場所を **IX（Internet Exchange、インターネットエクスチェンジ）** と呼びます。それぞれと個別に線を引く代わりに、IX のスイッチに 1 本つなげば、同じ場所にいる多くの AS とピアリングを張れます。
+
+この関係から、経路の選び方と見せ方に自然な規則が生まれます。Gao と Rexford は、各 AS がお金の都合に沿って経路を選べば、全体として経路が落ち着く（振動し続けない）ことを示しました（[Gao and Rexford 2001](https://doi.org/10.1109/90.974523)）。要点は次の 2 つです。
+
+- **選ぶとき**：顧客から来た経路 > ピアから来た経路 > 上流から来た経路 の順に好む。顧客経由ならお金がもらえ、上流経由ならお金を払うからです
+- **見せるとき**：ピアや上流から来た経路は、顧客にだけ渡す。別のピアや上流には渡さない。渡すと、自分がお金をもらえないまま他人の通信を運ぶことになります
+
+BGP そのものは、この規則を知りません。規則は各 AS の設定（後で見る LOCAL_PREF や経路のフィルタ）として書き込まれます。**BGP は経路を伝える道具で、どの経路を使い、誰に見せるかは、すべて各 AS の方針で決まります。**
+
+## BGP の会話
+
+BGP は TCP の上で話します（[RFC 4271 2](https://www.rfc-editor.org/rfc/rfc4271.html#section-2)）。
+
+> BGP uses TCP [RFC793] as its transport protocol. This eliminates the need to implement explicit update fragmentation, retransmission, acknowledgement, and sequencing. BGP listens on TCP port 179.
+
+再送や順序の保証は第 66 回の TCP に任せ、BGP 自身は 4 種類のメッセージだけを持ちます（[RFC 4271 4.1](https://www.rfc-editor.org/rfc/rfc4271.html#section-4.1)）。
+
+| 種類 | 役割 |
+| --- | --- |
+| OPEN | 接続の最初に、自分の AS 番号、保持時間、対応する拡張（4 バイト AS 番号など）を伝える |
+| UPDATE | 経路の追加と取り下げ。「このプレフィックスには、この属性で届く」と「このプレフィックスはもう届かない」を運ぶ |
+| KEEPALIVE | 何も変化がないときに、生きていることだけを伝える |
+| NOTIFICATION | 誤りを伝えて、接続を閉じる |
+
+UPDATE は**変化があったときだけ**送られます。OSPF のように地図全体を配り合うのではなく、最初に手持ちの経路をすべて送ったら、あとは差分だけです。相手が生きているかは、保持時間（推奨の既定値は 90 秒）の間に何も届かなければ切れたとみなす形で確かめ、KEEPALIVE はその 3 分の 1 程度の間隔で送るのが目安です（[RFC 4271 4.4](https://www.rfc-editor.org/rfc/rfc4271.html#section-4.4)、[10](https://www.rfc-editor.org/rfc/rfc4271.html#section-10)）。
+
+違う AS のルーター同士の BGP を **eBGP**、同じ AS の中のルーター同士の BGP を **iBGP** と呼びます。外から聞いた経路を AS の中の全ルーターに配るのが iBGP の役目ですが、iBGP で聞いた経路は別の iBGP の相手に渡さない決まりなので、素直に組むと AS の中の全ルーターが互いに接続を張る必要があります。これが規模の大きな AS で問題になるため、代表のルーターが中継する **ルートリフレクタ** が使われます（[RFC 4456](https://www.rfc-editor.org/rfc/rfc4456.html)）。
+
+## 手元に小さなインターネットを組む
+
+ここからは、BGP の実装である FRRouting（FRR）を 5 つのコンテナで動かします。環境は Apple M1 Pro / macOS 26.2 上の OrbStack の Linux VM（カーネル 7.0.14）、FRR は 10.3.1 です。
+
+```
+              AS65066（横取りする役）
+                   │
+   AS65001 ──── AS65002 ──── AS65004（様子を見る役）
+  （持ち主）  ╲               ╱
+               ── AS65003 ──
+```
+
+AS65001 が、文書用に予約されたアドレス 198.51.100.0/24（[RFC 5737](https://www.rfc-editor.org/rfc/rfc5737.html)）の持ち主として経路を広告します。AS65002 と AS65003 はその上流で、AS65004 は両方につながっています。AS65066 は後で他人の経路を横取りする役です。
+
+設定は、たとえば AS65004 なら次のとおりです。
+
+```
+router bgp 65004
+ bgp router-id 10.63.0.14
+ no bgp ebgp-requires-policy
+ neighbor 10.63.0.12 remote-as 65002
+ neighbor 10.63.0.13 remote-as 65003
+```
+
+`neighbor` で「この相手と、この AS 番号で話す」と書くだけで、TCP の 179 番で接続が張られます。`no bgp ebgp-requires-policy` は実験のための設定で、FRR は既定では、方針（フィルタ）を書いていない eBGP の相手とは経路を交換しません（[RFC 8212](https://www.rfc-editor.org/rfc/rfc8212.html) が定めた既定の振る舞い）。何も考えずに全部を受け取り全部を流す設定が、後で見る事故の元になるからです。
+
+<Callout type="note" title="この実験の Next Hop について">
+  5 台はすべて同じ Docker のネットワーク（同じサブネット）に置き、BGP の接続の張り方だけで隣どうしを決めています。
+  このため、以下の出力の Next Hop はどれも、元の持ち主 10.63.0.11 のまま伝わっています。
+  広告する相手と次の行き先が同じサブネットにいるときは、自分を経由させずに元の次の行き先をそのまま渡してよい、という規則があるからです（[RFC 4271 5.1.3](https://www.rfc-editor.org/rfc/rfc4271.html#section-5.1.3)）。
+  実際のインターネットでは AS ごとに線が分かれているので、Next Hop は隣の AS のルーターになります。
+</Callout>
+
+## 経路が伝わると、AS_PATH が伸びる
+
+起動して 20 秒ほど待ち、AS65004 の BGP の表を見ます。
+
+```text
+     Network          Next Hop            Metric LocPrf Weight Path
+ *>  198.51.100.0/24  10.63.0.11                             0 65003 65001 i
+ *                    10.63.0.11                             0 65002 65001 i
+```
+
+同じプレフィックスに 2 本の経路が届いています。`Path` の列が **AS_PATH** で、この経路が通ってきた AS の番号の列です。AS65001 が広告したとき AS_PATH は `65001` だけで、AS65002 がそれを AS65004 に渡すときに自分の番号を先頭に付けて `65002 65001` になります。末尾の `i` は、持ち主が自分の経路として広告したもの（origin が IGP）であることを示します。
+
+`*` は使える経路、`>` は最良として選ばれた経路です。どちらも AS_PATH は 2 個で同点なのに、AS65003 経由が選ばれています。理由は詳しい表示で分かります。
+
+```text
+  65003 65001
+    10.63.0.11 from 10.63.0.13 (10.63.0.13)
+      Origin IGP, valid, external, best (Older Path)
+  65002 65001
+    10.63.0.11 from 10.63.0.12 (10.63.0.12)
+      Origin IGP, valid, external
+```
+
+`best (Older Path)`、つまり**先に届いていたから**です。FRR の文書は、eBGP で受け取った 2 本が他の条件で同点なら、すでに選んでいる方を優先し、それによって振動を防げる場合がある、と説明しています（[FRR: Route Selection](https://docs.frrouting.org/en/latest/bgp.html#route-selection)）。2 本の到着の差は 1 秒でした。
+
+## ループを防ぐ：自分の番号が入っていたら捨てる
+
+AS65002 は、AS65001 から聞いた経路を、ほかの隣にも広告します。その中には AS65001 自身も含まれます。AS65001 が受け取った経路を見ると、確かに届いています。
+
+```text
+     Network          Next Hop            Metric LocPrf Weight Path
+ *> 198.51.100.0/24  10.63.0.12                             0 65002 65001 i
+```
+
+これは `received-routes`（フィルタをかける前に受け取ったもの）の表示です。しかし AS65001 の BGP の表には、自分で広告した経路しかありません。ログには理由が出ています。
+
+```text
+BGP: [RZMGQ-A03CG] 10.63.0.12(r2) rcvd UPDATE about 198.51.100.0/24 IPv4 unicast -- DENIED due to: as-path contains our own AS;
+```
+
+AS_PATH に自分の番号 65001 が入っているので捨てた、という記録です。仕様は次のように定めています（[RFC 4271 9.1.2](https://www.rfc-editor.org/rfc/rfc4271.html#section-9.1.2)）。
+
+> If the AS_PATH attribute of a BGP route contains an AS loop, the BGP route should be excluded from the Phase 2 decision function. AS loop detection is done by scanning the full AS path (as specified in the AS_PATH attribute), and checking that the autonomous system number of the local system does not appear in the AS path.
+
+OSPF のように全体の地図を持たなくても、経路が自分の通ってきた道筋（AS の列）を持ち歩くので、自分を 2 度通るループを受け取った側で止められます。このような方式を **パスベクトル** と呼びます。
+
+## 最良経路の選び方
+
+同じプレフィックスに複数の経路があるとき、どれを使うかは決まった順に比べて決めます。FRR の文書に載っている順のうち、主なものは次のとおりです（[FRR: Route Selection](https://docs.frrouting.org/en/latest/bgp.html#route-selection)）。
+
+| 順 | 比べるもの | 意味 |
+| --- | --- | --- |
+| 1 | Weight | そのルーターだけの重み（FRR や Cisco の独自のもの。他へは伝わらない） |
+| 2 | LOCAL_PREF | 高い方を選ぶ。AS の中で共有する「この経路をどれだけ好むか」 |
+| 3 | 自分で作った経路か | 自分で広告した経路を優先する |
+| 4 | AS_PATH の長さ | 短い方を選ぶ |
+| 5 | Origin | IGP < EGP < Incomplete の順に好む |
+| 6 | MED | 同じ隣の AS から来た経路どうしなら、小さい方を選ぶ |
+| 7 | eBGP か iBGP か | 外から直接聞いた経路を優先する |
+| 8 以降 | IGP のコスト、すでに選んでいるか、ルーター ID、相手のアドレス | 最後の同点を崩す |
+
+大事なのは、**AS_PATH の長さより LOCAL_PREF が先に比べられる**ことです。AS_PATH は「何 AS を経由するか」でしかなく、遅延や帯域とは関係がありません。先に見たお金の都合（顧客経由を好む）は、受け取った経路に LOCAL_PREF を付けることで表現します。
+
+### 相手の選び方に働きかける：AS_PATH の水増し
+
+持ち主の側から「こちらの入口を使ってほしくない」と伝えたいときは、その方向へ広告する経路の AS_PATH に、自分の番号を余分に重ねます。AS65001 から AS65003 へ送る経路に 65001 を 2 回足すと、AS65004 の選択が変わります。
+
+```
+route-map PREPEND permit 10
+ set as-path prepend 65001 65001
+router bgp 65001
+ address-family ipv4 unicast
+  neighbor 10.63.0.13 route-map PREPEND out
+```
+
+```text
+  65002 65001
+    10.63.0.11 from 10.63.0.12 (10.63.0.12)
+      Origin IGP, valid, external, best (AS Path)
+  65003 65001 65001 65001
+    10.63.0.11 from 10.63.0.13 (10.63.0.13)
+      Origin IGP, valid, external
+```
+
+今度は `best (AS Path)`、AS_PATH が短いという理由で AS65002 経由に切り替わりました。ただし、これは相手への「お願い」にすぎません。相手が LOCAL_PREF で別の好みを付けていれば、AS_PATH の長さまで比べてもらえないからです。
+
+### 受け取る側が決める：LOCAL_PREF
+
+AS65004 が、AS65003 から来た経路に LOCAL_PREF 200 を付けてみます（既定は 100）。
+
+```text
+     Network          Next Hop            Metric LocPrf Weight Path
+ *>  198.51.100.0/24  10.63.0.11                    200      0 65003 65001 65001 65001 i
+ *                    10.63.0.11                             0 65002 65001 i
+```
+
+```text
+      Origin IGP, localpref 200, valid, external, best (Local Pref)
+```
+
+AS_PATH が 4 個もある長い経路が、`best (Local Pref)` で選ばれました。水増しによる持ち主のお願いより、受け取る側の方針の方が強い、ということがそのまま見えています。
+
+### MED とコミュニティ
+
+**MED**（Multi-Exit Discriminator）は、隣の AS と複数か所でつながっているときに「こちらの入口から入ってほしい」と伝える値です。比べるのは同じ隣の AS から来た経路どうしだけで、LOCAL_PREF や AS_PATH の長さより後に比べられます。
+
+**コミュニティ**は、経路に貼る荷札です。RFC 1997 は、共通の性質を持つ宛先のまとまりとして定義しています（[RFC 1997](https://www.rfc-editor.org/rfc/rfc1997.html)）。
+
+> A community is a group of destinations which share some common property.
+
+4 バイトの値で、意味は AS 同士の取り決めで決まります。上流のプロバイダが「このコミュニティを付けて広告すれば、うちの先のピアには流さない」「LOCAL_PREF を下げる」といった機能を顧客に公開し、顧客はその値を付けるだけで上流の振る舞いを変えられます。
+
+<BgpPropagation client:visible />
+
+SIM は、上の実験と同じ 5 つの AS で UPDATE を 1 通ずつ処理します。最良経路の比較は、LOCAL_PREF、AS_PATH の長さ、隣の AS 番号の小さい方、の 3 段に縮めています。FRR の実験で「先に届いた方」が勝った同点の場面は、SIM では AS 番号の小さい AS65002 が勝ちます。最後のフレームでは、AS65004 から 198.51.100.10 へ送ったパケットが、各 AS の表をたどってどこに届くかを示します。
+
+## 経路は約束にすぎない：ハイジャック
+
+BGP の UPDATE は、「このプレフィックスには、うちを通れば届く」という**申告**です。申告が本当かどうかを、BGP そのものは確かめません。持ち主でない AS が他人のプレフィックスを広告すると、それを信じた AS の通信が吸い込まれます。
+
+有名な例が、2008 年 2 月の YouTube の事件です。RIPE NCC の報告は、経過を次のように記録しています（[RIPE NCC: YouTube Hijacking](https://www.ripe.net/publications/news/youtube-hijacking-a-ripe-ncc-ris-case-study/)）。
+
+> On Sunday, 24 February 2008, Pakistan Telecom (AS17557) started an unauthorised announcement of the prefix 208.65.153.0/24. One of Pakistan Telecom's upstream providers, PCCW Global (AS3491) forwarded this announcement to the rest of the Internet, which resulted in the hijacking of YouTube traffic on a global scale.
+
+YouTube 自身は 208.65.152.0/22 を広告していました。横取りされた /24 はその一部で、**より長いプレフィックス**です。第 62 回で見たとおり、ルーターは最も長く一致する経路を使うので、AS_PATH の長さや方針で比べる以前に、/24 の方が選ばれます。YouTube の対策も同じ規則を使ったものでした。
+
+> AS36561 (YouTube) starts announcing 208.65.153.128/25 and 208.65.153.0/25. Because of the longest prefix match rule, every router that receives these announcements will send the traffic to YouTube.
+
+### 同じ長さで横取りする
+
+手元の実験で、AS65066 に 198.51.100.0/24 を広告させます。AS65066 は AS65002 の顧客という想定で、AS65002 は顧客から来た経路に LOCAL_PREF 200 を付けています。お金の都合として普通の設定です。
+
+```text
+（AS65002 の表）
+     Network          Next Hop            Metric LocPrf Weight Path
+ *>  198.51.100.0/24  10.63.0.66               0    200      0 65066 i
+ *                    10.63.0.11               0             0 65001 i
+（AS65004 の表）
+ *>  198.51.100.0/24  10.63.0.66                             0 65002 65066 i
+ *                    10.63.0.11                             0 65003 65001 i
+```
+
+AS65002 は顧客を好むという方針どおりに偽の経路を選び、それを AS65004 にも広めました。AS65004 から見ると、2 本はどちらも AS_PATH が 2 個で区別がつきません。Next Hop が 10.63.0.66、つまり横取りした側になっています。LOCAL_PREF 200 を付けなかった場合、AS65002 は先に届いていた正しい経路を使い続けました。**同じ長さの横取りは、どちらが選ばれるかが各 AS の方針と偶然に左右されます。**
+
+### より長いプレフィックスで横取りする
+
+次に、AS65066 に 198.51.100.0/25 と 198.51.100.128/25 を広告させます（LOCAL_PREF の設定は外しました）。
+
+```text
+（AS65004 の表）
+     Network          Next Hop            Metric LocPrf Weight Path
+ *>  198.51.100.0/24  10.63.0.11                             0 65002 65001 i
+ *                    10.63.0.11                             0 65003 65001 i
+ *>  198.51.100.0/25  10.63.0.66                             0 65002 65066 i
+ *                    10.63.0.66                             0 65003 65001 65002 65066 i
+ *>  198.51.100.128/25
+                    10.63.0.66                             0 65002 65066 i
+ *                    10.63.0.66                             0 65003 65001 65002 65066 i
+```
+
+```text
+（AS65004 で 198.51.100.10 の行き先を引く）
+Routing entry for 198.51.100.0/25
+  Known via "bgp", distance 20, metric 0, best
+  * 10.63.0.66, via eth0, weight 1
+```
+
+正しい /24 は表に残っているのに、198.51.100.10 宛ては /25 の方に吸われます。目を引くのは 2 本目の `65003 65001 65002 65066` です。**持ち主の AS65001 自身が**、AS65002 から受け取った偽の /25 を受け入れ、AS65003 へ広めています。自分のプレフィックスの一部であっても、BGP は「自分のものではない」とは判断しないからです。
+
+<Callout type="warn" title="経路のリーク">
+  悪意がなくても、設定の誤りで同じことが起きます。
+  RFC 7908 は、経路のリークを「意図された範囲を越えて広告が伝わること」と定義しています（[RFC 7908](https://www.rfc-editor.org/rfc/rfc7908.html)）。
+
+  > A route leak is the propagation of routing announcement(s) beyond their intended scope.
+
+  典型的なのは、2 つの上流につながっている顧客が、一方の上流から受け取った全経路を、もう一方の上流へそのまま広告してしまう場合です。
+  先に見た「上流から来た経路は顧客にだけ渡す」という規則が破られ、小さな顧客の AS が大手どうしの通信の通り道になって、溢れます。
+  FRR が方針のない eBGP の相手と経路を交換しないのは、こうした事故を既定で防ぐためです。
+</Callout>
+
+## 起源を確かめる：RPKI と ROA
+
+「このプレフィックスを広告してよいのは、この AS だけ」という情報を、アドレスの割り当ての階層に沿って署名付きで公開する仕組みが **RPKI**（Resource Public Key Infrastructure）です（[RFC 6480](https://www.rfc-editor.org/rfc/rfc6480.html)）。
+
+> As an initial application of this architecture, the document describes how a legitimate holder of IP address space can explicitly and verifiably authorize one or more ASes to originate routes to that address space.
+
+アドレスの持ち主は **ROA**（Route Origin Authorization）として「プレフィックス、広告してよい起源の AS、許す最も長いプレフィックス長」を署名して公開します。各 AS は検証済みの ROA の一覧を手元に取り込み、受け取った経路の起源（AS_PATH の最後の番号）と照らします。結果は 3 つです（[RFC 6811 2](https://www.rfc-editor.org/rfc/rfc6811.html#section-2)）。
+
+> o  NotFound: No VRP Covers the Route Prefix.
+>
+> o  Valid: At least one VRP Matches the Route Prefix.
+>
+> o  Invalid: At least one VRP Covers the Route Prefix, but no VRP Matches it.
+
+VRP は検証済みの ROA の 1 件を指します。この照合を **ROV**（Route Origin Validation、起源の検証）と呼びます。
+
+手元では、検証済みの一覧をルーターに配る RTR サーバとして StayRTR を立て、「198.51.100.0/24、起源 AS65001、最大長 24」の 1 件だけを持たせました。AS65004 の FRR を `-M rpki` 付きで起動し直して接続すると、表の先頭に検証の結果が付きます。
+
+```text
+RPKI/RTR prefix table
+Prefix                                   Prefix Length  Origin-AS
+198.51.100.0                                24 -  24   65001
+```
+
+```text
+     Network          Next Hop            Metric LocPrf Weight Path
+V*>  198.51.100.0/24  10.63.0.11                             0 65003 65001 i
+V*                    10.63.0.11                             0 65002 65001 i
+I*>  198.51.100.0/25  10.63.0.66                             0 65002 65066 i
+I*                    10.63.0.66                             0 65003 65001 65002 65066 i
+I*>  198.51.100.128/25
+                    10.63.0.66                             0 65002 65066 i
+I*                    10.63.0.66                             0 65003 65001 65002 65066 i
+```
+
+/25 はどちらも `I`（Invalid）です。起源が違ううえに、ROA の最大長 24 より長いからです。ただし、印が付いただけで、まだ最良として使われています。Invalid を捨てるのは、方針として書いて初めて効きます。
+
+```
+route-map ROV deny 10
+ match rpki invalid
+route-map ROV permit 20
+```
+
+これを AS65004 の受け取りに付けると、/25 は表から消え、198.51.100.10 宛ては正しい /24 に戻りました。
+
+```text
+V*>  198.51.100.0/24  10.63.0.11                             0 65003 65001 i
+V*                    10.63.0.11                             0 65002 65001 i
+
+Routing entry for 198.51.100.0/24
+  Known via "bgp", distance 20, metric 0, best
+  * 10.63.0.11, via eth0, weight 1
+```
+
+ROV は、検証する AS が増えるほど効きます。偽の経路を最初に受け取る AS（実験なら AS65002）が捨てれば、その先へは広まりません。
+
+### ROV では防げないもの
+
+ROV が確かめるのは、AS_PATH の**最後の番号**だけです。横取りする側が、偽の経路の AS_PATH の末尾に持ち主の番号を書き足したらどうなるでしょうか。AS65066 から、`65066 65001` という AS_PATH で /24 を広告させました（AS65002 は再び顧客に LOCAL_PREF 200 を付けています）。
+
+```text
+（AS65002 の表）
+ *>  198.51.100.0/24  10.63.0.66               0    200      0 65066 65001 i
+ *                    10.63.0.11               0             0 65001 i
+（AS65004 の表）
+V*>  198.51.100.0/24  10.63.0.11                             0 65003 65001 i
+V*                    10.63.0.66                             0 65002 65066 65001 i
+```
+
+偽の経路も `V`（Valid）です。起源は確かに 65001 だからです。AS65002 は偽の経路を選び、AS65004 はたまたま AS_PATH が短い正しい経路を選びましたが、ROV が見分けたわけではありません。
+
+AS_PATH の途中の偽りを見つけるために検討されているのが **ASPA**（Autonomous System Provider Authorization）です。各 AS が「自分の上流はこの AS たち」と RPKI に登録し、受け取った AS_PATH の隣り合う 2 つが、登録された顧客と上流の関係に合っているかを確かめます。IETF の文書は、目的を次のように述べています（[draft-ietf-sidrops-aspa-verification-29](https://datatracker.ietf.org/doc/draft-ietf-sidrops-aspa-verification/)）。
+
+> This AS_PATH verification enhances routing security by adding means to detect and mitigate route leaks and AS_PATH manipulations.
+
+執筆時点（2026 年 10 月）では、この検証の手順と ASPA の形式はどちらもまだ RFC になっていない草案です。
+
+## 同じ経路を複数の場所から：エニーキャスト
+
+ここまでのハイジャックは、「同じプレフィックスを、持ち主ではない場所から広告する」ことでした。同じことを、持ち主が**自分の意思で**世界中の拠点から行うのがエニーキャストです。第 70 回で見た DNS のルートサーバや、第 126 回の CDN がこの方式で、各地の拠点が同じプレフィックスを広告し、利用者の AS はそれぞれ BGP の選択で「近い」拠点に届きます。ここでの「近い」は、AS_PATH と各 AS の方針で決まる近さで、地理的な距離ではありません。
+
+拠点が自分の判断で広告を取り下げると、その拠点に来ていた通信は別の拠点へ移ります。この仕組みが裏目に出た例が、第 77 回で見た Facebook の障害で、すべての拠点が同時に取り下げたために、権威 DNS ごと世界から見えなくなりました。
+
+## インターネット全体の経路表
+
+インターネット全体の経路を持つルーターの表は、どれくらいの大きさなのでしょうか。APNIC の Geoff Huston が運営する観測点の報告では、2026 年 10 月 20 日の時点で、IPv4 の有効な経路（転送に使われる表 FIB の行）が 1,085,693 件、すべての相手から受け取った経路の合計（RIB）が 3,230,285 件でした（[BGP Routing Table Analysis Report](https://bgp.potaroo.net/as2.0/)）。IPv6 の有効な経路は同日に 258,772 件です（[bgp.potaroo.net v6](https://bgp.potaroo.net/v6/as2.0/)）。
+
+ルーターは、この 100 万を超える行から、パケット 1 つごとに最も長く一致する行を引いています（第 62 回）。BGP の UPDATE は、この表の一部を書き換える差分として、昼夜を問わず世界中から届き続けています。
+
+## まとめ
+
+- インターネットは、方針を 1 つずつ持つ AS のつながり。BGP は、AS 同士が「このプレフィックスには、うちを通れば届く」と伝え合う仕組み
+- BGP は TCP の 179 番の上で、OPEN、UPDATE、KEEPALIVE、NOTIFICATION の 4 種類だけで話す。UPDATE は変化があったときの差分だけ
+- 経路は通ってきた AS の列（AS_PATH）を持ち歩き、自分の番号が入った経路は捨てる。これでループが止まる
+- 最良経路は決まった順に比べて選ぶ。AS_PATH の長さより LOCAL_PREF が先で、各 AS のお金の都合が経路の選択を決める
+- BGP の広告は申告にすぎず、持ち主でない AS が広告すれば通信が吸われる。より長いプレフィックスなら、方針で比べる前に勝つ
+- RPKI の ROA で起源の AS を検証すれば、起源の偽りと長すぎるプレフィックスは捨てられる。AS_PATH の途中の偽りは防げず、ASPA が検討されている
+
+次の第 64 回では、ここまで IPv4 で見てきたアドレスとルーターの話を IPv6 に移し、日本の家庭の回線がインターネットにつながる方式（PPPoE、IPoE、MAP-E）を見ます。

@@ -1,0 +1,305 @@
+---
+title: IPv6 と、日本の家庭の接続方式（PPPoE・IPoE・MAP-E）
+description: IPv4 のアドレスが尽きたあと、家庭の端末はどうやってアドレスを得て、どの装置を通って外へ出ていくのか。IPv6 のアドレスの読み方、NDP と SLAAC、プレフィックスの委任を実測で追い、日本の光回線で使われる PPPoE と IPoE の違い、IPv4 を IPv6 で運ぶ MAP-E のポートの割り当てまでを見ます
+chapter: link
+order: 5
+status: published
+topics:
+  - IPv6
+  - IPv6 アドレスの表記（RFC 5952）
+  - リンクローカルアドレス
+  - ULA
+  - NDP
+  - RA / RS
+  - SLAAC
+  - 一時アドレス
+  - DHCPv6
+  - プレフィックス委任（DHCPv6-PD）
+  - PPPoE
+  - IPoE
+  - 網終端装置
+  - VNE
+  - DS-Lite
+  - MAP-E
+  - PSID
+requires:
+  - ll-60-switch
+  - ll-62-router
+---
+
+import Callout from '../../components/Callout.astro'
+import MapePorts from '../../components/sim/problems/MapePorts'
+
+## 家の線の上で、IP はどう届くのか
+
+第 58 回では、光ファイバが家まで来て、ONU で電気の信号に戻るところまでを見ました。この回はその上の話です。家の端末はどうやってアドレスをもらい、どの装置を通って外へ出ていくのか。
+
+日本の家庭の光回線では、同じ線の上に **PPPoE** と **IPoE** という 2 つの接続方式があり、IPv4 を IPv6 で包んで運ぶ **MAP-E** や **DS-Lite** も使われています。どれも IPv4 のアドレスが足りなくなったことと深く関わっているので、そこから始めます。
+
+## IPv4 のアドレスは尽きている
+
+IPv4 のアドレスは 32 ビットで、全部で約 43 億個しかありません。JPNIC によれば、IANA で新規に割り振れる IPv4 アドレスが無くなったのが 2011 年 2 月 3 日、アジア太平洋地域の APNIC で通常の申請による在庫が無くなったのが同じ年の 4 月 15 日です。日本の JPNIC については「JPNICでは独自のアドレス在庫を保有せず、APNICと共有しているため、APNICでの通常割り振り終了に伴い、JPNICでの通常の割り振りも終了しました。」と書かれています（[JPNIC: IPv4アドレスの在庫枯渇に関して](https://www.nic.ad.jp/ja/ip/ipv4pool/)）。
+
+それ以降も IPv4 のインターネットが回っているのは、主に第 62 回で見る NAT のおかげです。家の中の端末はプライベートアドレスを使い、外に出るときにルーターが 1 つのグローバルアドレスとポート番号に書き換えます。この回の後半では、事業者がさらにその 1 つのアドレスを複数の家で分け合う仕組みが出てきます。
+
+根本の解決として用意されたのが IPv6 です。仕様の RFC 8200 は、変更点の最初に「IPv6 increases the IP address size from 32 bits to 128 bits（IPv6 は IP アドレスの長さを 32 ビットから 128 ビットに増やす）」を挙げています（[RFC 8200 1](https://www.rfc-editor.org/rfc/rfc8200.html#section-1)）。
+
+## IPv6 のアドレスを読む
+
+128 ビットは、16 ビットずつ 8 つに区切り、16 進数をコロンでつないで書きます。長いので、省略の規則があります。RFC 5952 は書き方を 1 つに揃えるために、次のように定めています（[RFC 5952 4](https://www.rfc-editor.org/rfc/rfc5952.html#section-4)）。
+
+- 各区切りの先頭の 0 は書かない。「Leading zeros MUST be suppressed.」
+- 0 が続く区切りは `::` でまとめ、できるだけ長くまとめる。「The use of the symbol "::" MUST be used to its maximum capability.」
+- 0 の区切りが 1 つだけなら `::` を使わない。「The symbol "::" MUST NOT be used to shorten just one 16-bit 0 field.」
+- 英字は小文字で書く
+
+`2001:0db8:0000:0000:0000:0000:0002:0001` は `2001:db8::2:1` と書きます。この回で例に使う `2001:db8::/32` は、文書の例示のために予約された範囲です（[RFC 3849](https://www.rfc-editor.org/rfc/rfc3849.html)）。
+
+アドレスの前半はネットワークを、後半はその中のインタフェースを表します。家庭の LAN では、前半 64 ビットがプレフィックス、後半 64 ビットが **インタフェース ID** という分け方がほぼ決まっています。RFC 4291 は「Interface IDs are required to be 64 bits long（インタフェース ID は 64 ビットの長さであることが求められる）」としています（[RFC 4291 2.5.1](https://www.rfc-editor.org/rfc/rfc4291.html#section-2.5.1)）。
+
+アドレスの種類は、先頭のビットで見分けます。
+
+| 種類 | 範囲 | 使われ方 |
+| --- | --- | --- |
+| ループバック | `::1` | 自分自身 |
+| リンクローカル | `fe80::/10` | 同じリンク（ルーターを越えない範囲）の中だけで通じる。どのインタフェースも必ず持つ |
+| ユニークローカル（ULA） | `fc00::/7` | 組織の中だけで使う。IPv4 のプライベートアドレスに近い（[RFC 4193](https://www.rfc-editor.org/rfc/rfc4193.html)） |
+| マルチキャスト | `ff00::/8` | グループ宛て。IPv6 にブロードキャストは無く、これで代える |
+| グローバルユニキャスト | 上記以外（実際に配られているのは `2000::/3`） | インターネットで通じる |
+
+範囲は [RFC 4291 2.4](https://www.rfc-editor.org/rfc/rfc4291.html#section-2.4) の表によります。
+
+## ARP の代わり：NDP
+
+IPv4 では、同じリンクの相手の MAC アドレスを ARP で引きました（第 60 回）。IPv6 にはブロードキャストが無いので、ARP は使えません。代わりに **NDP**（Neighbor Discovery Protocol）を使います。RFC 4861 は、NDP が「a combination of the IPv4 protocols Address Resolution Protocol [ARP], ICMP Router Discovery [RDISC], and ICMP Redirect [ICMPv4]（IPv4 の ARP、ICMP のルーター探索、ICMP のリダイレクトを合わせたもの）」に当たると書いています（[RFC 4861 3.1](https://www.rfc-editor.org/rfc/rfc4861.html#section-3.1)）。
+
+NDP のメッセージは ICMPv6 の上に載り、主なものは 4 つです（[RFC 4861 3](https://www.rfc-editor.org/rfc/rfc4861.html#section-3)）。
+
+| メッセージ | 送る側 | 目的 |
+| --- | --- | --- |
+| RS（Router Solicitation） | 端末 | インタフェースを上げたとき、ルーターに RA をすぐ出してもらう |
+| RA（Router Advertisement） | ルーター | 自分がいること、このリンクのプレフィックス、各種の設定を知らせる。定期的にも、RS に応えても出す |
+| NS（Neighbor Solicitation） | 誰でも | 相手の MAC アドレスを問う。相手がまだ届くかの確認や、アドレスの重複検査にも使う |
+| NA（Neighbor Advertisement） | 問われた側 | NS に答える |
+
+NS はリンク全体には送りません。問いたいアドレスの下位 24 ビットから作る **要請ノードマルチキャストアドレス**（`ff02::1:ffXX:XXXX`）宛てに送ります（[RFC 4291 2.7.1](https://www.rfc-editor.org/rfc/rfc4291.html#section-2.7.1)）。そのアドレスに参加しているのは、下位 24 ビットが同じ端末だけなので、ARP のように全員を起こさずに済みます。
+
+## アドレスを自分で作る：SLAAC
+
+IPv4 の家庭の LAN では、ルーターの DHCP サーバがアドレスを配るのが普通でした。IPv6 では、端末が **自分でアドレスを作る** 方式が基本です。**SLAAC**（Stateless Address Autoconfiguration）と呼びます。RFC 4862 は、ルーターがプレフィックスを知らせ、端末がインタフェース ID を作り、「An address is formed by combining the two.（アドレスはその 2 つを組み合わせて作る）」と説明しています（[RFC 4862 1](https://www.rfc-editor.org/rfc/rfc4862.html#section-1)）。サーバは要らず、ルーターは RA を出すだけです。
+
+### 手元で確かめる：RA を受けてアドレスが付くまで
+
+Docker の Linux コンテナの中に、ネットワークの名前空間を 2 つ作って仮想のケーブル（veth）でつなぎ、片方をルーター、片方を端末にしました。ルーター側では `radvd` に、プレフィックス `2001:db8:1:1::/64`（有効期間 1200 秒、推奨期間 600 秒）を含む RA を出させます。環境は OrbStack の Linux VM（カーネル 7.0.14）上の Debian 12 のコンテナです。
+
+端末側のインタフェース `h0` の MAC アドレスと、リンクを上げた直後のアドレスです。
+
+```text
+h0@if4           DOWN           8a:b8:e0:15:9d:57 <BROADCAST,MULTICAST>
+    inet6 fe80::88b8:e0ff:fe15:9d57/64 scope link
+```
+
+リンクを上げただけで、ルーターが無くても **リンクローカルアドレス** が付きます。インタフェース ID の `88b8:e0ff:fe15:9d57` は、MAC アドレス `8a:b8:e0:15:9d:57` の真ん中に `ff:fe` を挟み、先頭のバイト `8a` の下から 2 番目のビットを反転して `88` にしたものです。この作り方を Modified EUI-64 と呼びます（[RFC 4291 2.5.1](https://www.rfc-editor.org/rfc/rfc4291.html#section-2.5.1)、[付録 A](https://www.rfc-editor.org/rfc/rfc4291.html#appendix-A)）。この実験では、比較のためにわざとこの方式を選んでいます。
+
+その間に流れた ICMPv6 を `tcpdump` で見ると、手順がそのまま並んでいます（端末側の分を抜粋。ルーター側の重複検査の 2 行と、2 回目の RA を省いています）。
+
+```text
+IP6 :: > ff02::1:ff15:9d57: ICMP6, neighbor solicitation, who has fe80::88b8:e0ff:fe15:9d57, length 32
+IP6 fe80::88b8:e0ff:fe15:9d57 > ff02::2: ICMP6, router solicitation, length 16
+IP6 fe80::384d:41ff:feac:d84f > ff02::1: ICMP6, router advertisement, length 80
+IP6 :: > ff02::1:ff4b:5497: ICMP6, neighbor solicitation, who has 2001:db8:1:1:7c6d:2e43:5c4b:5497, length 32
+IP6 :: > ff02::1:ff15:9d57: ICMP6, neighbor solicitation, who has 2001:db8:1:1:88b8:e0ff:fe15:9d57, length 32
+```
+
+1. 送信元が `::`（まだアドレスが無い）の NS で、作ったリンクローカルアドレスを誰も使っていないかを確かめる。**重複アドレス検出**（DAD）です。宛先は、そのアドレスの下位 24 ビット `15:9d57` から作った要請ノードマルチキャストアドレスになっています
+2. 全ルーター宛て（`ff02::2`）に RS を出す
+3. ルーターが全ノード宛て（`ff02::1`）に RA を返す
+4. RA のプレフィックスから作ったグローバルアドレス 2 つについて、また DAD をする
+
+その後のアドレスと経路です。
+
+```text
+    inet6 2001:db8:1:1:7c6d:2e43:5c4b:5497/64 scope global temporary dynamic
+       valid_lft 1197sec preferred_lft 597sec
+    inet6 2001:db8:1:1:88b8:e0ff:fe15:9d57/64 scope global dynamic mngtmpaddr
+       valid_lft 1197sec preferred_lft 597sec
+    inet6 fe80::88b8:e0ff:fe15:9d57/64 scope link
+default via fe80::384d:41ff:feac:d84f proto ra metric 1024 expires 8sec hoplimit 64 pref medium
+```
+
+グローバルアドレスが 2 つ付きました。1 つは MAC アドレスから作ったもの、もう 1 つは `temporary` と印の付いた乱数のものです。寿命は RA で知らせた 1200 秒と 600 秒から減っていきます。既定の経路は、RA を出したルーターの **リンクローカルアドレス** 宛てです。IPv6 では、次の転送先をリンクローカルアドレスで指すのが普通です。
+
+最後にルーターへ `ping` を打つと、NS と NA で相手の MAC アドレスが引かれ、近隣の表に入りました。
+
+```text
+2001:db8:1:1::1 lladdr 3a:4d:41:ac:d8:4f router REACHABLE
+```
+
+### MAC アドレスを埋めると、どこへ行っても追える
+
+MAC アドレスから作ったインタフェース ID は、プレフィックスが変わっても後半 64 ビットが変わりません。家でもカフェでも同じ値が見えるので、通信先から端末を追跡できてしまいます。そのため、今の OS は次の 2 つを使います。
+
+- **安定したアドレス**：RFC 7217 の方式。インタフェース ID を、プレフィックスや秘密の値などからハッシュで作ります。RFC 7217 は、この方式で作ったアドレスは「stable within each subnet（各サブネットの中では安定している）」が、「the corresponding Interface Identifier changes when the host moves from one network to another（ホストが別のネットワークへ移るとインタフェース ID が変わる）」と説明しています（[RFC 7217 Abstract](https://www.rfc-editor.org/rfc/rfc7217.html)）
+- **一時アドレス**：RFC 8981 の方式。乱数のインタフェース ID を、時間とともに作り直します。RFC 8981 は、アドレスを変えていくことで、同じアドレスを使い続けた場合に盗聴者などが通信を結び付けられる時間の幅を狭める、という目的を述べています（[RFC 8981 Abstract](https://www.rfc-editor.org/rfc/rfc8981.html)）。既定の推奨期間は 1 日、有効期間は 2 日です（[RFC 8981 3.8](https://www.rfc-editor.org/rfc/rfc8981.html#section-3.8)）
+
+外へ接続を始めるときは一時アドレスが使われ、外から来てもらうためのアドレスとしては安定したアドレスが残ります。
+
+### 手元の Mac を見る
+
+執筆に使った Mac（macOS 26.2）の Wi-Fi のインタフェースで、IPv6 のアドレスを見ました。アドレスの値は伏せ、種類だけを残しています。
+
+```text
+inet6 fe80::<伏せた>%en0 prefixlen 64 secured scopeid 0xe
+inet6 2001:db8:<伏せた> prefixlen 64 autoconf secured
+inet6 2001:db8:<伏せた> prefixlen 64 deprecated autoconf temporary   ← 同じ行が 6 つ
+inet6 2001:db8:<伏せた> prefixlen 64 autoconf temporary
+```
+
+`secured` が RFC 7217 方式の安定したアドレス、`temporary` が一時アドレスです。リンクローカルアドレスも `secured` で、MAC アドレスは埋め込まれていません。一時アドレスは 7 つあり、新しい 1 つ以外は `deprecated`（推奨期間が過ぎ、新しい接続には使わない）になっています。
+
+macOS が受け取った RA の中身は、`ipconfig getsummary en0` で見られます（アドレスは伏せました）。
+
+```text
+RouterAdvertisement : from <伏せた>, length 80, hop limit 64, lifetime 1800s, reachable 0ms, retransmit 0ms, flags 0x40=[ other ], pref=medium
+prefix info option (3), length 32 (4):  <伏せた>/64, flags [ onlink auto ], valid time 1200s, pref. time 1200s
+rdnss option (25), length 24 (3):  lifetime 600s, addr: <伏せた>
+```
+
+この家のルーターは、プレフィックスの推奨期間を 1200 秒にしています。RFC 8981 は、一時アドレスの推奨期間を「the lower of the Preferred Lifetime of the prefix and TEMP_PREFERRED_LIFETIME - DESYNC_FACTOR（プレフィックスの推奨期間と、TEMP_PREFERRED_LIFETIME から乱数の値を引いたものの小さいほう）」とするよう定めています（[RFC 8981 3.4](https://www.rfc-editor.org/rfc/rfc8981.html#section-3.4)）。1 日ではなく 20 分ほどで推奨期間が切れ、作り直された古いアドレスが `deprecated` として並んでいる、という見え方と合います。
+
+RA の `rdnss` は DNS サーバのアドレスを知らせるオプション（[RFC 8106](https://www.rfc-editor.org/rfc/rfc8106.html)）です。`flags` の `other` は、アドレス以外の設定を DHCPv6 で取りにきてよい、という印です。
+
+## DHCPv6 と、プレフィックスの委任
+
+SLAAC があっても DHCPv6 は使われます。用途は大きく 2 つです。
+
+1 つ目は、アドレス以外の設定を配ることです。手元の Mac は、上の RA の `other` を見て、DHCPv6 で DNS サーバなどを取りにいっていました。`ipconfig getsummary` にはこの状態が `Mode : Stateless` と出ます。アドレスは SLAAC で作り、DHCPv6 からは設定だけを受け取る、という組み合わせです。
+
+```text
+DHCPv6 REPLY (7) Transaction ID <伏せた> Length 89
+Options[5] = {
+  CLIENTID (1) Length 10: DUID LL HW 1 Addr <伏せた>
+  SERVERID (2) Length 10: DUID LL HW 1 Addr <伏せた>
+  DNS_SERVERS (23) Length 16: <伏せた>
+  DOMAIN_LIST (24) Length 25: <伏せた>
+  <unknown> (32) Length 4:  Data 00 00 02 58
+}
+```
+
+最後のオプション 32 は、設定をもう一度取りにくるまでの時間（Information Refresh Time）で、`0x258` = 600 秒です（[RFC 8415 21.23](https://www.rfc-editor.org/rfc/rfc8415.html#section-21.23)）。
+
+2 つ目が、ここで大事な **プレフィックスの委任**（DHCPv6-PD）です。家のルーターが、事業者から /64 より短いプレフィックス（たとえば /56）をまとめて受け取り、それを /64 に切って家の中の LAN ごとに RA で配ります。RFC 8415 は、この仕組みが「appropriate for use by an ISP to delegate a prefix to a subscriber（ISP が加入者にプレフィックスを委任する用途に適している）」としています（[RFC 8415 6.3](https://www.rfc-editor.org/rfc/rfc8415.html#section-6.3)）。家のルーターから見ると、上流からはプレフィックスを DHCPv6-PD でもらい、下流へは RA で配る、という 2 つの役割を同時に持つことになります。
+
+<Callout type="note" title="IPv4 と IPv6 の両方があるとき">
+  今の家庭の多くは、IPv4 と IPv6 の両方を持つデュアルスタックです。宛先の名前を引いて両方のアドレスが返ってきたとき、どちらで接続するかは、第 73 回で見た Happy Eyeballs が決めます。IPv6 を少しだけ先に試し、つながらなければすぐ IPv4 に切り替えるので、IPv6 の経路が壊れていても利用者はほとんど気づきません。
+</Callout>
+
+## 日本の光回線の上で：PPPoE
+
+ここから日本の話です。家庭の光回線の多くは、NTT 東日本・西日本の NGN（次世代ネットワーク）という網を通って、利用者が契約した ISP（インターネット接続の事業者）へつながります。この NGN と ISP の間のつなぎ方に、2 つの方式があります。
+
+古くからあるのが **PPPoE**（PPP over Ethernet）です。PPP は、電話回線のダイヤルアップの時代から使われてきた、1 対 1 の回線の上で認証をしてアドレスをもらうためのプロトコルです。RFC 2516 は、PPPoE を「how to build PPP sessions and encapsulate PPP packets over Ethernet（Ethernet の上で PPP のセッションを作り、PPP のパケットを包む方法）」と説明しています（[RFC 2516 Abstract](https://www.rfc-editor.org/rfc/rfc2516.html)）。
+
+手順は 2 段階です。まず Ethernet の上で相手を探します。端末側が PADI をブロードキャストし、応えられる装置（RFC の用語で Access Concentrator）が PADO を返し、PADR と PADS でセッション番号が決まります（[RFC 2516 5](https://www.rfc-editor.org/rfc/rfc2516.html#section-5)）。その後は、そのセッションの中で PPP の認証（ID とパスワード）をして、IPv4 アドレスをもらいます。
+
+PPPoE のヘッダが 6 バイト、PPP のプロトコル番号が 2 バイト付くので、中に入る IP パケットは小さくなります。RFC 2516 は「the PPP MTU MUST NOT be greater than 1492（PPP の MTU は 1492 を超えてはならない）」と定めています（[RFC 2516 7](https://www.rfc-editor.org/rfc/rfc2516.html#section-7)）。
+
+日本の NGN では、このセッションの終点が **網終端装置**（NTE）です。総務省の研究会の資料は、PPPoE 方式を、ホームゲートウェイなどの利用者の端末と網終端装置の間に論理的なトンネル（セッション）を作り、インターネットとの通信をすべてそのセッションに通す方式だと説明しています（[総務省 接続料の算定に関する研究会「NGNのISP接続（PPPoEとIPoE）に関する当面の方向性」平成 30 年 2 月](https://www.soumu.go.jp/main_content/000532520.pdf)）。
+
+ここに混雑の原因がありました。同じ資料は、インターネットのトラヒックが年に 1.4〜1.5 倍の速さで増えるなかで、「PPPoE方式では必ずしも接続事業者のみの判断では関門系ルータの増設ができない仕組みとなっている。」と指摘しています。網終端装置を増やすかどうかは NGN の側の基準で決まり、ISP が自分の判断だけでは増やせなかった、ということです。資料には、平成 29 年度の 4 月から 10 月までに、インターネットの速度が遅いなどの苦情が総務省に約 100 件寄せられたことも書かれています。
+
+## IPoE：PPP を使わず、IPv6 をそのまま流す
+
+もう 1 つの方式が **IPoE**（IP over Ethernet）です。PPP のセッションも認証も使わず、IPv6 のパケットをそのまま Ethernet に載せて流します。総務省の同じ資料は、IPoE 方式を、NTT 東日本・西日本が他の事業者に割り振られた IPv6 アドレスを預かって各利用者に割り当て、NGN の外との通信も中の通信もその IPv6 アドレスで行う方式だと説明しています。このアドレスを預ける事業者は **VNE**（Virtual Network Enabler）と呼ばれます。
+
+利用者から見た違いは、通る装置です。
+
+| | PPPoE | IPoE |
+| --- | --- | --- |
+| 利用者と事業者の間 | PPP のセッション（ID とパスワードで認証） | セッションなし。IPv6 のまま |
+| NGN の出口の装置 | 網終端装置 | 事業者のゲートウェイルータ |
+| 出口の装置の増設 | NTT 東日本・西日本が可否を判断 | 接続事業者が自由に増設できる |
+| 接続点（資料の時点） | 都道府県ごと | 東京と大阪のみ（増設予定） |
+| 直接接続している事業者の数（資料の時点） | 77 | 6 |
+
+表の内容は同じ資料の比較表によります。資料は「PPPoE方式により７７の事業者が接続しているのに対し、IPoE方式で接続しているのは６事業者であり、差が生じている。」と書いています。数字は平成 30 年 2 月時点のもので、その後の状況はこの資料からは分かりません。
+
+IPoE で混雑が避けやすいのは、出口の装置を事業者が自分の判断で増やせることと、利用者ごとのセッションを終端する装置を通らないことによります。ただし、IPoE で流れるのは IPv6 です。世の中のサーバの多くはまだ IPv4 でしか届かないので、IPv4 を何とかして運ぶ必要があります。
+
+## IPv4 を IPv6 で運ぶ：DS-Lite と MAP-E
+
+IPv6 だけの網の上で IPv4 を使う方式として、日本では主に DS-Lite と MAP-E が使われています。どちらも、家のルーターが IPv4 のパケットを IPv6 で包み、事業者の装置まで運んでから外します。違いは、**NAT をどこで行うか** です。
+
+**DS-Lite**（RFC 6333）では、家のルーター（B4 と呼びます）は包むだけで、NAT は事業者の側の装置（AFTR）がまとめて行います。RFC 6333 は、DS-Lite が「IP in IP (IPv4-in-IPv6) and Network Address Translation (NAT)」の 2 つを組み合わせて、事業者が IPv4 アドレスを利用者の間で共有できるようにするものだと説明しています（[RFC 6333 Abstract](https://www.rfc-editor.org/rfc/rfc6333.html)）。AFTR は全利用者の変換表を持つので、状態を持つ大きな NAT になります。
+
+**MAP-E**（RFC 7597）では、NAT は家のルーター（CE）が行います。事業者の側の境界ルータ（BR）は包みを外すだけで、利用者ごとの状態を持ちません。RFC 7597 は「As MAP is stateless, any BR may be used at any time.（MAP は状態を持たないので、どの BR をいつ使ってもよい）」と書いています（[RFC 7597 7.2](https://www.rfc-editor.org/rfc/rfc7597.html#section-7.2)）。
+
+状態を持たずに済むのは、**どの家がどの IPv4 アドレスのどのポートを使ってよいかを、IPv6 のプレフィックスから計算で決める** からです。
+
+### プレフィックスから、IPv4 アドレスとポートを計算する
+
+事業者は CE に、BMR（Basic Mapping Rule）という規則を渡します。中身は、Rule IPv6 プレフィックス、Rule IPv4 プレフィックス、EA ビットの長さの 3 つです。利用者の IPv6 プレフィックスのうち、Rule IPv6 プレフィックスの直後にある **EA ビット** に、IPv4 アドレスの後半と、ポートの組を選ぶ番号 **PSID**（Port Set Identifier）が埋め込まれています。
+
+ポート番号 16 ビットの割り方は、次のとおりです（[RFC 7597 5.1](https://www.rfc-editor.org/rfc/rfc7597.html#section-5.1)）。
+
+```text
+ 0                   1
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
++-----------+-----------+-------+
+|     A     |    PSID   |   j   |
++-----------+-----------+-------+
+   a ビット     k ビット   m ビット
+```
+
+PSID は全員で同じ位置にあるので、PSID が違えばポートの範囲は重なりません。先頭の A は 0 を使わないことで、0〜1023 のシステムポートを外します。RFC は、a の既定値 6 について「this excludes the system ports (0-1023)」と書いています。
+
+RFC 7597 の付録 A の例 1 を、Python で計算し直しました。利用者のプレフィックスは `2001:db8:0012:3400::/56`、BMR は Rule IPv6 `2001:db8::/40`、Rule IPv4 `192.0.2.0/24`、EA ビット 16 です。
+
+```text
+EA ビット (16 bit) = 0x1234 = 0001001000110100
+  IPv4 の後ろ 8 bit = 0x12 -> IPv4 アドレス 192.0.2.18
+  PSID (8 bit) = 0x34
+連続するポートの数 2^m = 4、範囲の数 = 63、合計 252 ポート
+最初の 3 つ: 1232-1235, 2256-2259, 3280-3283 ... 最後: 64720-64723
+CE の IPv6 アドレス: 2001:0db8:0012:3400:0000:c000:0212:0034
+RFC の値と一致: True
+```
+
+RFC の付録は、この例の使えるポートを「Available ports (63 ranges): 1232-1235, 2256-2259, ...... , 63696-63699, 64720-64723」としており、計算と一致します（[RFC 7597 付録 A](https://www.rfc-editor.org/rfc/rfc7597.html#appendix-A)）。この家は、`192.0.2.18` というアドレスを 256 軒で分け合い、そのうち 252 個のポートだけを使えます。
+
+<MapePorts client:visible />
+
+PSID の長さ k を変えると、共有する軒数と 1 軒あたりのポート数が入れ替わります。RFC 7597 の式「2^(16 - k) - 2^m」で計算すると次のとおりです。
+
+| PSID の長さ k | 1 つの IPv4 アドレスを共有する軒数 | 1 軒あたりのポート数 |
+| --- | --- | --- |
+| 4 | 16 | 4,032 |
+| 6 | 64 | 1,008 |
+| 8 | 256 | 252 |
+
+### ポートの範囲が決まっていることの影響
+
+家のルーターの NAPT は、外へ出る IPv4 の接続の送信元ポートを、この範囲の中から選ばなければなりません。RFC 7597 は、CE の NAPT は送信元のポート番号を「so that they fall within the CE's assigned port range（CE に割り当てられたポートの範囲に収まるように）」書き換えなければならない、と定めています（[RFC 7597 4](https://www.rfc-editor.org/rfc/rfc7597.html#section-4)）。
+
+そのため、家の中の端末が IPv4 で同時に張れる接続の数に上限が生まれます。多数の接続を同時に張るアプリケーションや、多くの端末がある家では、ポートが足りなくなって新しい接続が作れなくなることがあります。外から接続を受けたい場合（ゲームの待ち受けやサーバの公開）も、自分の範囲のポートしか使えず、特定のポート番号（たとえば 80 番）を指定して開けることはできません。IPv6 で通信する分には、この制約はかかりません。
+
+なりすましへの対策もこの計算でできます。RFC 7597 は、CE と BR はパケットを受け取ったら、送信元の IPv6 アドレスから IPv4 アドレスと PSID を取り出し、中の IPv4 パケットの送信元アドレスとポートがその範囲から外れていたら黙って捨てなければならない、と定めています（[RFC 7597 8.1](https://www.rfc-editor.org/rfc/rfc7597.html#section-8.1)）。BR が利用者ごとの表を持たなくても、計算だけで「この家はこのポートを使ってよいか」を確かめられます。
+
+## 端末が直接見えるようになる
+
+IPv4 の家庭では、NAT のおかげで、外から家の中の端末へいきなり接続することはできませんでした。IPv6 では、家の中の端末一つひとつがグローバルアドレスを持ちます。アドレスとしては、世界のどこからでも届く形になっているということです。
+
+NAT は本来、アドレスを節約するための仕組みで、守るための仕組みではありません。IPv6 の家庭用ルーターは、内側から始まっていない通信を外から通さない **ステートフルなフィルタ** を持つべきだとされています。この話は第 91 回で、NAT 越えとあわせて見ます。一時アドレスも、端末を外から狙われにくくする役に立ちます。
+
+## まとめ
+
+- IPv4 のアドレスは 2011 年に新規の在庫が尽きた。IPv6 はアドレスを 128 ビットにし、家庭の LAN では前半 64 ビットのプレフィックスと後半 64 ビットのインタフェース ID に分けて使う
+- 表記は RFC 5952 で 1 つに揃える。先頭の 0 を省き、0 の続く区切りは `::` で最も長くまとめ、小文字で書く
+- IPv6 では ARP の代わりに NDP を使う。RS・RA でルーターを見つけ、NS・NA で相手の MAC アドレスを引き、アドレスの重複も NS で確かめる
+- 端末は、RA のプレフィックスと自分で作ったインタフェース ID からアドレスを作る（SLAAC）。MAC アドレスを埋めると追跡されるので、今の OS は RFC 7217 の安定したアドレスと RFC 8981 の一時アドレスを使う
+- 家のルーターは、事業者から DHCPv6-PD でプレフィックスを受け取り、LAN へは RA で配る
+- 日本の光回線では、PPPoE は利用者ごとのセッションを網終端装置で終える方式で、装置の増設が追いつかずに混雑した。IPoE はセッションを使わず IPv6 をそのまま流し、出口の装置を事業者が増やせる
+- IPoE の上で IPv4 を使うには、DS-Lite（NAT は事業者の側）か MAP-E（NAT は家のルーター）を使う。MAP-E は IPv6 のプレフィックスから IPv4 アドレスとポートの範囲を計算で決めるので、事業者の装置が状態を持たずに済む代わりに、1 軒が使えるポートの数が限られる
+- IPv6 では端末が直接見えるアドレスを持つ。守るのは NAT ではなくルーターのフィルタの仕事になる
+
+次の第 65 回では、ここまでのスイッチ、VLAN、ルーター、BGP の話が、クラウドのネットワークの製品の中でどう置き換えられているのかを見ます。

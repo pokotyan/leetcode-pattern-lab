@@ -1,0 +1,355 @@
+---
+title: VLAN と、ループを断つ仕組み
+description: 1 台のスイッチを、配線を変えずに別々の LAN に分けるにはどうするのか。フレームに 4 バイトのタグを挟む 802.1Q、アクセスポートとトランク、二重タグで VLAN を越える攻撃、4094 の上限と VXLAN、そして冗長な配線が止まらないブロードキャストを生む理由と、それを 1 辺閉じて止める STP を、Linux のブリッジで実際に組んで確かめます
+chapter: link
+order: 2
+status: published
+topics:
+  - ブロードキャストドメイン
+  - VLAN
+  - 802.1Q タグ
+  - PVID
+  - アクセスポート / トランクポート
+  - ネイティブ VLAN
+  - VLAN ホッピング
+  - QinQ（802.1ad）
+  - VXLAN / VNI
+  - ブロードキャストストーム
+  - STP（スパニングツリー）
+  - BPDU
+  - ルートブリッジ
+  - RSTP / MSTP
+  - リンクアグリゲーション / LACP
+requires:
+  - ll-60-switch
+---
+
+import Callout from '../../components/Callout.astro'
+import StpLoop from '../../components/sim/problems/StpLoop'
+
+## 全員宛ては、どこまで届くのか
+
+第 60 回で見たとおり、スイッチは送信元の MAC アドレスを覚え、宛先が分かっているフレームはその口にだけ出します。宛先がまだ分からないフレームと、宛先が `ff:ff:ff:ff:ff:ff`（全員宛て、ブロードキャスト）のフレームは、受けた口以外の**すべての口**へ流します。ARP の「この IP アドレスを持っているのは誰？」は、このブロードキャストで送られます。
+
+全員宛てのフレームが届く範囲を、**ブロードキャストドメイン**と呼びます。スイッチを何台つないでも、スイッチだけでつながっている範囲は 1 つのブロードキャストドメインです。端末が 1,000 台ある LAN では、誰かが ARP を 1 回送るたびに 999 台がそれを受け取って捨てます。それに、同じ LAN にいれば、経理の PC と来客用の Wi-Fi の端末が互いに直接フレームを送れてしまいます。
+
+この範囲を分けたいとき、昔はスイッチを分けて配線し直していました。この回では、1 台のスイッチのまま論理的に分ける **VLAN** と、冗長に配線したときに起きる別の問題、つまり**全員宛てのフレームが永遠に回り続ける**ことと、その止め方を見ます。
+
+<StpLoop client:visible />
+
+## VLAN：口ごとに「どの LAN か」を決める
+
+VLAN（Virtual LAN）は、スイッチの口ごとに所属する LAN の番号（VLAN ID、VID）を決め、**同じ VID の口のあいだでだけフレームを流す**仕組みです。Linux カーネルの文書は、VLAN を「a logical segmentation of a physical network into multiple isolated broadcast domains」（物理的なネットワークを、互いに隔離された複数のブロードキャストドメインへ論理的に分けたもの）と説明しています（[Linux kernel: Ethernet Bridging](https://docs.kernel.org/networking/bridge.html)）。
+
+スイッチの中では、MAC アドレスの表も VLAN ごとに分かれます。宛先の MAC アドレスが表にあっても、VID が違えば別物として扱います。同じ文書は、VLAN のフィルタを有効にしたブリッジが「based on their destination MAC address and VLAN tag (both must match)」（宛先の MAC アドレスと VLAN タグの両方が一致したときに）転送先を決めると書いています。
+
+### 手元で: 1 台のブリッジを VLAN 10 と 20 に分ける
+
+Linux のブリッジは、VLAN を理解するスイッチとして動きます。Docker の Linux コンテナ（OrbStack、カーネル 7.0.14、iproute2 6.9.0、tcpdump 4.99.4）の中に、ネットワーク名前空間で 3 台の端末を作り、1 台のブリッジにつなぎました。
+
+- h1: VLAN 10 の口（p1）
+- h2: VLAN 20 の口（p2）
+- h3: トランクの口（trunk）の向こうで、VLAN 10 のタグ付きフレームを受ける
+
+3 台には、わざと**同じサブネット**（10.0.0.1〜3/24）の IP アドレスを振っています。IP の上では隣同士です。
+
+```sh
+ip link add br0 type bridge vlan_filtering 1
+bridge vlan del dev p1 vid 1; bridge vlan add dev p1 vid 10 pvid untagged
+bridge vlan del dev p2 vid 1; bridge vlan add dev p2 vid 20 pvid untagged
+bridge vlan del dev trunk vid 1
+bridge vlan add dev trunk vid 10; bridge vlan add dev trunk vid 20
+```
+
+```text
+== bridge vlan show
+port              vlan-id
+br0               1 PVID Egress Untagged
+p1                10 PVID Egress Untagged
+p2                20 PVID Egress Untagged
+trunk             10
+                  20
+== h1 -> h3 (同じ VLAN 10、トランク越し)
+2 packets transmitted, 2 received, 0% packet loss, time 1050ms
+== h1 -> h2 (同じサブネット、別の VLAN)
+2 packets transmitted, 0 received, 100% packet loss, time 1014ms
+== h1 の ARP 表
+10.0.0.2 dev h1-eth0 INCOMPLETE
+10.0.0.3 dev h1-eth0 lladdr 46:c2:f4:94:c6:ef REACHABLE
+```
+
+h1 から h3 へは届き、h2 へは届きません。h1 の ARP 表で 10.0.0.2 が `INCOMPLETE` のままなのは、「10.0.0.2 は誰？」というブロードキャストが、VLAN 20 の h2 に一度も届いていないからです。IP アドレスが同じサブネットでも、**その下の L2 で分かれていれば、ARP の段階で話が終わります**。ブリッジの MAC アドレスの表も、VID ごとに載っていました。
+
+```text
+da:1f:b8:cc:eb:3b dev p1 vlan 10 master br0
+72:60:54:7b:01:ce dev p2 vlan 20 master br0
+46:c2:f4:94:c6:ef dev trunk vlan 10 master br0
+```
+
+（ここに出る MAC アドレスは、コンテナの中で作った仮想の口に毎回ランダムに振られるものです。）
+
+## アクセスポートとトランク
+
+上の設定には、2 種類の口がありました。
+
+| 種類 | つなぐもの | 受けたフレーム | 出すフレーム |
+| --- | --- | --- | --- |
+| アクセスポート（p1, p2） | VLAN を知らない端末 | タグなしを、その口の VID（PVID）のものとして扱う | タグを外して出す |
+| トランクポート（trunk） | 別のスイッチ、VLAN を扱えるサーバ | タグを見て VID を決める | どの VID かをタグで示して出す |
+
+`bridge(8)` の説明では、`pvid` は「Any untagged frames will be assigned to this VLAN」（タグのないフレームはすべてこの VLAN に入れる）、`untagged` は「the vlan specified is to be treated as untagged on egress」（この VLAN のフレームは出すときにタグを付けない）という指定です（[bridge(8)](https://man7.org/linux/man-pages/man8/bridge.8.html)）。p1 と p2 には両方を付け、トランクにはどちらも付けていません。
+
+端末は VLAN を知る必要がありません。h1 は普通のタグなしフレームを送っているだけで、それを「VLAN 10 のもの」と決めているのは、スイッチの口の設定です。
+
+スイッチとスイッチのあいだを VLAN ごとに 1 本ずつ配線するわけにはいかないので、1 本のトランクに複数の VLAN を通し、フレームごとに「どの VLAN か」を書き込みます。それがタグです。
+
+## 802.1Q のタグ：4 バイトを挟む
+
+トランク上で tcpdump を取ると、h1 の ARP と ping に `vlan 10` が付いて流れていました。
+
+```text
+da:1f:b8:cc:eb:3b > ff:ff:ff:ff:ff:ff, ethertype 802.1Q (0x8100), length 46: vlan 10, p 0, ethertype ARP (0x0806), Request who-has 10.0.0.3 tell 10.0.0.1, length 28
+46:c2:f4:94:c6:ef > da:1f:b8:cc:eb:3b, ethertype 802.1Q (0x8100), length 46: vlan 10, p 0, ethertype ARP (0x0806), Reply 10.0.0.3 is-at 46:c2:f4:94:c6:ef, length 28
+da:1f:b8:cc:eb:3b > 46:c2:f4:94:c6:ef, ethertype 802.1Q (0x8100), length 102: vlan 10, p 0, ethertype IPv4 (0x0800), 10.0.0.1 > 10.0.0.3: ICMP echo request, id 53, seq 1, length 64
+```
+
+タグはフレームのどこに入っているのか。優先度（PCP）を 5 にしたタグ付きの ARP をバイト列で見ます。
+
+```text
+vlan 10, p 5, ethertype ARP (0x0806), Request who-has 10.9.0.2 ...
+	0x0000:  ffff ffff ffff 2647 1cad e7f8 8100 a00a
+	0x0010:  0806 0001 0800 0604 0001 2647 1cad e7f8
+```
+
+宛先 6 バイト、送信元 6 バイトの後ろ、本来なら上の層の種類（ARP なら `0806`）が来る位置に、**`8100` と `a00a` の 4 バイト**が割り込んでいます。
+
+| バイト | 中身 |
+| --- | --- |
+| `81 00` | TPID。「この後ろは VLAN タグ」という印。タグの無いフレームでは、ここに `0806`（ARP）や `0800`（IPv4）が来る |
+| `a0 0a` = `1010 0000 0000 1010` | 先頭 3 ビットが **PCP**（優先度、`101` = 5）、次の 1 ビットが **DEI**（混雑時に捨ててよい印、0）、残り 12 ビットが **VID**（`0000 0000 1010` = 10） |
+
+その後ろに元の `0806` が続きます。タグを外す側は、この 4 バイトを抜けば元のフレームに戻ります。規格は IEEE 802.1Q で、IEEE はこれをブリッジとブリッジでつないだネットワークの規格として出しています（[IEEE 802.1Q-2022](https://standards.ieee.org/ieee/802.1Q/10323/)。PDF は IEEE GET Program で無償公開されています）。
+
+### 4094 という上限
+
+VID は 12 ビットなので 0〜4095 の 4096 通りですが、Linux のブリッジに 0 と 4095 を設定しようとすると断られました。
+
+```text
+vid 0: Error: bridge: Vlan id is invalid.
+vid 1: ok
+vid 4094: ok
+vid 4095: Error: bridge: Vlan id is invalid.
+```
+
+Linux のブリッジは、VID が 0 より大きく、12 ビットの最大値 0xfff（4095）より小さいことを条件にしています（[net/bridge/br_private.h の br_vlan_valid_id](https://github.com/torvalds/linux/blob/master/net/bridge/br_private.h)）。VID 0 のタグは、カーネルの文書が「priority-tagged」と呼ぶ、優先度だけを運び VLAN を指定しないフレームに使われます。使える VLAN は **1〜4094 の 4094 個**です。1 つの会社の LAN なら足ります。足りなくなるのは、何千もの顧客のネットワークを 1 つの建物に収めるデータセンターです（この話は後半の VXLAN で戻ります）。
+
+<Callout type="note" title="PCP は「どれから先に送るか」の目印">
+  タグの先頭 3 ビットの PCP（Priority Code Point）は、スイッチの出口の待ち行列のどれに入れるかの目印です。音声通話のフレームを 5 や 6 にしておけば、混んだ口でも先に出してもらえます。上の実験では、Linux の VLAN の口に `egress-qos-map 0:5` を付けて、送るフレームの PCP を 5 にしました。端末が付けた値を信じるかどうかはスイッチの設定次第で、信じずに口ごとに付け直すのが普通です。
+</Callout>
+
+## VLAN の間は、ルーターを通る
+
+VLAN 10 の h1 と VLAN 20 の h2 は、どうやっても L2 では話せません。話させたいときは、**ルーター**（または L3 スイッチ）を両方の VLAN に足を出す形で置き、IP の層で中継させます。そのとき 2 つの VLAN には別のサブネット（10.0.10.0/24 と 10.0.20.0/24 のように）を割り当て、端末は「自分のサブネットの外へはデフォルトゲートウェイへ送る」という動きで、ルーターにフレームを渡します。1 本のトランクの上に VLAN ごとの口（`eth0.10`、`eth0.20` のような副インタフェース）を切ってルーターにつなぐ形は、「ルーター・オン・ア・スティック」と呼ばれます。
+
+ルーターが何を見て次の行き先を決めるのかは、次の第 62 回で見ます。VLAN が「L2 の範囲を区切る」ものなら、ルーターは「区切られた範囲どうしを、決めた規則でつなぐ」ものです。
+
+## 二重のタグで VLAN を越える
+
+トランクにはもう 1 つ設定があります。**ネイティブ VLAN**です。トランクの上で、ある 1 つの VLAN だけはタグを付けずに流す、という設定で、タグを知らない古い機器とつなぐために使われてきました。Linux のブリッジでは、トランクの口に VID 1 を `pvid untagged` で残しておくと、この状態になります。
+
+ここに穴があります。攻撃者がネイティブ VLAN（ここでは 1）と同じ VLAN のアクセスポートにいて、**タグを 2 枚重ねた**フレームを送るとどうなるか。外側が VLAN 1、内側が VLAN 20 です。
+
+1. 最初のスイッチは外側のタグを見て「VLAN 1 のフレーム」と判断し、トランクへ出す
+2. トランクでは VLAN 1 はネイティブなので、**外側のタグを外して**出す
+3. 次のスイッチには、内側の「VLAN 20」のタグだけが付いたフレームが届く。VLAN 20 のフレームとして、VLAN 20 の口へ配る
+
+2 台のブリッジで実際に組みました。攻撃者は sw1 の VLAN 1 の口に、被害者は sw2 の VLAN 20 の口にいます。
+
+```text
+== 攻撃: 外側 VLAN 1・内側 VLAN 20 の二重タグで ARP を送る
+-- トランク上（外側のタグが外れているか）
+86:8c:a4:9c:27:12 > ff:ff:ff:ff:ff:ff, ethertype 802.1Q (0x8100), length 46: vlan 20, p 0, ethertype ARP (0x0806), Request who-has 10.20.0.9 tell 10.20.0.66, length 28
+-- VLAN 20 の被害者の受信
+86:8c:a4:9c:27:12 > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Request who-has 10.20.0.9 tell 10.20.0.66, length 28
+（受信したフレームの行数: 1）
+== 対策: トランクでネイティブ VLAN をタグ付きにする（vid 1 の untagged を外す）
+-- トランク上（外側のタグが外れているか）
+86:8c:a4:9c:27:12 > ff:ff:ff:ff:ff:ff, ethertype 802.1Q (0x8100), length 50: vlan 1, p 0, ethertype 802.1Q (0x8100), vlan 20, p 0, ethertype ARP (0x0806), Request who-has 10.20.0.9 tell 10.20.0.66, length 28
+-- VLAN 20 の被害者の受信
+（受信したフレームの行数: 0）
+```
+
+VLAN 1 にいるはずの攻撃者のフレームが、トランクの上では VLAN 20 のフレームになり、VLAN 20 の被害者に届きました。トランクでネイティブ VLAN にもタグを付けるようにすると、トランクの上でタグが 2 枚とも残り、sw2 は外側の VLAN 1 として扱うので、VLAN 20 には届きません。
+
+この攻撃は一方通行です。返事は攻撃者のいる VLAN へ戻ってこないので、会話はできません。それでも、届くだけで成立する攻撃（偽の ARP、UDP の 1 発で効く脆弱性）には使えます。対策の定石は、**ネイティブ VLAN を端末用の VLAN と分けて誰もいない番号にする**、**トランクでネイティブ VLAN にもタグを付ける**、**端末の口でトランクを自動で組まない**の 3 つです。
+
+## 4 バイトを重ねる、もっと大きな番号にする
+
+### QinQ（802.1ad）
+
+二重のタグには、正規の使い道もあります。通信事業者が、顧客ごとに VLAN を割り当てたまま、その中に顧客が自分で使う VLAN を通したい場合です。外側に事業者のタグ（S タグ）、内側に顧客のタグ（C タグ）を付けます。これが **QinQ**（IEEE 802.1ad）で、外側の TPID には `0x8100` ではなく `0x88a8` を使い、通常の 802.1Q のタグと区別します。Linux カーネルの文書は、ブリッジの VLAN の種類として「The valid values are 0x8100(802.1Q) or 0x88A8(802.1AD).」と書いています（[Linux kernel: Ethernet Bridging](https://docs.kernel.org/networking/bridge.html)）。
+
+```text
+ethertype 802.1Q-QinQ (0x88a8), length 94: vlan 100, p 0, ethertype 802.1Q (0x8100), vlan 10, p 0, ethertype IPv6 (0x86dd), ...
+	0x0000:  3333 ffe4 9c75 c2a6 f1e4 9c75 88a8 0064
+	0x0010:  8100 000a 86dd 6000 0000 0020 3aff 0000
+```
+
+`88a8 0064`（S タグ、VID 100）の後ろに `8100 000a`（C タグ、VID 10）が続いています。4094 × 4094 の組み合わせが使えるようになりますが、L2 のままなので、範囲が広がるほどブロードキャストも広がります。
+
+### VXLAN：L2 のフレームを UDP に包む
+
+データセンターで仮想マシンを顧客ごとに分けるには、4094 では足りません。VXLAN の RFC は、問題をこう書いています。「The current VLAN limit of 4094 is inadequate in such situations.」（現在の VLAN の上限である 4094 は、こうした状況では足りない）（[RFC 7348, Section 1](https://www.rfc-editor.org/rfc/rfc7348#section-1)）。
+
+VXLAN は、L2 のフレームを丸ごと **UDP のデータグラムに包んで**、IP のネットワークの上を運びます。区別の番号は 24 ビットの VNI です。「Each VXLAN segment is identified through a 24-bit segment ID, termed the "VXLAN Network Identifier (VNI)".  This allows up to 16 M VXLAN segments to coexist within the same administrative domain.」（各 VXLAN セグメントは VNI と呼ばれる 24 ビットのセグメント ID で識別され、1 つの管理範囲に最大 1,600 万のセグメントを共存させられる）（[RFC 7348, Section 4](https://www.rfc-editor.org/rfc/rfc7348#section-4)）。宛先の UDP ポートは 4789 です（[RFC 7348, Section 5](https://www.rfc-editor.org/rfc/rfc7348#section-5)）。
+
+包む装置（VTEP）から見ると、間の物理ネットワークはただの IP のネットワークで、L2 の広がりも、この後で見るループの問題も持ち込みません。RFC 7348 は、VXLAN が要る理由の 1 つとして、データセンター全体を 1 つの L2 にすると「using traditional approaches like the Spanning Tree Protocol (STP) for a loop-free topology can result in a large number of disabled links」（ループの無い形にするために STP のような従来の方法を使うと、使われない線が大量に出る）ことも挙げています（[RFC 7348, Section 1](https://www.rfc-editor.org/rfc/rfc7348#section-1)）。クラウドの仮想ネットワークがこの形をどう使っているかは、第 65 回で見ます。
+
+## 線を 2 本にすると、何が起きるか
+
+ここから後半です。スイッチ同士を 1 本の線でつないでいると、その線か片方のスイッチが壊れたとき、向こう側とはまったく話せなくなります。そこで線を 2 本にする、あるいは 3 台を三角形につなぐ、という冗長化を考えます。
+
+そこに、全員宛てのフレームを 1 つ流すとどうなるか。上の SIM の「STP なしの三角形」で追えます。S1 は受けた口以外の 2 方向へ写しを出し、S2 と S3 もそれぞれ受けた口以外へ出します。写しは三角形を両回りに回り、**どこにも消える理由がありません**。IP のパケットには、ルーターを通るたびに 1 ずつ減って 0 で捨てられる TTL がありますが、Ethernet のフレームには寿命を表す欄がありません。
+
+### 手元で: 2 台のブリッジを 2 本でつなぐ
+
+Linux のブリッジを 2 台作り（sw1 と sw2）、2 本の線（a1–b1 と a2–b2）でつなぎ、sw1 に端末 h を置きました。STP は切ってあります。h から ARP 要求を **1 発だけ**送り、sw1 の a1 の口が送ったフレーム数を 1 秒ごとに読みます。
+
+```text
+== STP なし: ARP 要求（ブロードキャスト）を 1 発だけ送る
+t=1s a1 が送ったフレーム累計: 13411514
+t=2s a1 が送ったフレーム累計: 18254651
+t=3s a1 が送ったフレーム累計: 27171242
+== ループを止める（線を 1 本落とす）
+落とした後 1 秒の増分: 0
+```
+
+1 発の ARP が、1 本の線の上だけで **1 秒に数百万回**送り直されています。同じ実験を 3 回取ると、1 秒目の値は 390 万、1,341 万、2,232 万とばらつきました。同じ VM で他の作業が動いていたためで、上限は CPU が回せる速さで決まっているだけです。線を 1 本落とすと、増分は 0 になりました。ループの中にいた写しは、その瞬間に行き場を失って消えます。
+
+これが**ブロードキャストストーム**です。実機のスイッチでも同じことが起き、線の帯域と、全員宛てを受け取るすべての端末の CPU が埋まります。
+
+### MAC アドレスの表も壊れる
+
+被害は帯域だけではありません。スイッチは、フレームの**送信元**を見て「この MAC アドレスはこの口の先にいる」と学習します（第 60 回）。ループの中では、h が送ったフレームの写しが、h のいない口からも何度も入ってきます。ループ中に、h の MAC アドレスが sw1 と sw2 の表のどの口に載っているかを 0.2 秒ごとに見ました。
+
+```text
+sw1: a2  / sw2: b2
+sw1: a2  / sw2: b2
+sw1: a1  / sw2: b1
+sw1:  / sw2: b2
+sw1: a1 a2  / sw2: b1
+sw1: a2  / sw2: b1
+sw1: a1 a2  / sw2: b1
+sw1: a1 a2  / sw2: b2
+sw1:  / sw2:
+sw1: a2  / sw2:
+```
+
+h が本当にいるのは sw1 の a0 の口ですが、sw1 の表には a1 と a2 しか現れません。h 宛てのフレームは、h ではなくループの方へ送られてしまいます。ストームが帯域を埋めるだけでなく、**ループに関係のない通信まで行き先を失う**のはこのためです。1 回のサンプルで 2 つの口が並んでいるのは、読んでいる途中で書き換わったためです。
+
+## STP：1 辺を閉じて、木にする
+
+冗長な線は欲しい。でもループは困る。この両立のために作られたのが **STP**（Spanning Tree Protocol）です。考え方は単純で、**スイッチ同士で相談して、ループができないように一部の口を閉じる**。閉じた口は待機させておき、使っている線が切れたら開けます。グラフの言葉でいえば、つながり方（グラフ）から、全頂点を含みループの無い部分（全域木、spanning tree）を選ぶ、ということです。
+
+Linux カーネルの文書はこの役割を、STP は「helps prevent loops and broadcast storms in Ethernet networks by identifying and disabling redundant links」（冗長な線を見つけて止めることで、Ethernet のループとブロードキャストストームを防ぐ）と説明しています（[Linux kernel: Ethernet Bridging, STP](https://docs.kernel.org/networking/bridge.html)）。
+
+### 手順：根を決め、根への近道を残す
+
+スイッチ同士は **BPDU**（Bridge Protocol Data Unit）という専用のフレームを交換します。中身の要点は「私が思う root は誰か、そこまでのコストはいくつか、私は誰か」の 3 つです。
+
+1. **root ブリッジを選ぶ**。各スイッチは「優先度（既定 32768）＋ MAC アドレス」のブリッジ ID を持ち、最初は全員が自分を root だと名乗ります。受け取った BPDU の root の方が小さければそれに乗り換え、最終的に**ブリッジ ID のいちばん小さいスイッチ**が root になります。
+2. **root ポートを選ぶ**。root 以外のスイッチは、root までのコストがいちばん小さい口を 1 つ選びます。
+3. **線ごとに代表（designated）を決める**。各線の両端のうち、root までのコストが小さい方（同点ならブリッジ ID の小さい方）の口が、その線にフレームを流す担当になります。
+4. **残りの口は blocking**。BPDU だけを受け取り、データのフレームは送りも受けもしません。
+
+SIM の「STP あり」では、S1・S2・S3 がすべて優先度 32768 なので、MAC アドレスの小さい S1 が root になり、S2–S3 の線では、コストが同点なので ID の小さい S2 の口が代表、S3 の口が blocking になります。その後に流したブロードキャストは、H2 と H3 にちょうど 1 回ずつ届いて消えます。
+
+### 手元で: STP を入れると、口が 1 つ閉じる
+
+先ほどの 2 台・2 本のループで、両方のブリッジの STP を有効にしました。sw1 を root にするために優先度を 4096 に下げています。
+
+```text
+== STP を有効にする（forward_delay 4 秒）
+t=0s sw1/a1=forwarding sw1/a2=forwarding sw1/a0=forwarding sw2/b1=forwarding sw2/b2=forwarding
+t=1s sw1/a1=forwarding sw1/a2=forwarding sw1/a0=forwarding sw2/b1=forwarding sw2/b2=blocking
+...
+t=12s sw1/a1=forwarding sw1/a2=forwarding sw1/a0=forwarding sw2/b1=forwarding sw2/b2=blocking
+-- ルートブリッジの ID
+sw1 root_id=1000.167bf54ef483 bridge_id=1000.167bf54ef483
+sw2 root_id=1000.167bf54ef483 bridge_id=8000.0643251f7fb9
+STP ありで ARP 1 発後 2 秒の a1 の送信増分（BPDU を含む）: 2
+```
+
+ブリッジ ID は「優先度（16 進）.MAC アドレス」の形で表示され、sw1 が `1000`（4096）、sw2 が既定の `8000`（32768）です。両方が sw1 を root と認め、root でない sw2 の 2 本の口のうち片方（b2）が blocking になりました。ARP を 1 発送っても、2 秒で増えたのは BPDU を含めて 2 フレームだけです。
+
+この実験では、すでに動いている口に後から STP を有効にしたので、最初の 1 秒は全部の口が forwarding のままでした。その間にフレームが流れていれば、ループしていたはずです。通常の順序、つまり **STP が動いているスイッチに線をつないだとき**はどうなるか。1 本目でつないで落ち着かせた後、2 本目を挿しました。
+
+```text
+== 1 本目だけで落ち着いた状態
+sw1/a1=forwarding sw1/a2=disabled sw2/b1=forwarding sw2/b2=disabled
+== 2 本目（a2-b2）を挿す
+t=0s sw1/a2=listening sw2/b2=listening
+t=2s sw1/a2=listening sw2/b2=blocking
+t=4s sw1/a2=learning sw2/b2=blocking
+t=8s sw1/a2=forwarding sw2/b2=blocking
+```
+
+新しくつないだ口は、すぐにはデータを流しません。**listening**（BPDU だけを聞いて自分の役割を決める）を経て、**learning**（データは流さず、MAC アドレスだけ覚える）を経て、ようやく **forwarding** です。sw2 の側は 2 秒で負けが決まり、blocking に落ち着きました。
+
+Linux カーネルの文書は、それぞれの状態を次のように定めています（[Linux kernel: Ethernet Bridging](https://docs.kernel.org/networking/bridge.html)）。
+
+| 状態 | 文書の記述 |
+| --- | --- |
+| listening | 「In this state the port listens for STP BPDUs and drops all other traffic frames.」 |
+| learning | 「In this state the port will accept traffic only for the purpose of updating MAC address tables.」 |
+| forwarding | 「Port is fully active.」 |
+| blocking | 「In this state, port will only process STP BPDUs.」 |
+
+### 収束が遅い
+
+listening と learning にとどまる時間は、それぞれ forward delay です。上の実験では 4 秒にしたので、forwarding まで 8 秒かかりました。既定値を新しく作ったブリッジで読むと、次のとおりでした。
+
+```text
+hello_time=200
+forward_delay=1500
+max_age=2000
+priority=32768
+```
+
+単位は 1/100 秒で、Hello（BPDU を送る間隔）が 2 秒、forward delay が 15 秒、max age（BPDU が途絶えてから相手を死んだとみなすまで）が 20 秒です。`ip-link(8)` は `forward_delay` などを「in seconds」と書いていますが、`ip link set ... forward_delay 400` で 4 秒になったので、このコマンドに渡す値も 1/100 秒単位でした。
+
+既定値のままだと、新しい線をつないでから使えるまで **30 秒**、使っていた線が壊れたことに気づいてから迂回路が開くまで、最悪で max age の 20 秒＋ 30 秒の **50 秒**かかります。その間、その線の向こうとは通信できません。
+
+## 速くする、分ける、束ねる
+
+### RSTP と MSTP
+
+この遅さを改めたのが **RSTP**（Rapid STP）です。待機中の口に「代わりの root ポート（alternate）」という役割を与えて、壊れたら待たずに切り替える、隣のスイッチと提案・合意をやりとりして、forward delay のタイマーを待たずに forwarding へ進む、といった工夫で、切り替えを速くしています。カーネルの文書によれば、元の STP は 802.1D-2004 で RSTP に置き換えられ、802.1D の内容は 2014 年までに 802.1Q などに取り込まれて、802.1D そのものは 2022 年に正式に廃止されました（[Linux kernel: Ethernet Bridging, STP](https://docs.kernel.org/networking/bridge.html)）。
+
+**MSTP**（Multiple STP）は、VLAN ごとに別の木を作れるようにしたものです。STP が 1 つの木しか作らないと、閉じた線は全 VLAN で使われません。VLAN 10 は線 A、VLAN 20 は線 B を通る、というように木を分ければ、冗長な線も働かせられます。
+
+Linux のブリッジには、カーネルの中の STP の実装とは別に、STP を `mstpd` のようなユーザー空間のデーモンに任せる仕組みが用意されています（同文書の「User space STP helper」）。この回の実験で動いていたのは、カーネルの中の実装です。
+
+### リンクアグリゲーション：ループにせず束ねる
+
+2 本の線を両方使いたいなら、もう 1 つの方法があります。2 本を**束ねて 1 本の論理的な線**として扱う、リンクアグリゲーションです。両端のスイッチ（またはサーバ）が「この 2 本は 1 本の束」と合意していれば、STP から見ても線は 1 本なので、ループになりません。合意のためのプロトコルが LACP で、もとは IEEE 802.3ad として規格化されました。
+
+Linux では bonding ドライバの `802.3ad` モードがこれで、文書は「IEEE 802.3ad Dynamic link aggregation.  Creates aggregation groups that share the same speed and duplex settings.」と説明しています（[Linux kernel: Bonding](https://docs.kernel.org/networking/bonding.html)）。どのフレームをどの線に流すかは、送信元・宛先のアドレスなどのハッシュで決めます（同文書の `xmit_hash_policy`）。1 つの通信の流れは 1 本の線に固定されるので、**1 本の TCP 接続が 2 倍速くなるわけではありません**。多数の流れを並べたときに合計が増えます。
+
+<Callout type="tip" title="データセンターは、L2 を広げずに L3 で冗長化する">
+  STP は、冗長な線の半分近くを止めて成り立つ仕組みです。大きなデータセンターでは、スイッチ同士を L2 でつなぐのをやめて L3（IP のルーティング）でつなぎ、同じコストの経路を複数同時に使う ECMP で冗長化と帯域の両方を得るのが主流です。そのうえで、仮想マシンから見た L2 は、先ほどの VXLAN で IP の上に作ります。L2 は「VXLAN の中の、小さな範囲」に閉じ込め、物理の線はすべて L3 にする、という分担です。
+</Callout>
+
+## まとめ
+
+- 全員宛てのフレームが届く範囲がブロードキャストドメイン。スイッチだけでつながっている範囲は、何台あっても 1 つ
+- VLAN は口ごとに VID を決め、同じ VID の口の間だけでフレームを流す。同じサブネットの IP を振っても、VLAN が違えば ARP が届かず通じない
+- アクセスポートはタグなしのフレームを PVID の VLAN に入れ、トランクは 802.1Q の 4 バイトのタグ（TPID `0x8100`、PCP 3 ビット、DEI 1 ビット、VID 12 ビット）で VLAN を示す。使える VID は 1〜4094
+- VLAN の間の通信には、ルーターを通す必要がある（第 62 回）
+- ネイティブ VLAN と二重のタグを組み合わせると、別の VLAN へフレームを送り込める。ネイティブ VLAN を空けておき、トランクではタグを付ける
+- QinQ はタグを重ね、VXLAN は L2 のフレームを UDP（ポート 4789）に包んで 24 ビットの VNI で分ける
+- Ethernet のフレームには寿命が無いので、冗長な配線のループでは 1 発のブロードキャストが毎秒数百万回回り続け、MAC アドレスの表も壊れる
+- STP は root ブリッジを選び、各スイッチから root への近道と、線ごとの代表の口だけを残して、残りを blocking にする。既定のタイマーでは、使えるまで 30 秒、障害からの迂回に最悪 50 秒かかる
+- RSTP は切り替えを速くし、MSTP は VLAN ごとに木を分け、リンクアグリゲーションは線を束ねてループにしない
+
+次の第 62 回では、VLAN の境目で何が起きるのか、つまりルーターがパケットを受け取ってから次の行き先を決めるまでを見ます。
