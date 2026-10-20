@@ -1,0 +1,321 @@
+---
+title: ロードアベレージと top を読む
+description: 「ロードアベレージが 8」は、何が 8 個あるという意味なのか。Linux が数えている 2 種類のタスク、1・5・15 分の値を作る指数移動平均の式、CPU は暇なのに値が上がる場面、top の各行と各列、そしてロードアベレージの弱点を補う PSI を、カーネルのソースと実測で確かめます
+chapter: observe
+order: 6
+status: published
+topics:
+  - ロードアベレージ
+  - 指数移動平均
+  - D 状態（TASK_UNINTERRUPTIBLE）
+  - top
+  - vmstat の r / b
+  - PSI（Pressure Stall Information）
+requires:
+  - ll-33-process
+  - ll-198-measure
+---
+
+import Callout from '../../components/Callout.astro'
+import LoadAverage from '../../components/sim/problems/LoadAverage'
+
+## 「ロードアベレージが 8」は何が 8 個なのか
+
+`uptime` や `top` の 1 行目には、必ず 3 つの数が出ます。この回の実測の途中で取った `top` の 1 行目です。
+
+```text
+top - 09:52:38 up 11 days,  1:52,  0 user,  load average: 4.14, 6.22, 5.18
+```
+
+障害対応の場で「ロードアベレージが 8 です」と報告されたとき、そこから何が言えて、何が言えないのか。これに即答できる人は多くありません。CPU が 8 個あればちょうど使い切っているのか、ディスクが詰まっているのか、ただの数え方の癖なのか。数そのものからは区別がつきません。
+
+この回では、まずこの数が**何を数えた結果なのか**をカーネルのソースで確かめ、次に**どう平均しているのか**を式で追います。そのうえで、`top` の画面を上から順に読み、ロードアベレージだけでは分からないことを補う PSI（Pressure Stall Information）までを見ます。CPU 使用率の内訳（`%Cpu(s)` の行）は第 199 回、メモリの行は第 201 回で扱います。
+
+## 数えているのは「実行中・実行待ち」と「割り込み不可の待ち」
+
+`/proc/loadavg` の説明は、proc のマニュアルにあります（[proc_loadavg(5)](https://man7.org/linux/man-pages/man5/proc_loadavg.5.html)）。
+
+> The first three fields in this file are load average figures giving the number of jobs in the run queue (state R) or waiting for disk I/O (state D) averaged over 1, 5, and 15 minutes.
+
+数えているのは 2 種類です。
+
+- **R**: CPU 上で動いているか、CPU が空くのを待っているタスク
+- **D**: 割り込み不可の待ち（TASK_UNINTERRUPTIBLE）に入っているタスク。第 33 回で見たとおり、ディスクの応答待ちなどで、シグナルでも起こせない状態です
+
+カーネルのソースも同じことを書いています。ロードアベレージを計算する `kernel/sched/loadavg.c` の冒頭のコメントです（[torvalds/linux v6.12 kernel/sched/loadavg.c](https://github.com/torvalds/linux/blob/v6.12/kernel/sched/loadavg.c)）。
+
+> The global load average is an exponentially decaying average of nr_running + nr_uninterruptible.
+
+`nr_running` が R、`nr_uninterruptible` が D の数です。数える単位はプロセスではなく**スレッド**（カーネルの言う task）です。スレッドを 4 本立てて CPU を回しているプロセスは、1 個ではなく 4 個と数えられます。
+
+### 1993 年に D が足された
+
+D を数えるのは Linux の特徴です。Brendan Gregg は「On other OSes, load averages are "CPU load averages", measuring the number of CPU running + CPU runnable threads.」と書き、Linux がなぜ違うのかを調べて、1993 年 10 月 29 日に Matthias Urlichs が送ったパッチのメールを掘り起こしています（[Linux Load Averages: Solving the Mystery](https://www.brendangregg.com/blog/2017-08-08/linux-load-averages.html)）。件名は「Load average broken ?」で、動機は次のように書かれています。
+
+> The kernel only counts "runnable" processes when computing the load average.
+> I don't like that; the problem is that processes which are swapping or
+> waiting on "fast", i.e. noninterruptible, I/O, also consume resources.
+
+続けて、R だけを数えると「速いスワップ用ディスクを遅いものに替えるとロードアベレージが下がる」という直感に反することが起きる、と指摘しています。遅いディスクに替えれば、待つプロセスは D に長く留まり、R の数は減るからです。Gregg はこの変更を、Linux が「CPU load averages」から「system load averages」とでも呼ぶべきものに変わった、とまとめています。
+
+### D に入るのは、ディスクの待ちだけではない
+
+マニュアルの「waiting for disk I/O」は、今では正確ではありません。D 状態はカーネルの中で「この待ちはシグナルで中断させない」と決めた場所すべてで使われます。Gregg は同じ記事で「Nowadays, in Linux 4.12, there are nearly 400 codepaths that set TASK_UNINTERRUPTIBLE, including some lock primitives.」と数えています。カーネル内のロック（mutex など）の待ちも D になり、ロードアベレージに入ります。
+
+逆に、D の見た目でも数えない待ちもあります。カーネルスレッドが仕事を待つだけの状態を毎回 D で数えると、何もしていない機械のロードアベレージが上がってしまうので、カーネルには `TASK_NOLOAD` という印があります。スケジューラが「このタスクはロードアベレージに入れるか」を決める箇所は、次のとおりです（[kernel/sched/core.c](https://github.com/torvalds/linux/blob/v6.12/kernel/sched/core.c)）。
+
+```c
+prev->sched_contributes_to_load =
+	(prev_state & TASK_UNINTERRUPTIBLE) &&
+	!(prev_state & TASK_NOLOAD) &&
+	!(prev_state & TASK_FROZEN);
+```
+
+`TASK_UNINTERRUPTIBLE | TASK_NOLOAD` の組み合わせには `TASK_IDLE` という名前が付いていて（[include/linux/sched.h](https://github.com/torvalds/linux/blob/v6.12/include/linux/sched.h)）、`top` や `ps` では D ではなく **I**（idle）と表示されます。`ps` で I のカーネルスレッドが大量に見えても、ロードアベレージには効いていません。
+
+## 1・5・15 分の値の作り方
+
+次は平均のとり方です。「1 分平均」と聞くと、過去 1 分間の値を足して割ったものを想像しますが、そうではありません。
+
+カーネルは約 5 秒に 1 回、その瞬間の R と D の数（`active`）を数え、3 つの値をそれぞれ少しだけ `active` に近づけます。使う係数は `include/linux/sched/loadavg.h` に定数として並んでいます（[loadavg.h](https://github.com/torvalds/linux/blob/v6.12/include/linux/sched/loadavg.h)）。
+
+```c
+#define FSHIFT		11		/* nr of bits of precision */
+#define FIXED_1		(1<<FSHIFT)	/* 1.0 as fixed-point */
+#define LOAD_FREQ	(5*HZ+1)	/* 5 sec intervals */
+#define EXP_1		1884		/* 1/exp(5sec/1min) as fixed-point */
+#define EXP_5		2014		/* 1/exp(5sec/5min) */
+#define EXP_15		2037		/* 1/exp(5sec/15min) */
+```
+
+カーネルの中では浮動小数点数を気軽に使えないので、1.0 を 2048（2 の 11 乗）で表す固定小数点で計算します。`EXP_1 = 1884` は、`2048 / e^(5/60) ≈ 1884.3` を整数にしたものです。更新の式は、同じヘッダの `calc_load` です。
+
+```c
+/*
+ * a1 = a0 * e + a * (1 - e)
+ */
+static inline unsigned long
+calc_load(unsigned long load, unsigned long exp, unsigned long active)
+{
+	unsigned long newload;
+
+	newload = load * exp + active * (FIXED_1 - exp);
+	if (active >= load)
+		newload += FIXED_1-1;
+
+	return newload / FIXED_1;
+}
+```
+
+コメントの `a1 = a0 * e + a * (1 - e)` がすべてです。1 分平均なら `e = 1884/2048 ≈ 0.92` なので、**5 秒ごとに、前の値を 92% 残し、いまの数を 8% だけ混ぜる**。5 分平均は前の値を 98.3%、15 分平均は 99.4% 残します。これが指数移動平均（exponential moving average）で、過去の値の影響は 5 秒ごとに一定の割合で薄まっていき、ゼロにはなりません。`active >= load` のときに `FIXED_1-1` を足しているのは、整数の割り算で切り捨てられて、値が上がりきらないことを避けるためです。
+
+下のシミュレーターは、この式をそのまま 5 秒ごとに回します。R と D の数の並びを選ぶと、3 本の平均がどう追いかけるかが見えます。
+
+<LoadAverage client:visible />
+
+### 「1 分平均」は 1 分では追いつかない
+
+指数移動平均の性質から、`active` が 0 から急に N に変わったとき、t 秒後の値は次のようになります。
+
+```text
+load(t) = N × (1 − e^(−t / 窓))      窓 = 60, 300, 900 秒
+```
+
+| 経過 | 1 分平均 | 5 分平均 | 15 分平均 |
+| --- | --- | --- | --- |
+| 1 分 | N の 63% | N の 18% | N の 6% |
+| 3 分 | N の 95% | N の 45% | N の 18% |
+| 5 分 | N の 99% | N の 63% | N の 28% |
+| 15 分 | N | N の 95% | N の 63% |
+
+**「1 分平均が N に達したら、N 本が 1 分動いた」とは読めません。** 1 分経ってもまだ 63% です。逆に、負荷が消えても値はすぐには 0 に戻りません。3 つを並べて読む意味はここにあります。
+
+- 1 分 > 5 分 > 15 分: 負荷が**増えている途中**
+- 1 分 < 5 分 < 15 分: 負荷が**引いている途中**
+- 3 つがほぼ同じ: しばらく同じ状態が続いている
+
+冒頭の `4.14, 6.22, 5.18` は 1 分 < 5 分なので、数分前に高かった負荷が引いている途中です。実際、この行は後で見る D 状態の実験を終えた数分後に取ったものです。
+
+### 手元で確かめる
+
+式どおりに動いているかを、実機で確かめます。環境は Apple M1 Pro（macOS 26.2）の上の OrbStack が動かす Linux 仮想マシン（カーネル 7.0.14、CPU 8 個）で、Debian bookworm のコンテナを `--pid=host` で起動し、仮想マシン上のすべてのスレッドを見えるようにしました。CPU を回し続けるだけのシェルを 4 本、約 200 秒動かして止めます。
+
+ただし、この仮想マシンでは他のコンテナやビルドも同時に動いていて、ロードアベレージは 0 から始まりません。そこで、**約 1.5 秒ごとに全スレッドの状態（`/proc/<pid>/task/<tid>/stat` の 3 番目の欄）を数え**、R と D の数を 5 秒ごとに平均して、カーネルと同じ固定小数点の式に自分で通しました。数えている自分自身の `cat` が R として 1 本混ざるので、1 を引いています。計算した値と、同じ時刻の `/proc/loadavg` を並べたのが次の表です（抜粋）。
+
+```text
+区間      経過(秒)  R+D の数  計算した1分  実際の1分  計算した5分  実際の5分
+基準          15       0.4       3.06       3.27       4.88       4.92
+4 本開始      46       6.0       3.53       3.71       4.80       4.85
+              76       9.4       5.20       5.09       5.07       5.06
+             106      15.2       9.33      10.07       6.07       6.28
+             135       5.6       8.15       9.46       6.11       6.51
+             166       9.2       7.87       8.28       6.21       6.50
+             196       7.0       7.56       9.39       6.29       6.90
+             226      20.5       9.39       8.90       6.83       7.03
+停止後       240       4.2       9.02       8.17       6.88       6.96
+             271       1.4       6.44       5.02       6.47       6.31
+             300       0.4       4.26       3.22       5.95       5.75
+             331       1.0       2.79       2.39       5.42       5.30
+             361       1.2       2.15       1.63       5.02       4.84
+```
+
+R と D の数は、自分の 4 本のほかに他のコンテナのぶんが乗って 4〜20 の間で揺れていますが、その数を式に通した値は、実際のロードアベレージを 1 前後の差で追いかけています。差が残るのは、カーネルが数える瞬間とこちらが数える瞬間がずれていることと、1.5 秒に 1 回の標本では短い山を取りこぼすことによります。5 分平均のほうが差が小さいのは、平均の窓が長く、瞬間ごとのずれがならされるからです。
+
+この表からは、もう 1 つ読み取れることがあります。**自分が足したのは 4 本でも、ロードアベレージは 8〜10 まで上がりました。** ロードアベレージは機械全体の値で、誰が増やしたのかは教えてくれません。
+
+## CPU の数と比べる
+
+ロードアベレージを CPU の数（論理コア数、`nproc` の値）で割ると、おおまかな目安になります。
+
+| ロードアベレージ ÷ CPU 数 | R だけと仮定したときの意味 |
+| --- | --- |
+| 1 未満 | CPU に空きがある |
+| 1 前後 | ちょうど使い切っている |
+| 1 を大きく超える | CPU を待っているスレッドがいる。待ちの長さは超えた分に比例して伸びる |
+
+ただし、これは**数えているのが R だけなら**という前提の話です。Linux では D も入るので、「1 を超えている」から「CPU が足りない」とは言えません。次の節の実測が、その典型です。
+
+Gregg も、ロードアベレージは「These system load averages count the number of threads working and waiting to work」という需要の指標であり、CPU の飽和を調べるなら CPU ごとの使用率（`mpstat -P ALL 1`）や、実行キューで待った時間（`/proc/schedstat`、`perf sched`、`runqlat`）を見るよう勧めています（同記事）。
+
+## ロードアベレージは高いのに、CPU は暇
+
+CPU を使っていないのに値が上がる場面を、わざと作ります。同じ環境で、コンテナの書き込み帯域を `--device-write-bps /dev/vdb:1mb` で毎秒 1 MB に絞り、その中で `dd if=/dev/zero of=/tmp/fN bs=64k count=160 oflag=direct` を 12 本同時に走らせました。`oflag=direct`（O_DIRECT）はページキャッシュを通さずにディスクへ書くので、`dd` は書き込みが終わるまでカーネルの中で待たされます。5 秒ごとに、コンテナ内で D 状態のプロセスの数、`/proc/stat` から計算した CPU の内訳、ロードアベレージを記録しました。
+
+```text
+区間    経過(秒)  D の数  idle  iowait  busy   ロードアベレージ
+基準        25      0     94%     0%     5%   3.16 5.36 4.43
+書込中      35     12     26%    70%     4%   3.86 5.43 4.46
+            60     12     35%    58%     8%   6.94 6.03 4.69
+            90     12     28%    65%     7%  10.98 7.11 5.09
+           120     12     39%    51%     9%  11.64 7.64 5.33
+           151     12     44%    48%     8%  12.88 8.34 5.64
+書込終了   156      0     78%    16%     6%  11.85 8.20 5.61
+           176      0     95%     0%     5%   8.56 7.69 5.49
+           206      0     93%     0%     7%   5.84 7.11 5.37
+           236      0     95%     0%     5%   4.04 6.54 5.24
+```
+
+`busy`（ユーザとカーネルで実際に命令を実行していた割合）は書き込み中もほとんど 10% 未満です。それでも 1 分平均は 3 から 12.9 まで上がりました。上がったぶんは、ほぼ D 状態の 12 本です。CPU から見れば、`dd` は待っているだけなので、その時間は `idle` か `iowait`（CPU が暇で、かつ I/O の完了を待っているタスクがいる時間。第 199 回）に数えられます。書き込みが終わると D は 0 に戻り、CPU はすぐに 95% 暇になりますが、ロードアベレージは指数移動平均なので、20 秒後でも 8.56、80 秒後でも 4.04 が残っています（他のコンテナのぶんの 3 前後を含みます）。
+
+この状態でロードアベレージだけを見て CPU を増やしても、何も良くなりません。D 状態が原因かどうかは、`top` や `ps` の状態の列（S 列）で D が並んでいるかどうか、`vmstat` の `b` 列が 0 でないかどうかで見分けます。D で止まっているスレッドがカーネルのどこで待っているかは、第 198 回の `/proc/<pid>/stack` や `/proc/<pid>/wchan` で確かめられます。NFS のマウント先が応答しなくなったときにも、同じ形でロードアベレージだけが積み上がります。
+
+## top を上から読む
+
+`top` は、上半分（サマリ）と下半分（タスクの一覧）に分かれています。Linux で普通に入っている `top` は procps-ng のもので、各項目の定義はマニュアルにあります（[top(1)](https://man7.org/linux/man-pages/man1/top.1.html)）。
+
+次は、上の環境で CPU を回すシェルを 2 本と、帯域を絞ったディスクへ書く `dd` を 3 本動かしているときの `top -b`（procps-ng 4.0.2）の出力です。
+
+```text
+top - 09:52:38 up 11 days,  1:52,  0 user,  load average: 4.14, 6.22, 5.18
+Tasks:   9 total,   3 running,   6 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 28.5 us,  0.9 sy,  0.0 ni, 53.6 id, 15.9 wa,  0.0 hi,  1.2 si,  0.0 st
+MiB Mem :  16040.7 total,   7733.9 free,   7402.7 used,   1244.1 buff/cache
+MiB Swap:  17064.7 total,  17064.7 free,      0.0 used.   8638.1 avail Mem
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+    191 root      20   0    2340   1420   1304 R 100.0   0.0   0:18.02 sh
+    192 root      20   0    2340   1420   1304 R 100.0   0.0   0:18.05 sh
+      1 root      20   0    2340   1420   1304 S   0.0   0.0   0:00.01 sh
+    193 root      20   0    2288   1248   1072 D   0.0   0.0   0:00.00 dd
+    194 root      20   0    2288   1248   1072 D   0.0   0.0   0:00.01 dd
+    195 root      20   0    2288   1228   1056 D   0.0   0.0   0:00.00 dd
+    197 root      20   0    8368   4520   2380 R   0.0   0.0   0:00.00 top
+```
+
+コンテナの中なので、一覧（`Tasks:` と下の表）にはこのコンテナのプロセスしか出ていません。一方、1 行目のロードアベレージ、`%Cpu(s)`、`MiB Mem` は仮想マシン全体の値です（後の注意を参照）。`dd` の 3 本は S 列が D で、`%CPU` は 0.0 です。CPU を使わずに、ロードアベレージにだけ数えられている 3 本です。
+
+### サマリの 5 行
+
+| 行 | 中身 | どこで読むか |
+| --- | --- | --- |
+| `top -` | 現在時刻、起動からの時間、ログイン中の利用者数、ロードアベレージ | この回 |
+| `Tasks:` | タスクの総数と、状態ごとの内訳（running / sleeping / stopped / zombie） | この回 |
+| `%Cpu(s):` | CPU 時間の内訳（us / sy / ni / id / wa / hi / si / st） | 第 199 回 |
+| `MiB Mem :` / `MiB Swap:` | 物理メモリとスワップ、`avail Mem` | 第 201 回 |
+
+`Tasks:` の数は、既定ではプロセス単位です。`H` キーでスレッド単位の表示に切り替わります。マニュアルも「Line 1 shows total tasks or threads, depending on the state of the Threads-mode toggle.」と書いています。ロードアベレージはスレッドを数えているので、両者を突き合わせるときはスレッド表示にします。
+
+`Tasks:` の running は R の数です。ここに D の数は出ません（sleeping に含まれます）。D を数えるには下の一覧の S 列を見ます。
+
+### 一覧の列
+
+| 列 | マニュアルの定義 | 読み方 |
+| --- | --- | --- |
+| `PR` | The scheduling priority of the task. | カーネルが使う優先度。`rt` と出たらリアルタイムスケジューリング |
+| `NI` | A negative nice value means higher priority, whereas a positive nice value means lower priority. | `nice` で変えた値。通常は 0 |
+| `VIRT` | The total amount of virtual memory used by the task. | 予約しただけで触っていない領域も入る。大きくても問題とは限らない |
+| `RES` | A subset of the virtual address space (VIRT) representing the non-swapped physical memory a task is currently using. | 今、物理メモリに載っている量 |
+| `SHR` | A subset of resident memory (RES) that may be used by other processes. | 共有ライブラリなど。RES の内数 |
+| `S` | The status of the task | 下の表 |
+| `%CPU` | The task's share of the elapsed CPU time since the last screen update, expressed as a percentage of total CPU time. | 1 CPU を使い切ると 100%。マニュアルは続けて、スレッド表示でなければマルチスレッドのプロセスは 100% を超えうると書いている（第 199 回） |
+| `%MEM` | A task's currently resident share of available physical memory. | RES を物理メモリで割ったもの |
+| `TIME+` | The same as TIME, but reflecting more granularity through hundredths of a second. | 起動から使った CPU 時間の累計。経過時間ではない |
+
+RES と SHR の関係、RSS を全プロセスで足すと物理メモリを超える理由は、第 198 回の RSS と PSS の話、第 201 回のメモリの読み方につながります。
+
+### S 列の状態
+
+マニュアルが挙げている状態は 7 つです。
+
+| 表示 | 意味 | ロードアベレージに入るか |
+| --- | --- | --- |
+| `R` | running（実行中、または実行待ち） | 入る |
+| `D` | uninterruptible sleep（割り込み不可の待ち） | 入る |
+| `S` | sleeping（割り込み可能な待ち） | 入らない |
+| `I` | idle（TASK_IDLE のカーネルスレッド） | 入らない |
+| `T` | stopped by job control signal（Ctrl-Z などで停止） | 入らない |
+| `t` | stopped by debugger during trace（デバッガで停止） | 入らない |
+| `Z` | zombie（終了したが親が回収していない） | 入らない |
+
+S と D は、どちらも「何かを待っている」状態です。違いはシグナルで起こせるかどうかで、ソケットの受信待ちや `sleep` は S、ディスクの読み書きの完了待ちやカーネル内のロック待ちの一部は D になります。**S がいくら多くてもロードアベレージは上がりません。** 何千ものスレッドが接続を待っているサーバでも、ロードアベレージが低いのはそのためです。
+
+## vmstat の r と b
+
+第 198 回で、`vmstat 1` の `r` と `b` の列を見ました。マニュアルの定義はそれぞれ「The number of runnable processes (running or waiting for run time).」「The number of processes blocked waiting for I/O to complete.」です（[vmstat(8)](https://man7.org/linux/man-pages/man8/vmstat.8.html)）。
+
+この 2 列は、**ロードアベレージの中身を、平均せずに 1 秒ごとに分けて見せてくれる**ものと考えると使いやすくなります。ロードアベレージが高いとき、`r` が大きければ CPU を待つスレッドが多く、`b` が大きければ I/O などで止まっているスレッドが多い。どちらなのかで、次に見る場所が変わります。
+
+## PSI: どれだけ待たされたかを測る
+
+ロードアベレージには、構造的な弱点があります。
+
+- R と D を**区別せずに足している**ので、CPU の待ちと I/O の待ちが混ざる
+- 「何本いるか」は分かっても、「**それでどれだけ遅くなったか**」は分からない。8 CPU で R が 8 本なら誰も待っていないが、1 CPU で 8 本なら 7 本が待っている
+- 機械全体で 1 つの値しかなく、cgroup（コンテナ）ごとには見られない
+
+これを補うために Linux 4.20 で入ったのが PSI（Pressure Stall Information）です（[Linux 4.20 の変更点](https://kernelnewbies.org/Linux_4.20)）。カーネルの文書は目的を「The psi feature identifies and quantifies the disruptions caused by such resource crunches」と説明しています（[PSI - Pressure Stall Information](https://docs.kernel.org/accounting/psi.html)）。CPU、メモリ、I/O の 3 つの資源ごとに、**タスクがその資源を待って止まっていた時間の割合**を出します。
+
+```text
+$ cat /proc/pressure/cpu
+some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+```
+
+| 項目 | 意味 |
+| --- | --- |
+| `some` | 「The “some” line indicates the share of time in which at least some tasks are stalled on a given resource.」少なくとも 1 本が待たされていた時間の割合 |
+| `full` | 「The “full” line indicates the share of time in which all non-idle tasks are stalled on a given resource simultaneously.」動きたいタスクが全部同時に止まっていた時間の割合。この間、その資源のせいで何も進んでいない |
+| `avg10` / `avg60` / `avg300` | 10 秒、60 秒、300 秒の窓での割合（%） |
+| `total` | 待たされた時間の累計（マイクロ秒） |
+
+ロードアベレージとの違いは、**本数ではなく時間で測っている**ことです。`/proc/pressure/cpu` の `some avg10=40.00` は、「直近 10 秒のうち 40% の時間、CPU が空かずに待たされたスレッドがいた」という意味で、CPU の数に関係なくそのまま読めます。`/proc/pressure/io` を見れば、I/O の待ちだけを分けて見られます。cgroup v2 では、cgroup ごとに `cpu.pressure`、`memory.pressure`、`io.pressure` という同じ形式のファイルがあり、コンテナ単位の詰まりを測れます。
+
+PSI はカーネルの設定（`CONFIG_PSI`）で有効になっている必要があります。この回の実測に使った環境では、`--privileged` を付けたコンテナから見ても `/proc/pressure` が存在せず、PSI は使えませんでした。手元で使えるかは、ファイルがあるかどうかで確かめます。
+
+<Callout type="warn" title="コンテナの中のロードアベレージは、機械全体の値">
+  ロードアベレージは、カーネル全体で 1 組しか持っていない値です。コンテナの中で `uptime` や `top` を実行しても、そのコンテナが動かしているスレッドの数ではなく、**同じカーネルの上で動いているすべてのスレッド**の数の平均が出ます。この回の実測でも、ほかのコンテナの負荷がそのまま値に混ざりました。
+
+  macOS や Windows の Docker Desktop や OrbStack では、コンテナは Linux の仮想マシンの上で動くので、出てくるのは**その仮想マシンの**ロードアベレージです。ホストの Mac の `uptime` とは別の値になります。コンテナ単位で詰まりを見たいときは、cgroup の `cpu.stat`（スロットリングの回数）や `cpu.pressure` を使います（第 184 回）。
+</Callout>
+
+## まとめ
+
+- Linux のロードアベレージは、R（実行中・実行待ち）と D（割り込み不可の待ち）のスレッド数を足したものの平均。D を足したのは 1993 年のパッチで、他の Unix とは数え方が違う
+- D はディスクの待ちだけでなく、カーネル内のロック待ちでも入る。`TASK_IDLE`（表示は I）のカーネルスレッドは数えない
+- 1・5・15 分の値は、5 秒ごとに前の値を 92%・98.3%・99.4% 残して更新する指数移動平均。1 分平均でも、1 分経って 63% までしか追いつかない
+- 3 つの値の大小関係で、負荷が増えている途中か、引いている途中かが分かる
+- CPU 数で割るのは R だけを数えている前提の目安。Linux では D が混ざるので、CPU が暇でも値が上がる
+- `top` の S 列と `vmstat` の `r` / `b` で、R と D のどちらが原因かを分ける
+- PSI は資源ごとに「待たされた時間の割合」を出す。本数ではなく時間なので CPU 数に関係なく読め、cgroup ごとにも見られる
+
+次の第 201 回では、`top` の `MiB Mem` の行と `free` を読み、メモリがどこで使われているのかを見ます。

@@ -23,7 +23,7 @@ topics:
 requires:
   - ll-55-packet-path
   - ll-64-dns-failure
-  - ll-175-network-storage
+  - ll-181-network-storage
   - ll-77-quic-beyond-http
 ---
 
@@ -49,7 +49,7 @@ import Callout from '../../components/Callout.astro'
                               turn 198.51.100.50（coturn）
 ```
 
-`nat-a` と `nat-b` は、2 つの NIC を持つ Linux のコンテナです。内側の端末の既定の経路をこのコンテナに向け、外向きの NIC で送信元を書き換えます。第 175 回で見た Docker の NAT と同じ `MASQUERADE` です。
+`nat-a` と `nat-b` は、2 つの NIC を持つ Linux のコンテナです。内側の端末の既定の経路をこのコンテナに向け、外向きの NIC で送信元を書き換えます。第 181 回で見た Docker の NAT と同じ `MASQUERADE` です。
 
 ```
 iptables -P FORWARD DROP

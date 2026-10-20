@@ -1,0 +1,278 @@
+---
+title: DevTools の Network パネルを読む
+description: ウォーターフォールの 1 本の帯は、DNS、TCP、TLS、HTTP、キャッシュの話をすべて含んでいる。Timing の各区間がこれまでのどの回の話か、HTTP/1.1 の 6 本の上限と優先度で帯が伸びる様子、キャッシュの見分け方、Size と Initiator の読み方、ネットワークの制限の限界を、手元のサーバと Chrome で確かめます
+chapter: browser
+order: 10
+status: published
+topics:
+  - Network パネル
+  - ウォーターフォール
+  - Queueing / Stalled
+  - Waiting (TTFB)
+  - Content Download
+  - 同一オリジンあたり 6 本の接続
+  - Priority 列
+  - fetchpriority
+  - memory cache / disk cache
+  - Size 列
+  - Initiator
+  - ネットワークの制限（throttling）
+  - HAR
+requires:
+  - ll-87-navigation
+  - ll-66-http2-frame
+  - ll-113-http-cache-cdn
+---
+
+import Callout from '../../components/Callout.astro'
+import NetworkWaterfall from '../../components/sim/problems/NetworkWaterfall'
+
+## 帯の 1 本に、これまでの章が詰まっている
+
+Chrome の開発者ツール（DevTools）の Network パネルは、ページが出した要求を 1 行ずつ並べ、右端の Waterfall 列に横向きの帯を描きます。帯の長さはその要求にかかった時間で、色の違う区間に分かれています。行を選んで Timing タブを開くと、区間ごとの名前と時間が表で出ます。
+
+この区間の名前は、そのまま第 9 章からの話に対応しています。DNS Lookup は第 10 章、Initial connection は第 53 回の TCP、SSL は第 127 回の TLS 1.3、Waiting (TTFB) は第 87 回で見た往復です。この回では、帯の各区間がどの層の待ち時間なのかを対応づけ、帯が伸びたときにどこを疑えばよいかを読めるようにします。
+
+その次の第 95 回でメインスレッドの側を見る Performance パネル、第 97 回でメモリを見る Memory パネルを扱います。Network パネルは、そのうちブラウザの外との通信を担当する窓です。
+
+## Timing の区間は、どの回の話か
+
+Chrome の文書は、Timing タブの各区間を次のように定義しています（[Network features reference: Timing breakdown phases explained](https://developer.chrome.com/docs/devtools/network/reference#timing-explanation)）。
+
+| 区間 | 文書の定義 | これまでの回 |
+| --- | --- | --- |
+| Queueing | 「The browser queues requests before connection start and when:」（理由は下で見る） | この回 |
+| Stalled | 「The request could be stalled after connection start for any of the reasons described in Queueing.」 | この回 |
+| DNS Lookup | 「The browser is resolving the request's IP address.」 | 第 57〜64 回 |
+| Initial connection | 「The browser is establishing a connection, including TCP handshakes or retries and negotiating an SSL.」 | 第 53 回 |
+| SSL | （Initial connection のうち TLS の部分） | 第 127 回 |
+| Request sent | 「The request is being sent.」 | 第 66 回 |
+| Waiting (TTFB) | 「This timing includes 1 round trip of latency and the time the server took to prepare the response.」 | 第 87 回 |
+| Content Download | 「This value is the total amount of time spent reading the response body.」 | 第 54 回 |
+
+Queueing の理由として、文書は 3 つを挙げています。
+
+- 「There are higher priority requests.」（より優先度の高い要求がある）
+- 「There are already six TCP connections open for this origin, which is the limit. (Applies to HTTP/1.0 and HTTP/1.1 only.)」（そのオリジンに TCP 接続がすでに 6 本あり、それが上限。HTTP/1.0 と 1.1 だけ）
+- 「The browser is briefly allocating space in the disk cache.」（ディスクキャッシュの領域を確保している）
+
+### DevTools はどう区間を切っているか
+
+この区間は、ブラウザのネットワーク処理が要求ごとに記録した時刻から、DevTools が計算しています。計算の本体は DevTools 自身のソース [RequestTimeRanges.ts](https://github.com/ChromeDevTools/devtools-frontend/blob/main/front_end/models/network_time_calculator/RequestTimeRanges.ts) にあり、要点は次の 2 行です。
+
+```ts
+if (issueTime < startTime) {
+  addRange(RequestTimeRangeNames.QUEUEING, issueTime, startTime);
+}
+const blockingEnd = firstPositive([timing.dnsStart, timing.connectStart, timing.sendStart, responseReceived]) || 0;
+addOffsetRange(RequestTimeRangeNames.BLOCKING, 0, blockingEnd);
+```
+
+`issueTime` はページ（レンダラ）が要求を出した時刻、`startTime`（`timing.requestTime`）はネットワーク処理がその要求を受け付けた時刻です。**Queueing は、要求がネットワーク処理に渡されるまでの待ち**です。BLOCKING が画面での Stalled で、受け付けてから DNS・接続・送信のどれかが始まるまでの時間になります。**Stalled は、ネットワーク処理の中で、使える接続が回ってくるまでの待ち**です。
+
+名前が似ていて混同しやすい 2 つですが、どこで待っているかが違います。手元で動かして、それぞれが伸びる条件を作ってみます。
+
+## 手元の環境
+
+測定には、手元の Node.js（v20.19.0）で立てた 3 つのサーバを使いました。どれも同じ内容を返し、遅延と大きさをクエリで変えられます。
+
+- `:8444`：HTTP/1.1（自己署名証明書の TLS）
+- `:8443`：HTTP/2（同じ証明書）
+- `:8081`：HTTP/1.1（平文。キャッシュの実験用）
+
+ブラウザは Chrome 155.0.8059.85 を Playwright 1.48.2 からヘッドレスで起動し、DevTools と同じ Chrome DevTools Protocol（CDP）の `Network` イベントを受け取って、上の DevTools のソースと同じ式で区間を計算しました。マシンは Apple M1 Pro（macOS 26.2）です。サーバもブラウザも同じマシンにあるので往復時間はほぼ 0 で、DNS Lookup もほぼ 0 になります。測定中は他の処理でロードアベレージが 40 前後あり、数 ms の差は誤差です。
+
+<Callout type="note" title="自己署名証明書とキャッシュ">
+  証明書エラーを無視して開いたページの応答は、Chrome の HTTP キャッシュに入りませんでした。キャッシュの実験だけ平文の `:8081` を使っているのはこのためです。
+</Callout>
+
+## 6 本で詰まる: HTTP/1.1 の Stalled
+
+300ms 待ってから 40,000 バイトを返す画像を 12 枚並べたページを、HTTP/1.1 で開きました。主な列を抜き出すと次のとおりです（単位は ms）。
+
+```text
+name     conn  start queue stall  conn  ssl  ttfb
+/img/0    160     20     0     0     0    0   303
+/img/1    182     20     0     0     3    2   302
+/img/2    207     20     2     0     2    1   305
+/img/3    216     20     2     0     5    4   303
+/img/4    217     21     2   309     0    0   301
+/img/5    219     21     2   310     0    0   301
+/img/6    219     21     7     4     4    4   302
+/img/7    160     21     7   296     0    0   301
+/img/8    217     21     7     3     3    3   300
+/img/9    207     21     7   301     0    0   302
+/img/10   182     21     7   298     0    0   301
+/img/11   216     21     7   303     0    0   302
+最後の画像が届くまで 634 ms 接続の数 6
+```
+
+`conn` は CDP が返す接続の番号です。番号は 6 種類しかありません。12 枚のうち 6 枚はすぐに送られ（`/img/0` は HTML を取った接続を使い回し、残りは新しい接続を張っています）、もう 6 枚は **Stalled が約 300ms** あります。前の画像の応答が終わって接続が空くまで、ネットワーク処理の中で待っていたわけです。どの要求が先に接続を得るかは順番どおりではありませんが、2 回に分かれて届くことは変わりません。
+
+同じページを HTTP/2 で開くと、こうなりました。
+
+```text
+name     conn  start queue stall  conn  ssl  ttfb
+/img/0    160      6     0     0     0    0   305
+/img/1    160      6     0     0     0    0   305
+  …（/img/2 から /img/10 も同じ形）
+/img/11   160      6     3     0     0    0   304
+最後の画像が届くまで 314 ms 接続の数 1
+```
+
+接続は 1 本だけで、12 枚すべての Stalled が 0 です。第 66 回で見たとおり、HTTP/2 は 1 本の接続の中にストリームを何本でも開けるので、接続の空きを待つ必要がありません。全体の時間は 634ms から 314ms に半減しました。
+
+下のシミュレーターは、この並び方を簡単な規則で再現したものです。HTML を取った接続が 1 本ある状態から始め、HTTP/1.1 では空きがなければ 6 本まで新しく張り、それ以上は空くまで待たせます。HTTP/2 では 1 本に全部を流します。往復時間を 150ms にすると、HTTP/1.1 の新しい接続は TCP と TLS で 2 往復払うので、そのぶん帯の頭が右にずれます。
+
+<NetworkWaterfall client:visible />
+
+<Callout type="tip" title="Stalled が長いときに疑うもの">
+  HTTP/1.1 で同じオリジンへの要求が 7 本以上同時に出ていると、Stalled が前の応答の時間ぶん伸びます。Protocol 列（右クリックで表示する列を足せます）が `http/1.1` なら、まず接続数の上限を疑ってください。HTTP/2 か HTTP/3 で配るのが根本的な対処です。
+
+  ただし HTTP/2 は 1 本の TCP 接続に頼るので、パケットが 1 つ落ちると全部のストリームが止まります（第 66 回の HOL ブロッキング）。HTTP/3 は QUIC の上でこれを避けます（第 67 回）。Protocol 列が `h3` なら、Initial connection の中で TCP と TLS の往復が 1 つにまとまっているはずです。
+</Callout>
+
+## Queueing: 優先度で後回しにされる
+
+Queueing は、接続の数ではなく、**ページの側で要求が後回しにされた時間**です。いろいろな種類の資源を 1 ページに並べて、HTTP/2 で開きました。どの応答も 50ms 待ってから返します。
+
+```text
+name             prio       start queue  ttfb  initiator
+/r/style.css     VeryHigh      14     3    55  parser /prio
+/r/head.js       High          14     3    55  parser /prio
+/r/async.js      Low           14    58    54  parser /prio
+/r/defer.js      Low           14    58    55  parser /prio
+/r/font.woff2    High          14     3    55  parser /prio   （rel=preload）
+/r/hero.jpg      High          14     3    55  parser /prio   （fetchpriority="high"）
+/r/plain.jpg     Low           14    59    53  parser /prio
+/r/api.json      High          73     0    53  script /prio   （fetch()）
+/r/api-low.json  Low           73     0    53  script /prio   （fetch(…, { priority: 'low' })）
+/r/lazy.jpg      Low           82     3    54  parser /prio   （loading="lazy"）
+```
+
+`prio` は CDP が返す初期の優先度で、Network パネルの Priority 列では VeryHigh が Highest、VeryLow が Lowest と表示されます（[web.dev: Fetch Priority](https://web.dev/articles/fetch-priority#resource-priority) の対応表）。
+
+HTML の解析器は、すべての要求を 14ms の時点でほぼ同時に出しています。それなのに、Low の 3 つ（`async.js`、`defer.js`、`plain.jpg`）だけ Queueing が 58ms あります。High 以上の要求の応答が返る（55ms）まで、ネットワーク処理に渡されなかったということです。web.dev は、読み込みの初期に画像を同時に 2 枚までしか取りに行かない段階を「tight mode」と呼んでいます。この実験では、画像に限らず Low の要求が、High 以上の応答が返るまで渡されませんでした。
+
+同じ画像でも、`fetchpriority="high"` を付けた `hero.jpg` は High で始まり、待たされていません。web.dev は「Images start at "Low" priority by default.」と書き、表示領域に入る画像はレイアウトの時点で High に引き上げられること、重要な画像に `fetchpriority="high"` を付ければ最初から High で始められることを説明しています（[web.dev: Fetch Priority](https://web.dev/articles/fetch-priority#resource-priority)）。Priority 列は、大きい行の表示（設定の Big request rows）にすると上に最終の優先度、下に初期の優先度が出ます。
+
+<Callout type="note" title="Queueing と Stalled、どちらが伸びているか">
+  Queueing が長いなら、ページの中で優先度が低いと判断されています。LCP の画像なら `fetchpriority="high"` や preload を考えます（第 94 回の「読み込み開始の遅れ」）。Stalled が長いなら、接続が足りないか、接続の確立そのものが遅れています。同じ「待ち」でも、直す場所がまったく違います。
+</Callout>
+
+## どこから届いたか: キャッシュの見分け方
+
+Size 列には、ネットワークから届いた応答なら転送量が出ますが、キャッシュから使われた応答では `(memory cache)` や `(disk cache)` と表示されます。キャッシュの指示を変えた 3 つの資源を置いたページを、平文の HTTP/1.1 で何通りかに開きました。
+
+- `/cached/fresh`：画像。`Cache-Control: max-age=3600`
+- `/cached/revalidate`：画像。`Cache-Control: no-cache` と `ETag`（毎回確かめ直させる）
+- `/cached/script.js`：スクリプト。`Cache-Control: max-age=3600`
+
+```text
+--- 初回
+  /cached/fresh          200 転送 30000B
+  /cached/revalidate     200 転送 30000B
+  /cached/script.js      200 転送 30258B
+--- 同じタブで再読み込み
+  /cached/fresh          (disk cache)
+  /cached/revalidate     200（通信路では 304）
+  /cached/script.js      (memory cache)
+--- 同じタブで別ページへ行き、戻る
+  /cached/fresh          (disk cache)
+  /cached/revalidate     200（通信路では 304）
+  /cached/script.js      (memory cache)
+--- 別タブで開く
+  /cached/fresh          (disk cache)
+  /cached/revalidate     200（通信路では 304）
+  /cached/script.js      (disk cache)
+```
+
+読み取れることが 3 つあります。
+
+**キャッシュには 2 段ある。** `(memory cache)` はレンダラのプロセスの中にあるキャッシュで、同じタブの中でしか当たりません。別のタブで開いたスクリプトは `(disk cache)`、つまり第 113 回で見たブラウザの HTTP キャッシュから来ています。どの資源がどちらに載るかは実装の都合で、この実験では、同じタブの中でも画像は毎回 `(disk cache)` でした。
+
+**再読み込みしても、新しいとされている資源は確かめ直さない。** `max-age` の期間内の `fresh` は、再読み込みでも通信せずにキャッシュから使われました。サーバに問い合わせたのは、ページ本体（`no-store`）と `no-cache` の `revalidate` だけです。
+
+**304 は、通信路の上でしか見えない。** `revalidate` は毎回 `If-None-Match` を付けて問い合わせ、サーバは 304 を返しています（サーバ側のログで、2 回目以降に `"v1-revalidate"` が届いていることを確かめました）。CDP の `responseReceived` が報告する状態は、キャッシュの中身と合わせた結果の 200 で、通信路で実際に受け取った 304 は別のイベント（`responseReceivedExtraInfo`）にしか出ません。ページの中の Resource Timing では、再読み込み後の `revalidate` の `transferSize` は 300 バイトで、本文の 30,000 バイトは通信路を流れていません。
+
+<Callout type="warn" title="Disable cache にチェックが入っていないか">
+  Network パネルの上部の Disable cache は、DevTools を開いている間だけキャッシュを使わなくします。速さを確かめるときに付けたまま忘れると、2 回目以降の訪問の速さが分かりません。逆に、初めて訪れた人の体験を確かめたいときには付けます。
+</Callout>
+
+## Size 列: 転送量と展開後の大きさ
+
+Size 列の定義は「The combined size of the response headers plus the response body, as delivered by the server.」です（[Network features reference: View network requests](https://developer.chrome.com/docs/devtools/network/reference#requests)）。圧縮されて届いた応答なら、圧縮された大きさです。大きい行の表示にすると、「the bottom value of the Size column is the uncompressed size of a request」、つまり下に展開後の大きさも出ます（[Use big request rows](https://developer.chrome.com/docs/devtools/network/reference#request-rows)）。
+
+同じ文を 2 万回繰り返した HTML を gzip で返して、Resource Timing の 3 つの値を読みました。
+
+```text
+["/gz", transferSize 822, encodedBodySize 522, decodedBodySize 240007]
+```
+
+本文は 522 バイトで届き、展開すると 240,007 バイトになりました。差の 300 バイトはヘッダです。**通信の速さには上の値、メモリと構文解析の重さには下の値**が効きます。第 129 回の圧縮の話の、ブラウザ側から見た姿です。
+
+## Initiator と依存の連鎖
+
+Initiator 列は、その要求を出したのが誰かを示します。HTML の解析器なら Parser、スクリプトなら Script とその行です。さらに文書は「To view the initiators and dependencies of a request, hold Shift and hover over the request in the Requests table. DevTools colors initiators green, and dependencies red.」と書いています（[View initiators and dependencies](https://developer.chrome.com/docs/devtools/network/reference#initiators-dependencies)）。Shift を押しながら行に乗せると、その要求を呼んだ側が緑、呼ばれた側が赤で塗られます。
+
+連鎖が性能に効く例を作りました。どの応答も 200ms 待ってから返します。
+
+- HTML が `chain.css` と `app.js` を読む
+- `chain.css` が `@font-face` でフォントを読む
+- `app.js` が `fetch()` で `data.json` を読み、その結果を受け取ってから画像を作る
+
+```text
+name                 prio      start  initiator
+/chain               VeryHigh      0  other
+/r/chain.css         VeryHigh      8  parser /chain
+/r/app.js            High          8  parser /chain
+/r/data.json         High        212  script /r/app.js
+/r/chain-font.woff2  VeryHigh    212  parser /r/chain.css
+/r/photo.jpg         Low         415  parser /chain
+```
+
+`photo.jpg` が始まるのは 415ms で、HTML から数えて 3 段目です。帯域にもサーバにも余裕があるのに、前の応答を受け取るまで次の要求の存在が分からないので、200ms ずつ直列に積み上がっています。Lighthouse などがクリティカルリクエストチェーンと呼んで指摘するのはこの形です。HTML に `<link rel="preload">` を書いて先に知らせるか、HTML の中に直接 `<img>` を書いて、解析器が最初から見つけられるようにします。
+
+<Callout type="note" title="Initiator が正確でないこともある">
+  `photo.jpg` は `app.js` のコードが作った画像ですが、CDP が報告した Initiator は `parser /chain` でした。要求が実際に出たのは、作られた画像が文書に入ったときだったためと考えられますが、確かめてはいません。Initiator は手がかりとして使い、因果を確かめたいときはコードを読みます。
+</Callout>
+
+## ネットワークの制限は、要求の単位でかかる
+
+Network パネルの Throttling（Fast 4G、Slow 4G など）は、遅い回線を手元で再現する機能です。ただし、遅れをどこに入れているかを知っておく必要があります。CDP の `Network.emulateNetworkConditions` で往復の遅れ 150ms を入れ、同じページ（画像 2 枚、遅延なし）を比べました。
+
+```text
+                  conn   ssl  ttfb
+制限なし  /page       3     3     2
+          /img/1      2     1     2
+遅れ 150ms /page      4     4   163
+          /img/1      1     1   163
+```
+
+TTFB は 150ms 増えましたが、**接続の確立（TCP と TLS）は 1〜4ms のまま**でした。本物の遅い回線なら、TCP のハンドシェイクに 1 往復、TLS に 1 往復かかるので、新しい接続のたびに 300ms 余計に払うはずです（第 87 回）。この制限は、ブラウザの中で要求ごとに遅れを足しているだけで、パケットを遅らせてはいません。
+
+Lighthouse の文書は、この方式を「request-level throttling」と呼び、「In real mobile connectivity, latency affects things at the packet level rather than the request level. As a result, this throttling isn't highly accurate.」と注意しています（[Lighthouse: Network Throttling](https://github.com/GoogleChrome/lighthouse/blob/main/docs/throttling.md)）。接続の数や往復の回数を減らす改善（HTTP/2 への移行、preconnect、TLS の再開）の効果は、この制限では小さく見えます。正確に確かめたいなら、OS のネットワークインタフェースでパケットを遅らせる道具を使います。
+
+<Callout type="note" title="ページの中から見ると、遅れは別の場所に出る">
+  同じ遅れの入ったページで Resource Timing を読むと、150ms ほどの遅れは `responseStart` から `responseEnd` の間、つまり本文の受信の時間として現れました。DevTools の Timing と、ページの中で測った値が一致しないことがあるのは、こうした遅れを足す場所が違うからです。
+</Callout>
+
+## HAR に書き出す
+
+Network パネルの記録は、HAR（HTTP Archive）という JSON の形式で書き出せます。障害の報告に添えたり、別の道具で読み込んだりするのに使います。HAR の各要求の `timings` には `blocked`、`dns`、`connect`、`ssl`、`send`、`wait`、`receive` があり、`blocked` は「Time spent in a queue waiting for a network connection.」と定義されています。ただし、この仕様書は「This document was never published by the W3C Web Performance Working Group and has been abandoned.」とあるとおり、W3C の勧告にはならずに放棄された草案で、実際には各ツールがこの形に従っている状態です（[HTTP Archive (HAR) format](https://w3c.github.io/web-performance/specs/HAR/Overview.html)）。
+
+書き出すときの既定に注意があります。文書によれば「by default you can export the "sanitized" network log in HAR format that excludes sensitive information such as Cookie, Set-Cookie, and Authorization headers.」で、Cookie、Set-Cookie、Authorization のヘッダを除いたものが既定です（[Save all network requests to a HAR file](https://developer.chrome.com/docs/devtools/network/reference#save-as-har)）。機密を含む版を明示的に選ぶこともできますが、それを他人に渡せば、ログインしたままのセッションを渡すのと同じです（第 143 回）。除かれるのはヘッダだけなので、URL のクエリや応答の本文に含まれる個人情報は、既定の書き出しでも残ります。
+
+## まとめ
+
+- Timing の区間は層に対応する。DNS Lookup は名前解決、Initial connection は TCP と TLS、Waiting (TTFB) は 1 往復とサーバの処理、Content Download は本文の受信
+- Queueing はページの側で後回しにされた時間、Stalled はネットワーク処理の中で接続を待った時間。似ているが直す場所が違う
+- HTTP/1.1 は同じオリジンに 6 本まで。7 本目からは前の応答のぶん Stalled が伸びる。手元では 12 枚の画像が HTTP/1.1 で 634ms、HTTP/2 で 314ms だった
+- 優先度の低い要求は、読み込みの初期に Queueing で待たされる。`fetchpriority="high"` で重要な資源を前に出せる
+- `(memory cache)` はタブの中、`(disk cache)` はブラウザの HTTP キャッシュ。304 は通信路の上の状態で、本文は流れない
+- Size 列は転送量。展開後の大きさは大きい行の表示の下段に出る
+- Initiator の連鎖が深いほど、往復が直列に積み上がる。先に知らせる手段を探す
+- DevTools のネットワークの制限は要求ごとに遅れを足すもので、接続の確立は遅くならない
+- HAR の既定の書き出しは Cookie と Authorization のヘッダを除くが、URL と本文は残る
+
+次の第 97 回では、ブラウザの中で使われているメモリを Memory パネルで見ます。

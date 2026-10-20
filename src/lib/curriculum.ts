@@ -289,7 +289,7 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'browser',
     title: '第14章　ブラウザの中身',
-    summary: 'ブラウザは、ここまでの部品をすべて使う大きなプログラム。URL を打ってから最初のバイトが届くまで、プロセスの分け方、HTML の構文解析、レンダリングパイプラインと合成、イベントループ、JavaScript エンジン、そして Web Vitals が測っているもの',
+    summary: 'ブラウザは、ここまでの部品をすべて使う大きなプログラム。URL を打ってから最初のバイトが届くまで、プロセスの分け方、HTML の構文解析、レンダリングパイプラインと合成、イベントループ、JavaScript エンジン、Web Vitals が測っているもの、そしてそれを DevTools の Performance・Network・Memory パネルで突き止める方法',
   },
   {
     id: 'graphics',
@@ -304,7 +304,7 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'crypto',
     title: '第17章　秘密を守る道具',
-    summary: '暗号は 1 つの技術ではなく、守るものの違う部品の組み合わせ。ハッシュと MAC、共通鍵暗号と AEAD、公開鍵暗号と鍵交換、デジタル署名、乱数と鍵の管理。何を保証し、何を保証しないのかを部品ごとに分ける',
+    summary: '暗号は 1 つの技術ではなく、守るものの違う部品の組み合わせ。ハッシュと MAC、共通鍵暗号と AEAD、公開鍵暗号と鍵交換、デジタル署名、乱数と鍵の管理。何を保証し、何を保証しないのかを部品ごとに分け、最後に量子コンピュータがどの部品を破るのか、ビットコインの所有権にどう響くのかを見る',
   },
   {
     id: 'tls',
@@ -319,7 +319,7 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'identity',
     title: '第20章　誰なのか、何をしてよいのか',
-    summary: '認証と認可は別の問い。パスワードと多要素認証とパスキー、セッションと Cookie、JWT の中身、OAuth 2.0 が本当に決めていること、その上に認証を載せた OpenID Connect、トークンの検証と縛り方、認可の設計',
+    summary: '認証と認可は別の問い。パスワードと多要素認証とパスキー、SMS とプッシュ通知の多要素が破られる経路、セッションと Cookie、JWT の中身、OAuth 2.0 が本当に決めていること、その上に認証を載せた OpenID Connect、トークンの検証と縛り方、認可の設計',
   },
   {
     id: 'sso',
