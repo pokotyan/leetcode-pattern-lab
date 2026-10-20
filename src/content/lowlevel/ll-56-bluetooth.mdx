@@ -1,0 +1,292 @@
+---
+title: Bluetooth と BLE
+description: イヤホン、キーボード、腕時計、紛失防止タグ。同じ 2.4 GHz 帯を Wi-Fi と分け合いながら、なぜ電池が何か月も持つのか。79 本を跳び回る Classic と、40 本と 3 本の広告用チャネルを持つ Low Energy の違い、次に跳ぶチャネルを決める計算、GATT、ペアリング、追跡を防ぐアドレスの付け替えを、仕様のサンプルデータとの突き合わせで確かめます
+chapter: radio
+order: 4
+status: published
+topics:
+  - Bluetooth Classic（BR/EDR）
+  - Bluetooth Low Energy（BLE）
+  - 周波数ホッピング
+  - AFH
+  - アドバタイジング
+  - 接続間隔
+  - Peripheral latency
+  - チャネル選択アルゴリズム（CSA #2）
+  - GATT
+  - ATT
+  - ペアリング / ボンディング
+  - LE Secure Connections
+  - Just Works
+  - Resolvable Private Address（RPA）
+  - IRK
+  - LE Coded PHY
+  - LE Audio
+requires:
+  - ll-53-radio-spectrum
+  - ll-131-public-key
+  - ll-130-symmetric
+---
+
+import Callout from '../../components/Callout.astro'
+import BleHopping from '../../components/sim/problems/BleHopping'
+
+## 同じ帯に、2 つの Bluetooth がある
+
+「Bluetooth」という名前の下には、互換性のない 2 つの無線方式が入っています。最初の版からある **Classic**（仕様の名前は BR/EDR、Basic Rate / Enhanced Data Rate）と、Bluetooth 4.0 で加わった **Low Energy**（LE。BLE とも呼ばれます）です（[Core 6.1 Vol 1 Part C: 変更履歴](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/core-specification-change-history.html)）。イヤホンで音楽を聞くのは主に Classic、心拍計や紛失防止タグは LE、という具合に、使われる場面が分かれてきました。最近の端末は両方を 1 つのチップに載せています。
+
+どちらも、免許なしで使える **2.4 GHz の ISM 帯**（Industrial, Scientific and Medical の略）を使います。LE の物理層の仕様は、冒頭で「Bluetooth Low Energy (LE) devices operate in the unlicensed 2.4 GHz ISM (Industrial Scientific Medical) band. A frequency hopping transceiver is used to combat interference and fading.」と書いています（[Core 6.1 Vol 6 Part A](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/physical-layer-specification.html)）。2.4 GHz 帯は Wi-Fi も電子レンジも使う混み合った帯なので、**同じ周波数に居座らず、細い帯を次々に跳び移る**（周波数ホッピング）というのが、どちらの Bluetooth にも共通する生き残り方です。帯の分け合い方の一般論は第 53 回、日本でこの帯がどう割り当てられているかは第 54 回、同じ帯を使う Wi-Fi は第 55 回で扱いました。この回では Bluetooth 自身の仕組みを見ます。
+
+この回で引く仕様は、Bluetooth SIG が公開している Core Specification 6.1 の HTML 版です。
+
+## Classic：79 本を、毎秒 1600 回跳ぶ
+
+Classic は、2.4 GHz 帯を **1 MHz 幅の 79 本**に切ります。BR/EDR の無線の仕様は、中心周波数を「f=2402+k MHz, k=0,...,78」と定めています（[Core 6.1 Vol 2 Part A](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/br-edr-controller/radio-specification.html)）。
+
+時間は 625 µs ごとの**スロット**に区切られ、つながっている機器はスロットごとに次のチャネルへ跳びます。ベースバンドの仕様には「The maximum hop rate is 1600 hops per second in the Connection state」とあります（[Core 6.1 Vol 2 Part B](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/br-edr-controller/baseband-specification.html)）。1 秒を 625 µs で割ると 1600 なので、1 スロットに 1 回跳ぶ計算です。どの順で跳ぶかは、親機（Central）のアドレスと時計から計算で決まります。
+
+親機 1 台を中心にした小さな網を**ピコネット**と呼びます。子機（Peripheral）には 3 ビットの論理アドレス（LT_ADDR）が割り振られ、全部 0 の値は一斉送信用に予約されています（同上）。したがって、同時に動ける子機は最大 7 台です。
+
+変調は 1 秒あたり 100 万シンボルで、Basic Rate は 1 シンボルに 1 ビット（1 Mb/s）、Enhanced Data Rate は位相の変化に 2 ビットか 3 ビットを載せて 2 Mb/s か 3 Mb/s にします（[Core 6.1 Vol 2 Part A](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/br-edr-controller/radio-specification.html)）。イヤホンへの音声のように、途切れずに一定の量を流し続ける用途に向いた作りです。
+
+### 混んだチャネルを避ける：AFH
+
+79 本を一様に跳ぶと、Wi-Fi が使っている 20 MHz 幅の帯にもおよそ 4 回に 1 回は入ってしまいます。そこで Bluetooth 1.2 で、**混んでいるチャネルを跳ぶ順番から外す** AFH（Adaptive Frequency Hopping）が入りました（[変更履歴](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/core-specification-change-history.html)）。仕様の説明は「used channels are part of the hopping sequence and unused channels are replaced in the hopping sequence by used channels in a pseudo-random way」です（[Core 6.1 Vol 1 Part A](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/architecture.html)）。ただし減らしすぎると跳ぶ意味がなくなるので、下限があります。「Each physical link on the adapted piconet physical channel shall use at least Nmin RF channels (where Nmin is 20).」（[Core 6.1 Vol 2 Part B](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/br-edr-controller/baseband-specification.html)）
+
+どのチャネルを混んでいると判断するかは、仕様では決めていません。チップが自分で測った結果や、同じ端末の Wi-Fi が使っているチャネルの情報を、実装ごとに組み合わせます。
+
+## LE：40 本と、3 本の広告用チャネル
+
+LE は帯の切り方から違います。「The LE system uses 40 RF channels with center frequencies at a 2 MHz spacing from 2402 MHz to 2480 MHz.」（[Core 6.1 Vol 6 Part A](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/physical-layer-specification.html)）
+
+40 本のうち 3 本は**広告用チャネル**（primary advertising channels）として別扱いにされ、残りの 37 本が接続後のデータなどに使う**汎用チャネル**（general-purpose channels）です。番号の振り方が少し変わっていて、広告用の 3 本に 37・38・39 という番号が付き、帯の両端と真ん中あたりに散らしてあります（[Core 6.1 Vol 6 Part B](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/link-layer-specification.html) の Table 1.3）。
+
+| 番号 | 中心周波数 | 用途 |
+| --- | --- | --- |
+| 37 | 2402 MHz | 広告用 |
+| 0〜10 | 2404〜2424 MHz | 汎用 |
+| 38 | 2426 MHz | 広告用 |
+| 11〜36 | 2428〜2478 MHz | 汎用 |
+| 39 | 2480 MHz | 広告用 |
+
+Wi-Fi のチャネル 1・6・11（中心 2412・2437・2462 MHz、それぞれ 20 MHz 幅として考えます）と重ねてみると、38 番と 39 番は 3 つのどれとも重なりません。37 番だけが、チャネル 1 の下の端にかかります。この判定は後の実験で使うので、計算で確かめた結果を載せておきます。
+
+```text
+広告用チャネル: {37: 2402, 38: 2426, 39: 2480} 重なる Wi-Fi: {37: [1], 38: [], 39: []}
+```
+
+Classic が 1 MHz 幅で 79 本だったのに対し、LE は 2 MHz 幅で 40 本です。変調は Classic の Basic Rate と同じく 1 秒に 100 万シンボルの周波数変調が必須で、2 倍の速さの方式は任意です（後で見ます）。**電波の作りは似ていて、違いの大部分は、いつ起きていつ眠るかという時間の使い方にあります。**
+
+## 広告と走査：つながる前のやりとり
+
+LE の機器は、つながる前から周りに自分の存在を知らせます。これが**アドバタイジング**（広告）です。広告する側は、決まった間隔で「広告イベント」を起こし、1 回のイベントの中で 37・38・39 の各チャネルに同じ広告 PDU（パケット）を 1 つずつ送ります（同上 4.4.2.2）。周りの機器は、3 本のうちどれかに受信機を合わせて待っていれば（**走査**、scan）、どこかで拾えます。
+
+イベントの間隔は、ホストが決めた advInterval（20 ms から約 10,486 秒、0.625 ms 単位）に、毎回ずらしの乱数を足したものです。「The advDelay is a (pseudo-)random value with a range 0 ms to 10 ms generated by the Link Layer for each advertising event.」（同上 4.4.2.2.1）。同じ間隔で広告する機器が 2 台あったとき、乱数がなければ毎回同じ時刻にぶつかり続けますが、毎回 0〜10 ms ずらせば、ぶつかってもその次は外れます。
+
+<BleHopping client:visible />
+
+上の SIM の「広告（37・38・39）」を選ぶと、1 回のイベントで 3 本を順に使い、次のイベントまで待つ様子が見えます。
+
+広告 PDU には、最大 31 バイト（拡張広告ならもっと）の中身を載せられます。機器の名前、提供する機能の番号、メーカー固有のデータなどです。**つながらずに、広告の中身だけで用が足りる使い方**もあり、それが**ビーコン**です。Apple の iBeacon は、iOS アプリが「its proximity to iBeacon-enabled hardware」（ビーコンとの近さ）を判断するための形式で（[Apple: iBeacon](https://developer.apple.com/ibeacon/)）、Google の Eddystone は「a Bluetooth low energy (BLE) message format for proximity beacon messages」と説明されています（[google/eddystone](https://github.com/google/eddystone)）。どちらも、広告の中身の並べ方を決めた取り決めで、無線の部分は LE の広告そのものです。近くの端末とのファイル共有で相手を見つける仕組みも、この広告の上に作られています（第 59 回）。
+
+<Callout type="note" title="手元で広告を数えようとして止まったこと">
+  この回では、手元の Mac で周りの広告を一定時間受け取り、相手がアドレスを替える様子を数えるつもりでした。しかし、macOS では Bluetooth を使うプログラムに利用者の許可が要り、端末から走査を始めたところ、許可の確認で処理が止まりました（20 秒の走査が 60 秒たっても終わらなかった）。
+
+  仮に許可されても、macOS の CoreBluetooth は相手の Bluetooth アドレスをそのまま見せません。Apple の文書は、相手を識別する値について「The first time a local manager encounters a peer, the system assigns the peer a UUID」と書いています（[Apple: CBPeer.identifier](https://developer.apple.com/documentation/corebluetooth/cbpeer/identifier)）。見えるのは OS が割り振った識別子だけです。そこで、アドレスの付け替えは後の節で、仕様のテスト値を使った計算で確かめます。
+</Callout>
+
+## つながると、決まった時刻にだけ起きる
+
+広告を拾った側が接続要求（CONNECT_IND）を返すと、接続が始まります。接続を始めた側が Central、広告していた側が Peripheral になります。
+
+接続中の 2 台は、**接続イベント**と呼ばれる決まった時刻にだけ通信します。間隔は接続間隔（connInterval）で、「The connInterval shall be a multiple of 1.25 ms in the range 7.5 ms to 4.0 s.」です（[Core 6.1 Vol 6 Part B 4.5.1](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/link-layer-specification.html)）。イベントとイベントの間、無線は止めておけます。
+
+さらに、Peripheral は **Peripheral latency**（connPeripheralLatency）の回数までイベントを聞き飛ばしてよいことになっています。送るものがないセンサは、毎回起きなくて済みます。ただし上限があり、接続が切れたと判断されるまでの時間（connSupervisionTimeout）の半分より短く収めるよう決められています（同上）。
+
+電池への効き方は、起きる回数で見積もれます。以下は仕様の定義から計算したもので、実測ではありません。
+
+| connInterval | Peripheral latency | Peripheral が起きる回数（送るものがないとき） |
+| --- | --- | --- |
+| 30 ms | 0 | 毎秒約 33 回 |
+| 30 ms | 9 | 毎秒約 3.3 回（10 回に 1 回だけ聞く） |
+| 1 s | 0 | 毎秒 1 回 |
+
+1 回の受信が数百マイクロ秒で済むなら、無線が動いている時間は全体の 1% にも届きません。**ボタン電池で何か月も動く理由は、電波が弱いからではなく、ほとんどの時間眠っているから**です。逆に Classic の音声は、休まず流し続けるのでこの節約が効きません。
+
+## 次にどのチャネルへ跳ぶか：CSA #2
+
+接続イベントのたびに、2 台は同じ汎用チャネルへ跳ばなければなりません。毎回相談していては電池が持たないので、**両方が同じ材料から同じ計算をして、同じ答えにたどり着く**仕組みになっています。これがチャネル選択アルゴリズム（Channel Selection Algorithm、CSA）です。
+
+LE の最初の版からある CSA #1 は、前回の番号に一定の数（hopIncrement）を足して 37 で割った余りを使うだけでした（[Core 6.1 Vol 6 Part B 4.5.8.2](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/link-layer-specification.html)）。Bluetooth 5.0 で加わった CSA #2（[変更履歴](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/core-specification-change-history.html)）は、次の 3 つを入力にします（[Core 6.1 Vol 6 Part B 4.5.8.3](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/link-layer-specification.html)）。
+
+- **channelIdentifier**：接続ごとに固定の 16 ビット。接続のアクセスアドレス（32 ビット）の上位 16 ビットと下位 16 ビットの XOR
+- **counter**：接続イベントの通し番号（connEventCounter）
+- **チャネルマップ**：37 本のうちどれを使うか
+
+計算は、16 ビットの値の上下 8 ビットずつをビット反転する操作（permutation）と、`(17 × a + b) mod 2^16` という掛け算と足し算（MAM）を 3 回繰り返して疑似乱数 prn_e を作り、37 で割った余りをチャネル番号にする、というものです。その番号が使わないチャネルだったら、`N × prn_e / 2^16`（N は使うチャネルの数）を添字にして、使うチャネルの表から選び直します。
+
+### 仕様のサンプルデータと突き合わせる
+
+この計算を Python で 30 行ほどに書き、仕様に付いているサンプルデータ（[Core 6.1 Vol 6 Part C 3 章](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/sample-data.html)）と比べました。サンプルは、アクセスアドレス 0x8E89BED6、チャネル 37 本すべてを使う場合と 9 本だけ使う場合の 2 組です。Python 3.14.0（Apple M1 Pro / macOS 26.2）で実行した結果です。
+
+```text
+channelIdentifier = 0x305F
+Sample data 1 (37 used) remapping table = [0, 1, 2, ..., 36]
+  counter=0: prn_e=56857 unmapped=25 mapped=25  spec=(56857,25,25)  OK
+  counter=1: prn_e=1685 unmapped=20 mapped=20  spec=(1685,20,20)  OK
+  counter=2: prn_e=38301 unmapped=6 mapped=6  spec=(38301,6,6)  OK
+  counter=3: prn_e=27475 unmapped=21 mapped=21  spec=(27475,21,21)  OK
+Sample data 2 (9 used) remapping table = [9, 10, 21, 22, 23, 33, 34, 35, 36]
+  counter=6: prn_e=10975 unmapped=23 mapped=23  spec=(10975,23,23)  OK
+  counter=7: prn_e=5490 unmapped=14 mapped=9  spec=(5490,14,9)  OK
+  counter=8: prn_e=46970 unmapped=17 mapped=34  spec=(46970,17,34)  OK
+```
+
+（1 組目の表は途中を省略して載せています。）7 件すべてで、疑似乱数・余り・最終的なチャネルが一致しました。counter=7 では、余り 14 は使わないチャネルなので、9 本の表の 0 番目（チャネル 9）へ写し直されています。
+
+### Wi-Fi を避けたチャネルマップで回す
+
+次に、Wi-Fi と重なるチャネルを外したマップを作り、10,000 イベントぶん回して、どのチャネルが何回使われたかを数えました。比べるために CSA #1（hopIncrement = 7）も同じマップで回しています。
+
+```text
+Wi-Fi [1] が使用中 → 使う汎用チャネル 27 本: [10, 11, 12, ..., 36]
+  CSA#2: 使ったチャネル 27 本、1 本あたり 323〜396 回（均等なら 370）
+  CSA#1 hop=7: 使ったチャネル 27 本、1 本あたり 270〜541 回（均等なら 370）
+  CSA#2 で外れたチャネルを引いて写し直した割合: 27.7%
+
+Wi-Fi [1, 6, 11] が使用中 → 使う汎用チャネル 6 本: [10, 21, 22, 34, 35, 36]
+  CSA#2: 使ったチャネル 6 本、1 本あたり 1611〜1746 回（均等なら 1667）
+  CSA#1 hop=7: 使ったチャネル 6 本、1 本あたり 1082〜1893 回（均等なら 1667）
+  CSA#2 で外れたチャネルを引いて写し直した割合: 83.6%
+```
+
+（1 行目のチャネルの並びは途中を省略しています。）どちらのマップでも、選ばれたチャネルはすべて Wi-Fi と重ならない側に収まりました。違いは偏り方です。CSA #1 は余りを表の大きさで割り直すので、写し直しが多いと特定のチャネルに集中し、多いものと少ないもので 2 倍近い差が出ました。CSA #2 は写し直しに prn_e の上位ビットを使うので、ほぼ均等に散ります。
+
+Wi-Fi の 3 つのチャネルがすべて使われていると、残る汎用チャネルは 6 本だけです。LE の下限は Classic より緩く、「The minimum number of used channels shall be 2.」です（[Core 6.1 Vol 6 Part B 4.5.8.1](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/link-layer-specification.html)）。SIM のプリセットを「接続: Wi-Fi 1・6・11 を避ける」にすると、12 イベントのうち 8 回で写し直しが起き、6 本の間を行き来する様子が見えます。
+
+<Callout type="tip" title="Wi-Fi と重なるかの判定は簡略化しています">
+  ここでは Wi-Fi の 1 チャネルを中心 ±10 MHz の 20 MHz 幅、BLE の 1 チャネルを ±1 MHz として、区間が重なるかだけで判定しました。実際の Wi-Fi の電波は端で急に消えるわけではなく、40 MHz 幅や 80 MHz 幅で使われることもあります。どのチャネルを外すかは実装が測定などから決めるもので、この表は計算の練習用の目安です。
+</Callout>
+
+## GATT：値の住所録
+
+接続した後に何をやりとりするかを決めるのが、**ATT**（Attribute Protocol）と、その上の **GATT**（Generic Attribute Profile）です。LE の機器の多くは、GATT の形でデータを見せます。
+
+ATT は単純な仕組みで、相手（サーバ）が持っている**属性**（attribute）の表を、16 ビットの番号（ハンドル）で読み書きします。GATT はその表の並べ方を決めたもので、仕様は「A service is a collection of data and associated behaviors to accomplish a particular function or feature.」、「A characteristic is a value used in a service along with properties and configuration information about how the value is accessed」と定義しています（[Core 6.1 Vol 3 Part G](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/generic-attribute-profile--gatt-.html)）。
+
+心拍計なら、「心拍のサービス」の中に「心拍数の値」というキャラクタリスティックがあり、それを読む、という形になります。サービスやキャラクタリスティックの種類は **UUID** で表します。よく使うものには 16 ビットの短い番号が割り当てられていて、決まった 128 ビットの基準値に埋め込んで長い UUID に戻せます。基準値は「00000000-0000-1000-8000-00805F9B34FB」で、「128_bit_value = 16_bit_value × 2^96 + Bluetooth_Base_UUID」と計算します（[Core 6.1 Vol 3 Part B](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/service-discovery-protocol--sdp--specification.html)）。
+
+値の受け取り方は 3 通りです。
+
+| 方法 | 向き | 確認 |
+| --- | --- | --- |
+| 読み出し（Read） | クライアントが要求し、サーバが答える | 応答がある |
+| 書き込み（Write） | クライアントがサーバへ送る | 応答あり／なし（Write Command）を選べる |
+| 通知（Notification）／表示（Indication） | 値が変わったときにサーバから送る | 通知はなし、表示は確認あり |
+
+通知について、ATT の仕様は「For notifications, which do not have a response PDU, there is no flow control and a notification can be sent at any time.」と書いています。表示のほうは、確認（ATT_HANDLE_VALUE_CFM）が返るまで次の表示を送れません（[Core 6.1 Vol 3 Part F](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/attribute-protocol--att-.html)）。センサの値のように、1 つ落ちても次がすぐ来るものは通知、設定の変更のように確実に届けたいものは表示、と使い分けます。クライアントが毎回読みに行かなくても値が届くので、ここでも起きる回数を減らせます。
+
+## ペアリング：鍵を共有し、相手を確かめる
+
+LE の接続そのものは暗号化されていません。暗号化するには、2 台が**ペアリング**で共通の鍵を作ります。作った鍵を保存して次回以降も使うことを**ボンディング**と呼びます。
+
+Bluetooth 4.2 で入った **LE Secure Connections**（[変更履歴](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/core-specification-change-history.html)）では、鍵の共有に楕円曲線の Diffie-Hellman（ECDH）を使います。「LE Secure Connections pairing utilizes the P-256 elliptic curve」（[Core 6.1 Vol 3 Part H](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/security-manager-specification.html)）。公開鍵を交換するだけで、盗み聞きしている第三者には分からない共通の秘密ができる、という第 131 回の仕組みそのものです。
+
+ただし、第 131 回で見たとおり、**鍵交換は相手が誰かを教えてくれません**。間に入った攻撃者と鍵を交換していても気づけない、中間者攻撃（MITM）の問題が残ります。そこで、ペアリングにはいくつかの確かめ方（association model）が用意されています。
+
+| 方式 | 利用者がすること | 中間者への守り |
+| --- | --- | --- |
+| Numeric Comparison | 両方の画面に出た 6 桁が同じか確かめる（legacy pairing には無い） | ある |
+| Passkey Entry | 片方に出た 6 桁を、もう片方に入力する | ある |
+| Out of Band | NFC など別の経路で情報を渡す | 別の経路しだい |
+| Just Works | 何もしない | **ない** |
+
+画面もボタンもないイヤホンやセンサは、確かめる手段がないので Just Works になります。仕様はこの方式で得た鍵の性質を「Unauthenticated no MITM Protection does not have protection against MITM attacks.」と書いています（同上）。全体の構成を説明する巻は、LE Secure Connections の 4 つの方式が BR/EDR の Secure Connections と「functionally equivalent」だとしたうえで、BR/EDR 側の Just Works を「The Just Works association model provides the same protection as the Numeric Comparison association model against passive eavesdropping but offers no protection against the MITM attack.」と説明しています（[Core 6.1 Vol 1 Part A 5.2 と 5.4](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/architecture.html)）。ECDH のおかげで盗み聞きには強くても、ペアリングの瞬間に割り込まれると防げません。
+
+4.2 より前からある **LE legacy pairing** はさらに弱く、仕様自身が「For LE Legacy Pairing, none of the pairing methods provide protection against a passive eavesdropper during the pairing process as predictable or easily established values for TK are used.」と認めています（同上）。6 桁の数字や 0 といった、総当たりできる値から鍵を作るためです。ペアリングの瞬間を録られていれば、後から鍵を計算されてしまいます。
+
+## 追跡されないために、アドレスを替える
+
+広告には送り主のアドレスが入っています。イヤホンや腕時計がずっと同じアドレスで広告していたら、あちこちに受信機を置くだけで、その人の動きを追えてしまいます。
+
+LE には、このための**ランダムなアドレス**が用意されています。中でもよく使われるのが **Resolvable Private Address**（RPA、解決可能な私的アドレス）です。48 ビットのアドレスを、24 ビットの乱数 prand と、24 ビットのハッシュに分けます（[Core 6.1 Vol 6 Part B 1.3.2.2](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/link-layer-specification.html)）。
+
+```text
+hash = ah(IRK, prand)
+randomAddress = prand || hash
+```
+
+IRK（Identity Resolving Key）は、ペアリングのときに相手へ渡しておく 128 ビットの鍵です。ハッシュ関数 ah の中身は AES-128 で、prand を 128 ビットに 0 で埋めて IRK で暗号化し、結果の下位 24 ビットを取ります（[Core 6.1 Vol 3 Part H 2.2.2](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/security-manager-specification.html)）。AES については第 130 回で扱いました。
+
+受け取った側は、手元にある IRK で同じ計算をして、アドレスの後半と一致するかを見ます。一致すれば「あのイヤホンだ」と分かり、IRK を持たない第三者には、ただの乱数にしか見えません。アドレスを替える間隔は、GAP の仕様の表で TGAP(private_addr_int) として「15 min」が推奨値とされ、意味は「Maximum time interval between private address change」です。また別の箇所に「The value of TGAP(private_addr_int) shall not be greater than 1 hour.」とあります（[Core 6.1 Vol 3 Part C](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/generic-access-profile.html)）。
+
+### 仕様のテスト値で確かめる
+
+Security Manager の仕様の付録 D.7 には、ah のテスト値があります。IRK が `ec0234a357c8ad05341010a60a397d9b`、prand が `0x708194` のとき、AES の出力が `159d5fb72ebe2311a48c1bdcc40dfbaa`、ah が `0x0dfbaa` です（同上）。Python 3.14.0 と cryptography 50.0.2 で ah を書き、このテスト値と比べてから、試験用に作った IRK で 15 分ごとに替わるアドレスを模擬しました。
+
+```text
+D.7 sample: ah(IRK, 0x708194) = 0x0dfbaa  (spec: 0x0dfbaa)
+D.7 sample: AES_128 = 159d5fb72ebe2311a48c1bdcc40dfbaa  (spec: 159d5fb72ebe2311a48c1bdcc40dfbaa)
+
+15 分ごとに替わるアドレス（試験用に毎回作った IRK で生成）
+  t= 0 分  7B:4F:96:68:B7:0A  上位 2 ビット=01  IRK で解決=True  別の IRK で解決=False
+  t=15 分  6F:92:1C:0C:C0:BB  上位 2 ビット=01  IRK で解決=True  別の IRK で解決=False
+  t=30 分  79:A5:E0:49:31:3F  上位 2 ビット=01  IRK で解決=True  別の IRK で解決=False
+  t=45 分  79:2A:05:6A:8B:2B  上位 2 ビット=01  IRK で解決=True  別の IRK で解決=False
+  t=60 分  51:AE:49:2E:32:EA  上位 2 ビット=01  IRK で解決=True  別の IRK で解決=False
+
+別の IRK のアドレス 200000 個のうち、誤って解決できた数: 0（期待値 0.012）
+```
+
+ここに出ているアドレスは、実験のために乱数で作った IRK から計算したもので、実在の機器のものではありません。5 つのアドレスに共通点は見えませんが、IRK を持っていればすべて同じ機器だと分かります。先頭の 2 ビットが `01` なのは、RPA であることを示す印です。ハッシュは 24 ビットなので、別の機器のアドレスがたまたま一致する確率は 1/2^24（約 1,700 万分の 1）で、20 万個試して偶然の一致は 0 回でした。
+
+<Callout type="warn" title="アドレスを替えても、中身で追跡できることがある">
+  RPA が隠すのはアドレスだけです。広告の中に、ずっと変わらない機器名やシリアル番号、メーカー固有の識別子を載せていれば、アドレスを替えても同じ機器だと分かってしまいます。アドレスの付け替えと同じ時刻に、広告の中身の変わる部分も替える必要があります。
+</Callout>
+
+## 速さと距離：2M PHY と Coded PHY
+
+Bluetooth 5.0 で、LE の物理層（PHY）に 2 Msym/s の方式と長距離向けの方式が加わりました（[変更履歴](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/core-specification-change-history.html)）。仕様の一覧は次のとおりです（[Core 6.1 Vol 6 Part A](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/physical-layer-specification.html)）。
+
+- LE 1M：1 Mb/s。すべての機器が対応する必須の方式
+- LE 2M：2 Msym/s で 2 Mb/s。同じ量を半分の時間で送れるので、無線が動く時間も短くなる
+- LE Coded：「LE Coded, with the Access Address, Coding Indicator, and TERM1 coded at 125 kb/s and the payload coded at either 125 kb/s or 500 kb/s.」
+
+Coded PHY は、誤り訂正の符号を付けて送る方式です。率 1/2 の畳み込み符号で 1 ビットを 2 ビットにし、S=8 ではさらにその 1 ビットずつを 4 シンボルに広げます（[Core 6.1 Vol 6 Part B 3.3](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/low-energy-controller/link-layer-specification.html)）。1 ビットあたり S=2 は 2 シンボル、S=8 は 8 シンボルです。速さを犠牲にする代わりに、弱い信号からでも復元できます。受信感度の要求値は、符号なしの PHY が -70 dBm 以下、S=2 が -75 dBm 以下、S=8 が -82 dBm 以下です（同上 Table 4.2）。S=8 は符号なしより 12 dB 弱い信号を受け取れることになり、障害物のない空間で考えると、第 53 回の自由空間の損失の式から、届く距離はおよそ 10^(12/20) ≒ 4 倍になります。壁や人体があれば、この見積もりは成り立ちません。
+
+## 音声：Classic のプロファイルと LE Audio
+
+Bluetooth では、用途ごとの取り決めを**プロファイル**と呼びます。Classic の時代からある代表的なものが、音楽を送る A2DP（Advanced Audio Distribution Profile）、通話用の HFP（Hands-Free Profile）、キーボードやマウスの HID（Human Interface Device）です。音楽を聞くときと通話するときで、イヤホンは別のプロファイルに切り替えて動いています。
+
+Bluetooth SIG は、音声を LE の上に載せ直した **LE Audio** を定めました。「LE Audio operates on the Bluetooth Low Energy radio.」とあり、新しいコーデックとして「LE Audio will include a new high-quality, low-power audio codec, the Low Complexity Communications Codec (LC3).」と説明されています。さらに、1 台から何台にでも同時に音を送る一斉送信が加わりました。「LE Audio will also add broadcast audio, enabling an audio source device to broadcast one or more audio streams to an unlimited number of audio sink devices.」（[Bluetooth SIG: LE Audio](https://www.bluetooth.com/learn-about-bluetooth/feature-enhancements/le-audio/)）。この一斉送信の機能に付けられた名前が Auracast です。受信する側は接続せずに受け取るので、広告と同じく「つながらずに受け取る」形です。
+
+## 手元の Mac で見る
+
+手元の Mac（Apple M1 Pro / macOS 26.2）で、`system_profiler SPBluetoothDataType` を実行しました。コントローラ（Bluetooth のチップ）の部分だけを載せ、アドレスは伏せています。ペアリング済みの機器の一覧は、機器名やシリアル番号を含むので省きました。
+
+```text
+Bluetooth Controller:
+    Address: XX:XX:XX:XX:XX:XX
+    State: On
+    Chipset: BCM_4387
+    Discoverable: Off
+    Firmware Version: 23.1.623.4111
+    Product ID: 0x4A04
+    Supported services: 0x392039 < HFP AVRCP A2DP HID Braille LEA AACP GATT SerialPort >
+    Transport: PCIe
+    Vendor ID: 0x004C (Apple)
+```
+
+対応しているサービスの一覧に、この回で見た HFP・A2DP・HID（Classic のプロファイル）と GATT（LE）が並んでいます。1 つのチップが Classic と LE の両方を受け持っていることが分かります。`Transport: PCIe` は、Bluetooth のチップが本体と PCIe でつながっていることを示します。
+
+## まとめ
+
+- Bluetooth には、1 MHz 幅 79 本を毎秒 1600 回跳ぶ Classic と、2 MHz 幅 40 本を使う Low Energy がある。どちらも 2.4 GHz の ISM 帯で、跳び回ることで混雑と干渉をかわす
+- Classic は AFH で、LE はチャネルマップで、混んだチャネルを跳ぶ順番から外す。下限は Classic が 20 本、LE が 2 本
+- LE は 3 本の広告用チャネルで存在を知らせ、接続後は決まった時刻にだけ起きる。Peripheral latency でさらに眠る時間を延ばせる。電池が持つのは、電波が弱いからではなく、ほとんど眠っているから
+- 次に跳ぶチャネルは、アクセスアドレスとイベントの番号から CSA #2 で両端が別々に計算する。仕様のサンプルデータ 7 件と一致し、Wi-Fi を避けたマップでもほぼ均等に散った
+- 接続後のデータは GATT のサービスとキャラクタリスティックで表し、読み出し・書き込み・通知・表示でやりとりする
+- LE Secure Connections は P-256 の ECDH で鍵を共有する。Just Works は中間者を防げず、legacy pairing は盗み聞きも防げない
+- RPA は IRK と AES から作ったハッシュでアドレスを付け替え、IRK を持つ相手だけが同じ機器だと分かるようにする
+
+ここまでは、免許なしで誰でも使える帯の話でした。次の第 57 回では、免許を受けた事業者だけが使う帯で動く携帯電話の網、4G と 5G、そして SMS が届くまでを見ます。

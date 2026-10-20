@@ -1,0 +1,262 @@
+---
+title: AirDrop と Quick Share はどうやって近くの端末に送るのか
+description: インターネットにもアクセスポイントにもつながっていない 2 台が、数秒で相手を見つけ、直接つなぎ、ファイルを渡す。BLE で見つけ、Wi-Fi の直接リンクでつなぎ、TLS や UKEY2 で守って送る 3 段階を、AWDL の仕組み、「連絡先のみ」の照合が電話番号を漏らす理由、Quick Share の確認コードと経路の引き上げまで見ます
+chapter: radio
+order: 7
+status: published
+topics:
+  - AirDrop
+  - AWDL（Apple Wireless Direct Link）
+  - BLE の advertising
+  - 短い ID ハッシュ
+  - 検証用レコード（validation record）
+  - PrivateDrop
+  - すべての人（10 分間のみ）
+  - Quick Share
+  - Nearby Connections
+  - UKEY2
+  - 帯域の引き上げ（bandwidth upgrade）
+  - Wi-Fi Aware
+requires:
+  - ll-55-wifi
+  - ll-56-bluetooth
+  - ll-140-tls13-handshake
+  - ll-129-hash-mac
+---
+
+import Callout from '../../components/Callout.astro'
+import AirdropFlow from '../../components/sim/problems/AirdropFlow'
+
+## 何にもつながっていない 2 台が、ファイルを渡す
+
+電車の中で隣の人に写真を送る。どちらの端末も同じ Wi-Fi にはつながっておらず、モバイル回線が圏外でもかまいません。それでも数秒で相手の名前が画面に出て、数百 MB の動画が送れます。
+
+ここまでの回で見てきた部品を並べると、この芸当には 3 つの仕事が要ることが分かります。
+
+| 段階 | 仕事 | 使う電波 | なぜその電波か |
+| --- | --- | --- | --- |
+| 見つける | 近くに相手がいるかを知る | BLE（2.4 GHz） | 待ち受けの電力が小さく、ずっと聞いていられる（第 56 回） |
+| つなぐ | 大きなデータを運べる経路を作る | Wi-Fi の直接リンク（2.4 / 5 GHz） | BLE では遅すぎる。ただしアクセスポイントは無い（第 55 回） |
+| 守って送る | 相手を確かめ、中身を読まれないようにする | 上の経路の上の TLS、または UKEY2 | 電波は誰にでも聞こえる。暗号で守るしかない（第 140 回） |
+
+AirDrop（Apple）と Quick Share（Google。以前の名前は Nearby Share）は、どちらもこの 3 段階でできています。違うのは、それぞれの段で何を使い、相手をどう確かめるかです。下の SIM で、各段で使う電波と、近くにいる第三者に何が見えるかを追えます。
+
+<AirdropFlow client:visible />
+
+## AirDrop の全体像
+
+Apple のセキュリティガイドは、AirDrop を次のように説明しています（[Apple Platform Security: AirDrop security](https://support.apple.com/guide/security/airdrop-security-sec2261183f4/web)）。
+
+> Apple devices that support AirDrop use Bluetooth Low Energy (BLE) and Apple-created peer-to-peer Wi-Fi technology to send files and information to nearby devices
+
+> The Wi-Fi radio is used to communicate directly between devices without using any internet connection or wireless access point (AP). This connection is encrypted with TLS.
+
+「Apple が作ったピアツーピアの Wi-Fi」が、AWDL（Apple Wireless Direct Link）です。Apple は仕様を公開していませんが、ダルムシュタット工科大学（TU Darmstadt）の研究グループがバイナリと実際の通信を解析し、プロトコルの中身を論文にまとめています（[Stute, Kreitschmann, Hollick: One Billion Apples' Secret Sauce, MobiCom 2018](https://arxiv.org/abs/1808.03156)）。同じグループは、AirDrop の認証の手順も解析し、その欠陥と対策を示しました（[Heinrich et al.: PrivateDrop, USENIX Security 2021](https://www.usenix.org/conference/usenixsecurity21/presentation/heinrich)）。以下の AirDrop の内部の話は、Apple の公開資料とこの 2 本の論文に拠っています。論文は解析の時点のもので、Apple はその後の版で振る舞いを変えている可能性があります。
+
+PrivateDrop の論文は、AirDrop を「見つける（discovery）」「確かめる（authentication）」「送る（data transfer）」の 3 段に分けて描いています。
+
+```text
+送信側                                         受信側
+  │ (1a) BLE advertising: 短いハッシュ ───────→ │ 定期的に BLE を聞いている
+  │                                             │ 一致したら（または「すべての人」なら）AWDL を起動
+  │ ←────────── (1b) AWDL の同期 ─────────────→ │
+  │ ←── (1c) mDNS で _airdrop._tcp を探す ───→ │
+  │ ═══ TLS（双方が証明書を出す）═════════════ │
+  │ (2) POST /Discover 送信者の検証用レコード → │
+  │ ←── 200 OK （知り合いなら受信者のレコード）  │
+  │ (3) POST /Ask  サムネイルなど ───────────→ │ 受け取るかを利用者に聞く
+  │ ←── 200 OK                                  │
+  │     POST /Upload ファイル本体 ───────────→ │
+```
+
+順に見ていきます。
+
+## 見つける: BLE に短いハッシュを載せる
+
+AirDrop は、Apple アカウントに登録された電話番号とメールアドレスから、短いハッシュを作ります。Apple のガイドの言葉では次のとおりです。
+
+> When a user signs in to iCloud, a 2048-bit RSA identity is stored on the device, and when the user turns on AirDrop, an AirDrop short identity hash is created based on the email addresses and phone numbers associated with the user’s Apple Account.
+
+> When a user chooses AirDrop as the method for sharing an item, the sending device emits an AirDrop signal over BLE that includes the user’s AirDrop short identity hash.
+
+この「短い」がどれくらい短いのかを、PrivateDrop の論文が書いています（5.4 節）。
+
+> AirDrop’s BLE advertisements contain the first two bytes of the sender’s hashed contact identifiers, which are also part of the validation record.
+
+識別子（電話番号やメールアドレス）ごとの SHA-256 の、**先頭 2 バイト**です。受信側は、自分の連絡先に入っている人の識別子を同じようにハッシュして、届いた 2 バイトと比べます。「連絡先のみ」の設定で一致がなければ、受信側は何も応答しません（[Apple のガイド](https://support.apple.com/guide/security/airdrop-security-sec2261183f4/web)の "If there is no match, the device doesn’t respond."）。
+
+2 バイトは 65,536 通りしかないので、別人の識別子と偶然一致することもあります。それで困らないのは、ここが本人確認ではなく、**Wi-Fi の直接リンクを起こすかどうか**の判定にすぎないからです。論文も、この短いハッシュは受信側の Wi-Fi を無駄に起こして電池を減らさないための工夫に見える、と述べています（"the short hashes appear to be an optimization to prevent wakeups of the receiver’s Wi-Fi radio that unnecessarily drain the device’s battery"）。本当の照合は、後で TLS の中で行います。
+
+### 手元で確かめる: 2 バイトでどこまで絞れるか
+
+BLE の advertising は暗号化されておらず、近くにいれば誰でも受け取れます。では、2 バイトから電話番号はどこまで絞れるでしょうか。
+
+電話番号は数字だけの形にしてからハッシュされます。論文の脚注には、"+1 (234) 567-8901" は "12345678901" としてハッシュされる、とあります。日本の携帯番号（070・080・090 で始まる 11 桁）なら、国番号の 81 を付けて先頭の 0 を落とした 12 桁、たとえば `8190` に 8 桁が続く形です。この形の番号は 3 種類 × 10^8 = 3 億通りしかありません。
+
+そこで、3 億通りすべての SHA-256 を計算するプログラムを書きました（C と macOS の CommonCrypto、8 スレッド）。標的の番号は乱数で 1 つ選び、プログラムの外には出していません。完全なハッシュと一致する番号と、先頭 2 バイトだけが一致する番号を数えます。Apple M1 Pro / macOS 26.2 での結果です（並行して別の重い処理が走っており、ロードアベレージは 40〜50 でした）。
+
+```text
+candidates          300000000
+threads             8
+elapsed_s           72.51
+hashes_per_s        4137542
+match_first_2_bytes 4635
+match_full_sha256   1
+```
+
+ノートパソコン 1 台で、3 億通りが 73 秒で尽きました。**完全な SHA-256 が 1 つ分かれば、電話番号は 1 分ほどで特定できます。** 先頭 2 バイトだけなら、候補は 4,635 件まで絞れます（期待値は 3 億 ÷ 65,536 ≈ 4,578）。2 バイトだけでは番号を 1 つに決められませんが、同じ人の別の識別子（メールアドレスなど）の短いハッシュや、ほかの手がかりと組み合わせれば、候補はさらに減ります。
+
+第 129 回で見たとおり、ハッシュ関数は入力の候補が少ないと何も隠せません。論文も、電話番号は総当たりで、メールアドレスは辞書や漏洩データとの突き合わせで逆算できると指摘しています（3.2 節）。
+
+## つなぐ: AWDL はアクセスポイントなしで同じチャネルに集まる
+
+普通の Wi-Fi では、端末はアクセスポイント（第 55 回）に参加し、アクセスポイントが決めたチャネルで話します。AWDL にはアクセスポイントがありません。代わりに、近くの AWDL 端末の中から 1 台が**マスター**に選ばれ、全員の時計を合わせます。MobiCom の論文によると、仕組みは次のとおりです。
+
+- **決まった集合場所**: 調整には固定の「ソーシャルチャネル」6、44、149 を使う（国によって異なる）。起動した端末はしばらくこれらを聞き、AWDL の action frame が聞こえれば既存のマスターに従い、聞こえなければ自分がマスターになる
+- **時間を窓に区切る**: 時間を Availability Window（AW）という窓に区切る。1 つの窓は 16 TU（1 TU = 1,024 µs なので約 16.4 ms）。64 個の窓で約 1 秒の周期になり、各端末は「どの窓にどのチャネルにいるか」の予定を action frame で配る
+- **予定が重なる窓でだけ話す**: データを送る端末は、相手と同じチャネルにいる窓を計算し、その窓の間だけ送る
+- **IPv6 だけを運ぶ**: AWDL のデータフレームが運ぶのは IPv6 だけ。アドレスは MAC アドレスから機械的に作るリンクローカルアドレス（RFC 4291 の付録 A）で、近隣探索（NDP）を省く
+- **MAC アドレスは毎回変える**: インタフェースを起動するたびに乱数の MAC アドレスを使う
+
+1 つの無線チップで、アクセスポイントとの通信と AWDL を同時にこなすために、チャネルを時分割で行き来します。論文の計測では、通信量が無いときでも周期の少なくとも 25% を AWDL の側に割き、アクセスポイントにつながっていれば少なくとも 25% をそちらに残していました。
+
+### 手元で確かめる: awdl0 は普段から上がっている
+
+macOS では、AWDL は `awdl0` というネットワークインタフェースとして見えます。sudo の要らない `ifconfig` で見てみます（macOS 26.2）。MAC アドレスとそこから作られるアドレスは、構造を保ったまま架空の値に置き換えています。
+
+```text
+$ ifconfig awdl0
+awdl0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether ae:12:34:56:78:9a
+	inet6 fe80::ac12:34ff:fe56:789a%awdl0 prefixlen 64 scopeid 0x10
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+```
+
+読み取れることが 3 つあります。
+
+1. **IPv4 のアドレスが無い。** `inet6` のリンクローカルアドレスだけです。論文の「IPv6 だけを運ぶ」と合っています
+2. **IPv6 のアドレスは MAC アドレスから作られている。** MAC アドレスの真ん中に `ff:fe` を挟み、先頭バイトの下から 2 ビット目（0x02）を反転させる、RFC 4291 の作り方です。`ae` を反転すると `ac` になります。実際の値でも同じ関係でした
+3. **MAC アドレスは Wi-Fi の本体（en0）と別物。** 実際の値では、先頭バイトの 0x02 のビット（ローカル管理アドレスの印）が立っており、`en0` の MAC アドレスとは違いました。工場で割り当てられた番号ではなく、乱数で作ったアドレスです
+
+同じ形のインタフェースがもう 1 つ、`llw0`（low latency WLAN）もありました。MAC アドレスとリンクローカルアドレスは `awdl0` と同じ値です。用途を説明した Apple の公開資料は見つけられなかったので、ここでは存在の指摘にとどめます。
+
+AirDrop のサービスは、DNS-SD（第 73 回で触れた mDNS の上でサービスを告知・検索する仕組み）で探します。誰も共有シートを開いていない状態で 8 秒間探しても、何も見つかりませんでした。
+
+```text
+$ dns-sd -B _airdrop._tcp local
+Browsing for _airdrop._tcp.local
+DATE: ---Tue 20 Oct 2026---
+19:27:34.036  ...STARTING...
+```
+
+同じ時刻に、この Mac から見えるサービスの種類をすべて列挙すると、`_airplay._tcp` や `_companion-link._tcp` は `en0` や仮想マシン用のブリッジの上に出てきましたが、`awdl0`（インタフェース番号 16）の上には何もありませんでした。インタフェースは上がっていても、AirDrop のサービスは要るときにだけ現れます。BLE の短いハッシュが「起こす」合図になっているのと整合します。
+
+### 速さ
+
+AWDL の上の速さは、普通の Wi-Fi 接続と変わりません。MobiCom の論文は、同じ 2 台の Mac を AWDL でつないだ場合と、片方をアクセスポイントにしてつないだ場合の TCP の速さを比べ、ほぼ同じだったと報告しています（"bandwidth is only limited by the hardware capabilities of the communicating nodes"）。一方で、アクセスポイントとの通信を同時に続け、そのアクセスポイントが AWDL と別のチャネルにいると、チャネルを行き来する分だけ合計の速さが約 13% 落ちました。
+
+## 守って送る: TLS と検証用レコード
+
+相手が見つかったら、送信側はサービスごとに TLS でつなぎます。このとき、双方が Apple の署名した証明書を出します。PrivateDrop の論文によると、AirDrop の相手確認には 2 つの書類が使われます（2.4 節）。
+
+- **証明書**: アカウントごとの UUID を含み、TLS のクライアント証明書・サーバ証明書として使う。UUID だけでは誰なのか分からない
+- **検証用レコード（validation record）**: UUID と、アカウントに登録されたすべての識別子の SHA-256 を、Apple が署名したもの
+
+```text
+VR  = (UUID, SHA-256(ID1), ..., SHA-256(IDm))
+VRσ = (VR, sign(σVR, VR), σVR)
+```
+
+どちらも iCloud にサインインしたときに Apple から受け取り、以後はオフラインで使えます。確かめる側は、(a) レコードの署名を検証し、(b) 証明書の UUID とレコードの UUID が一致することを確かめ、(c) 自分の連絡先の各項目を SHA-256 にかけてレコードの中のハッシュと比べます。すべて通れば「連絡先の誰それ」と確定し、名前と写真で表示します。
+
+確かめられなかった相手も、送信側の画面には出ます。Apple のガイドによると、そうした相手は "a silhouette icon and the device’s name" で「その他の人（Other People）」の欄に並びます。最後に、送信者がサムネイルなどの情報を `/Ask` で送り、受信者が承諾すると `/Upload` で本体を送ります。
+
+## 「連絡先のみ」の照合が漏らすもの
+
+この手順は、相手が知り合いかどうかを確かめるために、**完全な SHA-256 を相手に渡しています。** 上の実測のとおり、日本の携帯番号の完全な SHA-256 は 1 分ほどで元に戻せます。PrivateDrop の論文は、ここに 2 つの欠陥があると指摘しました。
+
+**送信者の漏洩**（3.3 節）: 送信側は、DNS-SD で見つけた相手すべてに、最初の `/Discover` で自分の検証用レコードを送ります。相手が知り合いかどうかを確かめる前にです。論文の言葉では "an attacker can learn the target’s validation record without any authentication by simply announcing an AirDrop service via multicast DNS (mDNS)"。人の多い場所で AirDrop のサービスを告知して待っていれば、共有シートを開いた人の電話番号とメールアドレスのハッシュが集まります。
+
+**受信者の漏洩**（3.4 節）: 受信側は、送信者を連絡先に入れていれば、自分のレコードを返します。悪意のある送信者は、受信者のことを知らなくても、**受信者に知られてさえいれば**受信者の識別子を得られます。論文は、会社の上司のように多くの人の連絡先に入っている人がこれを悪用すると、部下全員の識別子を集められると例を挙げています。
+
+論文は対策として、互いの集合の共通部分だけを明かす暗号の手順（Private Set Intersection、PSI）を使う PrivateDrop を提案し、iOS と macOS で実装して、認証の遅れを 1 秒未満に抑えられることを示しました。BLE の短いハッシュも、固定値に置き換えればよいと提案しています。
+
+<Callout type="warn" title="指摘から何年も経っている">
+  研究グループは 2019 年に Apple へ報告しました。TU Darmstadt が 2024 年 1 月 16 日に出した記事は、Apple から iOS 16（2022 年）で塞ぐと伝えられたが実現していない、と書いています（"A plan that has not yet been realised."）。同じ記事は、中国の当局が AirDrop で情報を広めた人の電話番号とメールアドレスを割り出したとされる件にも触れています（[TU Darmstadt: Failing to act](https://www.crossing.tu-darmstadt.de/news_events/crossing_details_294784.en.jsp)）。執筆時点（2026 年 10 月）で、Apple がこの手順をどう変えたかを示す公開資料は確認できませんでした。共有シートを開くこと自体が、近くの誰かに識別子のハッシュを渡しうる、と考えておくのが安全です。
+</Callout>
+
+## すべての人（10 分間のみ）
+
+「連絡先のみ」で一致しなかった受信者は、送信側の画面に現れません。知らない人と交換したいときは、受信側が一時的に誰にでも応答するように切り替えます。Apple のガイドは "In Everyone mode, the same overall process is used. However, the receiving device responds even if there is no match in the device’s Contacts app." と書いています。
+
+この設定は、iOS 16.2 から時間で切れるようになりました。Apple のサポート文書によると、"In iOS 16.2 and later, the setting called Everyone for 10 Minutes changes after 10 minutes." で、Apple アカウントにサインインしていれば「連絡先のみ」に、していなければ受信オフに戻ります（[Apple: How to use AirDrop on iPhone and iPad](https://support.apple.com/en-us/119857)）。電車の中などで知らない人から写真が一方的に届く問題への対処と考えられます。
+
+この設定の相手は、名前と写真ではなく**端末名**で表示されます。端末名は持ち主が自由に付けられるので、なりすましは容易です。目の前の相手と端末名を口頭で確かめるのが、この場面での本人確認になります。
+
+同じ文書によると、両方の端末が iOS 26.2 以降なら、AirDrop コードを使う手順が案内されます。受信側が表示したコードを送信側に入力すると、相手は 30 日間、連絡先の「その他の既知の連絡先（Other Known List）」に入ります。短いコードを口頭で伝えて相手を確かめる形で、後で見る Quick Share の確認コードと考え方が似ています。
+
+## Quick Share: Nearby Connections の上に載る
+
+Android の Quick Share は、Google の Nearby Connections という汎用の P2P 通信の仕組みの上に作られています。Nearby Connections について、Google の文書は "the API uses a combination of Bluetooth, BLE, and Wi-Fi technologies" と書いています（[Nearby Connections Overview](https://developers.google.com/nearby/connections/overview)）。実装の一部は google/nearby として公開されており、Quick Share の側の実装（`sharing/`）では、サービス ID が `NearbySharing`、接続の形（戦略）が 1 対 1 の `P2P_POINT_TO_POINT` と定義されています（[nearby_connections_manager_impl.cc](https://github.com/google/nearby/blob/main/sharing/nearby_connections_manager_impl.cc)）。Google の文書は、この戦略を "with the highest possible throughput" と説明しています（[Strategies](https://developers.google.com/nearby/connections/strategies)）。
+
+AirDrop が BLE と AWDL に決め打ちなのに対し、Nearby Connections は経路の候補を多く持っています。公開されている定義（[connections_enums.proto](https://github.com/google/nearby/blob/main/proto/connections_enums.proto)）には、`BLUETOOTH`、`BLE`、`WIFI_LAN`（同じ LAN）、`WIFI_HOTSPOT`（片方がアクセスポイントになる）、`WIFI_DIRECT`、`WIFI_AWARE`、`WEB_RTC`、`NFC`、`USB`、そして `AWDL` まで並んでいます。
+
+### 低速の経路でつないでから、速い経路へ移る
+
+Nearby Connections は、まず見つけやすく確実な経路で接続し、そのあと速い経路へ移ります。この手順のためのメッセージが公開されている定義に入っています（[offline_wire_formats.proto](https://github.com/google/nearby/blob/main/connections/implementation/proto/offline_wire_formats.proto) の `BandwidthUpgradeNegotiationFrame`）。
+
+```text
+UPGRADE_PATH_AVAILABLE       速い経路（Wi-Fi Direct の SSID や鍵など）を、いまの経路で知らせる
+CLIENT_INTRODUCTION          新しい経路でつなぎ直し、同じ相手であることを名乗る
+LAST_WRITE_TO_PRIOR_CHANNEL  古い経路での最後の書き込み
+SAFE_TO_CLOSE_PRIOR_CHANNEL  古い経路を閉じてよい
+```
+
+古い経路を閉じる前に、どこまで書いたかを互いに確認してから移ります。途中のデータを失わずに、走っている接続の下の経路を差し替えるためです。
+
+### UKEY2 と 4 桁の確認コード
+
+Nearby Connections の接続は、UKEY2 という鍵交換で守られます。UKEY2 の README は "UKEY2 is a Diffie-Hellman based authenticated key exchange protocol." と書き、3 つのメッセージを次のように説明しています（[google/ukey2](https://github.com/google/ukey2)）。
+
+> First, the client sends a `ClientInit` message to the server -- conceptually, this consists of a list of cipher suites and a commitment to an ephemeral public key for each suite. The server responds with a `ServerInit` -- conceptually, this is the server's chosen cipher suite and an ephemeral public key for the cipher suites selected by the server. Finally, the client responds with a `ClientFinished` -- conceptually, this consists of an ephemeral public key matching the cipher suite selected by the server.
+
+> After the handshake, both client and server derive authentication strings, which may be shown to users for visual comparison or sent over some other channel in order to authenticate the handshake.
+
+TLS と違い、証明書で相手を確かめる手順はありません。その代わり、鍵交換の結果から**認証用の文字列**を作り、両方の画面に出して人間に見比べてもらいます。中間者が割り込んで両側と別々に鍵交換をすると、両端の文字列が一致しなくなります。
+
+`ClientInit` に入れる「コミットメント」は、クライアントが後で送る `ClientFinished`（自分の公開鍵を含む）のハッシュです。クライアントは自分の公開鍵を先に約束させられるので、サーバの公開鍵を見てから自分の鍵を選び直すことができません。画面に出す文字列は短いので、もし鍵を何度も選び直せれば、中間者は両側で一致する文字列を探せてしまいます。先に約束させるのは、この探索を防ぐためです。
+
+公開されている実装では、Nearby Connections は UKEY2 を P-256 の楕円曲線で使い、得られた 32 バイトのトークンから 5 文字の文字列を作っています（[encryption_runner.cc](https://github.com/google/nearby/blob/main/connections/implementation/encryption_runner.cc) の `kCipher` と `kTokenLength`）。Quick Share の側では、同じトークンを 9973 を法とするハッシュで **4 桁の数字**に縮めて表示します（[share_session.cc](https://github.com/google/nearby/blob/main/sharing/share_session.cc) の `TokenToFourDigitString`）。
+
+そのうえで Quick Share は、事前に配られた証明書でこのトークンに署名し合い、相手が連絡先の人かどうかを確かめます（[paired_key_verification_runner.cc](https://github.com/google/nearby/blob/main/sharing/paired_key_verification_runner.cc)）。AirDrop がハッシュの一覧を見せ合って照合するのに対し、こちらは鍵交換のトークンへの署名で確かめる形です。
+
+## 2 つがつながる
+
+2025 年 11 月、Google は Pixel 10 の Quick Share が AirDrop とやりとりできるようにしたと発表しました（[Google Security Blog: Android Quick Share Support for AirDrop](https://security.googleblog.com/2025/11/android-quick-share-support-for-airdrop-security.html)）。Google のセキュリティブログによると、AirDrop の側は「すべての人（10 分間のみ）」に限られます。
+
+> To ensure a seamless experience for both Android and iOS users, Quick Share currently works with AirDrop's "Everyone for 10 minutes" mode.
+
+> the connection is direct and peer-to-peer, meaning your data is never routed through a server, shared content is never logged, and no extra data is shared.
+
+ブログは、相手の端末名を目の前で確かめるよう勧め、「連絡先のみ」への対応は Apple と協力できれば将来行いたいと書いています。他の機器から届く電波上のデータを解釈する部分は、メモリ安全な Rust で書いたとしています。外から届くデータを読む解析処理は、メモリ破壊の脆弱性が出やすい場所だからです。
+
+この方向を後押ししているのが、EU のデジタル市場法（DMA）です。欧州委員会は、Apple に対し iOS の接続機能を他社の機器やアプリにも開くよう求める決定を出し、その項目に「高帯域のピアツーピア Wi-Fi 接続」と「近距離の無線ファイル転送」を挙げています。前者は iOS 26 での Wi-Fi Aware 4.0 への対応、後者は "creating, for example, alternatives to AirDrop." と説明されています（[欧州委員会: Apple specification proceedings](https://digital-markets-act.ec.europa.eu/developer-portal/interoperability/apple-specification-proceedings-interoperability-connected-devices-and-request-based-process_en)）。Wi-Fi Aware は Wi-Fi Alliance の標準の近接通信の仕組みで、AWDL と同じく、アクセスポイントなしで近くの端末と同期して直接話すためのものです。独自の AWDL の代わりに標準の方式が使えるようになれば、他社の機器が AirDrop と同じ土俵に立ちやすくなります。
+
+## まとめ
+
+- 近くの端末へ送る仕組みは、BLE で見つけ、Wi-Fi の直接リンクでつなぎ、暗号で守って送る 3 段階でできている
+- AirDrop は、BLE の advertising に識別子ごとの SHA-256 の先頭 2 バイトを載せる。これは Wi-Fi を起こすかどうかの判定で、本人確認ではない
+- AWDL は、マスターが時計を合わせ、16 TU の窓ごとにチャネルの予定をそろえて、アクセスポイントなしで同じチャネルに集まる。運ぶのは IPv6 だけで、MAC アドレスは乱数、アドレスはそこから作るリンクローカル
+- 相手の確認は TLS の中で、Apple が署名した証明書と検証用レコード（識別子の完全な SHA-256）を見せ合って行う。電話番号の空間は小さく、実測では日本の携帯番号 3 億通りが 73 秒で尽きた
+- そのため送信者は共有シートを開くだけで、受信者は送信者を連絡先に入れているだけで、識別子を相手に渡しうる（PrivateDrop の指摘）
+- 「すべての人」は 10 分で切れ、相手は端末名で表示される。端末名は誰でも付けられる
+- Quick Share は Nearby Connections の上で、低速の経路でつないでから速い経路へ移る。UKEY2 で鍵を交換し、トークンを 4 桁に縮めて人間に見比べさせ、証明書の署名で連絡先かを確かめる
+
+## この章を終えて
+
+第 9 章では、ビットが空気と線を渡るところを見てきました。周波数と帯域幅が速さの上限を決め、その周波数は国が割り当て、Wi-Fi・Bluetooth・携帯網・光回線・同軸ケーブルがそれぞれの事情でその上限に近づこうとしていました。最後の AirDrop と Quick Share は、それらの電波を組み合わせて、アクセスポイントも基地局も無い場所でつながる例でした。
+
+ただし、この章で見たのは、隣の機器へ 1 ホップ届くところまでです。次の第 10 章「箱と線をつなぐ」では、届いたフレームとパケットを、どの機器がどこへ送り届けるのかを見ます。スイッチが MAC アドレスを覚える仕組み、VLAN、ルーターと経路表、インターネット全体をつなぐ BGP、IPv6 と日本の接続方式（PPPoE・IPoE・MAP-E）、そしてクラウドのネットワーク製品が、物理の何を置き換えたものなのかです。

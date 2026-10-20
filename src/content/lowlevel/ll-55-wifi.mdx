@@ -1,0 +1,279 @@
+---
+title: Wi-Fi の速度はどこで決まるか
+description: 箱に書かれた「最大 2.4Gbps」は、どういう計算で出てきた数字なのか。規格上の速度をサブキャリアとストリームの式から再現し、実際に出る速度がその半分以下になる理由を、空中の時間の取り合い（CSMA/CA）、ヘッダと確認応答、束ね方、隣のネットワークから順に見ます。OFDMA、MU-MIMO、MLO、チャネル幅の選び方、ローミング、WPA2 と WPA3 の鍵の扱いまで
+chapter: radio
+order: 3
+status: published
+topics:
+  - IEEE 802.11
+  - Wi-Fi 6 / Wi-Fi 7
+  - PHY レート
+  - MCS
+  - 空間ストリーム
+  - ガードインターバル
+  - CSMA/CA
+  - A-MPDU
+  - OFDMA
+  - MU-MIMO
+  - MLO
+  - ローミング（802.11k/v/r）
+  - WPA3 / SAE
+requires:
+  - ll-53-radio-spectrum
+  - ll-54-spectrum-japan
+---
+
+import Callout from '../../components/Callout.astro'
+import WifiRateCalc from '../../components/sim/problems/WifiRateCalc'
+
+## 箱に書かれた速度は、どこから来るのか
+
+無線 LAN の親機の箱には「最大 2402Mbps」「最大 5764Mbps」のような数字が書かれています。ところが、その親機につないだノート PC で速度を測ると、数百 Mbps しか出ないことがほとんどです。
+
+この差は、宣伝が嘘をついているのではなく、**2 つの別のものを測っている**から生まれます。箱の数字は、電波の上で 1 秒あたり何ビットを運べるかという **PHY レート**（物理層の速度）の、規格上の最大値です。私たちが体感するのは、その上でヘッダや確認応答や順番待ちを差し引いた残りの、データそのものの速さです。
+
+第 53 回では、手元の Mac の表示 432 Mbit/s が「80MHz・MCS 4・2 ストリーム」と一致することを確かめました。この回では、その計算を一般の式に広げて箱の数字を再現し、次に、そこから実際の速度まで何が削っていくのかを順に見ます。
+
+## 規格の名前と世代
+
+Wi-Fi の規格は IEEE 802.11 で、改定ごとに末尾に文字が付きます。業界団体の Wi-Fi Alliance は、主な世代に「Wi-Fi 4」「Wi-Fi 5」のような番号を振りました。Geraci らによる 25 年の歩みの解説（[Geraci et al., arXiv:2507.09613](https://arxiv.org/abs/2507.09613) の Table I）をもとに整理すると次のとおりです。
+
+| IEEE の規格 | 呼び名 | 年 | 主な追加 | 規格上の最大の PHY レート |
+| --- | --- | --- | --- | --- |
+| 802.11b | — | 1999 | 2.4GHz、DSSS | 11 Mb/s |
+| 802.11a | — | 1999 | 5GHz、OFDM | 54 Mb/s |
+| 802.11g | — | 2003 | 2.4GHz で OFDM | 54 Mb/s |
+| 802.11n | Wi-Fi 4 | 2009 | 40MHz 幅、束ねて送る、MIMO（4×4 まで） | 600 Mb/s |
+| 802.11ac | Wi-Fi 5 | 2013 | 160MHz 幅、下りの MU-MIMO、256-QAM | 6.9 Gb/s |
+| 802.11ax | Wi-Fi 6 / 6E | 2021 | OFDMA、上下の MU-MIMO（8×8 まで）、1024-QAM、6GHz 帯 | 9.6 Gb/s |
+| 802.11be | Wi-Fi 7 | 2024 | 320MHz 幅、4096-QAM、MLO | 23 Gb/s |
+
+表の右端の値は、その規格が許す組み合わせをすべて最大にしたときの理論値です。箱の数字はこれより小さく、たとえば Intel は 802.11ax の最大を「2.4 Gbps」とし、注記で「2 Spatial streams with 1024-QAM modulation.」と条件を書いています（[Intel: Different Wi-Fi Protocols and Data Rates](https://www.intel.com/content/www/us/en/support/articles/000005725/wireless/intel-wireless-products.html)）。同じ規格の中で、どの組み合わせを前提にするかで数字が 4 倍変わるわけです。
+
+## 規格上の速度を式で出す
+
+PHY レートは、次の掛け算と割り算で決まります。Geraci らの解説は 802.11be を例に、これを式 (2) として示しています。
+
+```
+PHY レート = データ用サブキャリア数 × 1 サブキャリアのビット数 × 符号化率 × 空間ストリーム数 ÷ 1 シンボルの時間
+```
+
+それぞれの項は、第 53 回で見た道具に対応しています。
+
+| 項 | 意味 | 802.11ax / be での値 |
+| --- | --- | --- |
+| データ用サブキャリア数 | OFDM で帯を細かく分けた数のうち、データを載せる数 | 20MHz で 234、40MHz で 468、80MHz で 980、160MHz で 1960、320MHz で 3920 |
+| ビット数 | 1 サブキャリアの 1 シンボルで送るビット数（変調の段） | BPSK 1、QPSK 2、16-QAM 4、64-QAM 6、256-QAM 8、1024-QAM 10、4096-QAM 12 |
+| 符号化率 | 誤り訂正のための冗長を除いた割合 | 1/2、2/3、3/4、5/6 |
+| 空間ストリーム数 | MIMO で同じ周波数に重ねる流れの数 | 1〜8 |
+| シンボルの時間 | 12.8µs にガードインターバル（GI）を足したもの | GI は 0.8、1.6、3.2µs |
+
+変調の段と符号化率の組み合わせには番号が振られていて、これが **MCS**（Modulation and Coding Scheme）です。802.11ax では MCS 0（BPSK 1/2）から MCS 11（1024-QAM 5/6）まで、802.11be では MCS 13（4096-QAM 5/6）まであります。
+
+サブキャリアの数は、802.11ax で 4 倍に増えました。Geraci らによると、802.11ax でサブキャリアの間隔が従来の 312.5kHz から 78.125kHz に縮められ、その結果シンボルの時間が「12.8 µs compared to the 3.2 µs in previous amendments」になったと説明しています。サブキャリアが 4 倍細かくなり、そのぶん 1 シンボルが 4 倍長くなったので、ガードインターバルの占める割合が小さくなり、反射の遅れにも強くなりました。
+
+<Callout type="note" title="80MHz のデータ用サブキャリアは 980">
+  Geraci らの式 (2) の説明は 80MHz の値を 936 としていますが、手元の実測（次の節）と Linux カーネルの計算表は 980 で一致します。Linux の `cfg80211_calculate_bitrate_he()` は 80MHz・8 ストリーム・MCS 11 の値を `480388888`（10 bit/s 単位で 4803.9 Mbit/s）として持っていて（[net/wireless/util.c（v6.12）](https://github.com/torvalds/linux/blob/v6.12/net/wireless/util.c)）、これは `980 × 10 × 5/6 × 8 ÷ 13.6µs` の値です。この回の計算はすべて 980 を使います。
+</Callout>
+
+### 箱の数字を再現する
+
+この式を Python で書いて、いくつかの組み合わせを計算しました（Python 3.14.0）。
+
+```python
+N_SD = {20: 234, 40: 468, 80: 980, 160: 1960, 320: 3920}
+MCS = [(1, 1/2), (2, 1/2), (2, 3/4), (4, 1/2), (4, 3/4), (6, 2/3), (6, 3/4), (6, 5/6),
+       (8, 3/4), (8, 5/6), (10, 3/4), (10, 5/6), (12, 3/4), (12, 5/6)]
+
+def rate(bw, mcs, nss, gi=0.8):
+    bits, r = MCS[mcs]
+    return N_SD[bw] * bits * r * nss / (12.8 + gi)
+```
+
+```text
+手元: 80MHz 2SS MCS4 GI0.8                     432.4 Mbps
+手元: 80MHz 2SS MCS4 GI1.6                     408.3 Mbps
+手元: 80MHz 2SS MCS5 GI0.8                     576.5 Mbps
+手元の上限: 80MHz 2SS MCS11                      1201.0 Mbps
+Wi-Fi 6 の看板: 160MHz 2SS MCS11               2402.0 Mbps
+Wi-Fi 6 の規格上限: 160MHz 8SS MCS11             9607.8 Mbps
+Wi-Fi 7: 320MHz 2SS MCS13                   5764.7 Mbps
+Wi-Fi 7: 320MHz 8SS MCS13                  23058.8 Mbps
+Wi-Fi 7 の初期目標: 320MHz 16SS MCS13           46117.6 Mbps
+```
+
+箱の 2402Mbps は「160MHz・2 ストリーム・1024-QAM 5/6・GI 0.8µs」で、表の 9.6Gb/s は同じ条件で 8 ストリームにしたものです。Wi-Fi 7 の 23Gb/s は「320MHz・8 ストリーム・4096-QAM 5/6」で、Geraci らも「a link using a 320 MHz channel, 8×8 MIMO, a short guard interval of 0.8µs, and 4096-QAM with 5/6 coding can achieve a data rate of 23 Gb/s」と書いています。
+
+### 46Gbps と 23Gbps
+
+Wi-Fi 7 の速度として「46Gbps」という数字を見かけることがあります。これは 16 ストリームを前提にした値です。802.11be の作業が始まった頃、IEEE の作業部会は「a maximum throughput of at least 30 Gbps」を目標に掲げ、16 ストリームも検討されていました。Deng らの解説は「The use of 16 spatial streams has been discussed as an attractive MIMO feature of EHT.」と書いています（[Deng et al., arXiv:2007.13401](https://arxiv.org/abs/2007.13401)）。
+
+しかし、最終的な規格に入ったのは 8 ストリームまでです。Geraci らは「802.11be and 802.11bn-compliant devices shall support up to 8 streams」と書いています。**46Gbps は初期の検討段階の 16 ストリームの目標値で、最終的な 802.11be の上限は 8 ストリームの約 23Gbps です。**
+
+### 端末の側が上限を決める
+
+箱の数字は親機の能力ですが、通信の速度は親機と端末の**弱い方**で決まります。ストリーム数はアンテナの数を超えられず、スマートフォンやノート PC の多くは 2 本です。手元の Mac も、`system_profiler` の対応表は「Supported PHY Modes: 802.11 a/b/g/n/ac/ax」で、対応チャネルに 6GHz 帯はありません。つまり Wi-Fi 6 の 2×2 で、親機が Wi-Fi 7 の 8 ストリームに対応していても、この Mac との間では 80MHz なら 1201Mbps、160MHz でも 2402Mbps が上限です。
+
+下の図で、規格・帯域幅・GI・ストリーム数・MCS を選ぶと PHY レートが計算されます。その下の段は次の節で使います。
+
+<WifiRateCalc client:visible />
+
+## 手元の Mac で測る
+
+手元の Mac（Apple M1 Pro、macOS 26.2、無線チップは Broadcom の BCM4387）で、`system_profiler SPAirPortDataType` を 4 秒おきに 12 回読みました。ネットワーク名、機器のアドレスなどの識別情報は伏せ、接続中のネットワークの行だけを抜き出しています。
+
+```text
+PHY Mode: 802.11ax | Channel: 104 (5GHz, 80MHz) | Signal / Noise: -70 dBm / -89 dBm | Transmit Rate: 432 | MCS Index: 4 |
+PHY Mode: 802.11ax | Channel: 104 (5GHz, 80MHz) | Signal / Noise: -70 dBm / -89 dBm | Transmit Rate: 432 | MCS Index: 4 |
+PHY Mode: 802.11ax | Channel: 104 (5GHz, 80MHz) | Signal / Noise: -70 dBm / -89 dBm | Transmit Rate: 576 | MCS Index: 6 |
+PHY Mode: 802.11ax | Channel: 104 (5GHz, 80MHz) | Signal / Noise: -71 dBm / -89 dBm | Transmit Rate: 576 | MCS Index: 4 |
+PHY Mode: 802.11ax | Channel: 104 (5GHz, 80MHz) | Signal / Noise: -71 dBm / -89 dBm | Transmit Rate: 432 | MCS Index: 4 |
+（以下同様。12 回中 10 回が 432、2 回が 576）
+```
+
+別の時刻には、Transmit Rate が 408 と表示されました。
+
+```text
+Signal / Noise: -71 dBm / -93 dBm | Transmit Rate: 408 | MCS Index: 4 |
+```
+
+3 つの値は、どれも式で説明できます。432 は MCS 4・GI 0.8µs、408 は同じ MCS 4 で GI を 1.6µs に伸ばしたもの、576 は MCS 5（64-QAM 2/3）の値です。**送信速度は 1 つに固定されているのではなく、電波の状態に合わせて MCS とガードインターバルを刻々と選び直しています。**これをリンクアダプテーションと呼びます。
+
+ただし、576 と同時に表示された MCS 番号が 4 や 6 だった行があり、どの組み合わせでも 576 にはなりません（MCS 6 の 2 ストリームは 648.5 です）。速度と MCS 番号は、少しずれた時刻の値を別々に読んでいると考えられます。表示から設定を読み取るときは、番号よりも速度の値を式と照らし合わせる方が確かです。
+
+受信電力は -71dBm 前後で、SNR はおよそ 18〜22dB です。この 80MHz・2 ストリームの接続の上限 1201Mbps（MCS 11）に対して、実際に選ばれているのは MCS 4〜5 なので、規格の上限の 3〜5 割で走っていることになります。1024-QAM を使うには、もっと強い電波（親機の近く）が要ります。
+
+### 実際にデータを流す
+
+macOS に付いている `networkQuality` で、インターネットの向こうのサーバとの間に実際にデータを流しました。上りと下りを順に測る `-s` の結果です。
+
+```text
+Uplink capacity: 292.521 Mbps
+Downlink capacity: 231.520 Mbps
+Uplink Responsiveness: Medium (97.793 milliseconds | 613 RPM)
+Downlink Responsiveness: Medium (111.309 milliseconds | 539 RPM)
+Idle Latency: 15.639 milliseconds | 3836 RPM
+```
+
+上りの 292Mbps は、送信速度 432Mbps の 68% です。下りは親機の側の送信速度が分からないので比べられません。同じ測定を上下同時に流す既定の設定で行ったときは上り 142Mbps、下り 78Mbps で、回によって大きく揺れました。この測定は Wi-Fi の先にある回線とインターネットも含み、さらにこの Mac は測定中にほかの通信もしていたので、差のすべてを Wi-Fi のせいにはできません。
+
+Wi-Fi の区間だけを切り出すために、親機（デフォルトゲートウェイ）への往復時間を `ping` で 40 回測りました。何も流していないときと、`networkQuality` で下りを流している最中です。
+
+```text
+何も流していないとき
+round-trip min/avg/max/stddev = 1.463/2.625/10.618/1.511 ms
+下りを流している最中
+round-trip min/avg/max/stddev = 1.920/48.540/141.340/28.973 ms
+```
+
+隣にある親機までの往復が、平均 2.6ms から 48.5ms に、最大では 141ms に伸びました。電波の上では、**大量のデータを送っている間、小さな ping も同じ順番待ちの列に並ぶ**ことが分かります。
+
+## 空中の時間は誰のものか：CSMA/CA
+
+Wi-Fi は半二重で、1 つのチャネルの上では、ある瞬間に送れるのは基本的に 1 台だけです（第 53 回）。親機も端末も、近くの別のネットワークも、同じチャネルなら同じ空間を取り合います。その取り合いの規則が **CSMA/CA**（Carrier Sense Multiple Access with Collision Avoidance）です。
+
+Geraci らは、基本の考え方を「before transmitting, a device listens to the channel to determine if it is free. If the channel is busy, the device waits until the channel becomes free to transmit.」と説明しています。ただ空くのを待つだけでは、待っていた全員が同じ瞬間に送り出してぶつかるので、空いた後にさらに**ランダムな数のスロット**だけ待ちます。
+
+> With BEB, after detecting that the medium is idle, a device waits for a random backoff time, uniformly selected between 0and a contention window (CW). The CW is initially set to a minimum value (CW min) to enable fast channel access, and it doubles after each failed transmission attempt—up to a maximum limit (CW max)
+
+（原文は PDF からの抽出で、「0and」の空白の欠けもそのままです）
+
+手順を時間の数字で書くと、次のようになります。5GHz 帯の OFDM では、1 スロットは 9µs、データを受けてから確認応答を返すまでの間隔 SIFS は 16µs です（FreeBSD の [net80211/ieee80211_phy.h](https://github.com/freebsd/freebsd-src/blob/main/sys/net80211/ieee80211_phy.h) は `IEEE80211_DUR_OFDM_SIFS	16` と `IEEE80211_DUR_OFDM_SLOT	9` を定義しています）。普通の通信（Best Effort）の待ちの規則は、Linux の既定値で AIFSN 3、CWmin 15、CWmax 1023 です（[net/mac80211/util.c（v6.12）](https://github.com/torvalds/linux/blob/v6.12/net/mac80211/util.c) の `ieee80211_set_wmm_default()`）。
+
+1. チャネルが空いたら、まず AIFS（SIFS + 3 スロット = 43µs）待つ
+2. 0〜CW のランダムな数を引き、空いている間だけ 1 スロットずつ数え下げる。途中で誰かが送り始めたら数え下げを止める
+3. 0 になったら送る。最初にプリアンブル（同期と設定を伝える頭の部分）、次にデータ
+4. 受けた側は SIFS の後に確認応答（束ねて送ったときは Block Ack）を返す
+5. 確認応答が来なければ衝突か電波の誤りとみなし、CW を倍にして引き直す
+
+数え下げの数を一番小さく引いた 1 台が先に送り、ほかの台は残りの数を持ったまま次の機会を待ちます。2 台が同じ数を引くと同時に送り出して衝突し、その時間は丸ごと無駄になります。
+
+### どこに時間が消えるか
+
+この手順を Python の模型にして、時間の内訳を数えました。飽和した（常に送るものがある）N 台が、80MHz・2 ストリーム・MCS 4（432.4Mbps）で 1 つのチャネルを 2 秒間取り合います。1 回の送信で 1538 バイト（MAC ヘッダ込み）の MPDU を agg 個束ねて送ります。プリアンブルを 48µs、SIFS と Block Ack を合わせて 68µs と置いたのは概算で、結果は「どこに時間が消えるか」の比較として読んでください。
+
+```text
+agg=  1 N=  1  合計   48.2 Mbps (11.2%)  AIFS+待ち 43.4%  プリアンブル 18.8%  データ 11.2%  SIFS+BlockAck 26.7%  衝突  0.0%
+agg=  1 N= 10  合計   46.9 Mbps (10.8%)  AIFS+待ち 30.4%  プリアンブル 18.3%  データ 10.8%  SIFS+BlockAck 25.9%  衝突 14.6%
+agg=  8 N=  1  合計  216.6 Mbps (50.1%)  AIFS+待ち 24.4%  プリアンブル 10.6%  データ 50.1%  SIFS+BlockAck 15.0%  衝突  0.0%
+agg=  8 N= 10  合計  191.9 Mbps (44.4%)  AIFS+待ち 15.5%  プリアンブル  9.4%  データ 44.4%  SIFS+BlockAck 13.3%  衝突 17.5%
+agg= 64 N=  1  合計  384.6 Mbps (88.9%)  AIFS+待ち  5.4%  プリアンブル  2.3%  データ 88.9%  SIFS+BlockAck  3.3%  衝突  0.0%
+agg= 64 N=  2  合計  361.8 Mbps (83.7%)  AIFS+待ち  4.2%  プリアンブル  2.2%  データ 83.7%  SIFS+BlockAck  3.1%  衝突  6.8%
+agg= 64 N=  5  合計  335.0 Mbps (77.5%)  AIFS+待ち  3.3%  プリアンブル  2.0%  データ 77.5%  SIFS+BlockAck  2.9%  衝突 14.2%
+agg= 64 N= 10  合計  301.6 Mbps (69.7%)  AIFS+待ち  3.2%  プリアンブル  1.8%  データ 69.7%  SIFS+BlockAck  2.6%  衝突 22.7%
+agg= 64 N= 20  合計  280.5 Mbps (64.9%)  AIFS+待ち  2.9%  プリアンブル  1.7%  データ 64.9%  SIFS+BlockAck  2.4%  衝突 28.1%
+```
+
+読み取れることは 2 つです。
+
+1 つ目に、**1 回に 1 フレームずつ送ると、速度は PHY レートの 1 割ほどになります**。1538 バイトは 432Mbps なら 28µs で送れますが、その前後に待ち、プリアンブル、確認応答で 200µs 以上かかるからです。電波が速くなるほどデータの時間は縮み、固定の待ちとヘッダの割合が増えます。これを解決したのが、802.11n で入った**束ねて送る仕組み**（A-MPDU）です。Geraci らは「without packet aggregation, each data packet requires its own PHY preamble and MAC header, resulting in considerable protocol overhead.」と書いています。64 個束ねると、1 台だけなら 9 割近くがデータの時間になります。
+
+2 つ目に、**同じチャネルで送る台数が増えると、衝突の時間が増えます**。64 個束ねていても、20 台では 3 割近くが衝突で消えます。しかも、残った 280Mbps は 20 台で分け合う合計です。
+
+手元の測定が 432Mbps に対して上りで 292Mbps だったのは、この模型の数字から見ても不自然ではありません。模型に入っていない要素もあります。TCP は受け取りの確認（ACK）を逆向きに送るので、上りの通信でも親機からの送信が混じります。リンクアダプテーションは誤りが少しは出る MCS を選ぶので再送も起きます。そして、手元の環境には、**同じチャネル 104 を 160MHz 幅で使っている隣のネットワークが、こちらの親機とほぼ同じ強さ（-73dBm）で見えていました**。チャネルが重なっていれば、隣の家の通信も同じ順番待ちの列に入ります。
+
+上の図の下の段で、「1 回に束ねる数」と「同じチャネルの送信者」を動かすと、この内訳が変わります。送信者を 2 台以上にして「次の取り合い」を押すと、各台の数え下げの残りと、同じ数を引いて衝突する様子を 1 回ずつ追えます。
+
+<Callout type="note" title="図の数値と本文の数値">
+  図の中の模型は本文の Python と同じ規則ですが、乱数の作り方が違うため、同じ設定でも数値は少しずれます。
+</Callout>
+
+## 取り合いを減らす：OFDMA と MU-MIMO
+
+CSMA/CA は、送るものが小さく、送る台数が多いほど効率が落ちます。チャットの通知やセンサーの値のような小さな送信が多い家庭や、端末が密集する会場では、空中の時間の大半が待ちとヘッダになります。802.11ax は、この問題に正面から取り組んだ改定でした。Geraci らは「802.11ax (Wi-Fi 6 [61]) [62] marked a shift from raw speed to efficiency.」と書き、密集した場所のために「OFDMA, uplink MU-MIMO, and spatial reuse (BSS coloring)」を入れたと説明しています。
+
+- **OFDMA**：80MHz のサブキャリアを、端末ごとの小さな束（RU、Resource Unit）に分け、**1 回の送信で複数の端末に同時に**送る。小さなデータを 1 台ずつ取り合わずに済む。上りでは、親機が「この RU で、この時刻に送れ」と指示してまとめて受ける
+- **MU-MIMO**：空間ストリームを、別々の端末に振り分ける。親機が 4 本、端末が 2 本なら、2 台に 2 本ずつ同時に送れる。802.11ac で下りに入り、802.11ax で上りにも広がった
+- **BSS カラー**：隣のネットワークの電波に色の番号を付け、弱い他所の電波なら待たずに送ってよいと判断できるようにする
+
+OFDMA と MU-MIMO は、どちらも**親機が割り振る**仕組みです。早い者勝ちの CSMA/CA の上に、4G や 5G の基地局に近い「指示して割り当てる」やり方を重ねたと言えます（第 57 回）。
+
+## 複数の帯を同時に使う：MLO
+
+802.11be（Wi-Fi 7）の最大の追加は **MLO**（Multi-Link Operation）です。これまでの Wi-Fi は、1 つの接続で 1 つのチャネルしか使えず、2.4GHz と 5GHz と 6GHz のどれにつなぐかを選んでいました。MLO では、1 回の接続で複数の帯のリンクを持ち、トラフィックを振り分けたり、空いている方へ逃がしたりできます。Wi-Fi Alliance は「Multi-link operation supports more efficient load balancing of traffic among links」と説明しています（[Wi-Fi Alliance: Wi-Fi CERTIFIED 7](https://www.wi-fi.org/discover-wi-fi/wi-fi-certified-7)）。
+
+実装には段階があります。Geraci らの解説によると、フル機能の 802.11be の無線を 1 つだけ持つ EMLSR（enhanced multi-link single radio）は、複数のリンクを聞いておき、「Upon receiving an initial control frame on one of the links, the device switches to that link and operates using all antennas.」という動作をします。同時に複数のリンクで送受信する STR は、無線を複数持つ機器でなければできません。端末の電池と部品の都合で、まずは「空いている方を選ぶ」使い方から広がっていきます。
+
+## チャネル幅は広ければよいのか
+
+式のとおり、チャネル幅を倍にすると PHY レートはほぼ倍になります。しかし、広い幅には代償があります。
+
+- **重ならないチャネルが減る**：2.4GHz 帯について、Geraci らは「There are only three non-overlapping 20 MHz channels in 2.4 GHz」と書いています。日本の 5GHz 帯でも 160MHz 幅は 2 本しか取れません（第 54 回）。集合住宅で隣と幅広のチャネルが重なれば、上の模型のとおり取り合いの相手が増えます
+- **電力が薄まる**：第 54 回で見たとおり、日本の 5GHz 帯の出力の上限は 1MHz あたりで決まっているので、幅を倍にしても全体の電力は増えません。1 サブキャリアあたりの電力が半分になり、SNR が 3dB 下がって、選べる MCS が下がりえます。遠い部屋では、狭い幅の方が速いこともあります
+- **DFS の帯に入りやすい**：80MHz や 160MHz を取ろうとすると、気象レーダーなどと共用する 5.3GHz・5.6GHz 帯（W53・W56）に入ります。手元の接続のチャネル 104 もこの帯です。レーダーを検出すると親機はチャネルを移るので、そのたびに通信が途切れます（第 54 回）
+
+広い幅は、近くに親機があり、周りに同じ帯のネットワークが少ないときに効きます。6GHz 帯が歓迎されたのは、まだ使っている機器が少なく、広い幅を重ならずに取れるからです。
+
+## 部屋を移る：ローミングとメッシュ
+
+親機を複数置いた家や事務所では、端末が移動すると、より近い親機へつなぎ替える必要があります。つなぎ替えるかどうかを決めるのは、**親機ではなく端末**です。Apple の文書によると、Mac は「Mac computers monitor and maintain the current BSSID’s connection until the RSSI crosses the –75 dBm threshold.」とされています（[Apple: Wi-Fi roaming support in Apple devices](https://support.apple.com/guide/deployment/wi-fi-roaming-support-dep98f116c0f/web)）。手元の -71dBm はこの閾値に近く、少し離れると隣の親機を探し始める位置にいます。
+
+つなぎ替えを速くするために、3 つの追加規格があります。同じ Apple の文書の説明では次のとおりです。
+
+| 規格 | 役割 |
+| --- | --- |
+| 802.11k | 「802.11k allows these devices to quickly identify nearby access points that are available for roaming.」。近くの親機の一覧を教え、探す時間を減らす |
+| 802.11v | 「802.11v provides additional information about nearby access points that could be optimal candidates to join.」。どこへ移るとよいかを親機から勧める |
+| 802.11r | 「802.11r streamlines the authentication process using a feature called Fast BSS Transition (FT)」。移った先での鍵の作り直しを短くする |
+
+**メッシュ**の Wi-Fi は、親機同士も無線でつなぎ、有線を引かずに範囲を広げる構成です。ただし、中継の区間も同じ電波を使うので、同じチャネルで中継すると、1 つのデータが空中を 2 回通り、その分だけ空中の時間を使います。中継専用の帯（別の 5GHz や 6GHz）を持つ機種や、親機同士を有線でつなぐ構成が速いのはこのためです。
+
+## 鍵の扱い：WPA2 と WPA3
+
+最後に、無線の上の暗号に触れておきます。家庭向けの WPA2-Personal では、親機と端末が同じパスフレーズを知っていて、そこから作った共通の鍵を出発点にします。接続のたびに **4-way handshake** と呼ばれる 4 通のやりとりで、互いの乱数を混ぜた使い捨ての鍵を作り、通信はその鍵で暗号化されます（暗号の部品は第 128 回からの第 19 章）。
+
+この方式の弱点は、パスフレーズを直接確かめられる材料が電波の上を流れることです。4 通のやりとりを録音した攻撃者は、パスフレーズの候補を手元で次々に試し、録音と合うものを探せます。電波の上で何度も試す必要がないので、弱いパスフレーズはこの方法で割り出されます。
+
+WPA3-Personal は、この出発点の部分を **SAE**（Simultaneous Authentication of Equals）という、パスワードで認証する鍵交換に置き換えました。Wi-Fi Alliance は「Users of WPA3-Personal receive increased protections from password guessing attempts」と説明しています（[Wi-Fi Alliance: Security](https://www.wi-fi.org/discover-wi-fi/security)）。SAE の土台になった Dragonfly 鍵交換を定めた [RFC 7664](https://www.rfc-editor.org/rfc/rfc7664.html) は、その性質を「It is resistant to active attack, passive attack, and offline dictionary attack.」と述べています。録音しても手元でパスフレーズを試す材料にならず、確かめるには 1 回ずつ実際に接続を試みるしかない、という性質です。手元の接続の表示「Security: WPA2/WPA3 Personal」は、親機が両方を受け付ける移行用の設定になっていることを示しています。
+
+## まとめ
+
+- 箱の速度は PHY レートの理論値。`データ用サブキャリア数 × ビット数 × 符号化率 × ストリーム数 ÷ (12.8µs + GI)` で再現でき、802.11ax の 2402Mbps は 160MHz・2 ストリーム・1024-QAM 5/6 の値
+- Wi-Fi 7 の 46Gbps は初期に検討された 16 ストリームの目標値で、最終的な 802.11be は 8 ストリームまで、上限は約 23Gbps
+- 速度は親機と端末の弱い方で決まる。多くの端末は 2 ストリーム。実際の MCS は電波の強さで刻々と変わり、手元の Mac では MCS 4〜5 と GI の切り替えが観測できた
+- 実際に出る速度を削るのは、CSMA/CA の待ち、プリアンブル、確認応答、衝突、そして同じチャネルを使う他人。束ねて送る A-MPDU がなければ PHY の 1 割ほどしか使えず、送り手が増えると衝突が増える
+- 802.11ax の OFDMA と MU-MIMO は、取り合いを親機の割り振りに置き換えて効率を上げ、802.11be の MLO は複数の帯を 1 つの接続で使う
+- チャネル幅を広げると速くなるが、重ならないチャネルが減り、1MHz あたりの電力が薄まり、DFS の帯に入りやすい
+- WPA3 の SAE は、録音から手元でパスフレーズを試す攻撃を防ぐ
+
+次の第 56 回では、同じ 2.4GHz 帯を Wi-Fi と分け合いながら、ずっと小さな電力で動く Bluetooth と BLE を見ます。

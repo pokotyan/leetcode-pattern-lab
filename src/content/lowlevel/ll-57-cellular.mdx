@@ -1,0 +1,322 @@
+---
+title: 携帯電話の網と SMS
+description: 電源を入れたスマートフォンは、どうやって全国に広がる網の一員になり、どこにいても着信を受けられるのか。セルと基地局、4G と 5G のコアネットワークの分担、SIM の鍵による相互認証と加入者番号の暗号化、データを運ぶトンネル、音声と SMS の通り道、そして eSIM までを、3GPP の仕様とテストベクタでの再現とともに見ます
+chapter: radio
+order: 5
+status: published
+topics:
+  - セル / ハンドオーバー
+  - ページング
+  - 無線アクセス網とコアネットワーク
+  - EPC（MME・S-GW・P-GW・HSS）
+  - 5GC（AMF・SMF・UPF・UDM・AUSF）
+  - サービスベースアーキテクチャ
+  - AKA（Authentication and Key Agreement）
+  - MILENAGE
+  - SUPI / SUCI / 5G-GUTI
+  - PDU セッション / ベアラ
+  - GTP-U
+  - APN / DNN
+  - NSA / SA
+  - FR1 / FR2
+  - ネットワークスライス
+  - IMS / VoLTE
+  - SMSC
+  - SMS over NAS
+  - eSIM / eUICC
+requires:
+  - ll-53-radio-spectrum
+  - ll-131-public-key
+  - ll-129-hash-mac
+---
+
+import Callout from '../../components/Callout.astro'
+import CellularAttach from '../../components/sim/problems/CellularAttach'
+
+## Wi-Fi と何が違うのか
+
+Wi-Fi のアクセスポイントは、家やオフィスの中だけで完結する小さな網の入口です。接続する端末はパスワードを知っていればよく、アクセスポイントは端末がどこへ移動しようと関知しません。
+
+携帯電話の網は、事情がまったく違います。
+
+- **移動する**：利用者は通話しながら電車で移動し、基地局を次々に乗り換える。電源を入れたまま鞄に入っている端末にも、着信を届けなければならない
+- **加入者を知っている**：つないでよいのは契約している人だけ。しかも、旅行先の他国の網からも同じ契約でつながる
+- **料金を数える**：誰がどれだけ使ったかを記録する
+
+これらを支えているのが、全国に散らばった基地局と、その奥にある**コアネットワーク**と呼ばれる計算機群、そして端末に挿さった（あるいは埋め込まれた）**SIM** です。この回では、端末の電源を入れてから SMS を 1 通受け取るまでに何が起きるかを、仕様を定めている 3GPP（3rd Generation Partnership Project。携帯電話の規格を作る標準化団体）の文書に沿って追います。
+
+下のシミュレーターは、端末・基地局・5G のコアの各機能・SMS を預かる SMSC のあいだを流れるメッセージを 1 通ずつ進めます。まずは最初の場面を最後まで流して、全体の流れを眺めてください。以下の節は、この流れを前から順に分解していきます。
+
+<CellularAttach client:visible />
+
+## セル：空間を区切って周波数を使い回す
+
+1 つの基地局のアンテナが受け持つ範囲を**セル**と呼びます。第 53 回で見たとおり、電波の帯域は限られた資源で、1 つのセルの中では利用者がそれを分け合います。全国を 1 つの巨大なセルで覆えば、日本中の利用者が同じ帯域を奪い合うことになります。そこで、範囲を小さなセルに区切り、**離れたセルでは同じ周波数をもう一度使う**ことで、全体の容量を増やします。セルを小さくするほど同じ周波数を使える回数が増えるので、利用者の多い都市部ほどセルは小さくなります。
+
+セルを区切ると、移動する利用者がセルの境界をまたぐ問題が出てきます。通信中の端末は、つながっている基地局の電波の強さと、隣のセルの電波の強さを測り続けて基地局に報告します。網はその報告をもとに、途中で通信を切らずに隣の基地局へ受け持ちを移します。これが**ハンドオーバー**です。
+
+通信していない（アイドル状態の）端末については、網は「どのセルにいるか」まで追いかけません。いくつかのセルをまとめた**トラッキングエリア**の単位で居場所を覚えておき、着信があればそのエリアのすべてのセルで一斉に端末を呼び出します。これを**ページング**と呼びます。端末はエリアをまたいだときだけ網に届け出ればよいので、電池の消耗を抑えられます。
+
+## 基地局と、その奥のコア
+
+携帯電話の網は、大きく 2 つの部分に分かれます。
+
+- **無線アクセス網（RAN）**：基地局の集まり。端末と電波でやりとりする部分
+- **コアネットワーク**：加入者の認証、居場所の管理、通信の経路の設定、インターネットへの出口を受け持つ部分
+
+4G（LTE）のコアは **EPC**（Evolved Packet Core）、5G のコアは **5GC**（5G Core）と呼ばれ、それぞれ次の機能に分かれています。
+
+| 役割 | 4G（EPC） | 5G（5GC） |
+| --- | --- | --- |
+| 基地局 | eNodeB | gNB |
+| 端末との制御のやりとり、登録、移動の管理 | MME | AMF |
+| 通信の経路（セッション）の管理、IP アドレスの割り当て | MME と S-GW・P-GW の制御部分 | SMF |
+| 利用者のパケットを実際に運ぶ | S-GW、P-GW | UPF |
+| 加入者のデータと認証の材料 | HSS | UDM（と、データを置く UDR） |
+| 認証の実行 | MME と HSS | AUSF |
+
+4G の仕様（[TS 23.401](https://www.etsi.org/deliver/etsi_ts/123400_123499/123401/19.06.00_60/ts_123401v190600p.pdf)、以下の引用は V19.6.0）は、S-GW を「the gateway which terminates the user plane interface towards E-UTRAN」（基地局の側への利用者データの接続を終端するゲートウェイ）、P-GW を「the gateway which terminates the SGi interface towards the PDN」（外部のパケット網への接続を終端するゲートウェイ）と定めています。端末から見て、基地局側の入口が S-GW、インターネット側の出口が P-GW です。
+
+5G では、この分け方がもう一歩進みました。5G の全体構成を定める [TS 23.501](https://www.etsi.org/deliver/etsi_ts/123500_123599/123501/19.09.00_60/ts_123501v190900p.pdf)（V19.9.0）は、設計の原則の 1 つ目に「Separate the User Plane (UP) functions from the Control Plane (CP) functions, allowing independent scalability, evolution and flexible deployments」（利用者データを運ぶ機能を制御の機能から分け、それぞれを独立に増やし、改め、柔軟に配置できるようにする）を挙げています。制御の判断は SMF、パケットの転送は UPF と、はっきり分けたことで、UPF だけを利用者の近く（地域の拠点）に置くといった配置ができるようになりました。
+
+### 機能同士は HTTP の API で話す
+
+5GC のもう 1 つの特徴は、制御の機能同士のやりとりを**サービス**として定義したことです。AMF は `Namf`、SMF は `Nsmf` という名前の API を公開し、ほかの機能はそれを呼び出します。TS 23.501 は「Service based interface: It represents how a set of services is provided/exposed by a given NF.」（サービスベースインタフェースとは、ある機能がサービスの集まりをどう提供し公開するかを表すものである）と定義しています。そしてその API の通信方式について、[TS 29.500](https://www.etsi.org/deliver/etsi_ts/129500_129599/129500/19.07.01_60/ts_129500v190701p.pdf)（V19.7.1）は「HTTP/2 as described in IETF RFC 9113 [7] shall be used in Service based interface.」（サービスベースインタフェースでは RFC 9113 の HTTP/2 を使わなければならない）と定めています。第 79 回で見た HTTP/2 のフレームが、携帯網の中核でも流れているわけです。
+
+シミュレーターのメッセージ名にある `Nausf_UEAuthentication_Authenticate` や `Nsmf_PDUSession_CreateSMContext` は、この API の操作の名前です。
+
+## 網に入るまで：セルを探し、声をかける
+
+電源を入れた端末は、まず周りのセルを探します。5G の無線の全体を述べる [TS 38.300](https://www.etsi.org/deliver/etsi_ts/138300_138399/138300/19.04.00_60/ts_138300v190400p.pdf)（V19.4.0）は、これを「Cell search is the procedure by which a UE acquires time and frequency synchronization with a cell and detects the Cell ID of that cell.」（セル探索とは、端末がセルと時刻・周波数の同期をとり、そのセルの番号を知る手順である）と説明しています。基地局は決まった周波数と間隔で同期用の信号を出し続けているので、端末はそれを探して時計を合わせます。続いて基地局が報知している情報を読み、そのセルがどの事業者の網に属するのか、どうすれば接続を始められるのかを知ります。
+
+時計が合っても、端末はまだ送信できません。いつ、どの周波数で送ってよいかを基地局から割り当ててもらっていないからです。そこで端末は、決められた形の信号（プリアンブル）を決められた枠で送り、基地局に存在を知らせます。これが**ランダムアクセス**です。TS 38.300 によれば、方式は「4-step RA type with MSG1 and 2-step RA type with MSGA」（4 段階の方式と 2 段階の方式）の 2 種類です。基地局はこれに応えて、上りの送信枠と、端末との距離に応じた送信タイミングの補正値を返します。
+
+ここまでは端末と基地局のあいだの話です。基地局との接続ができると、端末はその向こうのコアに向けて**登録**（4G ではアタッチ）を頼みます。登録の要求は基地局を素通りして AMF に届き、ここから認証が始まります。
+
+## SIM の中の鍵で、互いを確かめる
+
+### SIM が持っているもの
+
+SIM（正確には、カードの上で動く USIM というアプリケーション）の中には、加入者ごとに異なる 128 ビットの秘密の鍵 **K** が書き込まれています。同じ K は、事業者のコアの認証センター（AuC。5G では UDM の一部）だけが持っています。K は SIM の外に読み出せないように作られており、端末の OS からも見えません。
+
+認証の仕組みを定める [TS 33.102](https://www.etsi.org/deliver/etsi_ts/133100_133199/133102/19.01.00_60/ts_133102v190100p.pdf)（V19.1.0）は、その考え方を次のように書いています。
+
+> 「The mechanism described here achieves mutual authentication by the user and the network showing knowledge of a secret key K which is shared between and available only to the USIM and the AuC in the user's HE.」
+>
+> （ここで述べる仕組みは、利用者と網の双方が、USIM と利用者のホームの網の AuC だけが共有し持っている秘密の鍵 K を知っていると示すことで、相互の認証を達成する。）
+
+要点は**相互**の認証であることです。網が端末を確かめるだけでなく、端末も網を確かめます。
+
+### 2G の認証は片方向だった
+
+この「相互」が強調されるのは、2G（GSM）の認証が片方向だったからです。GSM の認証で網が使う材料は、TS 33.102 の言葉では「a) a network challenge RAND, b) an expected user response SRES and c) a cipher key Kc」（網からの挑戦である乱数 RAND、期待する利用者の応答 SRES、暗号鍵 Kc）の 3 つ組でした。網は乱数を送り、端末は K から計算した答えを返すだけで、**網が本物であることを示す材料が含まれていません**。そのため、事業者を装った偽の基地局を置かれると、端末はそれを見分けられませんでした。シミュレーターの「2G：偽の基地局」で、この流れを確かめられます。
+
+3G 以降の AKA（Authentication and Key Agreement）は、TS 33.102 が「a challenge/response protocol identical to the GSM subscriber authentication and key establishment protocol combined with a sequence number-based one-pass protocol for network authentication」（GSM と同じ挑戦応答の手順に、順序番号を使った網の認証の手順を組み合わせたもの）と述べるとおり、網の側の証明を足したものです。
+
+### AUTN：網が K を知っている証拠
+
+網（ホームの AuC）は、認証のたびに乱数 RAND を作り、K と RAND と順序番号 SQN を入力にして、いくつかの値を計算します。計算に使う関数は f1〜f5 と名付けられていて、3GPP は例として **MILENAGE** という AES を使った具体的な関数の組を定めています（[TS 35.206](https://www.etsi.org/deliver/etsi_ts/135200_135299/135206/19.00.00_60/ts_135206v190000p.pdf)）。事業者は別の関数を使ってもかまいません。
+
+| 関数 | 出力 | 役割 |
+| --- | --- | --- |
+| f1 | MAC | K を知る者にしか作れない検査値（第 129 回の MAC と同じ考え方） |
+| f2 | RES | 端末が返す応答 |
+| f3、f4 | CK、IK | 暗号化と完全性保護に使う鍵 |
+| f5 | AK | SQN を隠すための鍵 |
+
+網はこれらから、認証トークン **AUTN** を組み立てて RAND と一緒に端末に送ります。TS 33.102 の定義は `AUTN = SQN ⊕ AK || AMF || MAC` です（AMF はここでは認証の管理用のフィールドで、5G の AMF とは別物です）。SQN をそのまま送らずに AK と XOR するのは、SQN が利用者の識別や位置の手がかりになりうるからだと仕様は説明しています。
+
+受け取った USIM は、TS 33.102 の Figure 9 の順に検査します。
+
+1. RAND から AK を計算し、SQN を取り出す
+2. K で MAC を計算し直し、AUTN の MAC と比べる。違えば、相手は K を知らない網なので拒否する
+3. SQN が、これまでに受け入れたものより新しいかを確かめる。古ければ、盗聴した過去の RAND と AUTN の再送なので拒否する
+4. 合格なら、RES を計算して返す。この時点で、網と USIM の両方に同じ CK と IK が揃っている
+
+最後に網が RES と期待値を比べて、端末の側の認証が終わります。K そのものは一度も電波に乗りません。
+
+### 手元で確かめる：MILENAGE をテストベクタで動かす
+
+3GPP は MILENAGE の実装を確かめるためのテストベクタを [TS 35.208](https://www.etsi.org/deliver/etsi_ts/135200_135299/135208/19.00.00_60/ts_135208v190000p.pdf)（V19.0.0）で公開しています。TS 35.206 の 4.1 節の式を Python で書き、Test Set 2〜6 のすべての出力と一致するかを確かめました。中心の部分は次のとおりです。
+
+```python
+def milenage(k, opc, rand, sqn, amf):
+    temp = E(k, xor(rand, opc))                       # E は AES-128 で 1 ブロック暗号化
+    in1 = sqn + amf + sqn + amf
+    out = {1: xor(E(k, xor(temp, xor(rot(xor(in1, opc), R[1]), c(1)))), opc)}
+    for i in range(2, 6):
+        out[i] = xor(E(k, xor(rot(xor(temp, opc), R[i]), c(i))), opc)
+    return {
+        'f1': out[1][:8], 'f1*': out[1][8:], 'f2': out[2][8:], 'f3': out[3],
+        'f4': out[4], 'f5': out[2][:6], 'f5*': out[5][:6],
+    }
+```
+
+実行環境は Apple M1 Pro / macOS 26.2、Python 3.14.0、cryptography 48.0.0 です。
+
+```text
+Test Set 2: OPc 一致
+  f1   4a9ffac354dfafb3                 一致
+  f1*  01cfaf9ec4e871e9                 一致
+  f2   a54211d5e3ba50bf                 一致
+  f3   b40ba9a3c58b2a05bbf0d987b21bf8cb 一致
+  f4   f769bcd751044604127672711c6d3441 一致
+  f5   aa689c648370                     一致
+  f5*  451e8beca43b                     一致
+（Test Set 3〜6 もすべて一致）
+```
+
+続いて、Test Set 2 の値で網の側が作る認証ベクタと、それを受け取った USIM の検査を動かしました。USIM の側の SQN は網より 32 だけ古い値にしてあります。
+
+```text
+--- 網（ホームの AuC）が作る認証ベクタ ---
+RAND  23553cbe9637a89d218ae64dae47bf35
+AUTN  55f328b43577b9b94a9ffac354dfafb3
+XRES  a54211d5e3ba50bf
+CK    b40ba9a3c58b2a05bbf0d987b21bf8cb
+IK    f769bcd751044604127672711c6d3441
+
+--- USIM が受け取って検査する ---
+本物の網から      : 受理。RES = a54211d5e3ba50bf を返す。CK と IK が両者に揃う
+K を知らない偽の網: MAC 不一致で拒否（K を持つ網が作った RAND と AUTN の組ではない）
+RAND を 1 ビット変更: MAC 不一致で拒否（K を持つ網が作った RAND と AUTN の組ではない）
+同じベクタの再送 : SQN が古い: 使い回された認証ベクタとして拒否（同期のやり直しを求める）
+```
+
+AUTN の末尾 8 バイト `4a9ffac354dfafb3` は、f1 の出力（MAC）そのものです。K を知らない偽の網は正しい MAC を作れず、本物の網が過去に送った組をそのまま再送しても、今度は SQN の検査で止まります。これが、2G で欠けていた「網の側の証明」です。
+
+### 5G で足されたこと
+
+5G の AKA（5G AKA）は、この仕組みを土台に 2 つの点を強めています。5G のセキュリティを定める [TS 33.501](https://www.etsi.org/deliver/etsi_ts/133500_133599/133501/19.07.00_60/ts_133501v190700p.pdf)（V19.7.0）は、5G AKA を「enhances EPS AKA [10] by providing the home network with proof of successful authentication of the UE from the visited network」（訪問先の網から、端末の認証が成功した証拠をホームの網に届けることで、4G の AKA を強めたもの）と説明しています。4G では、ローミング先の網が「認証に成功した」と言えばホームの網はそれを信じるしかありませんでした。5G では、端末の応答 RES* を最終的に確かめるのはホームの網の AUSF です。シミュレーターで、AMF が受け取った RES* を AUSF へ送り直しているのはこのためです。
+
+もう 1 つは、応答に網の名前を混ぜることです。TS 33.501 は「In 5G AKA, the serving network name has a similar purpose of binding the RES* and XRES* to the serving network.」（5G AKA では、在圏網の名前が RES* と XRES* をその網に結び付ける役割を持つ）と述べています。ある網のために作った応答を、別の網で使い回すことはできません。
+
+## 番号を電波に流さない：SUPI と SUCI
+
+認証の前に、端末は「自分は誰か」を名乗らなければなりません。網はその名前で加入者を探し、K を使った計算をするからです。携帯電話の加入者番号は、2G から 4G では **IMSI**（International Mobile Subscriber Identity）、5G では **SUPI**（Subscription Permanent Identifier）と呼ばれます。
+
+4G でも、端末がまだ仮の名前を持っていなければ、IMSI をそのまま名乗ります。TS 23.401 の最初のアタッチの手順は、端末が送る要求の中身を「Attach Request (IMSI or old GUTI, ...」（IMSI または以前に振られた仮の名前）と書いています。偽の基地局を置いて IMSI を聞き出せば、その場に誰がいるかを特定できてしまいます。このような装置は IMSI キャッチャーと呼ばれます。
+
+5G はこれを塞ぎました。TS 33.501 は「The SUPI should not be transferred in clear text over NG-RAN except routing information, e.g. Mobile Country Code (MCC) and Mobile Network Code (MNC).」（SUPI は、国番号や事業者番号のような経路の情報を除いて、無線アクセス網の上を平文で送るべきではない）と定めています。端末は SUPI を、SIM に書き込まれたホームの網の**公開鍵**で暗号化した **SUCI**（Subscription Concealed Identifier）にして送ります。復号できる秘密鍵はホームの網の UDM にしかないので、偽の基地局は SUCI を受け取っても番号を読めません。
+
+暗号化の方式は ECIES と呼ばれる、第 131 回の鍵交換と第 130 回の共通鍵暗号を組み合わせたものです。端末は使い捨ての鍵ペアを作り、ホームの網の公開鍵と X25519 の鍵交換をして共有の秘密を得て、そこから導いた鍵で番号を AES で暗号化し、HMAC で検査値を付けます。TS 33.501 の Annex C は、方式（Profile A）の部品を「EC Diffie-Hellman primitive : X25519」「ENC : AES–128 in CTR mode」「MAC : HMAC–SHA-256」のように定め、C.4.3.1 節にテストデータを載せています。これも Python で再現しました。
+
+```text
+ホーム網の公開鍵  5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650
+Scheme Output     b2e92f836055a255837debf850b528997ce0201cb82adfe4be1f587d07d8457dcb02352410cddd9e730ef3fa87
+テストデータと    一致
+UDM で復号した MSIN 00012080f6
+```
+
+出力の先頭 32 バイトが端末の使い捨ての公開鍵、続く 5 バイトが暗号化された加入者番号、最後の 8 バイトが検査値です。使い捨ての鍵ペアを毎回作り直すので、同じ番号でも SUCI は毎回変わります。TS 33.501 が SUCI を「A one-time use subscription identifier」（一度だけ使う加入者識別子）と呼ぶのはこのためです。
+
+<Callout type="warn" title="公開鍵が書き込まれていなければ、守られない">
+  SUCI による保護は、SIM にホームの網の公開鍵が書き込まれていることが前提です。TS 33.501 は「If the home network has not provisioned the Home Network Public Key in USIM, the SUPI protection in initial registration procedure is not provided. In this case, the null-scheme shall be used by the ME.」（ホームの網が USIM に公開鍵を書き込んでいなければ、最初の登録での SUPI の保護は提供されない。その場合、端末は暗号化しない方式を使う）と定めています。5G だから必ず番号が隠れる、というわけではありません。
+</Callout>
+
+登録が終わると、AMF は端末に **5G-GUTI** という仮の名前を振ります。以後の端末は SUPI でも SUCI でもなく、この仮の名前で名乗ります。仮の名前は網の判断で振り直されるので、長く追跡する手がかりになりにくくなります。
+
+## データの通り道：トンネルの中を IP パケットが流れる
+
+認証と登録が終わっても、端末はまだインターネットに出られません。登録は「網の一員になった」というだけで、データを運ぶ経路は別に作ります。
+
+4G ではこの経路を**ベアラ**と呼びます。TS 23.401 は、最初に作られる**デフォルトベアラ**を「The EPS bearer which is first established for a new PDN connection and remains established throughout the lifetime of the PDN connection.」（新しいパケット網への接続のために最初に作られ、その接続が続くあいだ保たれるベアラ）と定義しています。4G では、アタッチの手順の中でデフォルトベアラまで作れます。TS 23.401 は「The always-on connectivity for UE/users of the EPS may be enabled by establishing a default EPS bearer during Network Attachment.」（アタッチの中でデフォルトベアラを作ることで、常時接続を提供できる）と述べています。電源を入れた 4G の端末が、すぐに IP アドレスを持っているのはこのためです。
+
+5G では、登録とは別の手順で **PDU セッション**を作ります。TS 23.501 の定義は「Association between the UE and a Data Network that provides a PDU connectivity service.」（端末とデータ網のあいだの、パケットのやりとりを提供する結び付き）です。どのデータ網に接続するかは、4G では **APN**（Access Point Name）、5G では **DNN**（Data Network Name）という名前で指定します。端末の設定画面にある「APN」は、この名前です。セッションの種類は IPv4、IPv6、その両方のほか、Ethernet のフレームや形を決めないデータも選べます。
+
+セッションを受け持つ SMF は、端末の IP アドレスを決め、パケットを運ぶ UPF に転送の規則を設定します。端末の IP パケットは、基地局と UPF（4G では S-GW と P-GW）のあいだを **GTP-U** というトンネルに包まれて運ばれます。GTP-U の仕様 [TS 29.281](https://www.etsi.org/deliver/etsi_ts/129200_129299/129281/19.02.00_60/ts_129281v190200p.pdf)（V19.2.0）は、トンネルを「identified in each node with a TEID, an IP address and a UDP port number」（各ノードで TEID と IP アドレスと UDP のポート番号によって識別される）と定め、ポート番号を「The UDP Destination Port number for GTP-U request messages is 2152.」と決めています。端末の IP パケットの外側に、トンネルの識別子 TEID を含む GTP-U のヘッダ、UDP のヘッダ、事業者の網の中での IP ヘッダを重ねて運ぶ構造です。
+
+トンネルを使う理由は、端末が移動してもインターネット側から見た出口（UPF）を変えずに済むことにあります。基地局を乗り換えたときは、基地局と UPF のあいだのトンネルの端を付け替えるだけで、端末の IP アドレスは変わりません。
+
+端末に振られる IPv4 アドレスは、多くの場合、事業者の内部用のアドレスです。UPF の先で第 91 回の CGNAT を通って、ほかの多数の加入者と同じ公開アドレスを分け合います。スマートフォンに外から直接接続できないのは、このためです。
+
+## 5G の 2 つの形：NSA と SA
+
+5G の導入は、基地局だけを先に新しくする形から始まりました。複数の無線方式を同時に使う仕組みを定める [TS 37.340](https://www.etsi.org/deliver/etsi_ts/137300_137399/137340/19.03.00_60/ts_137340v190300p.pdf)（V19.3.0）は、その形を「E-UTRAN supports MR-DC via E-UTRA-NR Dual Connectivity (EN-DC), in which a UE is connected to one eNB that acts as a MN and one en-gNB that acts as a SN. The eNB is connected to the EPC via the S1 interface」（端末は、主となる 4G の基地局と、従となる 5G の基地局の両方に接続し、4G の基地局は 4G のコアである EPC につながる）と説明しています。
+
+これが一般に **NSA**（Non-Standalone）と呼ばれる形です。制御は 4G の基地局と 4G のコアが受け持ち、5G の電波はデータを速く運ぶための追加の通り道として使われます。画面に「5G」と表示されていても、コアは 4G のままで、この回で見た SUCI や 5G AKA、PDU セッション、ネットワークスライスは使われません。5G の基地局と 5GC だけで動く形が **SA**（Standalone）で、5G のコアの機能はこちらで初めて使われます。
+
+## Sub6 とミリ波
+
+5G の電波は、周波数の範囲で 2 つに分けられています。5G の基地局の無線の仕様 [TS 38.104](https://www.etsi.org/deliver/etsi_ts/138100_138199/138104/19.06.00_60/ts_138104v190600p.pdf)（V19.6.0）の Table 5.1-1 による区分は次のとおりです。
+
+| 区分 | 周波数の範囲 |
+| --- | --- |
+| FR1 | 410 MHz – 7125 MHz |
+| FR2（FR2-1） | 24250 MHz – 52600 MHz |
+| FR2（FR2-2） | 52600 MHz – 71000 MHz |
+
+FR1 のうち 6 GHz 以下の帯域が一般に **Sub6**、FR2 が**ミリ波**と呼ばれます（30 GHz 以上は波長が 10 mm 以下になるのが名前の由来で、FR2 の下端の 24 GHz 付近はミリ波よりわずかに長い波長です）。第 53 回で見たとおり、周波数が高いほど広い帯域を確保しやすく速度を出せますが、遠くへ届かず、壁や人体に遮られやすくなります。ミリ波のセルが Sub6 のセルよりずっと小さくなるのはこのためです。日本でどの事業者にどの帯域が割り当てられているかは、第 54 回の表で見ました。
+
+## ネットワークスライス：1 つの網を用途ごとに切り分ける
+
+5GC の設計では、1 つの物理的な網の上に、性質の違う論理的な網を何本も作れるようにしています。TS 23.501 は**ネットワークスライス**を「A logical network that provides specific network capabilities and network characteristics.」（特定の能力と特性を提供する論理的な網）と定義し、標準の種類の例として次のような値を定めています（Table 5.15.2.2-1 から抜粋）。
+
+| 種類 | 値 | 特性 |
+| --- | --- | --- |
+| eMBB | 1 | 高速な大容量通信向け |
+| URLLC | 2 | 高信頼・低遅延の通信向け |
+| MIoT | 3 | 大量の IoT 機器向け |
+| V2X | 4 | 車と周囲の通信向け |
+
+スライスは、コアの機能（SMF や UPF）を用途ごとに別に用意したり、基地局で無線の資源を優先して割り当てたりすることで作ります。サービスベースの設計と、制御と転送の分離が、こうした切り分けを可能にしています。
+
+## 遅延はどれくらいか
+
+5G の要求条件をまとめた [TR 38.913](https://www.etsi.org/deliver/etsi_tr/138900_138999/138913/19.00.00_60/tr_138913v190000p.pdf)（V19.0.0）は、利用者データの遅延の目標を「For URLLC, the target for user plane latency should be 0.5ms for UL, and 0.5ms for DL.」「For eMBB, the target for user plane latency should be 4ms for UL, and 4ms for DL.」と定めています。
+
+ただし、この値が測っているのは**無線の区間だけ**です。同じ文書は対象を、無線のプロトコルの層 2/3 の入口から出口まで、つまり端末と基地局のあいだと定義しています。アプリケーションから見た往復時間には、基地局から UPF までのトンネル、UPF から先のインターネット、相手のサーバまでの距離が加わります。「5G なら 1ms」という言い方は、この区別を落としたものです。この回では携帯網の上での実測はしていません。
+
+## 音声：VoLTE は IMS の上の SIP
+
+2G と 3G の音声通話は、通話のあいだ専用の回線を確保する**回線交換**で運ばれていました。4G のコアは IP パケットだけを扱うので、音声も IP の上に載せる必要があります。そのための仕組みが **IMS**（IP Multimedia Subsystem）で、4G の上の音声通話を VoLTE、5G の上を VoNR と呼びます。
+
+IMS の仕様 [TS 23.228](https://www.etsi.org/deliver/etsi_ts/123200_123299/123228/19.08.00_60/ts_123228v190800p.pdf)（V19.8.0）は、IMS のインタフェースを「conform as far as possible to IETF "Internet standards" for the cases where an IETF protocol has been selected, e.g. SIP and RTP」（IETF の規格を採用した部分では、できる限りそれに従う。たとえば SIP と RTP）と述べています。通話の開始や終了の合図は SIP、音声そのものは RTP で運ばれ、IMS の合図の通り道としては専用のベアラ（または PDU セッション）が使われます。第 92 回の WebRTC と同じく、合図と音声を別々の流れで運ぶ構造です。
+
+4G でも IMS を持たない網や端末のために、着信や発信のときだけ 3G 以前の回線交換へ戻る方式（CS Fallback）も定められています（[TS 23.272](https://www.etsi.org/deliver/etsi_ts/123200_123299/123272/19.01.00_60/ts_123272v190100p.pdf)）。
+
+## SMS はどこを通るか
+
+### 蓄積交換の SMSC
+
+SMS の仕様 [TS 23.040](https://www.etsi.org/deliver/etsi_ts/123000_123099/123040/19.00.00_60/ts_123040v190000p.pdf)（V19.0.0）は、SMS の要となる SC（Service Centre。一般には SMSC と呼ばれます）を「function responsible for the relaying and store-and-forwarding of a short message between an SME and an MS」（SMS を送る側と端末のあいだで、短いメッセージを中継し、いったん蓄えてから送り出す機能）と定義しています。宛先の端末が圏外にいれば、SMSC が預かったまま、届けられるようになるのを待ちます。1 通の大きさは「up to 140 octets」（最大 140 オクテット）で、7 ビットの文字なら 140 × 8 ÷ 7 = 160 文字になります。長い文は、複数の SMS に分けて送り、端末の側でつなぎ直します。
+
+SMSC は宛先の端末に届けるために、まず加入者のデータベース（2G/3G の HLR、4G の HSS、5G の UDM）に「この加入者は今どこの配下にいるか」を問い合わせます。この問い合わせの答えを書き換えられると SMS が攻撃者に届いてしまうことは、第 155 回で見ました。
+
+### 世代ごとの通り道
+
+SMS の特徴は、**データ通信の経路ではなく、制御の合図の通り道に載って届く**ことです。そのため、データ通信の契約がない端末でも、IP アドレスがなくても受け取れます。
+
+| 世代 | SMS の通り道 |
+| --- | --- |
+| 2G/3G | 回線交換の交換機（MSC）が、端末との制御用のチャネルで届ける |
+| 4G（SMS over SGs） | MME と 3G の交換機を SGs というインタフェースでつなぎ、MME が NAS（端末とコアの制御の合図）に載せて届ける |
+| 4G / 5G（SMS over IMS） | IMS の SIP のメッセージとして届ける |
+| 5G（SMS over NAS） | SMSF が受け取り、AMF が NAS に載せて届ける |
+
+4G の SMS over SGs について、TS 23.272 は「The MO SMS and MT SMS are signalled over SGs and do not cause any CS Fallback to GERAN/UTRAN RATs」（発信と着信の SMS は SGs を通して合図され、2G/3G の無線への切り替えを起こさない）と述べています。4G のコアは回線交換を持たないので、SMS の部分だけ 3G の交換機を借りる形です。
+
+5G では、TS 23.501 の AMF の機能の一覧に「Provide transport for SMS messages between UE and SMSF.」（端末と SMSF のあいだで SMS を運ぶ）が入っています。シミュレーターの後半は、5G の手順を定める [TS 23.502](https://www.etsi.org/deliver/etsi_ts/123500_123599/123502/19.09.00_60/ts_123502v190900p.pdf)（V19.9.0）の Figure 4.13.3.6-1（アイドル状態の端末への SMS 着信）を簡略化したものです。SMSC が UDM に届け先の SMSF を問い合わせ、SMSF に本文を渡し、SMSF が AMF に端末の呼び出しを頼み、ページングで起きた端末に AMF が NAS で本文を届けます。端末は受け取ったことを SMSF に返し、SMSF が SMSC へ配達の報告を返します。
+
+## eSIM：SIM を書き換えて契約を変える
+
+SIM カードは、契約を変えるたびに差し替える物理的な部品でした。**eSIM** は、端末に埋め込まれた書き換え可能な SIM（eUICC）に、契約の情報を遠隔から書き込む仕組みです。その要件を定めた ETSI の [TS 103 383](https://www.etsi.org/deliver/etsi_ts/103300_103399/103383/14.00.00_60/ts_103383v140000p.pdf)（V14.0.0）は、目的を「remote management of an embedded UICC (eUICC) for purposes of changing an MNO subscription without requiring a physical removal and replacement of the UICC in the end device」（端末の SIM を物理的に取り外して交換することなく、事業者との契約を変えるための、埋め込み型 SIM の遠隔管理）と述べています。
+
+書き込まれる単位は**プロファイル**と呼ばれ、同じ文書は「combination of a file structure, data and applications to be provisioned onto, or present on, an eUICC」（eUICC に書き込まれる、ファイルの構造とデータとアプリケーションの組み合わせ）と定義しています。この回で見た加入者番号や鍵 K、ホームの網の公開鍵は、このプロファイルの中身です。プロファイルを届ける経路について、同じ文書は「There shall be an additional secure mechanism providing the capability for authorization, authentication, integrity and confidentiality for the loading and installation of Profiles」（プロファイルの読み込みと導入のために、認可、認証、完全性、秘匿性を提供する追加の安全な仕組みがなければならない）を要件に挙げています（REQ-12-EU-04-03）。消費者向けの端末の具体的な方式は、業界団体 GSMA の SGP.22 などの仕様が定めています（GSMA の文書は執筆時点で取得できなかったため、この回では中身を確かめていません）。
+
+<Callout type="note" title="SIM が変わったことは、外からは見えにくい">
+  プロファイルを別の端末に移す手続きは、事業者の本人確認に依存します。物理的な SIM カードの差し替えと同じく、その確認を突破されれば、電話番号は攻撃者の端末に移ります。第 155 回の SIM スワップは、eSIM でも同じように起こります。
+</Callout>
+
+## まとめ
+
+- 携帯網は、空間をセルに区切って周波数を使い回し、通信中はハンドオーバーで、アイドル中はトラッキングエリアとページングで端末を追う
+- 網は基地局の集まりとコアネットワークに分かれる。5GC は制御（AMF、SMF）と転送（UPF）を分け、機能同士は HTTP/2 の API で話す
+- 端末と網は、SIM とホームの網だけが持つ鍵 K で互いを確かめる。網の側の証拠が AUTN の MAC で、順序番号 SQN が再送を防ぐ。2G の認証にはこれがなく、偽の基地局を見分けられなかった
+- 5G は加入者番号を公開鍵で暗号化した SUCI で名乗り、応答の確認をホームの網が行う。ただし公開鍵が SIM に入っていなければ保護されない
+- データは PDU セッション（4G はベアラ）として作られ、基地局と UPF のあいだを GTP-U のトンネルで運ばれる。移動しても出口が変わらないので IP アドレスは保たれる
+- NSA は 4G のコアのまま 5G の電波を足した形で、5GC の機能は SA で初めて使われる。遅延の目標値は無線の区間だけの値
+- 音声は IMS の上の SIP と RTP、SMS は制御の合図の通り道に載って SMSC から届く
+- eSIM は契約の情報（プロファイル）を遠隔で書き込む仕組みで、番号の移転が本人確認に頼る点は物理的な SIM と変わらない
+
+次の第 58 回では、無線ではなく線の側、家まで届く光ファイバーと同軸ケーブルの仕組みを見ます。

@@ -277,7 +277,7 @@ XFetch で「期限前に作り直す」と決めた人がさらにロックを�
 
 ### HTTP のキャッシュにも同じ考え方がある
 
-古い値を返しながら裏で作り直す、という考え方は HTTP のキャッシュにもあります。`Cache-Control: max-age=600, stale-while-revalidate=30` は、RFC 5861 の言葉で「the stale-while-revalidate Cache-Control extension indicates that caches MAY serve the response in which it appears after it becomes stale, up to the indicated number of seconds.」です（[RFC 5861](https://www.rfc-editor.org/rfc/rfc5861)）。期限切れから 30 秒の間は、古い応答を返しつつ裏で取り直してよい、という意味になります。低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-113-http-cache-cdn/`}>他人の応答を配るキャッシュ</a>の回では、Varnish がこれを grace という仕組みで既定で行っていることを実測しました。
+古い値を返しながら裏で作り直す、という考え方は HTTP のキャッシュにもあります。`Cache-Control: max-age=600, stale-while-revalidate=30` は、RFC 5861 の言葉で「the stale-while-revalidate Cache-Control extension indicates that caches MAY serve the response in which it appears after it becomes stale, up to the indicated number of seconds.」です（[RFC 5861](https://www.rfc-editor.org/rfc/rfc5861)）。期限切れから 30 秒の間は、古い応答を返しつつ裏で取り直してよい、という意味になります。低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-126-http-cache-cdn/`}>他人の応答を配るキャッシュ</a>の回では、Varnish がこれを grace という仕組みで既定で行っていることを実測しました。
 
 ## 無いことも覚える：ネガティブキャッシュ
 
@@ -285,7 +285,7 @@ Cache-Aside では、DB に**存在しない**キーを読まれると、毎回�
 
 対策は、「無い」という結果もキャッシュすることです。DB に無かったら、「無い」を表す印を短い TTL でキャッシュに入れます。TTL を短くするのは、あとでその ID のデータが作られたときに、「無い」がいつまでも残らないようにするためです。作成のときに印を消すなら、TTL はもっと長くできます。
 
-DNS は、この考え方を標準として持っています。存在しない名前の答えにも期限を付けて覚えておく仕組みで、低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-61-dns-cache/`}>DNS のキャッシュ</a>の回で扱いました。存在しうるキーの集合があらかじめ分かっているなら、読み物の<a href={`${import.meta.env.BASE_URL}reading/bloom-filter/`}>Bloom Filter</a>で「確実に無い」キーを DB の手前ではじく方法もあります。
+DNS は、この考え方を標準として持っています。存在しない名前の答えにも期限を付けて覚えておく仕組みで、低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-74-dns-cache/`}>DNS のキャッシュ</a>の回で扱いました。存在しうるキーの集合があらかじめ分かっているなら、読み物の<a href={`${import.meta.env.BASE_URL}reading/bloom-filter/`}>Bloom Filter</a>で「確実に無い」キーを DB の手前ではじく方法もあります。
 
 ## 一斉に切れないようにする：TTL のゆらぎ
 

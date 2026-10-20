@@ -34,7 +34,7 @@ EC サイトの注文の表に対して、次の 2 つの問いを投げるこ�
 
 ## 2 つの並べ方
 
-**行指向（row-oriented）** は、1 行の列の値を隣り合わせに置き、それを固定の大きさのページ（PostgreSQL では 8 KB）に詰めていきます。ページの中の構造は低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-83-db-page/`}>ページとバッファプール</a>で扱いました。1 行を取り出すには、その行が入った 1 ページを読めば済みます。
+**行指向（row-oriented）** は、1 行の列の値を隣り合わせに置き、それを固定の大きさのページ（PostgreSQL では 8 KB）に詰めていきます。ページの中の構造は低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-96-db-page/`}>ページとバッファプール</a>で扱いました。1 行を取り出すには、その行が入った 1 ページを読めば済みます。
 
 **列指向（column-oriented）** は、1 つの列の値をまとめて置きます。注文番号の列、日付の列、金額の列が、それぞれ別の塊になります。BigQuery の文書は自身の保存形式を「BigQuery stores table data in columnar format, meaning it stores each column separately.」と説明し、その理由を「Often, an analytic query only needs to read a few columns from a table.」と述べています（[BigQuery: Storage overview](https://docs.cloud.google.com/bigquery/docs/storage_overview)）。
 
