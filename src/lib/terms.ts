@@ -65,7 +65,7 @@ export async function loadTerms(base: string) {
       .map((n) => ({
         page: {
           id: n.id,
-          label: `第 ${Number(n.id.slice(3, 5))} 回`,
+          label: `第 ${Number(n.id.split('-')[1])} 回`,
           title: n.data.title,
           href: `${base}lowlevel/${n.id}/`,
         },
