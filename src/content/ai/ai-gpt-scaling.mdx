@@ -1,0 +1,260 @@
+---
+title: GPT と事前学習、スケーリング則（2018〜2022）
+description: 次の語を当てるだけの学習を、ラベルのない大量の文章で行う。それがなぜ多くの課題に効くのかを、GPT・GPT-2・GPT-3 の 3 本の論文がそれぞれ何を主張したかでたどり、損失がモデルの大きさとデータ量のべき乗で下がるというスケーリング則、計算量の配り方を改めた Chinchilla、そして「大きくすると突然できるようになる」という報告とその反論までを、論文と手元の小さな実験で確かめます
+track: history
+order: 7
+status: published
+topics:
+  - 事前学習
+  - 微調整
+  - 自己回帰
+  - トークン化
+  - BPE
+  - ゼロショット
+  - 文脈内学習
+  - few-shot
+  - スケーリング則
+  - べき乗則
+  - Chinchilla
+  - 計算最適
+  - 創発的な能力
+related:
+  - kind: lowlevel
+    slug: ll-05-text
+    why: GPT-2 の BPE は文字ではなく UTF-8 のバイト列の上で動く。文字がバイト列としてどう表されるかの話
+requires:
+  - ai-softmax-entropy
+  - ai-word2vec
+  - ai-transformer
+---
+
+import Callout from '../../components/Callout.astro'
+import ScalingLaw from '../../components/sim/problems/ScalingLaw'
+
+## 「次の語を当てる」だけで、何が身につくのか
+
+ここまでの回で見てきたモデルは、どれも**課題ごとに**作られていました。手書きの数字を見分けるなら、数字の画像と「これは 7」という正解（ラベル）の組を何万件も集めて学習させます。翻訳なら、原文と訳文の組を集めます。ラベルを付けるのは人の手で、費用がかかります。
+
+一方、ラベルの付いていない文章なら、本やウェブにいくらでもあります。この回の主題は、**ラベルのない大量の文章で「次の語を当てる」練習だけをさせたモデルが、教えていない課題までこなし始めた**という一連の発見です。2018 年から 2020 年の 3 本の論文（GPT、GPT-2、GPT-3）がその流れを作り、同じ時期に「モデルを大きくすると、損失がどれだけ下がるか」を式で言い当てる研究（スケーリング則）が出てきました。
+
+次の語を当てる、という課題そのものは目新しくありません。<a href={`${import.meta.env.BASE_URL}ai/ai-probability/`}>確率の回</a>で見たとおり、言語モデルとは「直前までの語の列が与えられたときの、次の語の条件付き確率」を出すものです。<a href={`${import.meta.env.BASE_URL}ai/ai-word2vec/`}>単語をベクトルにする回</a>の Bengio et al. 2003 も、この課題で学習させていました。変わったのは、**規模**と、**その副産物を何に使ったか**です。
+
+## 文章を、数えられる単位に切る：トークン化と BPE
+
+言語モデルが扱う「語」は、正確には**トークン**（token）と呼ばれる単位です。文章をトークンの列に切る方法を、まず決めておく必要があります。
+
+- 単語ごとに切ると、語彙が膨大になり、学習データに一度も出てこない語（新語、固有名詞、綴りの誤り）を表せません
+- 1 文字ずつに切ると、どんな文章も表せますが、列が長くなり、モデルは「文字から単語を組み立てる」ところから学ばなければなりません
+
+その中間を取るのが、Sennrich, Haddow & Birch 2016 "Neural Machine Translation of Rare Words with Subword Units" が機械翻訳に持ち込んだ **BPE**（Byte Pair Encoding）です。元はデータ圧縮の手法で、論文は「Byte Pair Encoding (BPE) (Gage, 1994) is a simple data compression technique that iteratively replaces the most frequent pair of bytes in a sequence with a single, unused byte.（BPE は、列の中で最も頻繁に現れるバイトの組を、使われていない 1 バイトに置き換えることを繰り返す、単純なデータ圧縮の手法である）」と説明し、これを「Instead of merging frequent pairs of bytes, we merge characters or character sequences.（頻繁なバイトの組をまとめる代わりに、文字や文字の並びをまとめる）」形に変えました（[Sennrich et al. 2016](https://arxiv.org/abs/1508.07909)、3.2 節）。
+
+手順は次のとおりです。
+
+1. すべての単語を 1 文字ずつに分け、末尾に「単語の終わり」を表す記号を付ける
+2. 隣り合う記号の組を、単語の出現回数で重み付けして数える
+3. 最も多い組を 1 つの新しい記号にまとめる
+4. 決めた回数だけ 2〜3 を繰り返す
+
+論文の Algorithm 1 に載っている例の語彙（low が 5 回、lower が 2 回、newest が 6 回、widest が 3 回）で、同じ手順を Python で 10 回回しました。単語の終わりの記号は `·` で表しています。
+
+```text
+初期: {'l o w ·': 5, 'l o w e r ·': 2, 'n e w e s t ·': 6, 'w i d e s t ·': 3}
+ 1: 'e' + 's' -> 'es' (9 回)  語彙: l o w · | l o w e r · | n e w es t · | w i d es t ·
+ 2: 'es' + 't' -> 'est' (9 回)  語彙: l o w · | l o w e r · | n e w est · | w i d est ·
+ 3: 'est' + '·' -> 'est·' (9 回)  語彙: l o w · | l o w e r · | n e w est· | w i d est·
+ 4: 'l' + 'o' -> 'lo' (7 回)  語彙: lo w · | lo w e r · | n e w est· | w i d est·
+ 5: 'lo' + 'w' -> 'low' (7 回)  語彙: low · | low e r · | n e w est· | w i d est·
+ 6: 'n' + 'e' -> 'ne' (6 回)  語彙: low · | low e r · | ne w est· | w i d est·
+ 7: 'ne' + 'w' -> 'new' (6 回)  語彙: low · | low e r · | new est· | w i d est·
+ 8: 'new' + 'est·' -> 'newest·' (6 回)  語彙: low · | low e r · | newest· | w i d est·
+ 9: 'low' + '·' -> 'low·' (5 回)  語彙: low· | low e r · | newest· | w i d est·
+10: 'w' + 'i' -> 'wi' (3 回)  語彙: low· | low e r · | newest· | wi d est·
+lowest: ['low', 'est·']
+newer: ['new', 'e', 'r', '·']
+wider: ['wi', 'd', 'e', 'r', '·']
+slow: ['s', 'low·']
+```
+
+1 回目は `e s` と `s t` が同じ 9 回で並び、先に数えた方を選んでいます。10 回まとめたあとは、学習データにない `lowest` も `low` と `est·` の 2 つのトークンで表せます。`slow` のように見たことのない形も、知っている部品と 1 文字ずつの記号の組み合わせで必ず表せます。**よく出る並びは 1 トークンに、珍しい並びは細かく**、という割り振りが、頻度を数えるだけで決まります。
+
+GPT-2 はこれをさらに、文字ではなく **UTF-8 のバイト列**の上で行いました。論文は、文字（Unicode のコードポイント）の上で BPE を行うと出発点の語彙だけで 13 万を超えてしまうのに対し、「a byte-level version of BPE only requires a base vocabulary of size 256.（バイト単位の BPE なら、出発点の語彙は 256 で足りる）」と書いています（[Radford et al. 2019](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)、2.2 節）。どんな言語のどんな文字も、バイトに分ければ必ず表せます。
+
+## 自己回帰：1 トークンずつ出して、入力に戻す
+
+GPT の系列のモデルは、文章を**自己回帰**（autoregressive）で作ります。「自己回帰」とは、自分が出した値を次の入力に使う、という意味です。
+
+1. いまあるトークンの列を入力し、次のトークンの確率分布を出す（中身は<a href={`${import.meta.env.BASE_URL}ai/ai-softmax-entropy/`}>softmax の回</a>で見た計算）
+2. その分布から 1 つ選ぶ（最も確率の高いものを取るか、温度を付けて引く）
+3. 選んだトークンを列の末尾に足し、1 に戻る
+
+文の確率は、確率の連鎖律で 1 トークンずつの条件付き確率の掛け算になります。
+
+```
+P(t₁, t₂, …, tₙ) = P(t₁) × P(t₂ | t₁) × P(t₃ | t₁, t₂) × … × P(tₙ | t₁, …, tₙ₋₁)
+```
+
+学習では、この掛け算の対数を取った和、つまり各位置での交差エントロピーの平均を小さくします。正解の次のトークンに付けた確率が高いほど、損失は小さくなります。**学習のときは、正解の文章のすべての位置を一度に予測させられる**のが、この形の強みです。入力の位置ごとに「その位置より前だけを見て、次を当てる」ように計算を仕切っておけば（この仕切り方は前の回の Transformer で見た、後ろの位置を隠す注意の計算です）、1 本の文章から、長さの数だけ練習問題が作れます。ラベルを人が付ける必要はありません。文章そのものが、問題と正解の両方を兼ねています。
+
+## 2018 年 GPT：まず大量の文章で予習し、課題ごとに少し直す
+
+Radford, Narasimhan, Salimans & Sutskever 2018 "Improving Language Understanding by Generative Pre-Training" は、この「ラベルの要らない練習」を、ラベルの少ない課題の下地として使いました。論文の要旨はこう述べます。「We demonstrate that large gains on these tasks can be realized by generative pre-training of a language model on a diverse corpus of unlabeled text, followed by discriminative fine-tuning on each specific task.（多様なラベルなしの文章で言語モデルを生成的に事前学習し、その後それぞれの課題で識別的に微調整することで、これらの課題で大きな改善が得られることを示す）」（[Radford et al. 2018](https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf)）。
+
+- **事前学習**（pre-training）: 7,000 冊を超える未出版の本を集めた BooksCorpus で、次のトークンを当てる。モデルは 12 層の Transformer の復号器（前の回で見た、前の位置だけを見る形）
+- **微調整**（fine-tuning）: 含意の判定、質問応答、文の類似度などの課題ごとに、少量のラベル付きデータで同じモデルを少しだけ学習し直す
+
+それまでも、<a href={`${import.meta.env.BASE_URL}ai/ai-word2vec/`}>word2vec</a> のような事前に学習した**単語の埋め込み**を使い回すことはありました。GPT が使い回したのは、単語 1 つずつのベクトルではなく、**文脈を読んで次を当てるモデル全体**です。課題ごとに設計を変えず、入力の並べ方を変える（例えば 2 つの文を区切り記号でつないで 1 本の列にする）だけで、同じモデルを多くの課題に流用しました。
+
+## 2019 年 GPT-2：微調整なしで、課題をこなし始める
+
+翌年の Radford et al. 2019 "Language Models are Unsupervised Multitask Learners"（GPT-2）は、微調整そのものを省きました。ウェブのリンク 4,500 万件をたどって集めた約 800 万文書、40GB の文章（WebText）で、最大 15 億パラメータのモデルを学習させ、**何も直さずに**課題を解かせたのです。課題を学習データとして与えずに解かせる設定を、**ゼロショット**（zero-shot）と呼びます。
+
+論文の考え方の要は、課題の指定も文章で書ける、という点です。1 つの課題の学習は条件付き確率 p(output|input) を推定することで、多くの課題をこなす仕組みは課題も条件に入れた p(output|input, task) を推定すべきだ、と論文は整理します。そして、翻訳の練習問題なら「(translate to french, english text, french text)」のように、課題・入力・出力をすべて記号の列として書けると指摘します（[Radford et al. 2019](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)、2 節）。ウェブの文章には、「英語で言うと〜」「要するに〜」のように、課題とその答えがもともと混ざっています。次のトークンを当てる練習を十分に積んだモデルは、その形の続きも書けるようになるはずだ、という主張です。
+
+要旨は、読解の課題 CoQA で、文書と質問を与えて続きを書かせると、「the answers generated by the language model reach 55 F1 on the CoQA dataset - matching or exceeding the performance of 3 out of 4 baseline systems without using the 127,000+ training examples.（言語モデルが生成した答えは CoQA で F1 55 に達し、12 万 7,000 件を超える学習例を使わずに、4 つの基準となる手法のうち 3 つに並ぶか上回った）」と報告し、さらに「The capacity of the language model is essential to the success of zero-shot task transfer and increasing it improves performance in a log-linear fashion across tasks.（ゼロショットでの課題の転移には言語モデルの容量が欠かせず、容量を増やすと課題をまたいで対数線形に性能が上がる）」と書いています。
+
+<Callout type="note" title="「対数線形」とは">
+  パラメータ数を 10 倍にするたびに、性能がだいたい同じ幅ずつ上がる、という関係です。横軸にパラメータ数の対数を取ると、性能が直線に並びます。逆に言えば、同じ幅の改善を得るのに必要な大きさは、毎回 10 倍になります。この「対数を取ると直線」という形が、後のスケーリング則の出発点になります。
+</Callout>
+
+同じ論文は、最大のモデルでも WebText に対して「still underfits（まだ学習しきれていない）」と書いています。データに対してモデルがまだ小さい、つまり大きくすればまだ伸びる、という見立てです。
+
+## 2020 年 GPT-3：例を数個見せるだけで、その課題をこなす
+
+Brown et al. 2020 "Language Models are Few-Shot Learners"（GPT-3）は、パラメータを 1,750 億まで増やしました。要旨は「Here we show that scaling up language models greatly improves task-agnostic, few-shot performance, sometimes even reaching competitiveness with prior state-of-the-art fine-tuning approaches.（言語モデルを大きくすると、課題を問わない few-shot の性能が大きく上がり、ときにはそれまでの最良の微調整の手法に並ぶことを示す）」と述べ、評価では「GPT-3 is applied without any gradient updates or fine-tuning, with tasks and few-shot demonstrations specified purely via text interaction with the model.（GPT-3 は勾配による更新も微調整もせずに使い、課題と少数の実演は、モデルとの文章のやりとりだけで指定する）」としています（[Brown et al. 2020](https://arxiv.org/abs/2005.14165)）。
+
+few-shot とは、入力の冒頭に「課題の説明」と「解き方の例を数個」書いてから、本番の問いを続ける使い方です。
+
+```text
+英語を日本語に訳す。
+cat => 猫
+dog => 犬
+bird =>
+```
+
+モデルの重みは 1 つも変わりません。それでも、入力に並んだ例から課題の形を読み取って続きを書きます。論文はこれを **文脈内学習**（in-context learning）と呼び、例の数で 3 つの条件を分けました。入るだけ例を並べる few-shot（典型的には 10〜100 個）、1 個だけの one-shot、説明だけで例のないゼロショットです（同論文 1 節）。そして、例を増やしたときの伸び方がモデルが大きいほど急になることを示し、「Larger models make increasingly efficient use of in-context information.（大きなモデルほど、文脈の中の情報を効率よく使う）」と図 1.2 にまとめています。
+
+<Callout type="warn" title="「学習」という言葉に注意">
+  文脈内学習の「学習」は、重みを変える学習ではありません。論文自身も「these “learning” curves involve no gradient updates or fine-tuning, just increasing numbers of demonstrations given as conditioning.（これらの「学習」曲線には勾配による更新も微調整も含まれず、条件として与える実演の数を増やしているだけである）」と念を押しています。入力を読み終えれば、何も残りません。
+</Callout>
+
+なぜ次のトークンを当てるだけの学習で、こうしたことができるのか。3 本の論文が示したのは、「できた」という実験の結果と、「課題も文章として書けるので、次を当てる練習の中に多くの課題が含まれている」という見立てまでです。内部で何が起きているのかの説明は、これらの論文の範囲を超えます。
+
+## スケーリング則：損失は、大きさのべき乗で下がる
+
+GPT-2 と GPT-3 のあいだの 2020 年 1 月、Kaplan et al. "Scaling Laws for Neural Language Models" は、モデルの大きさと性能の関係そのものを測りました。要旨はこう始まります。「The loss scales as a power-law with model size, dataset size, and the amount of compute used for training, with some trends spanning more than seven orders of magnitude.（損失は、モデルの大きさ、データ量、学習に使った計算量に対してべき乗則で変わり、一部の傾向は 7 桁以上にわたって成り立つ）」（[Kaplan et al. 2020](https://arxiv.org/abs/2001.08361)）。
+
+**べき乗則**（power law）とは、y = a × x^(−k) の形の関係です。両辺の対数を取ると log y = log a − k log x となり、**両対数のグラフで直線**になります。論文の式 (1.1) と (1.2) は次のとおりです。
+
+```
+L(N) = (N_c / N)^0.076    N_c ≈ 8.8 × 10¹³（埋め込みを除いたパラメータ数）
+L(D) = (D_c / D)^0.095    D_c ≈ 5.4 × 10¹³（トークン数）
+```
+
+- L は検証データでの交差エントロピー（1 トークンあたりの nats。nats は自然対数で測った情報量の単位）
+- N はパラメータ数、D は学習データのトークン数
+- 右肩の 0.076 は、N を 10 倍にすると損失が 10^(−0.076) ≈ 0.84 倍、つまり **16% ほど下がる**ことを意味する
+
+小さな数で確かめます。N を 10 億から 100 億にすると、損失は (1/10)^0.076 ≈ 0.839 倍です。L(10⁹) = (8.8 × 10⁴)^0.076 ≈ 2.37 なので、L(10¹⁰) ≈ 1.99 になります。さらにもう 10 倍の 1,000 億にしても 0.839 倍で、約 1.67 です。**10 倍ごとに同じ割合ずつ**下がり、下げ止まる気配がない、というのがこの式の言っていることです。
+
+この論文はさらに、計算量を固定したときの配り方として、最適なモデルの大きさが計算量の 0.73 乗で増える（N ∝ C^0.73）と見積もり、「it should be spent primarily on larger models, without dramatic increases in training time or dataset size（計算量は主に大きなモデルに使うべきで、学習時間やデータ量を大きく増やす必要はない）」と結論しました（同論文 1.2 節）。
+
+計算量 C は、学習のときに行う浮動小数点の演算の回数で、Transformer ではおよそ **C ≈ 6ND** と見積もられます。1 トークンを処理するのに、順方向でパラメータ 1 個あたり 2 回（掛け算と足し算）、逆方向でその約 2 倍の 4 回、と数えた近似です（Kaplan et al. 2020 の 2.1 節）。
+
+## 2022 年 Chinchilla：大きさとデータは、同じ割合で増やす
+
+2 年後、Hoffmann et al. 2022 "Training Compute-Optimal Large Language Models" は、この配り方を改めました。要旨は「We find that current large language models are significantly undertrained（現在の大規模言語モデルは、学習が大きく足りていない）」と述べ、7,000 万から 160 億パラメータのモデルを 50 億から 5,000 億トークンで 400 本以上学習させた結果、「for compute-optimal training, the model size and the number of training tokens should be scaled equally: for every doubling of model size the number of training tokens should also be doubled.（計算量に対して最適に学習するには、モデルの大きさと学習トークン数を同じ割合で増やすべきで、モデルの大きさを 2 倍にするごとにトークン数も 2 倍にすべきである）」としています（[Hoffmann et al. 2022](https://arxiv.org/abs/2203.15556)）。
+
+論文は最適な配り方を 3 つの方法で見積もりました。そのうち 1 つ目（大きさを固定してトークン数を変える）の表 3 では、10 億パラメータに 202 億トークン、100 億パラメータに 2,051 億トークン、670 億パラメータに 1.5 兆トークンが最適とされています。**1 パラメータあたり約 20 トークン**です。この見積もりに従って、Gopher（2,800 億パラメータ、3,000 億トークン）と同じ計算量で、700 億パラメータを 1.4 兆トークンで学習させたのが Chinchilla で、多くの評価で Gopher を上回りました。GPT-3 の 1,750 億パラメータに 3,000 億トークンは、1 パラメータあたり 1.7 トークンにすぎません。
+
+3 つ目の方法は、損失を N と D の式で直接表して当てはめるものです。
+
+```
+L(N, D) = E + A / N^α + B / D^β
+```
+
+論文の説明では、3 つの項はそれぞれ次のものを表します。
+
+- E: 理想的なモデルでも残る損失。文章そのものの予測できなさ（論文の言葉では「entropy of natural text」）
+- A / N^α: モデルが有限の大きさであることによる不足
+- B / D^β: 有限のデータで、有限の回数しか学習していないことによる不足
+
+本文の式 (10) は E = 1.69、A = 406.4、B = 410.7、α = 0.34、β = 0.28 です。下の図は、この式で予測される損失を、横軸にパラメータ数、縦軸にトークン数を取った平面に塗ったものです。濃いほど損失が小さくなります。
+
+<ScalingLaw client:visible />
+
+橙の線は、いまの点と**同じ計算量**（6ND が等しい）の組を結んだものです。この線の上を左上へ動くと「小さなモデルを長く」、右下へ動くと「大きなモデルを短く」学習させることになります。下の曲線は、その線の上で損失がどう変わるかで、どちらの端に寄っても損失は上がり、**途中に最も低い点**（緑の丸）があります。GPT-3 と同じ点から始めると、同じ計算量なら、もっと小さなモデルにもっと多くのトークンを与えた方が損失が下がる、と式は予測します。
+
+<Callout type="warn" title="式の係数によって、最適な比が 20 にも 90 にもなる">
+  図を「論文の本文の値」のまま使うと、GPT-3 と同じ計算量での最適は 1 パラメータあたり約 87 トークンと出ます。表 3 の約 20 とは大きく違います。
+
+  この食い違いは、Besiroglu et al. 2024 "Chinchilla Scaling: A replication attempt" が調べています。論文の図からデータを読み取って当てはめ直した結果、本文の係数は丸められていて予測が大きく偏ること、丸める前の値（TeX ソースのコメントにある E = 1.6934、α = 0.3392、β = 0.2849 など）でも、最適な比は約 70 トークンになって Chinchilla 自身の学習の仕方と合わないことを指摘しました。当てはめ直した係数（E = 1.8172、A = 482.01、B = 2085.43、α = 0.3478、β = 0.3658）では、「our fitted model implies an optimal ratio of around 20 tokens per parameter, which is consistent with both how the Chinchilla model was trained and the findings from Approaches 1 and 2 in Hoffmann et al.（当てはめ直したモデルは、最適な比として 1 パラメータあたり約 20 トークンを示す。これは Chinchilla の学習のさせ方とも、Hoffmann et al. の 1 つ目と 2 つ目の方法の結果とも合う）」としています（[Besiroglu et al. 2024](https://arxiv.org/abs/2404.10102)）。
+
+  図の「係数」の切り替えで、3 通りを比べられます。「再現研究の値」にすると、最適の点が破線（D = 20N）の近くに来ます。べき乗の右肩の数がわずかに違うだけで、何桁も先の予測は大きく変わります。
+</Callout>
+
+Kaplan et al. 2020 と Hoffmann et al. 2022 の結論が違った理由として、後者は、前者が学習率の予定（学習の進み具合に応じて学習率を下げていく計画）をデータ量に合わせて変えずに測っていたことなどを挙げています。どちらの論文も、損失がべき乗則で下がるという形そのものは共有しており、違ったのは計算量の配り方です。
+
+## 手元で確かめる：小さなモデルでも、べき乗則は見えるか
+
+スケーリング則の論文は、数千万から数千億のパラメータのモデルで測っています。手元の CPU で同じことはできませんが、桁をずっと下げて、同じ傾向が見えるかを試しました。
+
+- **データ**: パブリックドメインの英語の小説 5 冊（Project Gutenberg の『不思議の国のアリス』『高慢と偏見』『フランケンシュタイン』『白鯨』『シャーロック・ホームズの冒険』）。小文字にし、英字と空白と一部の句読点だけを残した 303 万文字。末尾の 20 万文字を検証用に取り分けた
+- **モデル**: 文字単位の言語モデル。直前の 8 文字をそれぞれ 16 次元の埋め込みにして並べ、隠れ層 1 枚（幅 H）を通して、次の 1 文字（34 種類）の確率を softmax で出す。Bengio et al. 2003 と同じ形の、最も小さな構成
+- **学習**: Adam（学習率 0.002）、1 回 512 文字ぶん、4,000 回。250 回ごとに検証データ全体で損失を測り、最も低かった値を記録した
+- **振ったもの**: 隠れ層の幅 H を 4・16・64・256・1024（パラメータ数で約 1,200〜17 万）、学習に使う文字数 D を 1 万・3 万・10 万・30 万・100 万・283 万
+
+環境は Apple M1 Pro / macOS 26.2、Python 3.14.0、NumPy 2.5.4 です。表の値は検証データでの 1 文字あたりのビット数（小さいほど良い）です。
+
+| 学習に使った文字数 D ＼ パラメータ数 N | 1,230（H=4） | 3,186（H=16） | 11,010（H=64） | 42,306（H=256） | 167,490（H=1024） |
+| --- | --- | --- | --- | --- | --- |
+| 1 万 | 3.543 | 3.489 | **3.465** | 3.585 | 3.726 |
+| 3 万 | 3.442 | 3.271 | 3.216 | **3.201** | 3.265 |
+| 10 万 | 3.417 | 3.187 | 3.032 | **3.000** | 3.054 |
+| 30 万 | 3.330 | 2.980 | 2.733 | **2.619** | 2.639 |
+| 100 万 | 3.298 | 2.935 | 2.641 | 2.486 | **2.483** |
+| 283 万 | 3.291 | 2.891 | 2.590 | **2.397** | 2.424 |
+
+太字は、その行（同じデータ量）で最も損失が小さかったモデルです。
+
+表から読めることは 3 つあります。
+
+**データが十分にあれば、大きいほど損失は下がる。** いちばん下の行（283 万文字）で、パラメータを約 1,200 から約 4 万 2,000 まで増やすと、損失は 3.29 → 2.89 → 2.59 → 2.40 と下がりました。両対数で直線を引くと、傾きは −0.063 です。パラメータを 10 倍にすると損失が 10^(−0.063) ≈ 0.86 倍になる計算です。Kaplan et al. の −0.076 と数字は近いものの、1 文字あたりと 1 トークンあたりでは単位が違い、規模も桁違いなので、比べられる値ではありません。また、隠れ層の幅を 4 倍にするごとの下がり幅は 0.40、0.30、0.19 と縮んでいて、きれいな直線ではありません。そして最大の約 17 万パラメータでは 2.42 と、かえって少し悪くなっています。
+
+**データが少ないと、大きなモデルはかえって悪い。** いちばん上の行（1 万文字）では、最も良いのは中くらいの約 1 万 1,000 パラメータで、最大のモデルは最小のモデルより悪くなりました。この学習では、どの組でも 4,000 回 × 512 文字 = 約 200 万文字ぶんの予測を練習させています。1 万文字のデータなら、同じ文章を 200 周なぞることになり、大きなモデルほど学習データを覚え込んで、検証データで外します（<a href={`${import.meta.env.BASE_URL}ai/ai-statistics/`}>統計の回</a>で見た過学習です）。
+
+**最も良い大きさは、データが増えるにつれて大きくなる。** 太字の位置は、データが増えるにつれて右へ動きます。これは Chinchilla の「計算量やデータに見合った大きさがある」という主張と、同じ向きの傾向です。
+
+一方で、この実験はスケーリング則を確かめたことにはなりません。理由は 2 つあります。
+
+- **計算量を揃えていない。** どの組も同じ 4,000 回だけ学習させたので、大きなモデルにとっては練習が足りていない可能性があります。最大のモデルが最後の行で負けたのは、その表れかもしれません。283 万文字の行では、データを 1 周もなぞり終えていません
+- **桁が小さすぎる。** パラメータは 2 桁、データは 2.5 桁しか振っていません。論文は 7 桁以上にわたって直線を確かめています。2 桁では、直線にも曲線にも見えます
+
+D の方向も同じで、H=256 の列では 1 万文字から 283 万文字で損失が 3.58 から 2.40 まで下がり、両対数での傾きは −0.073 でしたが、点は直線のまわりで上下に揺れています。**「べき乗則らしい傾向はあるが、この規模ではべき乗則とは言い切れない」**というのが、手元の実験から言える範囲です。
+
+## 「大きくすると突然できるようになる」は本当か
+
+GPT-3 以降、ある大きさを超えたところで、それまでできなかった課題が急にできるようになる、という報告が相次ぎました。Wei et al. 2022 "Emergent Abilities of Large Language Models" は、これを **創発的な能力**（emergent abilities）と名付け、「We consider an ability to be emergent if it is not present in smaller models but is present in larger models.（小さなモデルには無く大きなモデルにはある能力を、創発的と呼ぶ）」と定義し、「Thus, emergent abilities cannot be predicted simply by extrapolating the performance of smaller models.（したがって、創発的な能力は、小さなモデルの性能を外挿するだけでは予測できない）」と述べました（[Wei et al. 2022](https://arxiv.org/abs/2206.07682)）。損失はなめらかに下がるのに、個々の課題の正解率は、ある大きさまで偶然と変わらず、そこから跳ね上がる、という図がいくつも示されています。
+
+これに対し、Schaeffer, Miranda & Koyejo 2023 "Are Emergent Abilities of Large Language Models a Mirage?" は、別の説明を出しました。創発は「emergent abilities appear due to the researcher's choice of metric rather than due to fundamental changes in model behavior with scale（規模によるモデルの振る舞いの根本的な変化ではなく、研究者が選んだ評価の尺度のせいで現れる）」もので、「nonlinear or discontinuous metrics produce apparent emergent abilities, whereas linear or continuous metrics produce smooth, continuous predictable changes in model performance.（非線形な、あるいは不連続な尺度は見かけの創発を生み、線形な、あるいは連続な尺度では、性能はなめらかで連続的な、予測できる変化を示す）」と主張しています（[Schaeffer et al. 2023](https://arxiv.org/abs/2304.15004)）。
+
+小さな数で、この主張の筋道を確かめます。答えが 10 トークンの課題を考え、各トークンを正しく出す確率 p が、モデルが大きくなるにつれてなめらかに上がっていくとします。「10 トークンすべてが正しいときだけ正解」と採点すると、正解率は p の 10 乗です。
+
+| 1 トークンを当てる確率 p | 0.5 | 0.7 | 0.8 | 0.9 | 0.95 | 0.99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 トークンすべて正しい確率 p¹⁰ | 0.001 | 0.028 | 0.107 | 0.349 | 0.599 | 0.904 |
+
+p は 0.5 から 0.99 まで一様に上がっているのに、すべて正しい確率は 0.8 あたりまでほぼ 0 にとどまり、そこから急に立ち上がります。完全一致という**不連続な尺度**で測れば、なめらかな改善が「突然」に見えます。1 トークンずつの正しさや、正解との距離のような連続な尺度で測れば、なめらかなままです。
+
+この反論で、すべての創発の報告が否定されたわけではありません。Schaeffer らも、自分たちの主張は創発が存在しないということではなく、報告された多くの例が尺度の選び方で説明できる、というものだと断っています。いまも議論の続いている問いです。
+
+## まとめ
+
+- GPT（2018）は、ラベルのない大量の文章で次のトークンを当てる事前学習をし、課題ごとに少しだけ微調整する形で、多くの課題に同じモデルを流用した
+- GPT-2（2019）は、課題も文章として書けることに着目し、微調整なしで課題を解かせた（ゼロショット）。性能はモデルの大きさの対数に比例して上がった
+- GPT-3（2020）は 1,750 億パラメータまで大きくし、入力に例を数個並べるだけで課題をこなすことを示した（文脈内学習）。重みは変わらない
+- 文章は BPE でトークンに切る。よく出る並びを繰り返しまとめるだけで、珍しい語は細かく、よく出る語は 1 トークンになる
+- スケーリング則（2020）: 損失はパラメータ数、データ量、計算量のべき乗で下がり、両対数のグラフで直線になる
+- Chinchilla（2022）: 計算量が一定なら、パラメータ数とトークン数を同じ割合で増やすのが最適で、目安は 1 パラメータあたり約 20 トークン。ただし式の係数の当てはめ方で、この比は大きく変わる
+- 「大きくすると突然できる」という創発的な能力には、評価の尺度が不連続なために見えているだけだ、という反論がある
+
+ここまでの学習は、正解の文章をなぞる練習だけでした。次の回では、正解を見せる代わりに、行動の結果に点数を付けて学ばせる強化学習を、Q 学習から AlphaGo までたどります。その考え方は、後の回で、言語モデルを人の好みに合わせる方法（RLHF）として戻ってきます。

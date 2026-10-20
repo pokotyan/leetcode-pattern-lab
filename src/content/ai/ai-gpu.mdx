@@ -1,0 +1,312 @@
+---
+title: GPU で行列積が回る仕組み
+description: 2012 年の AlexNet から、深層学習は GPU と切り離せなくなりました。GPU は何が CPU と違い、なぜ行列積がその得意分野なのか。32 本のスレッドが同じ命令を実行する仕組み、メモリの階層とタイル、1 バイト読むあたりの演算回数で速さの上限が決まるルーフラインモデルを順に見て、LLM が 1 語ずつ文章を作るときに演算器ではなくメモリが足を引っ張る理由、KV キャッシュの大きさ、低い精度の数で速く小さくなる理由を、手元の実測とともに確かめます
+track: history
+order: 12
+status: published
+topics:
+  - GPU
+  - SIMT
+  - ワープ
+  - 共有メモリ
+  - HBM
+  - タイル分割
+  - 演算強度
+  - ルーフラインモデル
+  - メモリ帯域
+  - KV キャッシュ
+  - Grouped-Query Attention
+  - FP16 / BF16
+  - 混合精度
+  - Tensor Core
+  - FlashAttention
+related:
+  - kind: lowlevel
+    slug: ll-114-webgpu
+    why: ブラウザから GPU に行列積を計算させ、JavaScript と速さを比べた回。この回の話を手で動かして確かめられる
+  - kind: lowlevel
+    slug: ll-16-cache-levels
+    why: CPU のキャッシュの階層。GPU のレジスタ・共有メモリ・L2・HBM の階層は、同じ「近いほど速く小さい」の考え方でできている
+  - kind: lowlevel
+    slug: ll-17-cache-friendly
+    why: 行列積のループの順番とブロック化で速さが桁で変わる理由。この回のタイル分割は、その GPU 版にあたる
+  - kind: lowlevel
+    slug: ll-04-float
+    why: 浮動小数点数の指数部と仮数部。FP16 と BF16 の違いは、このビットの配分の違い
+requires:
+  - ai-matrix
+  - ai-transformer
+---
+
+import Roofline from '../../components/sim/problems/Roofline'
+
+## 計算の量より、計算の並べ方
+
+歴史トラックの第 3 回で、2012 年の AlexNet が 2 枚の GPU で学習されたことを見ました。それ以降、深層学習の進歩は GPU で大量の計算を回せることと切り離せなくなります。ニューラルネットの計算のほとんどは、数学トラックの「行列」の回で見た**行列の積**です。
+
+この回では、GPU がなぜ行列の積を速く計算できるのかを、仕組みの側から見ます。結論を先に言うと、速さを決めるのは「演算器がいくつあるか」だけではありません。**データを演算器まで運ぶ速さ**と、**1 回運んだデータで何回計算できるか**の組み合わせで決まります。この見方を持つと、AI の計算でよく出てくる工夫（大きな塊での計算、低い精度の数、KV キャッシュ、FlashAttention）が、どれも同じ問題への答えだと分かります。
+
+## CPU と GPU は、目指すものが違う
+
+NVIDIA の CUDA のプログラミングガイドは、両者の違いをこう書いています（[CUDA Programming Guide: Introduction](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/introduction.html)）。
+
+> While a CPU is designed to excel at executing a serial sequence of operations (called a thread) as fast as possible and can execute a few tens of these threads in parallel, a GPU is designed to excel at executing thousands of threads in parallel, trading off lower single-thread performance to achieve much greater total throughput.
+
+CPU は、1 本の処理の流れ（スレッド）をできるだけ速く終わらせるように作られていて、同時に動かせるのは数十本です。GPU は、1 本 1 本は遅くてよいので、何千本ものスレッドを同時に動かして、全体としての処理量を稼ぎます。同じガイドは続けて、チップの面積の使い方の違いを述べています。
+
+> GPUs are specialized for highly parallel computations and devote more transistors to data processing units, while CPUs dedicate more transistors to data caching and flow control.
+
+CPU は、キャッシュや、分岐の予測・命令の並べ替えといった「1 本を速くする仕組み」にトランジスタを多く割きます。GPU は、その分を計算をする部品に回します。
+
+たとえるなら、CPU は少人数の熟練の職人で、どんな複雑な注文にも手早く応じます。GPU は大人数の作業者で、1 人 1 人の判断は単純ですが、同じ作業を全員で一斉にこなします。ただし、この比喩は次の節で見る「一斉に」の意味を正確にしないと誤解のもとになります。
+
+## 32 本が同じ命令を実行する：SIMT
+
+GPU の何千本ものスレッドは、ばらばらに動いているわけではありません。CUDA のガイドの説明です（[CUDA Programming Guide: Programming Model](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html)）。
+
+> Within a thread block, threads are organized into groups of 32 threads called warps.
+
+> All threads in the warp execute the same instruction simultaneously.
+
+32 本のスレッドが 1 つの組（**ワープ**、warp）になり、組の全員が**同じ命令を同時に**実行します。この実行の仕方を **SIMT**（Single-Instruction Multiple-Threads、単一命令・複数スレッド）と呼びます。命令は 1 つですが、32 本はそれぞれ別のデータを持っています。「32 個の数に、同じ足し算を一度に施す」と考えると近いです。
+
+命令を 1 つにまとめるのは、命令を読んで解釈する部品を 32 本で共有できるからです。その分の面積を、計算の部品に回せます。
+
+代償は**分岐**です。ガイドはこう書いています。
+
+> If some threads within a warp follow a control flow branch in execution while others do not, the threads which do not follow the branch will be masked off while the threads which follow the branch are executed.
+
+`if` の条件が、あるスレッドでは真、別のスレッドでは偽になったとします。ワープは同じ命令しか実行できないので、まず真の側の命令を実行し、その間は偽のスレッドを休ませます（masked off）。次に偽の側の命令を実行し、今度は真のスレッドを休ませます。条件が半々に分かれると、両方の道を順に通るので、**時間はおよそ 2 倍**かかります。
+
+ですから、GPU に向くのは「全員がほぼ同じ手順を踏む」計算です。行列の積は、その典型です。
+
+## 行列の積は、なぜ並べやすいのか
+
+行列 A（n×n）と B（n×n）の積 C = A·B の、i 行 j 列の要素はこうです。
+
+```text
+C[i][j] = A[i][0]·B[0][j] + A[i][1]·B[1][j] + … + A[i][n-1]·B[n-1][j]
+```
+
+A の i 行目と B の j 列目の**内積**です。大事なのは、C のどの要素も、**ほかの要素の計算結果を必要としない**ことです。n = 4096 なら、C の要素は 4096 × 4096 = 1,677 万 7,216 個あり、そのすべてを同時に計算し始めてかまいません。しかも、どの要素も「掛けて足す」を 4096 回繰り返すという同じ手順なので、分岐もありません。
+
+計算の量も見積もっておきます。1 つの要素に掛け算と足し算が n 回ずつで 2n 回、それが n² 個あるので、合計は **2n³ 回**です。n = 4096 なら約 1,374 億回になります。演算の回数を **FLOP**（浮動小数点演算の回数）と数え、1 秒あたりの回数を **FLOP/s** と書きます。
+
+## 近いメモリは速く、小さい
+
+計算の部品をいくら並べても、データが届かなければ止まります。GPU のメモリにも、CPU と同じように階層があります。CUDA のガイドの説明です（[Programming Model](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html)）。
+
+> From the perspective of device code, the DRAM attached to the GPU is called global memory, because it is accessible to all SMs in the GPU.
+
+> Each SM has its own register file and shared memory.
+
+SM（Streaming Multiprocessor）は、ワープをいくつも抱えて実行する GPU の中の単位です。メモリは、演算器に近い順に次のように並びます。
+
+| 置き場所 | 誰から見えるか | 性質 |
+| --- | --- | --- |
+| レジスタ | そのスレッドだけ | 最も速く、最も小さい |
+| 共有メモリ（shared memory） | 同じスレッドブロックのスレッド | チップの上にあり、速い。プログラムで明示的に使う |
+| L2 キャッシュ | GPU 全体 | チップの上にあり、共有メモリより大きく遅い |
+| グローバルメモリ（HBM などの DRAM） | GPU 全体 | チップの外。大きいが、遠く遅い |
+
+**HBM**（High Bandwidth Memory）は、たくさんの配線で並列に読み書きして帯域を稼ぐ DRAM ですが、それでも演算の速さには追いつきません。低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-16-cache-levels/`}>キャッシュの階層</a>の回で見た CPU の話と同じ構図で、**遠いメモリへの往復をいかに減らすか**が速さを決めます。
+
+## タイルに分けて、読んだデータを使い回す
+
+行列の積を素朴に計算すると、C の 1 つの要素のために A の 1 行と B の 1 列、合わせて 2n 個の数をグローバルメモリから読みます。C の要素は n² 個あるので、読む数の合計は 2n³ 個です。n = 4096、1 個 4 バイト（FP32）なら、約 550 GB を読むことになります。ところが、A と B そのものの大きさは合わせて 2n² × 4 バイト = 約 134 MB しかありません。**同じ数を 4096 回ずつ読み直している**わけです。
+
+そこで、行列を T×T の小さな塊（**タイル**）に分けます。スレッドブロックが A と B のタイルを 1 枚ずつ共有メモリに読み込み、そのタイルの中で掛け算と足し算を済ませてから次のタイルへ進みます。共有メモリに置いた数は、ブロックの中で T 回使い回せるので、グローバルメモリから読む量は **2n³ / T** に減ります。
+
+| タイルの一辺 T | グローバルメモリから読む量（n = 4096、FP32） |
+| --- | --- |
+| 1（素朴な方法） | 約 550 GB |
+| 16 | 約 34 GB |
+| 64 | 約 8.6 GB |
+| 128 | 約 4.3 GB |
+
+T を大きくするほど読む量は減りますが、タイルは共有メモリとレジスタに収まらなければなりません。この兼ね合いで T が決まります。CPU の行列積でも、同じ発想で<a href={`${import.meta.env.BASE_URL}lowlevel/ll-17-cache-friendly/`}>ループをブロックに分けて速くする</a>ことを低レイヤで見ました。
+
+## 1 バイトあたり何回計算するか：ルーフライン
+
+ここまでの話を 1 枚の図にまとめたのが、Williams、Waterman、Patterson が 2009 年に Communications of the ACM に発表した**ルーフラインモデル**です（[Roofline: An Insightful Visual Performance Model for Multicore Architectures](https://doi.org/10.1145/1498765.1498785)）。中心になる量を、論文はこう定義しています（著者の公開した原稿より）。
+
+> we use the term operational intensity to mean operations per byte of DRAM traffic.
+
+**演算強度**（operational intensity）は、メモリから 1 バイト運ぶあたりに何回計算するか、です。論文は、出せる速さの上限を次の式で表します。
+
+```text
+出せる速さ（FLOP/s） = min( 演算性能の上限,  メモリ帯域 × 演算強度 )
+```
+
+式の意味はこうです。メモリ帯域が 200 GB/s なら、1 秒に 200 GB 運べます。演算強度が 0.5 FLOP/バイトの仕事なら、運んだデータでできる計算は 1 秒に 200 × 0.5 = 100 GFLOP（1,000 億回）までです。演算器がそれより速くても、データ待ちで遊びます。演算強度が十分に高ければ、今度は演算器の速さが上限になります。
+
+横軸に演算強度、縦軸に出せる速さを、どちらも対数で取ると、上限は「斜めの坂」と「平らな屋根」をつないだ折れ線になります。これが屋根（roofline）の名前の由来です。坂と屋根の折れ目（リッジ）より左の仕事は**メモリ帯域で頭打ち**、右の仕事は**演算性能で頭打ち**です。
+
+下の図で、帯域と演算性能のスライダーを動かしてみてください。点は 3 つの仕事です。
+
+- **行列積**：計算 2n³ 回に対し、読み書きは最低 3n² 個。演算強度は 2n / 3 を 1 要素のバイト数で割った値で、**n が大きいほど右へ動きます**。
+- **行列×ベクトル**：4096×4096 の行列に長さ 4096 のベクトルを掛けます。計算 2n² 回に対し、行列を n² 個読みます。演算強度は 1 要素あたり 2 回で、FP32 なら約 0.5 FLOP/バイトです。
+- **1 語生成**：後の節で説明します。
+
+<Roofline client:visible />
+
+### 手元の CPU で測る
+
+GPU は手元に無いので、同じ現象を Apple M1 Pro の CPU で確かめます。Python 3.14.0 と NumPy 2.5.4 で、FP32 の行列積と行列×ベクトルの速さを測りました（同じ計算を何回か繰り返したうちの最短時間）。測定中、同じマシンで他の重い処理が動いていて、ロードアベレージは 23〜65 でした。値はその影響を受けています。
+
+```text
+[行列積 C = A @ B, float32]
+     n     時間(ms)   GFLOP/s     演算強度(FLOP/B)
+    64      0.002     331.2             10.7
+   256      0.029    1139.1             42.7
+   512      0.120    2232.3             85.3
+  1024      0.999    2148.7            170.7
+  4096     89.269    1539.6            682.7
+
+[行列×ベクトル y = A @ x, float32]
+     n     時間(ms)   GFLOP/s    GB/s     演算強度(FLOP/B)
+  1024      0.026      79.8   159.8             0.50
+  2048      0.322      26.1    52.2             0.50
+  4096      2.104      15.9    31.9             0.50
+ 16384     41.913      12.8    25.6             0.50
+```
+
+（表は一部の行を抜き出したもの）
+
+行列積は n = 512 あたりで 2,000 GFLOP/s を超えます。行列×ベクトルは、どの大きさでも 1 要素あたり 2 回しか計算しないので、**速さはメモリから読める速さでほぼ決まり**、n = 4096 では 16 GFLOP/s 程度にとどまりました。行列積の**約 100 分の 1** です。
+
+n = 1024 の行列（4 MiB）までは 160 GB/s 近く出ていて、n = 2048（16 MiB）から急に落ちています。小さい行列は CPU のキャッシュに収まるので、主記憶まで取りに行かずに済んだと考えられます。M1 Pro の主記憶の帯域は、Apple の発表では「up to 200GB/s」です（[Apple Newsroom](https://www.apple.com/newsroom/2021/10/introducing-m1-pro-and-m1-max-the-most-powerful-chips-apple-has-ever-built/)）。実測の約 30 GB/s がそれよりずっと低いのは、1 本の計算が使えるのが全体の帯域の一部だからか、同時に動いていた他の処理のためか、ここでは切り分けていません。それでも「行列×ベクトルは帯域で頭打ちになり、行列積はならない」という違いははっきり出ています。
+
+## LLM が 1 語ずつ作るとき、演算器は待っている
+
+文章を作る LLM は、1 語（正確にはトークン）ずつ順に出力します。1 語を出すたびに、モデルの重みをすべて使って計算します。Google の Pope らの 2022 年の論文 "Efficiently Scaling Transformer Inference" は、計算量をこう見積もっています（[arXiv:2211.05102](https://arxiv.org/abs/2211.05102)）。
+
+> An N-parameter decoder-only model requires 2N matmul FLOPs in the forward pass per token seen because each matmul performs one multiplication and one addition per pair of input token and parameter values in the forward pass
+
+重みが N 個のモデルなら、1 語あたり約 2N 回です。一方で、1 語を出すたびに N 個の重みを**すべてメモリから読む**必要があります。1 語だけを作っているなら、重み 1 個を読んで掛け算と足し算を 1 回ずつしかしません。つまり、これは**行列×ベクトル**そのものです。同じ論文は、問題をこう述べています。
+
+> The large memory footprint gives rise to a large amount of memory traffic to load the parameters and KV cache from high-bandwidth memory (HBM) into the compute cores for each step, and hence a large total memory bandwidth required to meet a given latency target.
+
+（PDF の改行で切れていた単語はつないで引用しています）
+
+1 語ごとに、重みと KV キャッシュ（次の節）を HBM から演算器まで運ぶ量が大きく、それが速さを縛る、という指摘です。
+
+### まとめて作れば、同じ読み込みで何本も進む
+
+逃げ道は、**同時に何本もの文章を作る**ことです。B 本の文章を同時に 1 語ずつ進めるなら、重みを 1 回読むだけで B 本ぶんの計算ができます。演算強度はおよそ B 倍になります。図の「1 語生成」の点は、この B をスライダーで動かせます。B を上げていくと、点が坂を右上に登っていき、やがて屋根に届きます。
+
+手元でも確かめました。4096×4096 の重み（FP32 で 64 MiB）に、長さ 4096 のベクトルを B 本まとめて掛けます。
+
+```text
+[重み 4096x4096 にベクトルを B 本まとめて通す, float32]
+    B     時間(ms)   GFLOP/s     1 本あたり(ms)
+    1      2.497      13.4          2.497
+    8      2.402     111.7          0.300
+   32      2.654     404.6          0.083
+  128      4.146    1035.9          0.032
+  256      6.018    1427.5          0.024
+```
+
+（表は一部の行を抜き出したもの）
+
+B = 1 と B = 8 で、かかった時間はほとんど同じ（約 2.5 ms）です。時間の大半は重みを読むことに使われていて、計算が 8 倍になっても読む量は変わらないからです。1 本あたりの時間は、B = 256 で約 100 分の 1 になりました。B が大きくなると、やっと計算の量が効いてきて、時間が延び始めます。ルーフラインの坂を登り切って屋根に近づいた、ということです。
+
+## KV キャッシュの大きさ
+
+Transformer は、新しい 1 語を作るたびに、それまでの全部の語に注意を向けます（歴史トラック第 6 回）。そのたびに過去の語の計算をやり直さなくて済むよう、過去の語ごとの **K**（キー）と **V**（バリュー）のベクトルを、層ごとに取っておきます。これが **KV キャッシュ**です。
+
+大きさは、式で数えられます。
+
+```text
+1 語あたり = 2（K と V）× 層の数 × ベクトルの次元 × 1 要素のバイト数
+```
+
+層 32、次元 4096、1 要素 2 バイト（FP16）の仮のモデルで計算すると、1 語あたり 2 × 32 × 4096 × 2 = 52 万 4,288 バイト、ちょうど **0.5 MiB** です。
+
+| 文脈の長さ | 同時 1 本 | 同時 16 本 | K と V を 8 組で共有（1 本） |
+| --- | --- | --- | --- |
+| 1,024 語 | 0.5 GiB | 8 GiB | 0.125 GiB |
+| 4,096 語 | 2 GiB | 32 GiB | 0.5 GiB |
+| 32,768 語 | 16 GiB | 256 GiB | 4 GiB |
+| 131,072 語 | 64 GiB | 1,024 GiB | 16 GiB |
+
+同じモデルの重みは、70 億個 × 2 バイトとすると約 13 GiB です。文脈が長くなったり、同時に作る本数が増えたりすると、**KV キャッシュは重みよりずっと大きくなります**。しかも KV キャッシュは文章ごとに別のものなので、前の節の「まとめて読めば得をする」が効きません。
+
+表の右端の列は、K と V を複数の注意のヘッドで共有する工夫です。Ainslie らの 2023 年の論文は、これを Grouped-Query Attention（GQA）としてまとめました（[arXiv:2305.13245](https://arxiv.org/abs/2305.13245)）。
+
+> introduce grouped-query attention (GQA), a generalization of multi-query attention which uses an intermediate (more than one, less than number of query heads) number of key-value heads.
+
+32 本のヘッドで K と V を 8 組に減らせば、KV キャッシュは 4 分の 1 になります。
+
+## 数を小さくすれば、運ぶ量が減る
+
+運ぶ量を減らすもう 1 つの手は、**1 つの数を表すビットを減らす**ことです。FP32（4 バイト）を FP16（2 バイト）にすれば、同じ帯域で 2 倍の数を運べ、演算強度は 2 倍になり、メモリに置ける重みも 2 倍になります。
+
+| 1 要素の形式 | 重み 70 億個に要る大きさ |
+| --- | --- |
+| FP32 | 26.1 GiB |
+| FP16 / BF16 | 13.0 GiB |
+| FP8 / INT8 | 6.5 GiB |
+| INT4 | 3.3 GiB |
+
+ただし、ビットを減らせば、表せる範囲と細かさが落ちます。<a href={`${import.meta.env.BASE_URL}lowlevel/ll-04-float/`}>浮動小数点数</a>は、桁の大きさを表す指数部と、有効数字を表す仮数部からできています。
+
+- **FP16** は指数部 5 ビット、仮数部 10 ビット。表せる最大は 65,504 で、70,000 を入れると無限大になります（手元の NumPy で確認しました）。
+- **BF16** は指数部 8 ビット、仮数部 7 ビット。指数部が FP32 と同じなので、範囲は FP32 と同じです。その代わり細かさが粗く、70,000 は 70,144 に丸まりました。
+
+長さ 4096 の内積を、float64 の答えと比べた相対誤差（100 回の中央値）も測りました。
+
+```text
+FP32                             1.58e-07
+FP16 で入力を丸め FP32 で足す             3.60e-04
+BF16 で入力を丸め FP32 で足す             2.65e-03
+FP16 で入力も和も                      8.09e-03
+```
+
+入力を粗くしても、**足し合わせを FP32 で行えば**、誤差は抑えられます。足し合わせまで FP16 で行うと、誤差はさらに 20 倍ほど大きくなりました。学習を低い精度で行う方法を示した Micikevicius らの 2017 年の論文 "Mixed Precision Training" は、この考え方を学習に持ち込みました（[arXiv:1710.03740](https://arxiv.org/abs/1710.03740)）。
+
+> Firstly, we recommend maintaining a single-precision copy of the weights that accumulates the gradients after each optimizer step.
+
+重みの正本は FP32（単精度）で持ち、計算の多くを FP16 で行う、という分担です。この**混合精度**が、低い精度で速さを稼ぎつつ学習を崩さないための基本の形になりました。推論では、重みを 8 ビットや 4 ビットの整数に変換して持つ**量子化**も使われます。
+
+## 行列の塊ごとに掛けて足す演算器
+
+近年の GPU は、普通の演算器のほかに、**小さな行列の塊どうしの積を 1 つの命令で計算し、結果に足し込む**専用の演算器を持っています。NVIDIA はこれを Tensor Core と呼んでいます。CUDA のガイドは、タイル単位でプログラムを書く方式の説明の中で、この演算を次のように紹介しています（[CUDA Programming Guide: Writing Tile Kernels](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-tile-kernels.html)）。
+
+> CUDA Tile provides two forms of matrix multiplication between tiles: a pure matrix multiply (matmul), a @ b , and a matrix multiply-accumulate (mma), a @ b + acc .
+
+> The programmer writes them at tile granularity and the compiler maps them to hardware, including tensor cores where available.
+
+「a × b を計算して acc に足す」を、数ではなく行列の塊で 1 回の命令として行います。命令 1 つあたりの計算の量が増えるので、命令を読んで解釈する手間がさらに減ります。こうした演算器は、FP16 や BF16、さらに小さい形式の入力を受け取り、FP32 で足し合わせる、という混合精度の形で使われるのが一般的です。前の節の実測の「入力を丸め FP32 で足す」は、この形を真似たものです。
+
+## 注意の計算を、タイルで回す：FlashAttention
+
+Transformer の注意の計算は、文の長さ n に対して n × n の大きさの行列（どの語がどの語にどれだけ注意を向けるか）を作ります。これを素直にグローバルメモリに書き出してから softmax をかけ、また読み直すと、メモリの往復が文の長さの 2 乗で増えます。Dao らの 2022 年の論文 "FlashAttention" は、問題をこう捉えました（[arXiv:2205.14135](https://arxiv.org/abs/2205.14135)）。
+
+> We argue that a missing principle is making attention algorithms IO-aware -- accounting for reads and writes between levels of GPU memory.
+
+> We propose FlashAttention, an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM.
+
+計算の回数を減らすのではなく、**メモリの階層の間の読み書き（IO）を減らす**ことを目標にした、という点が新しいところです。注意の行列を小さな塊に分けて、チップの上のメモリ（SRAM、共有メモリにあたる）の中で計算を済ませ、n × n の行列全体を HBM に書き出さずに済ませます。結果は近似ではなく、元の計算と同じ答え（exact）です。行列積のタイル分割と同じ発想を、注意の計算に当てはめたものと言えます。
+
+## データを動かすのは、計算よりずっと高くつく
+
+速さだけでなく、消費するエネルギーでも、データの移動は計算より高くつきます。Horowitz は 2014 年の ISSCC の基調講演の論文 "Computing's Energy Problem (and what we can do about it)" でこう述べています（[DOI: 10.1109/ISSCC.2014.6757323](https://doi.org/10.1109/ISSCC.2014.6757323)）。
+
+> The energy cost of a DRAM access (1 to 2nJ) is a couple of orders-of-magnitude higher than the cost of an internal cache access or functional operation (10pJ).
+
+DRAM を 1 回読むエネルギー（1〜2 ナノジュール）は、チップの中のキャッシュを読んだり演算を 1 回したりするエネルギー（10 ピコジュール）より 2 桁ほど大きい、という見積もりです（1 ナノジュールは 1,000 ピコジュール）。タイルで使い回すこと、低い精度の数を使うこと、まとめて計算すること、FlashAttention は、どれも**遠いメモリとの往復を減らす**工夫なので、速さとエネルギーの両方に効きます。
+
+## まとめ
+
+- CPU は少数のスレッドを速く、GPU は何千ものスレッドを同時に動かして全体の処理量を稼ぐように作られている
+- GPU は 32 本のスレッド（ワープ）が同じ命令を同時に実行する（SIMT）。分岐で道が分かれると、両方の道を順に通るので遅くなる
+- 行列の積は、出力のどの要素も独立で、同じ手順の繰り返しなので、GPU に向く。計算の回数は 2n³
+- 遠いメモリ（HBM）は大きいが遅い。行列をタイルに分けて共有メモリで使い回すと、読む量は 2n³ / T に減る
+- 出せる速さは「演算性能」と「メモリ帯域 × 演算強度」の小さいほうで決まる（ルーフライン）。手元の CPU でも、行列積は 2,000 GFLOP/s を超え、行列×ベクトルは 16 GFLOP/s 程度で頭打ちになった
+- LLM が 1 語ずつ作る計算は行列×ベクトルと同じで、メモリ帯域で頭打ちになる。同時に B 本作れば、同じ読み込みで B 本進められる
+- KV キャッシュは 1 語あたり 2 × 層 × 次元 × バイト数で、文脈が長いと重みより大きくなる。K と V を共有すれば減らせる
+- 低い精度の数は運ぶ量を減らす。足し合わせを FP32 で行えば誤差を抑えられ、これが混合精度の基本の形
+- タイル、低い精度、まとめての計算、FlashAttention は、どれもメモリとの往復を減らす工夫で、データの移動は計算より 2 桁ほど多くのエネルギーを使う
+
+ここまでの回は、すべて画面の中、データの中の話でした。次の第 13 回では、学習したモデルが現実の物体を動かす「フィジカル AI」へ進みます。そこでは、データを集めること自体が難しく、間違いが物理的な結果を生むという、別の種類の問題が加わります。

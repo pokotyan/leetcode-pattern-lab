@@ -3,16 +3,17 @@ import { splitTopic } from '../lib/terms'
 import BaseLayout from '../layouts/BaseLayout.astro'
 import { getCollection } from 'astro:content'
 import { AREAS, SITE_TAGLINE } from '../lib/nav'
-import { LOWLEVEL_CHAPTERS, BUILD_TRACKS } from '../lib/curriculum'
+import { LOWLEVEL_CHAPTERS, BUILD_TRACKS, AI_TRACKS } from '../lib/curriculum'
 
 const base = import.meta.env.BASE_URL
 
-const [articles, math, reading, lowlevel, build] = await Promise.all([
+const [articles, math, reading, lowlevel, build, ai] = await Promise.all([
   getCollection('articles'),
   getCollection('math'),
   getCollection('reading'),
   getCollection('lowlevel'),
   getCollection('build'),
+  getCollection('ai'),
 ])
 
 const pub = (xs: { data: { status: string } }[]) =>
@@ -35,6 +36,10 @@ const STATS: Record<string, { label: string; value: number | string }[]> = {
     { label: '章', value: LOWLEVEL_CHAPTERS.length },
     { label: '記事', value: pub(lowlevel) },
     { label: '扱う用語', value: new Set(lowlevel.flatMap((n) => n.data.topics.flatMap(splitTopic))).size },
+  ],
+  ai: [
+    { label: 'トラック', value: AI_TRACKS.length },
+    { label: '公開済みの回', value: pub(ai) },
   ],
   build: [
     { label: 'トラック', value: BUILD_TRACKS.length },

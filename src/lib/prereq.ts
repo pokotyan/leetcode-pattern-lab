@@ -1,6 +1,6 @@
 import { getCollection } from 'astro:content'
 import type { CollectionEntry } from 'astro:content'
-import { BUILD_TRACKS, LOWLEVEL_CHAPTERS, SECTIONS } from './curriculum'
+import { AI_TRACKS, BUILD_TRACKS, LOWLEVEL_CHAPTERS, SECTIONS } from './curriculum'
 
 export type Article = CollectionEntry<'articles'>
 export type Ref = { id: string; title: string; description: string; level: string }
@@ -255,4 +255,48 @@ export async function loadLowLevelNotes() {
   }
 
   return { notes, byId, requires, buildById }
+}
+
+export type AiNote = CollectionEntry<'ai'>
+
+const aiTrackRank = new Map(AI_TRACKS.map((t, i) => [t.id, i]))
+
+/**
+ * AI 区画の回を、トラックの並び順 → 回の order の順に並べる。
+ * requires / related に存在しない slug があればビルドを止める。
+ */
+export async function loadAiNotes() {
+  const notes = [...(await getCollection('ai'))].sort((a, b) => {
+    const ta = aiTrackRank.get(a.data.track) ?? 99
+    const tb = aiTrackRank.get(b.data.track) ?? 99
+    return ta !== tb ? ta - tb : a.data.order - b.data.order
+  })
+  const byId = new Map(notes.map((n) => [n.id, n]))
+  const pools = {
+    lowlevel: new Map((await getCollection('lowlevel')).map((n) => [n.id, n.data.title])),
+    reading: new Map((await getCollection('reading')).map((n) => [n.id, n.data.title])),
+    math: new Map((await getCollection('math')).map((n) => [n.id, n.data.title])),
+  }
+
+  const requires = new Map<string, AiNote[]>()
+  for (const n of notes) {
+    if (!aiTrackRank.has(n.data.track)) {
+      throw new Error(`[ai] ${n.id}.mdx の track "${n.data.track}" が AI_TRACKS にありません`)
+    }
+    for (const slug of n.data.requires) {
+      if (!byId.has(slug)) throw new Error(`[ai] ${n.id}.mdx の requires に存在しない回 "${slug}" があります`)
+      if (slug === n.id) throw new Error(`[ai] ${n.id}.mdx の requires が自分自身を指しています`)
+    }
+    requires.set(
+      n.id,
+      n.data.requires.map((slug) => byId.get(slug)!),
+    )
+    for (const r of n.data.related) {
+      if (!pools[r.kind].has(r.slug)) {
+        throw new Error(`[ai] ${n.id}.mdx の related に存在しない ${r.kind} "${r.slug}" があります`)
+      }
+    }
+  }
+
+  return { notes, byId, requires, pools }
 }

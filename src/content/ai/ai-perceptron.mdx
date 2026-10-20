@@ -1,0 +1,228 @@
+---
+title: パーセプトロンと XOR の壁（1943〜1969）
+description: 神経細胞を「足し算としきい値」に置き換えた最初の模型から、間違えたら重みを直すだけで学ぶパーセプトロン、そして直線 1 本では XOR を分けられないという限界まで。学習するコンピュータの考え方の出発点を、元の論文と実際に動かした結果で確かめる
+track: history
+order: 1
+status: published
+topics:
+  - 形式ニューロン（McCulloch–Pitts）
+  - ヘッブの法則
+  - パーセプトロン
+  - 誤り訂正学習
+  - 線形分離
+  - パーセプトロンの収束定理
+  - XOR 問題
+  - 『Perceptrons』（Minsky & Papert）
+requires:
+  - ai-vector
+---
+
+import Callout from '../../components/Callout.astro'
+import PerceptronLearn from '../../components/sim/problems/PerceptronLearn'
+
+## このトラックで追うもの
+
+いま「AI」と呼ばれているものの多くは、**ニューラルネットワーク**という仕組みの上に作られています。たくさんの数を掛けて足し、その結果を次へ渡す、という単純な部品を大量につないだものです。部品の作り方とつなぎ方、そして「どうやって数を決めるか（学習させるか）」は、ここ 80 年ほどのあいだに、いくつかの論文によって段階的に塗り替えられてきました。
+
+このトラックでは、その段階を元の論文の順にたどります。使い方の流行は数か月で入れ替わりますが、ここで扱う考え方は、いま動いているモデルの中にもそのまま残っています。
+
+| 回 | 主な時期 | 題材 |
+| --- | --- | --- |
+| 1 | 1943〜1969 | パーセプトロンと XOR の壁（この回） |
+| 2 | 1986 | 層を重ねて、誤差を逆向きに伝える |
+| 3 | 1980〜2012 | 画像を読む畳み込み（LeNet から AlexNet へ） |
+| 4 | 2003〜2014 | 単語をベクトルにする（word2vec） |
+| 5 | 1990〜2015 | 並びを読む RNN と LSTM、そして attention |
+| 6 | 2017 | Transformer |
+| 7 | 2018〜2022 | GPT と事前学習、規模と性能の関係 |
+| 8 | 1988〜2017 | 強化学習（Q 学習から AlphaGo まで） |
+| 9 | 2017〜2023 | 人の評価から学ぶ（RLHF） |
+| 10 | 2022〜 | 答える前に長く考えさせる（推論時スケーリング） |
+| 11 | 2014〜2022 | 雑音から絵を作る拡散モデル |
+| 12 | — | GPU で行列の掛け算が速く回る理由 |
+| 13 | — | 体を持って動く AI（フィジカル AI） |
+
+年は目安です。各回で、元になった論文と年を出典とともに示します。必要な数学（ベクトル、行列、微分、確率）は数学トラックにまとめてあり、この回で使うのは足し算と掛け算、それに「直線の片側」という考え方だけです。
+
+## 神経細胞を、足し算としきい値に置き換える（1943）
+
+出発点は、神経生理学者の Warren McCulloch と、論理学に通じた若い研究者 Walter Pitts が 1943 年に書いた論文「A Logical Calculus of the Ideas Immanent in Nervous Activity」です（Bulletin of Mathematical Biophysics 5 巻。ここでは 1990 年の再録版 [Bulletin of Mathematical Biology 52 巻](https://www.cs.cmu.edu/~epxing/Class/10715/reading/McCulloch.and.Pitts.pdf) を読みます）。要旨の 1 文目が、この論文の考え方をそのまま言っています。
+
+> Because of the “all-or-none” character of nervous activity, neural events and the relations among them can be treated by means of propositional logic.
+
+神経細胞の活動は「発火するか、しないか」の 2 通りしかない。だから、神経の働きは命題論理（真か偽かを組み合わせる論理）として扱える、という主張です。論文が置いた仮定のうち、最初の 2 つは次のとおりです。
+
+> (1) The activity of the neuron is an “all-or-none” process.
+> (2) A certain fixed number of synapses must be excited within the period of latent addition in order to excite a neuron at any time, and this number is independent of previous activity and position on the neuron.
+
+言い換えると、**ある神経細胞につながっている入力のうち、決まった数以上が同時に「発火」していれば、その細胞も発火する**。この「決まった数」が**しきい値**です。さらに、抑制性の入力が 1 つでも発火していれば、ほかがどうであれ発火しない、という仮定（4 番目）も置いています。
+
+これだけで論理回路が作れます。入力が 2 本でしきい値が 2 なら、両方が発火したときだけ発火するので **AND**、しきい値が 1 なら、どちらか一方で発火するので **OR** です。後の時代の言い方では、これを**形式ニューロン**と呼びます。
+
+ただし、この 1943 年の模型には、まだ**学習**がありません。しきい値やつなぎ方は、設計する人が決めるものでした。
+
+## 一緒に発火するつなぎ目は、強くなる（1949）
+
+学習の考え方の源として必ず挙がるのが、心理学者 Donald Hebb が 1949 年の著書『The Organization of Behavior』で述べた仮説です（[Internet Archive の所蔵本](https://archive.org/details/in.ernet.dli.2015.226341)）。
+
+> When an axon of cell A is near enough to excite a cell B and repeatedly or persistently takes part in firing it, some growth process or metabolic change takes place in one or both cells such that A’s efficiency, as one of the cells firing B, is increased.
+
+細胞 A が細胞 B の発火に繰り返し関わると、A が B を発火させる「効き目」が上がる。つまり、**よく一緒に働くつなぎ目は強くなる**という考えです（引用は OCR された本文から取ったもので、「A’s」のアポストロフィは OCR で落ちていたため補っています）。
+
+ここで初めて、つなぎ目ごとに「強さ」があり、それが経験によって変わる、という見方が出てきます。この強さを数で表したものが、後の**重み**です。
+
+## パーセプトロン：間違えたら直す（1958）
+
+この 2 つを、実際に学習する機械の理論にまとめたのが、コーネル航空研究所の Frank Rosenblatt です。1958 年の論文「The Perceptron: A Probabilistic Model for Information Storage and Organization in the Brain」（[Psychological Review 65 巻 6 号](https://homepages.math.uic.edu/~lreyzin/papers/rosenblatt58.pdf)）は、次の 3 つの問いから始まります。
+
+> 1. How is information about the physical world sensed, or detected, by the biological system?
+> 2. In what form is information stored, or remembered?
+> 3. How does information contained in storage, or in memory, influence recognition and behavior?
+
+論文が扱うのは 2 つ目と 3 つ目、つまり「記憶はどんな形で残り、それが認識にどう効くのか」です。Rosenblatt の答えは、**記憶は絵のような写しとしてではなく、つなぎ目の強さの変化として残る**というものでした。網膜にあたる感覚の点（S-points）、そこから信号を受ける連合の細胞（A-units）、最後に答えを出す応答の細胞（R-units）を並べ、A-units の「値」が経験によって増えたり減ったりします。どう変えるかについて、論文は次のように書いています。
+
+> the experimenter does not force the system to respond in the desired fashion, but merely applies positive reinforcement when the response happens to be correct, and negative reinforcement when the response is wrong.
+
+正しく答えたら強め、間違えたら弱める。設計者が答えを書き込むのではなく、**例を見せて当たり外れを伝えるだけで、機械の側が自分を直していく**。これが、プログラムを書く代わりに「学習させる」という考え方の始まりです。
+
+<Callout type="note" title="教科書のパーセプトロンと 1958 年の論文">
+  1958 年の論文は、ランダムにつながった多数の細胞を確率で扱う、脳の模型としての理論です。今日の教科書で「パーセプトロンの学習則」と呼ばれる、入力ベクトルを重みに足し引きする簡潔な形は、その後 Rosenblatt のグループや周辺の研究者が整理していったものです。この回の SIM と実験は、その教科書の形を使います。
+</Callout>
+
+### 教科書の形で書くと
+
+入力が 2 つ（`x0` と `x1`）のパーセプトロンは、次の計算をします。
+
+```
+s = w0·x0 + w1·x1 + b
+出力 y = +1（s > 0 のとき）、−1（それ以外）
+```
+
+`w0` と `w1` が**重み**（それぞれの入力をどれだけ効かせるか）、`b` は**バイアス**（しきい値を符号を変えて足したもの）です。McCulloch と Pitts の「入力の数を数えて、しきい値と比べる」を、「入力に重みを掛けて足し、0 と比べる」に広げた形です。
+
+たとえば `w0 = 2`、`w1 = 1`、`b = −2` で、入力が `(1, 1)` なら、`s = 2·1 + 1·1 − 2 = 1` で正なので `+1`。入力が `(1, 0)` なら `s = 2 − 2 = 0` で正ではないので `−1` です。
+
+学習の規則は 1 行です。正解を `t`（+1 か −1）として、**答えを間違えたときだけ**
+
+```
+w0 ← w0 + t·x0
+w1 ← w1 + t·x1
+b  ← b  + t
+```
+
+とします。正解が +1 なのに −1 と答えたら、その入力を重みに**足し**、正解が −1 なのに +1 と答えたら**引く**。
+
+なぜこれで良くなるのか、1 回計算してみます。正解が +1 の点 `(1, 1)` で間違えたとします。直した後に同じ点で `s` を計算し直すと、`w0` と `w1` がそれぞれ 1 増え、`b` も 1 増えているので、`s` は `1·1 + 1·1 + 1 = 3` だけ増えます。一般に、増える量は「入力の各成分の 2 乗の和 + 1」で、これは必ず正です。**間違えた点については、必ず正しい向きに `s` が動く**。ほかの点が悪くなることはありえますが、それも次に見たときに直されます。
+
+### 境界線という見方
+
+`s = 0` になる点の集まり、つまり `w0·x0 + w1·x1 + b = 0` は、平面の上では 1 本の**直線**です。パーセプトロンは、平面をこの直線で 2 つに切り、片側を +1、反対側を −1 と答えます。学習とは、**例の点をうまく分ける直線の位置を探すこと**だと言えます。
+
+下の SIM は、入力が 0 か 1 の 4 点に、AND、OR、XOR の正解を付けて、学習を 1 点ずつ進めます。間違えるたびに直線が動く様子を見てください。
+
+<PerceptronLearn client:visible />
+
+AND と OR では、何度か直線が動いた後、4 点すべてを正しく分けて止まります。XOR では止まりません。
+
+## 実際に回す
+
+同じ学習を Python 3.14.0 と NumPy 2.5.4（Apple M1 Pro / macOS 26.2）で書き、4 点を `(0,0)`、`(0,1)`、`(1,0)`、`(1,1)` の順に繰り返し見せました。この 4 点を 1 周することを 1 **エポック**と呼びます。重みとバイアスの初期値はすべて 0、上限は 1000 エポックです。
+
+```text
+AND: 6 エポック目で誤り 0（w=[2, 1], b=-2）
+   epoch 1: 誤り 1  w=[1, 1] b=1
+   epoch 2: 誤り 3  w=[2, 1] b=0
+   epoch 3: 誤り 3  w=[2, 1] b=-1
+   epoch 4: 誤り 2  w=[2, 2] b=-1
+   epoch 5: 誤り 1  w=[2, 1] b=-2
+   epoch 6: 誤り 0  w=[2, 1] b=-2
+OR: 4 エポック目で誤り 0（w=[1, 1], b=0）
+   epoch 1: 誤り 1  w=[0, 1] b=1
+   epoch 2: 誤り 2  w=[1, 1] b=1
+   epoch 3: 誤り 1  w=[1, 1] b=0
+   epoch 4: 誤り 0  w=[1, 1] b=0
+XOR: 1000 エポック後も誤り 4（最後の 1 エポック）, 誤り 0 のエポック数 0
+   エポック 2 と 3 の終わりで重みが同じ: w=[-1, 0] b=1 → 以後は同じ周期を繰り返す
+```
+
+AND は 6 エポック目、OR は 4 エポック目に、1 回も間違えずに 1 周しました。AND の最終的な重み `w = [2, 1]`、`b = −2` は、上で例に使った値です。`(1, 1)` だけが `s = 1` で正になり、ほかの 3 点は 0 以下になります。
+
+XOR は 1000 エポック回しても、1 度も誤り 0 になりません。それどころか、エポック 3 からは**エポックの終わりの重みが毎回まったく同じ**です。1 エポックの中で何が起きているかを書き出すと、こうなります。
+
+```text
+XOR, エポック 3 の中の各更新:
+   x=[0, 0] 正解 -1 出力 +1 → w=[-1, 0] b=0
+   x=[0, 1] 正解 +1 出力 -1 → w=[-1, 1] b=1
+   x=[1, 0] 正解 +1 出力 -1 → w=[0, 1] b=2
+   x=[1, 1] 正解 -1 出力 +1 → w=[-1, 0] b=1
+```
+
+4 点すべてで間違え、4 回の修正が足し合わさるとちょうど 0 になって、元の重みに戻っています。直線は 1 周ごとに同じ位置を巡回するだけで、どこにも落ち着きません。
+
+## 分けられるなら、必ず止まる（1962）
+
+AND と OR が止まったのは、たまたまではありません。1962 年、スタンフォード研究所の Albert Novikoff は「On Convergence Proofs for Perceptrons」（Symposium on Mathematical Theory of Automata、[論文の PDF](https://cs.uwaterloo.ca/~y328yu/classics/novikoff.pdf)）で、この性質をごく短い証明で示しました。冒頭の要約はこう述べています。
+
+> In other words, if a solution exists, error correction will find one in a finite time.
+
+正しく分ける重みが**存在するなら**、誤り訂正（間違えたら直す規則）は、有限回の修正で必ずそれを見つける。これが**パーセプトロンの収束定理**です。Novikoff 自身が書いているとおり、定理そのものは Rosenblatt のグループが最初期に証明したもので、Novikoff の貢献は、それを「a single threshold element acting on a weighted set of inputs（重み付きの入力を受ける、しきい値の素子 1 つ）」についての、短く見通しのよい証明にしたことでした。
+
+「直線 1 本で正しく分けられる」ことを**線形分離可能**と呼びます。定理の前提はまさにこれで、XOR のように前提が満たされないときについては、何も保証しません。
+
+## XOR は、直線 1 本では分けられない
+
+XOR は「2 つの入力のうち、ちょうど 1 つが 1 のときだけ 1」という関数です。`(0,1)` と `(1,0)` が +1、`(0,0)` と `(1,1)` が −1 で、正解が +1 の点が対角に並んでいます。
+
+これを分ける直線が存在しないことは、4 つの不等式で確かめられます。分けられたとすると、4 点それぞれについて次が成り立つはずです。
+
+| 点 | 正解 | 成り立つべき式 |
+| --- | --- | --- |
+| (0, 0) | −1 | `b ≤ 0` |
+| (1, 1) | −1 | `w0 + w1 + b ≤ 0` |
+| (1, 0) | +1 | `w0 + b > 0` |
+| (0, 1) | +1 | `w1 + b > 0` |
+
+下の 2 つを足すと `w0 + w1 + 2b > 0`、つまり `w0 + w1 + b > −b` です。1 行目から `b ≤ 0` なので `−b ≥ 0`、よって `w0 + w1 + b > 0` になります。これは 2 行目の `w0 + w1 + b ≤ 0` と矛盾します。**どんな重みを選んでも、4 点のうちどれかは必ず間違える**ということです。
+
+実験でも確かめました。`w0`、`w1`、`b` をそれぞれ −3 から 3 まで 0.1 刻みで動かし、61 × 61 × 61 = 226,981 通りの組をすべて試して、4 点を正しく分ける組を数えました。
+
+```text
+AND: 格子 61^3=226981 通りの (w1,w2,b) のうち 4 点を正しく分けるもの 4429 通り
+OR: 格子 61^3=226981 通りの (w1,w2,b) のうち 4 点を正しく分けるもの 9240 通り
+XOR: 格子 61^3=226981 通りの (w1,w2,b) のうち 4 点を正しく分けるもの 0 通り
+```
+
+（出力の `w1, w2` は本文の `w0, w1` のことです。）AND と OR には数千通りの答えがあり、XOR には 1 つもありません。パーセプトロンが XOR で回り続けたのは、学習の規則が悪いからではなく、**探している直線がそもそも存在しない**からです。
+
+## 『Perceptrons』（1969）とその後
+
+この限界を、XOR のような小さな例にとどめず、数学として体系的に調べたのが、MIT の Marvin Minsky と Seymour Papert の 1969 年の著書『Perceptrons: An Introduction to Computational Geometry』（MIT Press。[DOI: 10.7551/mitpress/11301.001.0001](https://doi.org/10.7551/mitpress/11301.001.0001)、1988 年に増補版）です。この本は、パーセプトロンが図形のどんな性質を判定でき、どんな性質を判定できないのかを分析しました。XOR を一般化した「1 の数が偶数か奇数か（パリティ）」や、「図形がひとつながりかどうか（連結性）」のように、全体を見ないと決まらない性質が、単純なパーセプトロンでは扱いにくいことを示しています。
+
+その後、1970 年代にニューラルネットワークの研究は目立たなくなりました。この経緯は、しばしば次のように単純化して語られます。科学社会学者 Mikel Olazaran は、1993 年の論文「A Sociological History of the Neural Network Controversy」（[Advances in Computers 37 巻](https://gwern.net/doc/ai/nn/1993-olazaran.pdf)）の中で、論文や本の短い「歴史」の序文によく見られる語られ方の例として、1988 年の Cruz の文章を引いています。
+
+> In 1968, Minsky and Papert published a book called Perceptrons, pointing out some of the limitations of that model. What ensued was an almost total shift in research funding from neural nets to the nascent field of Artificial Intelligence which was being defined by Minsky, McCarthy, Newell, Simon and others.
+
+（Cruz の文章は出版年を 1968 年としていますが、本の出版は 1969 年です。）Olazaran 自身は、この「よく語られる歴史」に対して慎重な立場をとります。
+
+> It has often been argued that Rosenblatt made exaggerated claims, and that he somehow “provoked” the reaction of symbol-processing researchers. However, in Section 3 I show that Rosenblatt was well aware of the main problems of his machine, and that he even insisted on them in his books and papers.
+
+さらに、Minsky と Papert の結果を、彼ら自身とニューラルネットワークの研究者たちが「rather differently（かなり違うふうに）」読んだことを指摘しています。本 1 冊が分野を止めた、という筋書きは分かりやすい一方で、実際には研究資金の競争、記号を操作する AI の台頭、計算機の性能など、いくつもの事情が重なっていました。どれがどれだけ効いたのかは、いまも評価が分かれます。
+
+## 層を重ねれば解ける。では、どう学ぶのか
+
+XOR を解く方法自体は、当時から分かっていました。入力と出力のあいだに、もう 1 段の細胞（**隠れ層**）を挟めばよいのです。たとえば「両方が 1 のときだけ発火する」細胞を 1 つ足し、それが発火したら出力を強く抑える、という組み方をすれば XOR になります。Olazaran はこう書いています。
+
+> Early neural network researchers knew that a solution to some of the problems of single-layer networks was possible by introducing a layer of hidden units between the input and the output layers. The problem was that no weight modification rule had been developed for multilayer networks that guaranteed results comparable to those obtained with both the perceptron learning algorithm and Widrow and Hoff’s LMS (least mean square) algorithm for single-layer networks.
+
+問題は、**隠れ層の重みをどう直せばよいか**でした。パーセプトロンの規則が使えるのは、出力が間違えたときに「どの重みのせいか」がはっきりしているからです。隠れ層を挟むと、出力の間違いが、どの隠れた細胞の、どの重みの責任なのかが分かりません。人が隠れ層を設計すれば XOR は解けますが、それでは「例から学ぶ」ことになりません。
+
+## まとめ
+
+- 1943 年、McCulloch と Pitts は、神経細胞を「発火するかしないか」の素子と見なし、入力の数としきい値で論理を組めることを示した。まだ学習はない
+- 1949 年、Hebb は「一緒に働くつなぎ目は強くなる」という仮説を述べた。つなぎ目の強さ、つまり重みが経験で変わるという見方の源になった
+- 1958 年、Rosenblatt のパーセプトロンは、当たり外れを伝えるだけで機械が自分を直す、という「学習させる」考え方を示した。教科書の形では、間違えた入力を重みに足すか引くだけ
+- パーセプトロンは平面を直線 1 本で切る。正しく分ける直線があるなら、有限回の修正で必ず見つかる（収束定理）
+- XOR を分ける直線は存在しない。実験でも、AND は 6 エポック、OR は 4 エポックで止まり、XOR は 1000 エポック回っても同じ重みを巡回し続けた
+- 隠れ層を挟めば XOR は表せる。足りなかったのは、隠れ層の重みを例から直す方法だった
+
+次の回では、この最後の問題に答えた方法を見ます。出力の誤差を、層を逆向きにたどって各重みに配り直す**誤差逆伝播法**です。それを支えるのは、微分の連鎖律という数学の道具です（数学トラックの「微分」と「連鎖律と誤差逆伝播」の回で扱います）。

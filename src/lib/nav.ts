@@ -68,6 +68,16 @@ export const AREAS: Area[] = [
     items: [{ title: '用語索引', path: 'terms/', summary: '用語から、主に扱う回と言及している回を引く' }],
   },
   {
+    id: 'ai',
+    title: 'AI',
+    tagline: 'ニューラルネットワークから Transformer、拡散モデルまで',
+    summary:
+      '流行りの使い方ではなく、元になった論文の考え方を順にたどる。必要な数学（ベクトル、行列、微分、確率、統計）は、スライダーで動かして形で掴む。',
+    path: 'ai/',
+    status: 'published',
+    items: [],
+  },
+  {
     id: 'build',
     title: '作る',
     tagline: 'NAND ひとつから、CPU と言語と NES エミュレータへ',

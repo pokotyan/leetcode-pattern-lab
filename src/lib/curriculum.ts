@@ -216,6 +216,22 @@ export const BUILD_TRACKS: Track[] = [
 
 export const trackById = new Map(BUILD_TRACKS.map((t) => [t.id, t]))
 
+/** AI 区画のトラック。数学を先に置くが、歴史トラックから読み始めて必要なときに戻ってもよい */
+export const AI_TRACKS: Section[] = [
+  {
+    id: 'math',
+    title: 'AI のための数学',
+    summary: 'ベクトル、行列、微分、勾配、確率、統計。数式を覚えるより先に、スライダーを動かして形で掴む',
+  },
+  {
+    id: 'history',
+    title: 'AI の仕組みと歴史',
+    summary: 'パーセプトロンから Transformer、強化学習、推論時スケーリング、拡散モデルまで。流行りの使い方ではなく、元になった論文の考え方を順にたどる',
+  },
+]
+
+export const aiTrackById = new Map(AI_TRACKS.map((t) => [t.id, t]))
+
 /**
  * 低レイヤの読み物の章。/lowlevel のグルーピングに使う。
  * 並び順がそのまま読む順で、後ろの章は前の章の用語を説明なしに使う。

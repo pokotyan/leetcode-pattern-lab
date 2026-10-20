@@ -147,4 +147,32 @@ const lowlevel = defineCollection({
   }),
 })
 
-export const collections = { articles, math, reading, build, lowlevel }
+/**
+ * AI の区画。数学トラックと、仕組みと歴史トラックの 2 本立て。
+ * 読者は理系でない実務者を想定し、related で低レイヤ・読み物の該当回へ橋を張る。
+ */
+const ai = defineCollection({
+  loader: glob({ base: 'src/content/ai', pattern: '**/*.{md,mdx}' }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string(),
+    /** curriculum.ts の AI_TRACKS の id */
+    track: z.string(),
+    order: z.number(),
+    status: z.enum(['published', 'planned']).default('published'),
+    topics: z.array(z.string()).default([]),
+    /** 先に読む回の slug（同じ ai 区画内） */
+    requires: z.array(z.string()).default([]),
+    related: z
+      .array(
+        z.object({
+          kind: z.enum(['lowlevel', 'reading', 'math']),
+          slug: z.string(),
+          why: z.string(),
+        }),
+      )
+      .default([]),
+  }),
+})
+
+export const collections = { articles, math, reading, build, lowlevel, ai }
