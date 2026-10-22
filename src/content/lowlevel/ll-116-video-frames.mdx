@@ -72,7 +72,7 @@ YUV にしても、1080p で 1 秒 93MB です。ここからさらに 100 分�
 
 差分を積み重ねると誤差も積み重なるので、ときどきキーフレームを挟んで画をリセットします。シークしたときも、直前のキーフレームから復号し直します（[MDN: Web video codec guide](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs)）。
 
-もう 1 つ、第 142 回で見た DEFLATE や Brotli と違い、動画のコーデックの多くは**非可逆**です。MDN は、ほとんどの動画のコーデックは復号した映像が元と正確には一致しない非可逆の方式で、縮めるほど細部が失われる、と書いています（[MDN: Web video codec guide](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs)）。テキストは 1 ビットでも変われば壊れますが、映像は目に分からない範囲なら捨ててよい。だから桁違いに縮められます。
+もう 1 つ、第 143 回で見た DEFLATE や Brotli と違い、動画のコーデックの多くは**非可逆**です。MDN は、ほとんどの動画のコーデックは復号した映像が元と正確には一致しない非可逆の方式で、縮めるほど細部が失われる、と書いています（[MDN: Web video codec guide](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs)）。テキストは 1 ビットでも変われば壊れますが、映像は目に分からない範囲なら捨ててよい。だから桁違いに縮められます。
 
 符号化と復号は計算が重いので、多くの機械は専用の回路（ハードウェアのエンコーダとデコーダ）を持っています。第 48 回の DMA と同じく、CPU は指示を出すだけで、実際の仕事は別の装置が行います。
 

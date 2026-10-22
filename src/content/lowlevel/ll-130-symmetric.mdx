@@ -206,7 +206,7 @@ AEAD の使い方は、どの方式でも同じ形をしています。
 | **AES-GCM** | AES の CTR モードで暗号化し、GHASH（GF(2¹²⁸) 上の多項式の評価）でタグを作る。nonce は 96 ビットが標準 | [NIST SP 800-38D](https://csrc.nist.gov/pubs/sp/800/38/d/final)（2007） |
 | **ChaCha20-Poly1305** | ChaCha20 で暗号化し、Poly1305 でタグを作る。Poly1305 の鍵は、nonce ごとに ChaCha20 で使い捨てのものを作る | [RFC 8439 2.8](https://www.rfc-editor.org/rfc/rfc8439.html#section-2.8) |
 
-TLS 1.3 は、共通鍵暗号をこの AEAD だけに絞りました。RFC は、残したものが「すべて AEAD のアルゴリズム」だと書いています（[RFC 8446 1.2](https://www.rfc-editor.org/rfc/rfc8446.html#section-1.2)）。TLS 1.3 の暗号スイートが `TLS_AES_128_GCM_SHA256` や `TLS_CHACHA20_POLY1305_SHA256` のような短い名前になっているのはこのためで、詳しくは第 140 回で見ます。
+TLS 1.3 は、共通鍵暗号をこの AEAD だけに絞りました。RFC は、残したものが「すべて AEAD のアルゴリズム」だと書いています（[RFC 8446 1.2](https://www.rfc-editor.org/rfc/rfc8446.html#section-1.2)）。TLS 1.3 の暗号スイートが `TLS_AES_128_GCM_SHA256` や `TLS_CHACHA20_POLY1305_SHA256` のような短い名前になっているのはこのためで、詳しくは第 141 回で見ます。
 
 さきほどの改ざんを、AES-128-GCM で試しました。
 
@@ -350,7 +350,7 @@ except InvalidTag:
 | 鍵交換の結果から、向きごと・用途ごとの鍵を作ること | 鍵導出（HKDF） | 第 134 回 |
 | 予測できない鍵と nonce | 暗号用の乱数 | 第 134 回 |
 
-TLS 1.3 は、この表を 1 本のプロトコルにまとめたものです。ECDHE で共通の秘密を作り、HKDF で送信用と受信用の鍵と IV を導出し、レコードの通し番号から nonce を作って、AEAD でレコードを暗号化します。第 140 回で、そのハンドシェイクを 1 メッセージずつ読みます。
+TLS 1.3 は、この表を 1 本のプロトコルにまとめたものです。ECDHE で共通の秘密を作り、HKDF で送信用と受信用の鍵と IV を導出し、レコードの通し番号から nonce を作って、AEAD でレコードを暗号化します。第 141 回で、そのハンドシェイクを 1 メッセージずつ読みます。
 
 ## まとめ
 

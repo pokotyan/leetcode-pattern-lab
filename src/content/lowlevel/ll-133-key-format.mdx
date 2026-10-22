@@ -289,7 +289,7 @@ $ sed '1d;$d' id_ed25519 | base64 -d | xxd | head -3
 
 ## JWK と PKCS#12
 
-**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 157 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
+**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 158 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
 
 ```
 $ node -e 'const c=require("crypto"),fs=require("fs");
@@ -416,7 +416,7 @@ $ openssl dgst -sha256 -verify rsa2.pub -signature m.sig m.txt
 Verification failure
 ```
 
-結果は公開鍵の比較と同じですが、**意味が違います**。公開鍵の比較は「この 2 つのファイルは同じ鍵を指している」ことを、手元で静かに確かめるだけです。署名の検証は「**今この瞬間、秘密鍵を持っている誰かが応答した**」ことを示します。後者は、秘密鍵を見せられない相手に対して「持っている」ことを示す手段で、プロトコルが使うのはこちらです。CSR に自分の署名が付いているのも（`openssl req -verify` で `self-signature verify OK`）、TLS の CertificateVerify（第 140 回）も、SSH の公開鍵認証（第 143 回）も同じ考え方です。
+結果は公開鍵の比較と同じですが、**意味が違います**。公開鍵の比較は「この 2 つのファイルは同じ鍵を指している」ことを、手元で静かに確かめるだけです。署名の検証は「**今この瞬間、秘密鍵を持っている誰かが応答した**」ことを示します。後者は、秘密鍵を見せられない相手に対して「持っている」ことを示す手段で、プロトコルが使うのはこちらです。CSR に自分の署名が付いているのも（`openssl req -verify` で `self-signature verify OK`）、TLS の CertificateVerify（第 141 回）も、SSH の公開鍵認証（第 144 回）も同じ考え方です。
 
 秘密鍵を HSM や KMS から取り出せない場合（第 134 回）は、公開鍵をそこから取り出して比べるか、署名を 1 回頼んで検証するかのどちらかになります。
 
@@ -476,9 +476,9 @@ error:05800074:x509 certificate routines:ossl_x509_check_private_key:key values 
 | 鍵が入る場所 | 「誰の鍵か」を示すもの | 回 |
 | --- | --- | --- |
 | 証明書の SPKI | CA の署名 | 第 119〜121 回 |
-| TLS のサーバの秘密鍵 | 証明書 + CertificateVerify の署名 | 第 140 回 |
+| TLS のサーバの秘密鍵 | 証明書 + CertificateVerify の署名 | 第 141 回 |
 | SSH のホスト鍵・ユーザ鍵 | known_hosts / authorized_keys（fingerprint） | 第 125〜126 回 |
-| JWKS の公開鍵 | TLS で守られた IdP の URL と `kid` | 第 138、140 回 |
+| JWKS の公開鍵 | TLS で守られた IdP の URL と `kid` | 第 138、141 回 |
 
 どの場合も、確かめているのは第 132 回で見たとおり「**この鍵**で署名された」ことだけです。その鍵が本物かどうかは、ペアの確認とは別に、それぞれの仕組みが引き受けています。
 

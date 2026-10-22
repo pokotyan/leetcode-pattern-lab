@@ -19,8 +19,8 @@ requires:
   - ll-100-navigation
   - ll-119-cors
   - ll-123-security-headers
-  - ll-141-tls-ops
-  - ll-156-session-cookie
+  - ll-142-tls-ops
+  - ll-157-session-cookie
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -329,7 +329,7 @@ attacker /account/x.css   302 Found  MISS
 
 ### TLS を終えるのは CDN
 
-CDN を使うと、ブラウザとの TLS は CDN の拠点で終わります（第 141 回）。CDN が暗号を解いて HTTP の要求と応答を読めるからこそ、URL をキーにキャッシュでき、`Cache-Control` を読めます。裏返せば、**CDN は全利用者の Cookie と、全利用者向けの応答を平文で見る位置**にいます。ドメインを CDN に CNAME で向けるのも（第 72 回）、使わなくなった CDN の設定に CNAME を残すと乗っ取られうるのも（第 78 回）、この位置の強さの表と裏です。
+CDN を使うと、ブラウザとの TLS は CDN の拠点で終わります（第 142 回）。CDN が暗号を解いて HTTP の要求と応答を読めるからこそ、URL をキーにキャッシュでき、`Cache-Control` を読めます。裏返せば、**CDN は全利用者の Cookie と、全利用者向けの応答を平文で見る位置**にいます。ドメインを CDN に CNAME で向けるのも（第 72 回）、使わなくなった CDN の設定に CNAME を残すと乗っ取られうるのも（第 78 回）、この位置の強さの表と裏です。
 
 ### CDN にだけ効く指示
 
@@ -396,7 +396,7 @@ https://www.google.com/
 | ログインした利用者ごとのページ | `private` または `no-store` | **ヘッダを無視して全部キャッシュする規則を作らない** |
 | 認証付きの API（`Authorization`） | `private` または `no-store` | 規則（RFC 9111 3.5）を守らない実装がある。nginx なら `proxy_no_cache` を設定する |
 | `Access-Control-Allow-Origin` を要求で変える API | `Vary: Origin`（第 119 回） | キーに `Origin` を含めるか確かめる |
-| トークン、パスワードのリセットなど | `no-store`（OAuth のトークンの応答は RFC 6749 の要求、第 158 回） | — |
+| トークン、パスワードのリセットなど | `no-store`（OAuth のトークンの応答は RFC 6749 の要求、第 159 回） | — |
 | プロキシの後ろでホスト名を使ってリンクを作るページ | 独自のヘッダの値を信用しない | `X-Forwarded-Host` などは手前で上書きする |
 
 ## 実装ごとの違い

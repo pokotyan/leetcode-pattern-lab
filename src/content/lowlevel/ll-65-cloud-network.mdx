@@ -246,7 +246,7 @@ AWS には、通信を許可する部品が 2 つあります。インスタン�
 
 > NACLs are stateless, which means that information about previously sent or received traffic is not saved. If, for example, you create a NACL rule to allow specific inbound traffic to a subnet, responses to that traffic are not automatically allowed.
 
-SG は、第 202 回で見る Linux の conntrack と同じように、通した接続を覚えておき、その戻りを規則に関係なく通します。NACL は、物理のルーターに書くアクセスリストと同じで、1 つ 1 つのパケットを、その場で番号順の規則に照らすだけです。Google Cloud の VPC ファイアウォールルールは SG と同じく状態を持ち、接続の追跡表で戻りを対応づけると書かれています（[Google Cloud: VPC firewall rules](https://cloud.google.com/firewall/docs/firewalls)）。
+SG は、第 203 回で見る Linux の conntrack と同じように、通した接続を覚えておき、その戻りを規則に関係なく通します。NACL は、物理のルーターに書くアクセスリストと同じで、1 つ 1 つのパケットを、その場で番号順の規則に照らすだけです。Google Cloud の VPC ファイアウォールルールは SG と同じく状態を持ち、接続の追跡表で戻りを対応づけると書かれています（[Google Cloud: VPC firewall rules](https://cloud.google.com/firewall/docs/firewalls)）。
 
 > When a connection is allowed through the firewall in either direction, return traffic matching this connection is also allowed. You cannot configure a firewall rule to deny associated response traffic.
 
