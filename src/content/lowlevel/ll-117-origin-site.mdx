@@ -89,7 +89,7 @@ about:blank                        -> null
 - 公開接尾辞: その下を**誰でも登録できる**部分。`com`、`co.jp`、`github.io` など
 - 登録可能なドメイン: その下で**1 つの組織が管理している**単位。`example.com`、`example.co.jp`
 
-公開接尾辞は DNS の構造からは分かりません。`co.jp` も `example.jp` も、DNS の上では同じ 2 ラベルのドメインです。第 72 回で見た DNS のレコードのどこにも「ここから下は別の持ち主」とは書かれていません。そこで、ブラウザは **Public Suffix List**（PSL）という、有志が管理する一覧表に頼っています（[publicsuffix.org](https://publicsuffix.org/)）。
+公開接尾辞は DNS の構造からは分かりません。`co.jp` も `example.jp` も、DNS の上では同じ 2 ラベルのドメインです。第 72 回で見た DNS のレコードのどこにも「ここから下は別の持ち主」とは書かれていません。そこで、ブラウザは **Public Suffix List**（PSL）という、有志が管理する一覧表に頼っています（[publicsuffix.org](https://publicsuffix.org/)）。同じ理由で、登録可能なドメインは DNS のゾーンの頂点（apex）とも別の概念です。普段は同じ名前になりますが、サブドメインを別のゾーンに委任したときなどに分かれます（第 70 回）。
 
 PSL には 2 つの区画があります。
 

@@ -15,6 +15,9 @@ topics:
   - リファーラル
   - グルーレコード
   - anycast
+  - apex（ゾーンの頂点）
+  - 公開接尾辞と登録可能なドメイン
+  - サブドメイン
 requires:
   - ll-66-socket-tcp
 ---
@@ -227,6 +230,113 @@ $ dig @ns1.google.com www.google.com A +norec
 
 ANSWER が 0 で AUTHORITY に NS が並ぶのがリファーラル、`aa` が立って ANSWER に値が入るのが最終的な答えです。
 
+## 公開接尾辞、apex、サブドメイン
+
+ゾーンと委任が分かると、ドメインの話で混ざりやすい言葉を区別できます。`news.example.co.jp` を例に並べます。
+
+| 言葉 | 何で決まるか | `news.example.co.jp` の場合 |
+| --- | --- | --- |
+| 公開接尾辞（public suffix） | 登録の方針。その下を第三者が登録できるか | `co.jp` |
+| 登録可能なドメイン（eTLD+1） | 公開接尾辞に 1 ラベル足したもの。レジストラで登録する単位 | `example.co.jp` |
+| apex（ゾーンの頂点） | DNS の構造。SOA と NS が置かれた、ゾーンの切れ目の位置 | 通常は `example.co.jp`。`news` を別のゾーンに委任していれば `news.example.co.jp` |
+| サブドメイン | 名前の包含関係。右側のラベルが一致するか | `example.co.jp` のサブドメインであり、`co.jp` や `jp` のサブドメインでもある |
+
+**サブドメインは、名前の種類ではなく 2 つの名前の関係です。** RFC 1034 は「あるドメインに含まれるドメインは、そのドメインのサブドメインである。名前の末尾が、含む側の名前で終わるかで判定できる」と定義しています（[RFC 9499](https://datatracker.ietf.org/doc/html/rfc9499) による引用）。比較はラベル単位なので、`ooo.example.com` は `oo.example.com` のサブドメインではありません。この定義では `example.com` も `com` のサブドメインです。普段の会話で「サブドメイン」と言うときは、たいてい「登録可能なドメインのサブドメイン」を指しています。
+
+**apex は DNS の構造で決まります。** RFC 9499 は apex を「SOA と、それに対応する権威のある NS の組を持つ、木の上の位置」と定義し、zone apex とも呼ぶとしています。前の節の言葉でいえば、**切れ目の子の側の名前**です。どこに切れ目を入れるかはゾーンの持ち主が委任で決めるので、`dig` で問い合わせれば確かめられます。
+
+**公開接尾辞は DNS の外で決まります。** RFC 9499 は、ドメイン名のどこにも公開接尾辞かどうかを示す情報はなく、外部の手段でしか判定できない、と書いています。その外部の手段が、有志が管理する Public Suffix List（PSL）です。PSL の中身と、ブラウザがそれをどう使うかは第 117 回で見ます。
+
+どれも**ドットの数では決まりません**。`news.example.com` と `example.co.jp` はどちらもドットが 2 つですが、前者は登録可能なドメイン `example.com` のサブドメインで、後者は登録可能なドメインそのものです。
+
+<Callout type="note" title="「apex ドメイン」「ルートドメイン」という呼び方">
+  ホスティングや DNS 事業者の画面と文書では、**レジストラで登録した（購入した）ドメインそのもの**を「apex ドメイン」と呼ぶのが一般的です。
+  たとえば GitHub Pages の文書は、カスタムドメインを `www.example.com` のようなサブドメインと、`example.com` のような apex ドメインの 2 種類に分けています（[GitHub Docs](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/about-custom-domains-and-github-pages)）。
+  同じものを「ルートドメイン」「ネイキッドドメイン」と呼ぶこともあります。
+  登録したドメインにゾーンを 1 つ作るのが普通なので、この使い方は DNS の apex（ゾーンの頂点）と同じ名前を指すことがほとんどです。
+  ただし、厳密には指すものが違います。サブドメインを別のゾーンに委任すると、DNS の apex はそのサブドメインに移りますが、apex ドメインと呼ばれる登録したドメインは変わりません。
+  また、DNS で「ルート」といえば木の頂上の `.` のことなので、「ルートドメイン」は DNS の文脈では紛らわしい言い方です。
+  この連載では、ゾーンの頂点を apex、レジストラで登録する単位を登録可能なドメインと呼び分けます。
+</Callout>
+
+### 普段は重なり、ときどき分かれる
+
+多くの組織は、登録したドメインに対して DNS 事業者でゾーンを 1 つ作り（Route 53 ならホストゾーン）、サブドメインのレコードもすべてそこに書きます。この場合、登録可能なドメインと apex は同じ名前になります。2 つが分かれるのは、次のような場合です。
+
+- **サブドメインを別のゾーンに委任している**: apex が下にずれる。登録可能なドメインは変わらない
+- **公開接尾辞がゾーンになっていない**: 公開接尾辞かどうかは登録の方針で決まり、ゾーンの切れ目とは関係がない
+- **PSL の私的な区画**: 企業が利用者ごとのサブドメインを公開接尾辞として登録していても、ゾーンはその企業が 1 つで持っていることがある
+
+### 手元で確かめる: SOA で apex を探す
+
+ある名前がどのゾーンに属するかは、その名前の SOA を問い合わせると分かります。その名前が apex なら ANSWER に SOA が返り、apex でなければ「その型のレコードは無い」という応答の AUTHORITY に、属するゾーンの SOA が添えられて返ってきます。公開接尾辞と登録可能なドメインは、第 117 回の 30 行ほどの Python で PSL（2026-10-20 版）から計算しました。2026 年 10 月 23 日に実行した結果です。
+
+```bash
+$ dig +noall +answer +authority SOA ec2.amazonaws.com
+ec2.amazonaws.com.  900  IN  SOA  ns-15.awsdns-01.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 900
+```
+
+```
+名前                  公開接尾辞    登録可能なドメイン     apex（SOA の持ち主）
+www.example.com       com          example.com          example.com
+www.jprs.co.jp        co.jp        jprs.co.jp           jprs.co.jp
+co.jp                 co.jp        （なし）              jp
+mail.google.com       com          google.com           google.com
+ec2.amazonaws.com     com          amazonaws.com        ec2.amazonaws.com
+pokotyan.github.io    github.io    pokotyan.github.io   github.io
+```
+
+上の 3 つの分かれ方が、それぞれ現れています。
+
+**`ec2.amazonaws.com` は、委任されたサブドメインです。** `amazonaws.com` の権威サーバに聞くと、`aa` の無いリファーラルが返ります。
+
+```bash
+$ dig @ns-27.awsdns-03.com ec2.amazonaws.com NS +norec +noall +authority
+ec2.amazonaws.com.  7200  IN  NS  ns-1026.awsdns-00.org.
+ec2.amazonaws.com.  7200  IN  NS  ns-15.awsdns-01.com.
+ec2.amazonaws.com.  7200  IN  NS  ns-1813.awsdns-34.co.uk.
+ec2.amazonaws.com.  7200  IN  NS  ns-817.awsdns-38.net.
+```
+
+`amazonaws.com` のゾーンは、`ec2` から下を別のゾーンに任せています。PSL には `ec2.amazonaws.com` が載っていないので、登録可能なドメインは `amazonaws.com` のままです。
+
+**`co.jp` は、`jp` のゾーンの中の名前です。** `jp` の権威サーバは、`co.jp` について `aa` を立てて自分で答え、`jprs.co.jp` については直接リファーラルを返します。
+
+```bash
+$ dig @a.dns.jp co.jp NS +norec +noall +comments +authority
+;; flags: qr aa; QUERY: 1, ANSWER: 0, AUTHORITY: 1, ADDITIONAL: 1
+jp.          900    IN  SOA  z.dns.jp. root.dns.jp. 1792735203 3600 900 1814400 900
+
+$ dig @a.dns.jp jprs.co.jp NS +norec +noall +comments +authority
+;; flags: qr; QUERY: 1, ANSWER: 0, AUTHORITY: 4, ADDITIONAL: 9
+jprs.co.jp.  86400  IN  NS   ns1.jprs.co.jp.
+```
+
+`co.jp` は PSL では公開接尾辞ですが、DNS の上では切れ目のない、ただの名前です。
+
+**`pokotyan.github.io` は、私的な区画です。** `github.io` が PSL に載っているので、ブラウザは `pokotyan.github.io` を 1 つのサイトとして扱います。一方、ゾーンは GitHub が `github.io` で 1 つ持っています。
+
+<Callout type="warn" title="この方法の注意点">
+  調べる名前が CNAME だと、フルリゾルバが CNAME の先を引くので、**転送先のゾーンの SOA** が返ります。
+  たとえば CDN に向けた名前を調べると、CDN 事業者のゾーンが出てきます。
+  CNAME を置いた名前は apex ではないので、CNAME が返ってきた時点で apex でないことは分かります。
+</Callout>
+
+### どの場面で、どれを意識するか
+
+| 場面 | 効く言葉 | 何が起きるか | 回 |
+| --- | --- | --- | --- |
+| DNS のレコードをどこに書くか | apex | 名前を含む、いちばん下のゾーンに書く。サブドメインが委任されていれば、親のゾーンに書いても親はリファーラルを返すだけで、そのレコードは使われない | 第 70 回（この回） |
+| apex に CNAME を置けない | apex | apex には SOA と NS があるので、CNAME と同居できない。apex でない `www` には置ける | 第 72 回 |
+| 使わなくなったサブドメインの委任 | apex（委任） | 親に NS が残ったままだと、サブドメインから下を丸ごと乗っ取られる | 第 78 回 |
+| ワイルドカード証明書 | サブドメイン（1 ラベル） | `*.example.com` は `www.example.com` に一致し、`example.com` にも `a.b.example.com` にも一致しない | 第 137 回 |
+| Cookie の `Domain` 属性、SameSite、サイト分離 | 公開接尾辞、登録可能なドメイン | 同じ登録可能なドメインのサブドメインどうしは同じサイトになる。公開接尾辞には Cookie を置けない | 第 117 回、第 157 回 |
+| WebAuthn の RP ID | 登録可能なドメイン | 自分のホストから登録可能なドメインまでの名前しか名乗れない | 第 155 回 |
+| DMARC の relaxed アラインメント | 組織ドメイン | おおむね登録可能なドメインにあたる。`news.example.com` と `example.com` は揃っているとみなされる | 第 178 回 |
+| 用途ごとに送信用のサブドメインを分ける | サブドメイン | SPF は名前ごとに別々に評価され、DMARC は組織ドメインで束ねられる | 第 176 回、第 181 回 |
+
+DNS の運用（レコードをどこに書くか、委任をどう片付けるか）では apex を、ブラウザやメールの「同じ持ち主か」という判定では公開接尾辞と登録可能なドメインを見ます。問題が起きたとき、どちらの話をしているのかを最初に分けると、原因を探しやすくなります。
+
 ## まとめ
 
 - DNS は名前と IP アドレスの対応を 1 か所に置かず、名前の階層に沿って管理を分ける
@@ -237,5 +347,6 @@ ANSWER が 0 で AUTHORITY に NS が並ぶのがリファーラル、`aa` が�
 - ルートサーバは 13 の名前で、12 の組織が運用する。13 は 512 バイトに収まる上限。実体は anycast で世界中に 2000 を超える拠点がある
 - サーバの名前が委任先の内側にあるときは、親がグルーレコードでアドレスを添える
 - `dig +trace` で各段の案内が、`+norec` で権威サーバの生の応答が見える
+- apex はゾーンの切れ目で決まる DNS の言葉で、公開接尾辞と登録可能なドメインは PSL で決まる登録の言葉。サブドメインは名前どうしの包含関係。普段は登録可能なドメインと apex が重なるが、委任や PSL の私的な区画で分かれる
 
 次は、ここで行き交っていた問い合わせと応答を、**バイト列として**見ます。Python のソケットだけで DNS のメッセージを組み立ててフルリゾルバに送り、返ってきた応答を読み解きます。
