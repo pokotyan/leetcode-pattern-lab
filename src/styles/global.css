@@ -167,12 +167,17 @@ body {
     display: block;
     overflow-x: auto;
   }
+  @media (min-width: 640px) {
+    .prose table {
+      display: table;
+    }
+  }
   .prose th,
   .prose td {
     border: 1px solid var(--border);
     padding: 0.5rem 0.7rem;
     text-align: left;
-    white-space: nowrap;
+    vertical-align: top;
   }
   .prose th {
     background: var(--bg-soft);
