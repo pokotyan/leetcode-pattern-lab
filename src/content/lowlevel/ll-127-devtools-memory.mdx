@@ -17,7 +17,7 @@ topics:
   - FinalizationRegistry
 requires:
   - ll-26-gc
-  - ll-118-js-engine
+  - ll-123-js-engine
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -73,7 +73,7 @@ class ListView {
 
 - **JS ヒープ**：V8 が管理する JavaScript のオブジェクト。配列、文字列、クロージャ
 - **DOM**：要素やテキストノード。Blink（Chrome の描画エンジン）が自分のヒープで管理する
-- **その他**：デコード済みの画像、GPU のテクスチャ（第 116 回）、ネットワークのバッファ
+- **その他**：デコード済みの画像、GPU のテクスチャ（第 121 回）、ネットワークのバッファ
 
 Chrome のタスクマネージャ（`Shift+Esc`）は、この違いを列で分けています。文書は「The Memory footprint column represents OS memory. DOM nodes are stored in OS memory.」「The JavaScript Memory column represents the JS heap.」と説明しています（[Fix memory problems](https://developer.chrome.com/docs/devtools/memory-problems)）。
 
@@ -278,7 +278,7 @@ fixed 版にも 1,515 個の生き残りがあります。初回の操作で一�
 - **Allocation instrumentation on timeline**：記録中の割り当てを時刻つきで残す。文書は時間軸に出る青い棒について「Those blue bars represent new memory allocations. Those new memory allocations are your candidates for memory leaks.」と書いており、棒の区間を選ぶと、その間に作られたオブジェクトだけに絞り込める
 - **Allocation sampling**：割り当てを一定の量ごとに抜き取り、関数ごとに集計する。文書は「Use the Allocation sampling profile type in the Memory panel to view memory allocation by JavaScript function.」と書いている（どちらも [Fix memory problems](https://developer.chrome.com/docs/devtools/memory-problems)）
 
-Allocation sampling は、第 228 回で見た CPU のサンプリングプロファイラのメモリ版です。leak 版を 30 回開いて閉じる間、1 KiB ごとに抜き取って集計すると、記録の終わりに生きていた割り当てはこうなりました。
+Allocation sampling は、第 238 回で見た CPU のサンプリングプロファイラのメモリ版です。leak 版を 30 回開いて閉じる間、1 KiB ごとに抜き取って集計すると、記録の終わりに生きていた割り当てはこうなりました。
 
 ```text
 2,559,456  ListView        （leak.html 14 行目、コンストラクタ）
@@ -309,4 +309,4 @@ Allocation sampling は、第 228 回で見た CPU のサンプリングプロ�
 - 弱い参照は指す先を回収させるが、入れ物の項目は残る。FinalizationRegistry が呼ばれる時期は保証されない
 - 比べるときは、操作の回数の倍数で増えたものを探す。3 スナップショット法で一時的なものを除く
 
-ここまでで第 16 章は終わりです。ブラウザは、ネットワーク、プロセスとサンドボックス、パーサ、GPU、イベントループ、JIT と GC という、ここまでの章の部品をほぼすべて使う大きなプログラムでした。最後の 3 回では、その中で起きていることを DevTools で外から確かめる方法を見ました。ただし、この章で見たのは、ブラウザが DOM と CSS から**自分で**画面を作る道筋だけです。次の第 17 章では、その道筋の外側に出て、ページの側がピクセルを描く手段を見ます。Canvas 2D、WebGL、WebGPU、DOM を canvas に描き込む HTML-in-Canvas、そして動画のフレームです。その後の第 18 章で、互いに信用しない多数のサイトのコードを同時に動かすときの境界を、第 19 章からの 4 章で、通信の中身を読まれたり書き換えられたりする心配を扱います。
+ここまでで第 17 章は終わりです。ブラウザは、ネットワーク、プロセスとサンドボックス、パーサ、GPU、イベントループ、JIT と GC という、ここまでの章の部品をほぼすべて使う大きなプログラムでした。最後の 3 回では、その中で起きていることを DevTools で外から確かめる方法を見ました。ただし、この章で見たのは、ブラウザが DOM と CSS から**自分で**画面を作る道筋だけです。次の第 18 章では、その道筋の外側に出て、ページの側がピクセルを描く手段を見ます。Canvas 2D、WebGL、WebGPU、DOM を canvas に描き込む HTML-in-Canvas、そして動画のフレームです。その後の第 19 章で、互いに信用しない多数のサイトのコードを同時に動かすときの境界を、第 20 章からの 4 章で、通信の中身を読まれたり書き換えられたりする心配を扱います。

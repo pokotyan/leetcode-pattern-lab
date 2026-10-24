@@ -16,17 +16,17 @@ topics:
   - CRLite / CRLSets
   - 証明書の有効期間の短縮
 requires:
-  - ll-150-pki-chain
-  - ll-149-x509
+  - ll-155-pki-chain
+  - ll-154-x509
   - ll-72-dns-records
-  - ll-144-signature
+  - ll-149-signature
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## 証明書は、誰が何を確かめて出しているのか
 
-第 149 回で、証明書は「この公開鍵はこの名前のものだ」という CA の署名付きの文書だと見ました。第 150 回では、その CA をなぜ信じてよいのかを、ルートまでの連鎖でたどりました。
+第 154 回で、証明書は「この公開鍵はこの名前のものだ」という CA の署名付きの文書だと見ました。第 155 回では、その CA をなぜ信じてよいのかを、ルートまでの連鎖でたどりました。
 
 残っている問いは 3 つです。
 
@@ -54,14 +54,14 @@ $ openssl req -in app.csr -noout -verify
 Certificate request self-signature verify OK
 ```
 
-CSR の署名が示すのは、**申請者がこの公開鍵の秘密鍵を持っている**ことだけです（第 144 回）。名前の持ち主であることは、何も示していません。CSR には誰でも好きな名前を書けます。
+CSR の署名が示すのは、**申請者がこの公開鍵の秘密鍵を持っている**ことだけです（第 149 回）。名前の持ち主であることは、何も示していません。CSR には誰でも好きな名前を書けます。
 
-大事なのは、**秘密鍵は CA に渡らない**ことです。CA が受け取るのは公開鍵と申請内容だけで、秘密鍵は申請者の手元（第 146 回の保管場所）から出ません。PEM のヘッダは `BEGIN CERTIFICATE REQUEST` です（第 145 回）。
+大事なのは、**秘密鍵は CA に渡らない**ことです。CA が受け取るのは公開鍵と申請内容だけで、秘密鍵は申請者の手元（第 151 回の保管場所）から出ません。PEM のヘッダは `BEGIN CERTIFICATE REQUEST` です（第 150 回）。
 
 <Callout type="warn" title="誤解: CSR に書いたとおりの証明書が出てくる">
   CSR は「お願い」であって、証明書の下書きではありません。CA は確認できた名前だけを載せ、Subject の中身も自分の方針で決めます。
   後の実験でこの CSR を送ると、返ってきた証明書の Subject は**空**でした。SAN は 2 つとも載っていますが、CN は落とされています。
-  第 149 回で見たとおり、名前の照合は SAN で行うので、CN は無くても困りません。Let's Encrypt の新しいプロファイルも CN を載せません（[Let's Encrypt: Profiles](https://letsencrypt.org/docs/profiles/)）。
+  第 154 回で見たとおり、名前の照合は SAN で行うので、CN は無くても困りません。Let's Encrypt の新しいプロファイルも CN を載せません（[Let's Encrypt: Profiles](https://letsencrypt.org/docs/profiles/)）。
 </Callout>
 
 ## CA は何を確かめるのか: DV / OV / EV
@@ -91,7 +91,7 @@ EV の Subject には登記の情報まで入っています。かつてブラ�
 
 <Callout type="warn" title="誤解: EV や OV の証明書は、DV より通信が安全">
   DV・OV・EV の違いは、**CA が発行前に調べた範囲**だけです。鍵の種類も、TLS の暗号も、ブラウザの検証の手順も同じで、DV だから盗聴されやすいということはありません。
-  また、どの種類でも「そのサイトが善良であること」は保証しません（第 149 回）。フィッシングサイトも、自分で持っているドメインの DV 証明書は正当に取れます。
+  また、どの種類でも「そのサイトが善良であること」は保証しません（第 154 回）。フィッシングサイトも、自分で持っているドメインの DV 証明書は正当に取れます。
 </Callout>
 
 以下では、Web のほとんどを占める **DV** の発行を見ていきます。
@@ -115,14 +115,14 @@ DV の確認は「そのドメインを今管理している人にしかでき�
   │── POST certificate ─────────────────────────→  証明書とチェーンの PEM
 ```
 
-ACME の要求は、本文をすべて **JWS**（署名付きの JSON）で包みます（[RFC 8555 6.2](https://www.rfc-editor.org/rfc/rfc8555.html#section-6.2)）。署名に使うのは**アカウント鍵**で、証明書に載る鍵とは別の鍵です。JWS の形は第 170 回で詳しく見ます。ここで押さえておきたいのは 2 点です。
+ACME の要求は、本文をすべて **JWS**（署名付きの JSON）で包みます（[RFC 8555 6.2](https://www.rfc-editor.org/rfc/rfc8555.html#section-6.2)）。署名に使うのは**アカウント鍵**で、証明書に載る鍵とは別の鍵です。JWS の形は第 176 回で詳しく見ます。ここで押さえておきたいのは 2 点です。
 
 - **アカウント鍵が、利用者の身元の代わり**になる。パスワードはない。authorization は「このアカウント鍵の持ち主が、このドメインを管理していると確かめた」という記録になる
 - JWS のヘッダに、サーバが払い出した使い捨ての **nonce** と宛先の URL を入れる（[RFC 8555 6.4, 6.5](https://www.rfc-editor.org/rfc/rfc8555.html#section-6.5)）。途中で拾った要求を**送り直しても通らない**（リプレイの防止）
 
 ## 3 つのチャレンジ
 
-authorization に並ぶのが**チャレンジ**です。どれも、CA が渡した**トークン**と、アカウント鍵の公開鍵の thumbprint（第 145 回の RFC 7638）をつないだ **key authorization** を、決められた場所に置けるかを試します（[RFC 8555 8.1](https://www.rfc-editor.org/rfc/rfc8555.html#section-8.1)）。
+authorization に並ぶのが**チャレンジ**です。どれも、CA が渡した**トークン**と、アカウント鍵の公開鍵の thumbprint（第 150 回の RFC 7638）をつないだ **key authorization** を、決められた場所に置けるかを試します（[RFC 8555 8.1](https://www.rfc-editor.org/rfc/rfc8555.html#section-8.1)）。
 
 ```
 keyAuthorization = token || '.' || base64url(Thumbprint(accountKey))
@@ -181,7 +181,7 @@ No CAA identities configured, using default [pebble.letsencrypt.org]
 Configured to reject 5% of good nonces
 ```
 
-ルートと中間の 2 段は第 150 回の形です。有効期間は 90 日（7,776,000 秒）と 6 日（518,400 秒）の 2 つのプロファイルがあります。「正しい nonce の 5% をわざと拒否する」のは、クライアントがやり直しを正しく実装しているかを試すための意地悪です。
+ルートと中間の 2 段は第 155 回の形です。有効期間は 90 日（7,776,000 秒）と 6 日（518,400 秒）の 2 つのプロファイルがあります。「正しい nonce の 5% をわざと拒否する」のは、クライアントがやり直しを正しく実装しているかを試すための意地悪です。
 
 **HTTP-01 で 1 枚発行する。** lego に 5002 番で待ち受けさせます（Pebble は 80 番の代わりに 5002 番へ確かめに来ます）。
 
@@ -248,7 +248,7 @@ SAME_KEY
 
 証明書の公開鍵は手元の `csr.key` のものと一致し、秘密鍵は一度も外に出ていません。Subject が空で SAN が critical なのは、RFC 5280 が「Subject が空なら SAN を critical にせよ」と決めているからです（[RFC 5280 4.2.1.6](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.6)）。
 
-**ACME を自分で話す。** lego が隠している中身を見るため、Python の標準ライブラリと cryptography だけで 100 行ほどのクライアントを書き、DNS-01 で 1 枚取りました（JWS の組み立て方は第 170 回で扱うので省きます）。
+**ACME を自分で話す。** lego が隠している中身を見るため、Python の標準ライブラリと cryptography だけで 100 行ほどのクライアントを書き、DNS-01 で 1 枚取りました（JWS の組み立て方は第 176 回で扱うので省きます）。
 
 ```
 protected: {"alg": "ES256", "nonce": "zQg62iZ5vMYGurI32i-fKQ", "url": ".../sign-me-up", "jwk": {...}}
@@ -283,7 +283,7 @@ certificate 200 2 certs in chain
 
 見つかったきっかけは Chrome でした。Chrome は Gmail などの Google のサイトについて、発行してよい CA を少数に限る仕組みを組み込んでいて、DigiNotar の証明書を不正と判定できました（[Google Security Blog 2011](https://security.googleblog.com/2011/08/update-on-attempted-man-in-middle.html)）。ブラウザ各社は DigiNotar のルートを外し、DigiNotar は 2011 年 9 月 20 日に破産を宣告されました（[VASCO の発表](https://www.prnewswire.com/news-releases/vasco-announces-bankruptcy-filing-by-diginotar-bv-130181213.html)）。
 
-この事件が示したのは、第 150 回で見た Web の PKI の弱点そのものです。**トラストストアにある CA は、どれでも、どの名前の証明書でも出せる。** そして CA が黙っていれば、ドメインの持ち主には**自分の名前の証明書が出たことを知る手段がない**。Google が気づけたのは、自分のサイトについてだけ特別な仕組みを持っていたからでした。
+この事件が示したのは、第 155 回で見た Web の PKI の弱点そのものです。**トラストストアにある CA は、どれでも、どの名前の証明書でも出せる。** そして CA が黙っていれば、ドメインの持ち主には**自分の名前の証明書が出たことを知る手段がない**。Google が気づけたのは、自分のサイトについてだけ特別な仕組みを持っていたからでした。
 
 ## Certificate Transparency: すべての発行を公開ログに載せる
 
@@ -298,7 +298,7 @@ CA ──③ SCT を埋め込んで本物の証明書を発行──→ サー�
 ```
 
 - ログは**マークル木**（葉が証明書のハッシュ木）で作られていて、過去のエントリを消したり書き換えたりすると、その後の木の根が合わなくなる。ログが「追記しかしていない」ことを、第三者が確かめられる（[RFC 6962 2.1](https://www.rfc-editor.org/rfc/rfc6962.html#section-2.1)）
-- **SCT**（Signed Certificate Timestamp）は第 149 回で見た拡張で、ログの署名付きの受領証。証明書に埋め込むほか、TLS の拡張や OCSP の応答で渡すこともできる（[RFC 6962 3.3](https://www.rfc-editor.org/rfc/rfc6962.html#section-3.3)）
+- **SCT**（Signed Certificate Timestamp）は第 154 回で見た拡張で、ログの署名付きの受領証。証明書に埋め込むほか、TLS の拡張や OCSP の応答で渡すこともできる（[RFC 6962 3.3](https://www.rfc-editor.org/rfc/rfc6962.html#section-3.3)）
 - Chrome は 2018 年 4 月 30 日より後に発行された証明書に CT への準拠を求め、Chrome 68 から実際に拒否し始めた（[ct-policy の告知 2018](https://groups.google.com/a/chromium.org/g/ct-policy/c/Qqr59r6yn1A/m/2t0bWblZBgAJ)）。執筆時点（2026 年 9 月）の [Chrome CT Policy](https://googlechrome.github.io/CertificateTransparency/ct_policy.html) では、埋め込みの SCT は有効期間 180 日以下の証明書で 2 つ以上、それより長ければ 3 つ以上、しかも別々のログ事業者から必要
 
 RFC 6962 は実験的な仕様で、改訂版の CT 2.0（[RFC 9162](https://www.rfc-editor.org/rfc/rfc9162.html)）が出ていますが、Web で実際に動いているのは今も 6962 の形式です。
@@ -340,7 +340,7 @@ CT Precertificate SCTs:
 
 ## 失効: CRL と OCSP
 
-秘密鍵が漏れた、ドメインを手放した、CA が誤って発行した。こうしたとき、期限前の証明書を無効にするのが**失効**です。第 149 回で見たとおり、証明書自体には「失効したかどうか」は書かれていないので、**外の情報**を見に行くしかありません。方法は 2 つあります。
+秘密鍵が漏れた、ドメインを手放した、CA が誤って発行した。こうしたとき、期限前の証明書を無効にするのが**失効**です。第 154 回で見たとおり、証明書自体には「失効したかどうか」は書かれていないので、**外の情報**を見に行くしかありません。方法は 2 つあります。
 
 | | CRL | OCSP |
 | --- | --- | --- |
@@ -438,16 +438,16 @@ Let's Encrypt はもともと 90 日で、さらに短くする計画を 2025 �
 - **cert-manager**（Kubernetes）: Certificate リソースに欲しい名前を書き、Issuer に ACME のサーバとチャレンジの方式を書く。証明書と鍵は Secret に入る。既定では有効期間の **3 分の 2** が過ぎたところで更新する（[cert-manager: Certificate](https://cert-manager.io/docs/usage/certificate/)）
 - **ARI**（ACME Renewal Information、[RFC 9773](https://www.rfc-editor.org/rfc/rfc9773.html)）: いつ更新すべきかを CA が窓の形で教える拡張。大量の失効をする前に「早めに更新して」と促せる。Pebble の directory にも `renewalInfo` がありました
 
-自動化で見落としやすいのは、**更新が成功したことと、新しい証明書が使われていることは別**だという点です。証明書のファイルを書き換えても、nginx を再読み込みしなければ古い証明書を出し続けます（lego の `--deploy-hook` などの出番です）。LB やアプリに手でコピーした証明書は、自動更新の外にあります。監視は「ファイルの期限」ではなく、**外から接続して実際に返ってくる証明書の期限**で行うのが確実です（期限切れの障害の典型は第 154 回、実際の事例は第 181 回）。
+自動化で見落としやすいのは、**更新が成功したことと、新しい証明書が使われていることは別**だという点です。証明書のファイルを書き換えても、nginx を再読み込みしなければ古い証明書を出し続けます（lego の `--deploy-hook` などの出番です）。LB やアプリに手でコピーした証明書は、自動更新の外にあります。監視は「ファイルの期限」ではなく、**外から接続して実際に返ってくる証明書の期限**で行うのが確実です（期限切れの障害の典型は第 159 回、実際の事例は第 190 回）。
 
 ## この部品は何と組み合わさるか
 
 | 段階 | 使う部品 | 保証すること | 保証しないこと |
 | --- | --- | --- | --- |
-| 申請 | CSR（署名: 第 144 回、鍵の形式: 第 145 回） | 申請者が秘密鍵を持っている | 名前の持ち主であること |
+| 申請 | CSR（署名: 第 149 回、鍵の形式: 第 150 回） | 申請者が秘密鍵を持っている | 名前の持ち主であること |
 | 確認 | ACME（JWS、nonce、TXT: 第 72 回、HTTP、TLS） | このアカウント鍵の持ち主が、今その名前を管理している | 組織の身元、サイトの善良さ |
 | 発行の制限 | CAA（第 72 回） | まともな CA が他人のドメインに出さない | 悪意のある CA を止めること |
-| 監視 | CT（署名、マークル木＝ハッシュ: 第 141 回） | 発行が隠れていない | 発行を止めること。誰かが見ていること |
+| 監視 | CT（署名、マークル木＝ハッシュ: 第 146 回） | 発行が隠れていない | 発行を止めること。誰かが見ていること |
 | 失効 | CRL、OCSP、CRLite（署名） | CA が取り消したという事実 | それがクライアントに届くこと |
 | 更新 | ACME クライアント、ARI、短い寿命 | 失効に頼らず期限が来る | 新しい証明書が実際に配られていること |
 

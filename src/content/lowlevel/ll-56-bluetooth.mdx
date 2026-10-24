@@ -24,8 +24,8 @@ topics:
   - LE Audio
 requires:
   - ll-53-radio-spectrum
-  - ll-143-public-key
-  - ll-142-symmetric
+  - ll-148-public-key
+  - ll-147-symmetric
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -190,9 +190,9 @@ ATT は単純な仕組みで、相手（サーバ）が持っている**属性**
 
 LE の接続そのものは暗号化されていません。暗号化するには、2 台が**ペアリング**で共通の鍵を作ります。作った鍵を保存して次回以降も使うことを**ボンディング**と呼びます。
 
-Bluetooth 4.2 で入った **LE Secure Connections**（[変更履歴](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/core-specification-change-history.html)）では、鍵の共有に楕円曲線の Diffie-Hellman（ECDH）を使います。「LE Secure Connections pairing utilizes the P-256 elliptic curve」（[Core 6.1 Vol 3 Part H](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/security-manager-specification.html)）。公開鍵を交換するだけで、盗み聞きしている第三者には分からない共通の秘密ができる、という第 143 回の仕組みそのものです。
+Bluetooth 4.2 で入った **LE Secure Connections**（[変更履歴](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/architecture,-change-history,-and-conventions/core-specification-change-history.html)）では、鍵の共有に楕円曲線の Diffie-Hellman（ECDH）を使います。「LE Secure Connections pairing utilizes the P-256 elliptic curve」（[Core 6.1 Vol 3 Part H](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/security-manager-specification.html)）。公開鍵を交換するだけで、盗み聞きしている第三者には分からない共通の秘密ができる、という第 148 回の仕組みそのものです。
 
-ただし、第 143 回で見たとおり、**鍵交換は相手が誰かを教えてくれません**。間に入った攻撃者と鍵を交換していても気づけない、中間者攻撃（MITM）の問題が残ります。そこで、ペアリングにはいくつかの確かめ方（association model）が用意されています。
+ただし、第 148 回で見たとおり、**鍵交換は相手が誰かを教えてくれません**。間に入った攻撃者と鍵を交換していても気づけない、中間者攻撃（MITM）の問題が残ります。そこで、ペアリングにはいくつかの確かめ方（association model）が用意されています。
 
 | 方式 | 利用者がすること | 中間者への守り |
 | --- | --- | --- |
@@ -216,7 +216,7 @@ hash = ah(IRK, prand)
 randomAddress = prand || hash
 ```
 
-IRK（Identity Resolving Key）は、ペアリングのときに相手へ渡しておく 128 ビットの鍵です。ハッシュ関数 ah の中身は AES-128 で、prand を 128 ビットに 0 で埋めて IRK で暗号化し、結果の下位 24 ビットを取ります（[Core 6.1 Vol 3 Part H 2.2.2](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/security-manager-specification.html)）。AES については第 142 回で扱いました。
+IRK（Identity Resolving Key）は、ペアリングのときに相手へ渡しておく 128 ビットの鍵です。ハッシュ関数 ah の中身は AES-128 で、prand を 128 ビットに 0 で埋めて IRK で暗号化し、結果の下位 24 ビットを取ります（[Core 6.1 Vol 3 Part H 2.2.2](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/security-manager-specification.html)）。AES については第 147 回で扱いました。
 
 受け取った側は、手元にある IRK で同じ計算をして、アドレスの後半と一致するかを見ます。一致すれば「あのイヤホンだ」と分かり、IRK を持たない第三者には、ただの乱数にしか見えません。アドレスを替える間隔は、GAP の仕様の表で TGAP(private_addr_int) として「15 min」が推奨値とされ、意味は「Maximum time interval between private address change」です。また別の箇所に「The value of TGAP(private_addr_int) shall not be greater than 1 hour.」とあります（[Core 6.1 Vol 3 Part C](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host/generic-access-profile.html)）。
 

@@ -18,9 +18,9 @@ topics:
   - authorized_keys の command=
   - Mosh
 requires:
-  - ll-160-ftp-ftps
-  - ll-156-ssh-protocol
-  - ll-157-ssh-ops
+  - ll-165-ftp-ftps
+  - ll-161-ssh-protocol
+  - ll-162-ssh-ops
   - ll-67-tcp-flow
 ---
 
@@ -28,9 +28,9 @@ import Callout from '../../components/Callout.astro'
 
 ## SSH の入口は、ネットワークの入口でもある
 
-前回の第 160 回では、FTP が制御とデータの 2 本の接続を使うために、暗号化するとファイアウォールが中身を読めなくなる事情を見ました。この回は向きが逆です。**SSH の接続は 1 本なのに、その中を何でも通せてしまう**ことを扱います。
+前回の第 165 回では、FTP が制御とデータの 2 本の接続を使うために、暗号化するとファイアウォールが中身を読めなくなる事情を見ました。この回は向きが逆です。**SSH の接続は 1 本なのに、その中を何でも通せてしまう**ことを扱います。
 
-第 156 回の最後に、ポートフォワーディングの 3 つのオプション（`-L`、`-R`、`-D`）を表で並べ、「SSH で入れる人は、そのサーバが届く範囲すべてに手が届く」と書きました。この回はその先を見ます。
+第 161 回の最後に、ポートフォワーディングの 3 つのオプション（`-L`、`-R`、`-D`）を表で並べ、「SSH で入れる人は、そのサーバが届く範囲すべてに手が届く」と書きました。この回はその先を見ます。
 
 - 3 つのオプションは、それぞれ**どちら側に、どのアドレスで入口を開ける**のか
 - 標準入出力を通す `-W`、IP パケットを通す `-w` は何が違うのか
@@ -38,7 +38,7 @@ import Callout from '../../components/Callout.astro'
 - TCP の上に TCP を載せると何が起きるのか
 - SSH の上に載っている代表的なプロトコル、Git と Mosh は、SSH の何を使っているのか
 
-どれも第 156 回で見た**チャネル**の使い方の違いです。シェルの代わりに、TCP のバイト列、IP パケット、あるいは別のプログラムの標準入出力を運んでいるだけです。
+どれも第 161 回で見た**チャネル**の使い方の違いです。シェルの代わりに、TCP のバイト列、IP パケット、あるいは別のプログラムの標準入出力を運んでいるだけです。
 
 ## 実験の環境
 
@@ -251,7 +251,7 @@ $ echo | ssh -W ll119-inner:22 gw | head -c 40 | od -c | head -3
 0000040   H       i   d   e   n   t   i
 ```
 
-標準出力に、`inner` の sshd のバージョン文字列（第 156 回）がそのまま出てきました。送った空行には `Invalid SSH identification` と返しています。
+標準出力に、`inner` の sshd のバージョン文字列（第 161 回）がそのまま出てきました。送った空行には `Invalid SSH identification` と返しています。
 
 `ProxyCommand` は、「TCP の代わりに、このコマンドの標準入出力を使って SSH を話せ」という指定です（[ssh_config(5)](https://man.openbsd.org/ssh_config.5)）。`-W` と組み合わせると、`gw` 越しに `inner` へ入れます。
 
@@ -264,7 +264,7 @@ Authenticated to ll119-inner (via proxy) using "publickey".
 inner
 ```
 
-第 157 回の `ProxyJump` は、これの略記です。`-W` 以前は、上の実験のように踏み台で `nc` を動かすのが定番でした。`ProxyCommand` に渡すのは標準入出力を持つものなら何でもよく、ssh_config(5) には、`nc -X connect -x` で HTTP プロキシの `CONNECT` を越える例も載っています（[ssh_config(5)](https://man.openbsd.org/ssh_config.5)）。**SSH から見ると、下が TCP でも、別の SSH のチャネルでも、HTTP プロキシでも同じ**です。
+第 162 回の `ProxyJump` は、これの略記です。`-W` 以前は、上の実験のように踏み台で `nc` を動かすのが定番でした。`ProxyCommand` に渡すのは標準入出力を持つものなら何でもよく、ssh_config(5) には、`nc -X connect -x` で HTTP プロキシの `CONNECT` を越える例も載っています（[ssh_config(5)](https://man.openbsd.org/ssh_config.5)）。**SSH から見ると、下が TCP でも、別の SSH のチャネルでも、HTTP プロキシでも同じ**です。
 
 ## -w: IP パケットを運ぶ
 
@@ -309,13 +309,13 @@ TCP ではない ICMP が通りました。`gw` で、tun0 と eth0 を同時に
   84  IP パケット
 +  4  アドレスファミリ（tun@openssh.com）
 +  9  CHANNEL_DATA の種類 1、チャネル番号 4、データ長 4
-+  7  padding_length 1、パディング 6（第 156 回の形。長さの欄を除いて 8 の倍数に揃える）
++  7  padding_length 1、パディング 6（第 161 回の形。長さの欄を除いて 8 の倍数に揃える）
 +  4  packet_length
 + 16  Poly1305 のタグ（chacha20-poly1305）
 = 124
 ```
 
-`-w` を使えば、経路を足すだけで `gw` の向こうのネットワーク全体に届く、**簡易な VPN** になります。ただし ssh(1) 自身が、SSH を使った構成はオーバーヘッドが大きいので一時的な用途に向く、と書いています（[ssh(1)](https://man.openbsd.org/ssh.1) の SSH-BASED VIRTUAL PRIVATE NETWORKS）。理由の 1 つが次の節です。恒常的な VPN は第 163 回と第 180 回で扱います。
+`-w` を使えば、経路を足すだけで `gw` の向こうのネットワーク全体に届く、**簡易な VPN** になります。ただし ssh(1) 自身が、SSH を使った構成はオーバーヘッドが大きいので一時的な用途に向く、と書いています（[ssh(1)](https://man.openbsd.org/ssh.1) の SSH-BASED VIRTUAL PRIVATE NETWORKS）。理由の 1 つが次の節です。恒常的な VPN は第 168 回と第 189 回で扱います。
 
 ## TCP の上に TCP を載せる
 
@@ -354,7 +354,7 @@ rto:243 rtt:42.063/1.351 ... bytes_retrans:291164 ... retrans:1/206 lost:2 ... m
   宛先への TCP は sshd が新しく張り直すので（`inner` のログの送り元は `gw` でした）、TCP の再送や輻輳制御が二重に動くことはありません。
   二重になるのは、`-w` のように **IP パケットごと**運ぶときだけです。
   ただし、バイト列を運ぶ転送にも別の弱点はあります。複数の転送が 1 本の SSH の TCP を共有するので、1 つのパケットの損失が全チャネルを止めます（第 67 回の HOL ブロッキング）。
-  UDP を運べないのも同じ理由です。トンネルの下に UDP を使う VPN が多いのは、この 2 つを避けるためです（第 163 回）。
+  UDP を運べないのも同じ理由です。トンネルの下に UDP を使う VPN が多いのは、この 2 つを避けるためです（第 168 回）。
 </Callout>
 
 実験の後、netem は外しました。
@@ -379,14 +379,14 @@ debug1: mux_client_request_session: master session id: 2
 
 10 回の接続が 1.68 秒から 0.157 秒になりました。2 回目以降は、`kex:` も `Authenticated` も出ていません。鍵交換も認証もせず、既存の接続にチャネルを足しているだけだからです。`gw` 側の `ss` でも、確立済みの 22 番の接続は 1 本だけでした。Ansible の SSH 接続の既定の引数が `-C -o ControlMaster=auto -o ControlPersist=60s` になっているのはこのためです（[Ansible の ssh connection](https://docs.ansible.com/ansible/latest/collections/ansible/builtin/ssh_connection.html)）。
 
-裏返すと、**制御ソケットに話しかけられる者は、認証なしにそのサーバでコマンドを実行できます**。手元のソケットは `srw-------`（所有者だけ）で作られていましたが、第 157 回のエージェント転送と同じく、守りはファイルの権限だけです。共有のマシンでは `ControlPath` を他人の書けないディレクトリに置き、`ControlPersist` を必要以上に長くしないことです。また、多重化された `ssh` に付けたオプションの一部（たとえば別の鍵）は、既存の接続には効きません。認証をやり直したいときは `-O exit` で親を閉じます。
+裏返すと、**制御ソケットに話しかけられる者は、認証なしにそのサーバでコマンドを実行できます**。手元のソケットは `srw-------`（所有者だけ）で作られていましたが、第 162 回のエージェント転送と同じく、守りはファイルの権限だけです。共有のマシンでは `ControlPath` を他人の書けないディレクトリに置き、`ControlPersist` を必要以上に長くしないことです。また、多重化された `ssh` に付けたオプションの一部（たとえば別の鍵）は、既存の接続には効きません。認証をやり直したいときは `-O exit` で親を閉じます。
 
 ## X11 転送とエージェント転送
 
 チャネルで運べるものには、ほかに X11 の画面とエージェントがあります。
 
 - **X11 転送**（`-X`、`-Y`）は、サーバ上の GUI アプリケーションの描画を手元の X サーバに送ります（[RFC 4254 6.3](https://www.rfc-editor.org/rfc/rfc4254.html#section-6.3)）。ssh(1) は、リモート側でファイルの権限を越えられる者が転送を通じて手元の画面に触れ、キー入力の監視などができてしまう、と警告しています（[ssh(1)](https://man.openbsd.org/ssh.1)）。sshd の `X11Forwarding` の既定は `no` です（[sshd_config(5)](https://man.openbsd.org/sshd_config.5)）
-- **エージェント転送**（`-A`）は、第 157 回で実際に root から署名を代行させました。構図は X11 と同じで、**手元の資源への窓口を、相手のサーバに置く**転送です
+- **エージェント転送**（`-A`）は、第 162 回で実際に root から署名を代行させました。構図は X11 と同じで、**手元の資源への窓口を、相手のサーバに置く**転送です
 
 `-L` が「相手側のネットワークへの入口を手元に置く」のに対し、X11、エージェント、`-R` は「手元への入口を相手側に置く」転送です。**相手のサーバをどこまで信頼するか**で、使ってよいかが決まります。
 
@@ -402,7 +402,7 @@ debug1: Sending command: git-receive-pack 'demo.git'
  * [new branch]      main -> main
 ```
 
-`git@host:path` の形の URL は、パスがホームディレクトリからの相対になり、リポジトリのパスは必ず単引用符で囲まれます（[gitprotocol-pack](https://git-scm.com/docs/gitprotocol-pack)）。SSH から見ると、`ssh gw "git-receive-pack 'demo.git'"` と何も変わりません。第 156 回の `session` チャネルと `exec` 要求です。
+`git@host:path` の形の URL は、パスがホームディレクトリからの相対になり、リポジトリのパスは必ず単引用符で囲まれます（[gitprotocol-pack](https://git-scm.com/docs/gitprotocol-pack)）。SSH から見ると、`ssh gw "git-receive-pack 'demo.git'"` と何も変わりません。第 161 回の `session` チャネルと `exec` 要求です。
 
 ### プロトコル v2 は、環境変数で頼む
 
@@ -450,7 +450,7 @@ packet:  clone> 0000
 packet:  clone< 329682f4944b0792190ef112c9cf6a8c173d503e HEAD symref-target:refs/heads/main
 ```
 
-v2 では、サーバはまず**できること（capability）**だけを伝え、クライアントが `ls-refs` で欲しい ref の接頭辞を指定してから一覧が返ります。ref が何十万もあるリポジトリでは、この違いが大きく効きます。各行の先頭（トレースでは省かれています）には 4 桁の 16 進数で長さが付き、`0000` は区切り（flush-pkt）、`0001` は引数との区切り（delim-pkt）です（[gitprotocol-v2](https://git-scm.com/docs/gitprotocol-v2)）。第 156 回の SSH のパケット、第 79 回の HTTP/2 のフレームと同じく、**長さが先にある形**です。
+v2 では、サーバはまず**できること（capability）**だけを伝え、クライアントが `ls-refs` で欲しい ref の接頭辞を指定してから一覧が返ります。ref が何十万もあるリポジトリでは、この違いが大きく効きます。各行の先頭（トレースでは省かれています）には 4 桁の 16 進数で長さが付き、`0000` は区切り（flush-pkt）、`0001` は引数との区切り（delim-pkt）です（[gitprotocol-v2](https://git-scm.com/docs/gitprotocol-v2)）。第 161 回の SSH のパケット、第 79 回の HTTP/2 のフレームと同じく、**長さが先にある形**です。
 
 v2 を既定にしたのは Git 2.26 で（[2.26.0 のリリースノート](https://github.com/git/git/blob/master/Documentation/RelNotes/2.26.0.adoc)）、不具合のため 2.27 でいったん既定から外され（[2.27.0](https://github.com/git/git/blob/master/Documentation/RelNotes/2.27.0.adoc)）、2.29 で再び既定になりました（[2.29.0](https://github.com/git/git/blob/master/Documentation/RelNotes/2.29.0.adoc)）。なお、push のときは、`AcceptEnv` を足した後でも `GIT_PROTOCOL` は空で届き、`git-receive-pack` は v0 の形で ref を広告しました。
 
@@ -462,7 +462,7 @@ v2 を既定にしたのは Git 2.26 で（[2.26.0 のリリースノート](htt
 
 ### 鍵 1 本で利用者を決める
 
-GitHub などでは、誰もが `git@github.com` という**同じユーザ名**で入ります。それでも誰が来たかが分かるのは、**どの鍵で認証したか**から利用者を決めているからです。`ssh -T git@github.com` を打つと `Hi USERNAME! You've successfully authenticated, but GitHub does not provide shell access.` と返ります（[GitHub Docs](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/testing-your-ssh-connection)）。GitHub の内部の実装は公開されていませんが、同じ振る舞いは、第 157 回の `authorized_keys` と `command=` で作れます。
+GitHub などでは、誰もが `git@github.com` という**同じユーザ名**で入ります。それでも誰が来たかが分かるのは、**どの鍵で認証したか**から利用者を決めているからです。`ssh -T git@github.com` を打つと `Hi USERNAME! You've successfully authenticated, but GitHub does not provide shell access.` と返ります（[GitHub Docs](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/testing-your-ssh-connection)）。GitHub の内部の実装は公開されていませんが、同じ振る舞いは、第 162 回の `authorized_keys` と `command=` で作れます。
 
 ```
 command="/usr/local/bin/gitshell alice",restrict ssh-ed25519 AAAA... alice@client
@@ -487,7 +487,7 @@ command not allowed
 この形には、次の帰結があります。
 
 - **1 本の鍵は 1 人の利用者にしか結び付けられません**。GitHub でも、別のアカウントや別のリポジトリにすでに登録した鍵を追加しようとすると `Key is already in use` になり、デプロイキーは 1 つのリポジトリにしか使えません（[GitHub Docs](https://docs.github.com/en/authentication/troubleshooting-ssh/error-key-already-in-use)）
-- 認証（どの鍵か）は sshd がし、**認可（そのリポジトリに push してよいか）は `command=` の先のプログラムの仕事**です。sshd はリポジトリのことを何も知りません。第 22 章の「認証と認可を分ける」の小さな実例です
+- 認証（どの鍵か）は sshd がし、**認可（そのリポジトリに push してよいか）は `command=` の先のプログラムの仕事**です。sshd はリポジトリのことを何も知りません。第 23 章の「認証と認可を分ける」の小さな実例です
 - `SSH_ORIGINAL_COMMAND` は**利用者が自由に書ける文字列**です。シェルに渡して評価すれば、コマンドの注入になります。決まった形にだけ一致させ、パスに `..` や `/` を許さず、`exec` に引数として渡すのが基本です
 
 Git には、この役を受け持つ制限付きのシェル `git-shell` も付いていて、Git の送受信のコマンドだけを実行させられます（[git-shell](https://git-scm.com/docs/git-shell)）。
@@ -512,9 +512,9 @@ alice   583  ...  mosh-server new -s -l LANG=C.UTF-8
 UNCONN 0  0   172.22.0.2:60001   0.0.0.0:*
 ```
 
-`MOSH CONNECT` の行が、UDP のポート番号と、22 文字のセッション鍵です（[mosh.org](https://mosh.org/)）。この行は**SSH の暗号化された `exec` チャネルの出力として**クライアントに届きます。`mosh-server` は自分を切り離して残り、SSH の接続は閉じます。データグラムは、この鍵を使って AES-128 の OCB3 モード（第 142 回の AEAD の 1 つ）で暗号化と認証をされます（[mosh.org](https://mosh.org/)）。
+`MOSH CONNECT` の行が、UDP のポート番号と、22 文字のセッション鍵です（[mosh.org](https://mosh.org/)）。この行は**SSH の暗号化された `exec` チャネルの出力として**クライアントに届きます。`mosh-server` は自分を切り離して残り、SSH の接続は閉じます。データグラムは、この鍵を使って AES-128 の OCB3 モード（第 147 回の AEAD の 1 つ）で暗号化と認証をされます（[mosh.org](https://mosh.org/)）。
 
-つまり Mosh の信頼の根は、**最初の SSH 接続**にあります。サーバを確かめたのは SSH のホスト鍵（第 156 回）、利用者を確かめたのは SSH の公開鍵認証で、Mosh 自身はサーバの鍵も利用者の鍵も持ちません。「SSH で安全に渡した使い捨ての共通鍵で、別の通信路を守る」という形です。
+つまり Mosh の信頼の根は、**最初の SSH 接続**にあります。サーバを確かめたのは SSH のホスト鍵（第 161 回）、利用者を確かめたのは SSH の公開鍵認証で、Mosh 自身はサーバの鍵も利用者の鍵も持ちません。「SSH で安全に渡した使い捨ての共通鍵で、別の通信路を守る」という形です。
 
 実際に `mosh gw` を動かし、`gw` の eth0 を見ました（`client` はコンテナなので、`script` で擬似端末を用意して起動しています）。
 
@@ -563,9 +563,9 @@ SSP が同期するのは**端末の画面の状態**で、バイト列ではあ
 | Git | Git のプロトコル | `exec` と `env` | `AcceptEnv`、`command=` | なし |
 | Mosh | 起動と鍵の受け渡しだけ | `exec` | （UDP のポートを開ける） | サーバの UDP |
 
-どの行も、第 156 回で見たチャネルを、違う相手につないでいるだけです。そして、どの行についても「シェルを渡した利用者は、自分で同じものを作れる」ことは変わりません。**SSH で入れることを許すとき、許しているのはシェルだけではない**、と考えるのが出発点です。
+どの行も、第 161 回で見たチャネルを、違う相手につないでいるだけです。そして、どの行についても「シェルを渡した利用者は、自分で同じものを作れる」ことは変わりません。**SSH で入れることを許すとき、許しているのはシェルだけではない**、と考えるのが出発点です。
 
-次の第 162 回では、SSH から TLS に戻り、PostgreSQL や MySQL のようなデータベースが、平文で始まった接続をどう TLS に切り替えるのか、そして接続の設定の既定値が中間者に対して何を守り、何を守らないのかを見ます。
+次の第 167 回では、SSH から TLS に戻り、PostgreSQL や MySQL のようなデータベースが、平文で始まった接続をどう TLS に切り替えるのか、そして接続の設定の既定値が中間者に対して何を守り、何を守らないのかを見ます。
 
 ## まとめ
 

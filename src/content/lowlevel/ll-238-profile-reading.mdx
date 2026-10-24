@@ -2,7 +2,7 @@
 title: プロファイルを読む（フレームグラフ・フレームチャート・コールツリー）
 description: プロファイラが集めているのは、一定間隔で覗いたスタックの束だけです。その束が、フレームグラフ、フレームチャート、コールツリー、ボトムアップという 4 つの表示にどう変換されるのか。self と total、ホットスポットの探し方、そして表示が嘘をつく場面を、Go の pprof と Linux の perf の実測で確かめます
 chapter: observe
-order: 8
+order: 9
 status: published
 topics:
   - サンプリングプロファイラ
@@ -17,9 +17,9 @@ topics:
   - 差分プロファイル
   - pprof
 requires:
-  - ll-224-measure
+  - ll-233-measure
   - ll-31-abi
-  - ll-201-debugger
+  - ll-210-debugger
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -27,7 +27,7 @@ import ProfileViews from '../../components/sim/problems/ProfileViews'
 
 ## プロファイラが持っているもの
 
-第 224 回では、`perf record` で取ったプロファイルをフレームグラフにすれば「横に広い平らな部分がボトルネック」だと書きました。この回では、その一言の中身を分解します。
+第 233 回では、`perf record` で取ったプロファイルをフレームグラフにすれば「横に広い平らな部分がボトルネック」だと書きました。この回では、その一言の中身を分解します。
 
 先に結論を書くと、CPU プロファイラが手にしているのは、**一定の間隔で対象を覗いたときのスタックの記録の束**だけです。スタックとは、その瞬間に実行中の関数と、そこへ至るまでの呼び出し元の列（`main → handle → render → template → escapeHTML` のようなもの）のことです。フレームグラフも、時系列のチャートも、関数の一覧表も、すべてこの同じ束を別の切り口で集計し直したものにすぎません。
 
@@ -83,7 +83,7 @@ import ProfileViews from '../../components/sim/problems/ProfileViews'
 
 フレームチャートは、同じ箱の積み方を時刻の順で行います。Gregg はこれを「flame charts put the passage of time on the x-axis instead of the alphabet」と説明しています。隣り合う標本が同じ経路なら箱をつなげ、違えばそこで切ります。
 
-「段階ごとにまとめて」に切り替えると、フレームチャートでは前半が `parseJSON`、後半が `render` と `logLine` に分かれて見えます。「リクエストごとに交互」では細切れになります。フレームグラフでは区別できなかった**いつ何が起きたか**が見えるのが、この表示の価値です。ブラウザの Performance パネルのメインスレッドの表示はこの形で、1 回のクリックの処理がどの順で進んだかを追うのに向いています（第 120 回で扱います）。
+「段階ごとにまとめて」に切り替えると、フレームチャートでは前半が `parseJSON`、後半が `render` と `logLine` に分かれて見えます。「リクエストごとに交互」では細切れになります。フレームグラフでは区別できなかった**いつ何が起きたか**が見えるのが、この表示の価値です。ブラウザの Performance パネルのメインスレッドの表示はこの形で、1 回のクリックの処理がどの順で進んだかを追うのに向いています（第 125 回で扱います）。
 
 その代わり、同じ処理が何百回も繰り返されると、細い箱が何百本も並ぶだけで、全体として何が重いのかは読み取れません。**集計の問いにはフレームグラフ、順序の問いにはフレームチャート**、と使い分けます。
 
@@ -252,9 +252,9 @@ runtime.main;main.main;main.handle;main.step 56
 
 ### スタックが途中で切れる
 
-第 224 回で触れたとおり、フレームポインタを省略したプログラムでは、スタックをたどる連鎖が途中で切れます。切れた標本は根から始まらない短い塔になり、フレームグラフの端に「`[unknown]`」のような箱として並びます。本来は深い経路の一部だった時間が、根の近くに浮いて見えるわけです。
+第 233 回で触れたとおり、フレームポインタを省略したプログラムでは、スタックをたどる連鎖が途中で切れます。切れた標本は根から始まらない短い塔になり、フレームグラフの端に「`[unknown]`」のような箱として並びます。本来は深い経路の一部だった時間が、根の近くに浮いて見えるわけです。
 
-フレームポインタを持たせるか、DWARF の情報を使ってたどるか（`perf record --call-graph dwarf`）で対処します。Ubuntu は 24.04 LTS から、ほぼすべてのパッケージをフレームポインタ付きで作り直す方針を取りました（[Ubuntu: Performance engineering with frame pointers by default](https://ubuntu.com/blog/ubuntu-performance-engineering-with-frame-pointers-by-default)）。経緯は第 201 回で扱いました。
+フレームポインタを持たせるか、DWARF の情報を使ってたどるか（`perf record --call-graph dwarf`）で対処します。Ubuntu は 24.04 LTS から、ほぼすべてのパッケージをフレームポインタ付きで作り直す方針を取りました（[Ubuntu: Performance engineering with frame pointers by default](https://ubuntu.com/blog/ubuntu-performance-engineering-with-frame-pointers-by-default)）。経緯は第 210 回で扱いました。
 
 ## on-CPU と off-CPU
 
@@ -269,7 +269,7 @@ runtime.main;main.main;main.handle;main.step 56
 
 経過時間は 4.6 秒延びたのに、標本の量はほとんど変わらず、待ちの時間を表す関数も出てきません。利用者から見て「遅くなった」原因が CPU プロファイルには一切写らない、ということです。
 
-待ちの時間を見るのが **off-CPU 分析**です。Gregg は「Off-CPU analysis is a performance methodology where off-CPU time is measured and studied, along with context such as stack traces.」と定義し、「It differs from CPU profiling, which only examines threads if they are executing on-CPU.」と対比しています（[Brendan Gregg: Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html)）。スレッドが眠りに入るときと起きるときのスタックと時刻を記録し、眠っていた時間で重み付けして同じようにフレームグラフにします。第 221 回の eBPF でスケジューラの切り替えを捕まえる方法が代表的です。Go なら、待っているゴルーチンのスタックを集める `goroutine` や、ブロックした時間を数える `block`・`mutex` のプロファイルが、それに近い役割を持ちます。
+待ちの時間を見るのが **off-CPU 分析**です。Gregg は「Off-CPU analysis is a performance methodology where off-CPU time is measured and studied, along with context such as stack traces.」と定義し、「It differs from CPU profiling, which only examines threads if they are executing on-CPU.」と対比しています（[Brendan Gregg: Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html)）。スレッドが眠りに入るときと起きるときのスタックと時刻を記録し、眠っていた時間で重み付けして同じようにフレームグラフにします。第 230 回の eBPF でスケジューラの切り替えを捕まえる方法が代表的です。Go なら、待っているゴルーチンのスタックを集める `goroutine` や、ブロックした時間を数える `block`・`mutex` のプロファイルが、それに近い役割を持ちます。
 
 **応答が遅いのに CPU 使用率が低いなら、CPU プロファイルを取っても答えは出ません。**
 
@@ -311,15 +311,15 @@ $ go tool pprof -top -diff_base a.pprof prof2 b.pprof
 | Go | `runtime/pprof`、`go tool pprof` | SIGPROF でランタイムが自分のスタックを記録する |
 | Python | `py-spy`、`profiling.sampling` | 別のプロセスから対象のメモリを読み、インタプリタのスタックを復元する |
 | Java などの JVM | async-profiler | perf のイベントと JVM の内部の API を組み合わせ、JIT された関数の名前も出す |
-| ブラウザの JavaScript | Chrome の Performance パネル | エンジンが内蔵する計測。第 120 回で扱う |
+| ブラウザの JavaScript | Chrome の Performance パネル | エンジンが内蔵する計測。第 125 回で扱う |
 
 インタプリタや JIT の言語では、OS から見たスタックはインタプリタ自身の関数（`_PyEval_EvalFrameDefault` の繰り返しなど）にしかなりません。言語の関数名で見たいなら、その言語のスタックを理解する道具を選びます。pprof の形式や FlameGraph の中間形式に変換できる道具が多いので、表示は共通の道具に寄せられます。
 
 ## この章を終えて
 
-第 29 章では、本番で動いているものを止めずに外から見る方法と、手元で測る道具と、その出力の読み方を見てきました。観測の目的は性能や障害だけではありません。守りの仕組みが**今も効いているか**を確かめるのも、同じ「動いているものを見る」仕事です。
+第 30 章では、本番で動いているものを止めずに外から見る方法と、手元で測る道具と、その出力の読み方を見てきました。観測の目的は性能や障害だけではありません。守りの仕組みが**今も効いているか**を確かめるのも、同じ「動いているものを見る」仕事です。
 
-次の第 30 章「守りが効き続けているか」では、ここまでの章で個別に見てきた守り（権限の絞り方、暗号と鍵、TLS、認証と認可、ブラウザの境界）を、設計の段階でどう洗い出し、どの基準に沿って作り、動かしている間もずれていないことを機械でどう確かめ続け、最後にどう証跡として残すのかを見ます。
+次の第 31 章「守りが効き続けているか」では、ここまでの章で個別に見てきた守り（権限の絞り方、暗号と鍵、TLS、認証と認可、ブラウザの境界）を、設計の段階でどう洗い出し、どの基準に沿って作り、動かしている間もずれていないことを機械でどう確かめ続け、最後にどう証跡として残すのかを見ます。
 
 ## まとめ
 

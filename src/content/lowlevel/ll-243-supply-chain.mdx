@@ -21,17 +21,17 @@ topics:
   - GitHub artifact attestations
   - Action の SHA 固定
 requires:
-  - ll-211-container-security
-  - ll-179-workload-identity
-  - ll-144-signature
-  - ll-151-cert-lifecycle
+  - ll-220-container-security
+  - ll-187-workload-identity
+  - ll-149-signature
+  - ll-156-cert-lifecycle
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## 自分のコードの外側
 
-第 230 回と第 231 回では、自分たちが書いたコードと設定に問題がないかを機械で確かめました。しかし、本番で動いているものの大部分は、自分たちが書いたものではありません。
+第 240 回と第 241 回では、自分たちが書いたコードと設定に問題がないかを機械で確かめました。しかし、本番で動いているものの大部分は、自分たちが書いたものではありません。
 
 ```
 ソースのコミット ── 依存パッケージ ── CI の道具（Action など）
@@ -45,9 +45,9 @@ import Callout from '../../components/Callout.astro'
                        本番で動かす
 ```
 
-矢印の 1 本 1 本が、中身をすり替えられる場所です。第 230 回の SCA は「**既知の脆弱性を持つ版**を使っていないか」を調べるものでした。この回で扱うのは、**悪意をもって差し込まれた中身**です。脆弱性のデータベースには、まだ載っていません。
+矢印の 1 本 1 本が、中身をすり替えられる場所です。第 240 回の SCA は「**既知の脆弱性を持つ版**を使っていないか」を調べるものでした。この回で扱うのは、**悪意をもって差し込まれた中身**です。脆弱性のデータベースには、まだ載っていません。
 
-第 211 回では、イメージを digest で固定し、BuildKit で SBOM と provenance を付け、cosign で署名するところまでを短く見ました。この回では、その一つ一つが**何を記録し、何を証明し、何を証明しないのか**を、実物の JSON を開いて確かめます。
+第 220 回では、イメージを digest で固定し、BuildKit で SBOM と provenance を付け、cosign で署名するところまでを短く見ました。この回では、その一つ一つが**何を記録し、何を証明し、何を証明しないのか**を、実物の JSON を開いて確かめます。
 
 ## 実験の環境
 
@@ -103,7 +103,7 @@ Codecov では、Docker イメージを作る手順の誤りから、スクリ�
 | ビルド環境の侵害 | ビルドを隔離された基盤で行い、その基盤が provenance を書いて署名する（SLSA Build L3） |
 | CI の道具の書き換え | Action やスクリプトを内容のハッシュで固定する。CI に渡すシークレットを短命にする |
 
-ロックファイルの `integrity`（第 141 回のハッシュ）は、「前回取得したものと同じ中身か」を確かめます。依存の乗っ取りでは、悪意ある**新しい版**に更新した時点でロックファイルも書き換わるので、ハッシュは更新を止めません。ハッシュで固定するのは、**中身が勝手に変わらないようにし、変わるときを差分として見えるようにする**ためです。
+ロックファイルの `integrity`（第 146 回のハッシュ）は、「前回取得したものと同じ中身か」を確かめます。依存の乗っ取りでは、悪意ある**新しい版**に更新した時点でロックファイルも書き換わるので、ハッシュは更新を止めません。ハッシュで固定するのは、**中身が勝手に変わらないようにし、変わるときを差分として見えるようにする**ためです。
 
 ## Action を SHA で固定する理由
 
@@ -116,7 +116,7 @@ GitHub のドキュメントは、完全な長さのコミット SHA に固定�
 - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2 付け替えられない
 ```
 
-第 211 回のイメージのタグと digest と同じ関係です。SHA は Git のオブジェクトの中身のハッシュなので、同じ SHA で違う中身を指すことはできません。ただし、次の点に注意が要ります。
+第 220 回のイメージのタグと digest と同じ関係です。SHA は Git のオブジェクトの中身のハッシュなので、同じ SHA で違う中身を指すことはできません。ただし、次の点に注意が要ります。
 
 - SHA が**本家のリポジトリのもの**で、フォークのものではないことを確かめる（同じドキュメントが注意している）
 - 固定した Action の中で、別の Action をタグで呼んでいれば、その先は固定されない
@@ -125,7 +125,7 @@ GitHub のドキュメントは、完全な長さのコミット SHA に固定�
 <Callout type="warn" title="固定は改ざんを防ぐが、悪い版を選ぶのは防がない">
   SHA で固定すると、**固定した時点の中身から変わらない**ことは保証されます。
   固定した時点ですでに悪い中身だった場合や、更新の PR で悪い版に上げてしまった場合は防げません。
-  更新の差分を読むこと、CI に渡すシークレットを最小にして短命にすること（第 179 回、第 232 回）と組み合わせます。
+  更新の差分を読むこと、CI に渡すシークレットを最小にして短命にすること（第 187 回、第 242 回）と組み合わせます。
 </Callout>
 
 ## SLSA: 何をどこまで保証するか
@@ -185,7 +185,7 @@ curl -s -H 'Accept: application/vnd.oci.image.index.v1+json' \
 
 （digest を短縮し、`mediaType` と `size` の一部を省略）
 
-第 203 回で見たインデックスに、2 つ目の項目として**証明のためのマニフェスト**が加わっています。プラットフォームを `unknown/unknown` にしているのは、ランタイムがこれを誤って取得して動かさないようにするためです（[Docker Docs](https://docs.docker.com/build/metadata/attestations/attestation-storage/)）。その中を開くと、層が 2 つあります。
+第 212 回で見たインデックスに、2 つ目の項目として**証明のためのマニフェスト**が加わっています。プラットフォームを `unknown/unknown` にしているのは、ランタイムがこれを誤って取得して動かさないようにするためです（[Docker Docs](https://docs.docker.com/build/metadata/attestations/attestation-storage/)）。その中を開くと、層が 2 つあります。
 
 ```
 層 1  application/vnd.in-toto+json   88478 バイト   predicate-type: https://spdx.dev/Document
@@ -255,7 +255,7 @@ SBOM と provenance が、どちらも in-toto の Statement として入って�
 
 ## Sigstore: 鍵を持たずに署名し、記録を公開する
 
-第 179 回で、Sigstore の認証局 **Fulcio** が、CI の OIDC トークンの身元を書いた有効期間 10 分の証明書を発行する仕組みを見ました。ここでは、その証明書で作った署名を**後から誰がどう検証するのか**を、公開されている npm パッケージで確かめます。
+第 187 回で、Sigstore の認証局 **Fulcio** が、CI の OIDC トークンの身元を書いた有効期間 10 分の証明書を発行する仕組みを見ました。ここでは、その証明書で作った署名を**後から誰がどう検証するのか**を、公開されている npm パッケージで確かめます。
 
 ### npm audit signatures
 
@@ -350,7 +350,7 @@ X509v3 Subject Alternative Name: critical
     URI:https://github.com/sigstore/sigstore-js/.github/workflows/release.yml@refs/heads/main
 ```
 
-有効期間はちょうど 10 分です。subject は空で、身元は SAN に**ワークフローのファイルの URI**として書かれています。第 149 回の証明書がドメイン名を SAN に書いたのと同じ場所に、「このリポジトリのこのワークフロー」が入っています。
+有効期間はちょうど 10 分です。subject は空で、身元は SAN に**ワークフローのファイルの URI**として書かれています。第 154 回の証明書がドメイン名を SAN に書いたのと同じ場所に、「このリポジトリのこのワークフロー」が入っています。
 
 拡張の欄には、Sigstore 独自の OID で、さらに細かい身元が入っていました（[Fulcio OID info](https://github.com/sigstore/fulcio/blob/main/docs/oid-info.md)）。
 
@@ -381,7 +381,7 @@ provenance の中身（ビルド基盤が書いた主張）と、証明書の身
 }
 ```
 
-`integratedTime` の 1753831006 は、2025 年 7 月 29 日 23:16:46（UTC）です。証明書の `notBefore` と同じ秒で、有効期間の中に収まっています。`inclusionProof` は、第 151 回の Certificate Transparency と同じ Merkle 木の包含証明で、署名済みの木の根（checkpoint）に、この記録が含まれていることを示します。
+`integratedTime` の 1753831006 は、2025 年 7 月 29 日 23:16:46（UTC）です。証明書の `notBefore` と同じ秒で、有効期間の中に収まっています。`inclusionProof` は、第 156 回の Certificate Transparency と同じ Merkle 木の包含証明で、署名済みの木の根（checkpoint）に、この記録が含まれていることを示します。
 
 同じ記録を、Rekor の公開 API からも読み出しました（読み取りだけです）。
 
@@ -397,7 +397,7 @@ $ jq -r '.attestations[] | select(.predicateType=="https://slsa.dev/provenance/v
 
 公開のログに記録された中身のハッシュと、npm から受け取った provenance のハッシュが一致しました。
 
-透明性ログには、もう 1 つの役割があります。第 151 回で、ドメインの持ち主が CT のログを見張って、自分の知らない証明書を見つけられると書きました。同じように、リポジトリの持ち主は Rekor を見張り、**自分のワークフローの名前で、自分の知らない署名が作られていないか**を確かめられます。鍵を持たない署名は、記録を公開することで成り立っています。
+透明性ログには、もう 1 つの役割があります。第 156 回で、ドメインの持ち主が CT のログを見張って、自分の知らない証明書を見つけられると書きました。同じように、リポジトリの持ち主は Rekor を見張り、**自分のワークフローの名前で、自分の知らない署名が作られていないか**を確かめられます。鍵を持たない署名は、記録を公開することで成り立っています。
 
 <Callout type="note" title="公開のリポジトリと非公開のリポジトリ">
   Rekor の公開インスタンスに載せた記録は、誰でも読めます。リポジトリの名前やワークフローの名前も載ります。
@@ -444,7 +444,7 @@ Error: no signatures found
 
 タグは新しい digest を指すようになり、その digest には署名がありません。署名は**タグではなく digest に付いている**ので、タグを付け替えても署名は付いてきません。
 
-この実験の検証の条件は「この公開鍵で署名されたか」だけです。キーレス署名では、第 211 回の `--certificate-identity` と `--certificate-oidc-issuer` で、上の表の SAN と Issuer を指定します。**どのリポジトリの、どのワークフローの、どの枝か**まで書かなければ、同じ CI を使う誰の署名でも通ってしまいます。
+この実験の検証の条件は「この公開鍵で署名されたか」だけです。キーレス署名では、第 220 回の `--certificate-identity` と `--certificate-oidc-issuer` で、上の表の SAN と Issuer を指定します。**どのリポジトリの、どのワークフローの、どの枝か**まで書かなければ、同じ CI を使う誰の署名でも通ってしまいます。
 
 ### GitHub artifact attestations
 
@@ -454,7 +454,7 @@ GitHub Actions には、ビルドした成果物に provenance を付けて Sigs
 
 GitHub はこれだけで SLSA v1.0 Build L2 になり、組織で共有する再利用可能なワークフローでビルドすれば L3 に届くとしています（[GitHub Docs](https://docs.github.com/en/actions/concepts/security/artifact-attestations)）。L3 の「ビルドの手順から署名の秘密に触れない」を、呼び出す側のリポジトリが書き換えられないワークフローで実現する、という考え方です。
 
-npm の **trusted publishing** も、同じ考え方で長期のトークンをなくします。CI の OIDC トークンで公開し、GitHub Actions と GitLab CI/CD から公開した場合は provenance が自動で付きます（[npm Docs](https://docs.npmjs.com/trusted-publishers)）。盗まれて使い回されるトークンが無くなるので、第 232 回の漏洩の経路が 1 つ減ります。
+npm の **trusted publishing** も、同じ考え方で長期のトークンをなくします。CI の OIDC トークンで公開し、GitHub Actions と GitLab CI/CD から公開した場合は provenance が自動で付きます（[npm Docs](https://docs.npmjs.com/trusted-publishers)）。盗まれて使い回されるトークンが無くなるので、第 242 回の漏洩の経路が 1 つ減ります。
 
 ## SBOM: 何が入っているか
 
@@ -544,7 +544,7 @@ BuildKit が付けた SBOM（provenance と並んでいたもう 1 つの層）�
 
 ### VEX: 入っているが影響しない
 
-SBOM と脆弱性のデータベースを突き合わせると、警告が大量に出ます。その多くは、第 230 回で見たように、脆弱な関数を呼んでいない、設定で無効になっている、といった理由で実際には影響しません。**VEX**（Vulnerability Exploitability eXchange）は、作った側が「この製品は、この脆弱性の影響を受けるか」を機械が読める形で述べるための文書です（[CISA](https://www.cisa.gov/resources-tools/resources/minimum-requirements-vulnerability-exploitability-exchange-vex)）。
+SBOM と脆弱性のデータベースを突き合わせると、警告が大量に出ます。その多くは、第 240 回で見たように、脆弱な関数を呼んでいない、設定で無効になっている、といった理由で実際には影響しません。**VEX**（Vulnerability Exploitability eXchange）は、作った側が「この製品は、この脆弱性の影響を受けるか」を機械が読める形で述べるための文書です（[CISA](https://www.cisa.gov/resources-tools/resources/minimum-requirements-vulnerability-exploitability-exchange-vex)）。
 
 OpenVEX の仕様では、状態は `not_affected`（影響しない）、`affected`（影響する）、`fixed`（この版で直っている）、`under_investigation`（調査中）の 4 つです。`not_affected` と述べるときは、次の 5 つから理由を必ず選びます（[OpenVEX](https://github.com/openvex/spec/blob/main/OPENVEX-SPEC.md)）。
 
@@ -581,7 +581,7 @@ SBOM が「何が入っているか」、VEX が「そのうちどれが問題�
 
 どれも、**記録を作るだけでは何も防ぎません**。provenance も SBOM も署名も、使う側が検証して、合わないものを止めて初めて意味を持ちます。Kubernetes ならアドミッションの段階で、CI なら取得の直後で、検証に落ちたものを止める場所を決めておく必要があります。そして、その検証が**今も動いているか**を確かめ続けることが、この章の主題です。
 
-ここまでは、ソフトウェアが外から入ってくる道を見てきました。次の第 234 回では、視点を自分たちのサービスの内側に移します。1 つのシステムに多くの顧客のデータが同居するとき、ある顧客の要求が別の顧客のデータに届かないことを、アプリケーションとデータベースのどこで、どう保証するかを見ます。
+ここまでは、ソフトウェアが外から入ってくる道を見てきました。次の第 244 回では、視点を自分たちのサービスの内側に移します。1 つのシステムに多くの顧客のデータが同居するとき、ある顧客の要求が別の顧客のデータに届かないことを、アプリケーションとデータベースのどこで、どう保証するかを見ます。
 
 ## まとめ
 

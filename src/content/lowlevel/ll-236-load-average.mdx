@@ -2,7 +2,7 @@
 title: ロードアベレージと top を読む
 description: 「ロードアベレージが 8」は、何が 8 個あるという意味なのか。Linux が数えている 2 種類のタスク、1・5・15 分の値を作る指数移動平均の式、CPU は暇なのに値が上がる場面、top の各行と各列、そしてロードアベレージの弱点を補う PSI を、カーネルのソースと実測で確かめます
 chapter: observe
-order: 6
+order: 7
 status: published
 topics:
   - ロードアベレージ
@@ -13,7 +13,7 @@ topics:
   - PSI（Pressure Stall Information）
 requires:
   - ll-33-process
-  - ll-224-measure
+  - ll-233-measure
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -29,7 +29,7 @@ top - 09:52:38 up 11 days,  1:52,  0 user,  load average: 4.14, 6.22, 5.18
 
 障害対応の場で「ロードアベレージが 8 です」と報告されたとき、そこから何が言えて、何が言えないのか。これに即答できる人は多くありません。CPU が 8 個あればちょうど使い切っているのか、ディスクが詰まっているのか、ただの数え方の癖なのか。数そのものからは区別がつきません。
 
-この回では、まずこの数が**何を数えた結果なのか**をカーネルのソースで確かめ、次に**どう平均しているのか**を式で追います。そのうえで、`top` の画面を上から順に読み、ロードアベレージだけでは分からないことを補う PSI（Pressure Stall Information）までを見ます。CPU 使用率の内訳（`%Cpu(s)` の行）は第 225 回、メモリの行は第 227 回で扱います。
+この回では、まずこの数が**何を数えた結果なのか**をカーネルのソースで確かめ、次に**どう平均しているのか**を式で追います。そのうえで、`top` の画面を上から順に読み、ロードアベレージだけでは分からないことを補う PSI（Pressure Stall Information）までを見ます。CPU 使用率の内訳（`%Cpu(s)` の行）は第 235 回、メモリの行は第 237 回で扱います。
 
 ## 数えているのは「実行中・実行待ち」と「割り込み不可の待ち」
 
@@ -195,9 +195,9 @@ CPU を使っていないのに値が上がる場面を、わざと作ります�
            236      0     95%     0%     5%   4.04 6.54 5.24
 ```
 
-`busy`（ユーザとカーネルで実際に命令を実行していた割合）は書き込み中もほとんど 10% 未満です。それでも 1 分平均は 3 から 12.9 まで上がりました。上がったぶんは、ほぼ D 状態の 12 本です。CPU から見れば、`dd` は待っているだけなので、その時間は `idle` か `iowait`（CPU が暇で、かつ I/O の完了を待っているタスクがいる時間。第 225 回）に数えられます。書き込みが終わると D は 0 に戻り、CPU はすぐに 95% 暇になりますが、ロードアベレージは指数移動平均なので、20 秒後でも 8.56、80 秒後でも 4.04 が残っています（他のコンテナのぶんの 3 前後を含みます）。
+`busy`（ユーザとカーネルで実際に命令を実行していた割合）は書き込み中もほとんど 10% 未満です。それでも 1 分平均は 3 から 12.9 まで上がりました。上がったぶんは、ほぼ D 状態の 12 本です。CPU から見れば、`dd` は待っているだけなので、その時間は `idle` か `iowait`（CPU が暇で、かつ I/O の完了を待っているタスクがいる時間。第 235 回）に数えられます。書き込みが終わると D は 0 に戻り、CPU はすぐに 95% 暇になりますが、ロードアベレージは指数移動平均なので、20 秒後でも 8.56、80 秒後でも 4.04 が残っています（他のコンテナのぶんの 3 前後を含みます）。
 
-この状態でロードアベレージだけを見て CPU を増やしても、何も良くなりません。D 状態が原因かどうかは、`top` や `ps` の状態の列（S 列）で D が並んでいるかどうか、`vmstat` の `b` 列が 0 でないかどうかで見分けます。D で止まっているスレッドがカーネルのどこで待っているかは、第 224 回の `/proc/<pid>/stack` や `/proc/<pid>/wchan` で確かめられます。NFS のマウント先が応答しなくなったときにも、同じ形でロードアベレージだけが積み上がります。
+この状態でロードアベレージだけを見て CPU を増やしても、何も良くなりません。D 状態が原因かどうかは、`top` や `ps` の状態の列（S 列）で D が並んでいるかどうか、`vmstat` の `b` 列が 0 でないかどうかで見分けます。D で止まっているスレッドがカーネルのどこで待っているかは、第 233 回の `/proc/<pid>/stack` や `/proc/<pid>/wchan` で確かめられます。NFS のマウント先が応答しなくなったときにも、同じ形でロードアベレージだけが積み上がります。
 
 ## top を上から読む
 
@@ -230,8 +230,8 @@ MiB Swap:  17064.7 total,  17064.7 free,      0.0 used.   8638.1 avail Mem
 | --- | --- | --- |
 | `top -` | 現在時刻、起動からの時間、ログイン中の利用者数、ロードアベレージ | この回 |
 | `Tasks:` | タスクの総数と、状態ごとの内訳（running / sleeping / stopped / zombie） | この回 |
-| `%Cpu(s):` | CPU 時間の内訳（us / sy / ni / id / wa / hi / si / st） | 第 225 回 |
-| `MiB Mem :` / `MiB Swap:` | 物理メモリとスワップ、`avail Mem` | 第 227 回 |
+| `%Cpu(s):` | CPU 時間の内訳（us / sy / ni / id / wa / hi / si / st） | 第 235 回 |
+| `MiB Mem :` / `MiB Swap:` | 物理メモリとスワップ、`avail Mem` | 第 237 回 |
 
 `Tasks:` の数は、既定ではプロセス単位です。`H` キーでスレッド単位の表示に切り替わります。マニュアルも「Line 1 shows total tasks or threads, depending on the state of the Threads-mode toggle.」と書いています。ロードアベレージはスレッドを数えているので、両者を突き合わせるときはスレッド表示にします。
 
@@ -247,11 +247,11 @@ MiB Swap:  17064.7 total,  17064.7 free,      0.0 used.   8638.1 avail Mem
 | `RES` | A subset of the virtual address space (VIRT) representing the non-swapped physical memory a task is currently using. | 今、物理メモリに載っている量 |
 | `SHR` | A subset of resident memory (RES) that may be used by other processes. | 共有ライブラリなど。RES の内数 |
 | `S` | The status of the task | 下の表 |
-| `%CPU` | The task's share of the elapsed CPU time since the last screen update, expressed as a percentage of total CPU time. | 1 CPU を使い切ると 100%。マニュアルは続けて、スレッド表示でなければマルチスレッドのプロセスは 100% を超えうると書いている（第 225 回） |
+| `%CPU` | The task's share of the elapsed CPU time since the last screen update, expressed as a percentage of total CPU time. | 1 CPU を使い切ると 100%。マニュアルは続けて、スレッド表示でなければマルチスレッドのプロセスは 100% を超えうると書いている（第 235 回） |
 | `%MEM` | A task's currently resident share of available physical memory. | RES を物理メモリで割ったもの |
 | `TIME+` | The same as TIME, but reflecting more granularity through hundredths of a second. | 起動から使った CPU 時間の累計。経過時間ではない |
 
-RES と SHR の関係、RSS を全プロセスで足すと物理メモリを超える理由は、第 224 回の RSS と PSS の話、第 227 回のメモリの読み方につながります。
+RES と SHR の関係、RSS を全プロセスで足すと物理メモリを超える理由は、第 233 回の RSS と PSS の話、第 237 回のメモリの読み方につながります。
 
 ### S 列の状態
 
@@ -271,7 +271,7 @@ S と D は、どちらも「何かを待っている」状態です。違いは
 
 ## vmstat の r と b
 
-第 224 回で、`vmstat 1` の `r` と `b` の列を見ました。マニュアルの定義はそれぞれ「The number of runnable processes (running or waiting for run time).」「The number of processes blocked waiting for I/O to complete.」です（[vmstat(8)](https://man7.org/linux/man-pages/man8/vmstat.8.html)）。
+第 233 回で、`vmstat 1` の `r` と `b` の列を見ました。マニュアルの定義はそれぞれ「The number of runnable processes (running or waiting for run time).」「The number of processes blocked waiting for I/O to complete.」です（[vmstat(8)](https://man7.org/linux/man-pages/man8/vmstat.8.html)）。
 
 この 2 列は、**ロードアベレージの中身を、平均せずに 1 秒ごとに分けて見せてくれる**ものと考えると使いやすくなります。ロードアベレージが高いとき、`r` が大きければ CPU を待つスレッドが多く、`b` が大きければ I/O などで止まっているスレッドが多い。どちらなのかで、次に見る場所が変わります。
 
@@ -305,7 +305,7 @@ PSI はカーネルの設定（`CONFIG_PSI`）で有効になっている必要�
 <Callout type="warn" title="コンテナの中のロードアベレージは、機械全体の値">
   ロードアベレージは、カーネル全体で 1 組しか持っていない値です。コンテナの中で `uptime` や `top` を実行しても、そのコンテナが動かしているスレッドの数ではなく、**同じカーネルの上で動いているすべてのスレッド**の数の平均が出ます。この回の実測でも、ほかのコンテナの負荷がそのまま値に混ざりました。
 
-  macOS や Windows の Docker Desktop や OrbStack では、コンテナは Linux の仮想マシンの上で動くので、出てくるのは**その仮想マシンの**ロードアベレージです。ホストの Mac の `uptime` とは別の値になります。コンテナ単位で詰まりを見たいときは、cgroup の `cpu.stat`（スロットリングの回数）や `cpu.pressure` を使います（第 210 回）。
+  macOS や Windows の Docker Desktop や OrbStack では、コンテナは Linux の仮想マシンの上で動くので、出てくるのは**その仮想マシンの**ロードアベレージです。ホストの Mac の `uptime` とは別の値になります。コンテナ単位で詰まりを見たいときは、cgroup の `cpu.stat`（スロットリングの回数）や `cpu.pressure` を使います（第 219 回）。
 </Callout>
 
 ## まとめ
@@ -318,4 +318,4 @@ PSI はカーネルの設定（`CONFIG_PSI`）で有効になっている必要�
 - `top` の S 列と `vmstat` の `r` / `b` で、R と D のどちらが原因かを分ける
 - PSI は資源ごとに「待たされた時間の割合」を出す。本数ではなく時間なので CPU 数に関係なく読め、cgroup ごとにも見られる
 
-次の第 227 回では、`top` の `MiB Mem` の行と `free` を読み、メモリがどこで使われているのかを見ます。
+次の第 237 回では、`top` の `MiB Mem` の行と `free` を読み、メモリがどこで使われているのかを見ます。

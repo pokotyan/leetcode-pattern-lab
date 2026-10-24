@@ -16,8 +16,8 @@ topics:
   - ImageBitmap
   - OffscreenCanvas
 requires:
-  - ll-123-drawing-map
-  - ll-117-event-loop
+  - ll-128-drawing-map
+  - ll-122-event-loop
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -122,7 +122,7 @@ fill('evenodd') の中心: alpha = 0     ← 穴になる（2 回は偶数）
 
 手元で確かめると、`'一行目\n二行目'` と `'一行目 二行目'` の `measureText` の幅は、どちらも 125.56px で同じでした。幅 395.75px の英文を `maxWidth` 150 で描くと、インクの右端は x = 149 に収まりました。150px の中に押し縮めて描いたわけです。
 
-**折り返し、行間、双方向テキストの並べ替え、文字の選択は、すべて自分で書くことになります。**グラフの凡例やゲームのメニューを canvas で作ると苦労するのはここです。この穴を埋めようとする提案が、第 127 回の HTML-in-Canvas です。
+**折り返し、行間、双方向テキストの並べ替え、文字の選択は、すべて自分で書くことになります。**グラフの凡例やゲームのメニューを canvas で作ると苦労するのはここです。この穴を埋めようとする提案が、第 132 回の HTML-in-Canvas です。
 
 ## GPU で描き、CPU で読む
 
@@ -132,7 +132,7 @@ HTML Standard も、この選択を次のように書いています（[HTML Sta
 
 > On most devices the user agent needs to decide whether to store the canvas's output bitmap on the GPU (this is also called "hardware accelerated"), or on the CPU (also called "software"). Most rendering operations are more performant for accelerated canvases, with the major exception being readback with getImageData(), toDataURL(), or toBlob().
 
-GPU の canvas では、`fillRect` や `arc` を呼んでもその場では画素になりません。命令は記録されるだけで、まとめて GPU プロセスに送られてから描かれます（GPU プロセスについては第 113 回と第 116 回）。
+GPU の canvas では、`fillRect` や `arc` を呼んでもその場では画素になりません。命令は記録されるだけで、まとめて GPU プロセスに送られてから描かれます（GPU プロセスについては第 118 回と第 121 回）。
 
 ```
  メインスレッド              GPU プロセス / GPU
@@ -173,17 +173,17 @@ const ctx = canvas.getContext('2d', { willReadFrequently: true })
 
 <Callout type="note" title="performance.now() の粒度">
   上の値が 0.1ms 刻みなのは、`performance.now()` の分解能がわざと粗くされているからです。
-  第 136 回で見るクロスオリジン分離をしていないページでは、Spectre 型の攻撃に使われないよう、時刻が丸められます。
+  第 141 回で見るクロスオリジン分離をしていないページでは、Spectre 型の攻撃に使われないよう、時刻が丸められます。
   ここでの比較は、0.1ms の刻みで十分に差が見える範囲に限っています。
 </Callout>
 
 ## 汚れた canvas
 
-画素を読めるということは、**canvas に描いたものの中身を JavaScript で取り出せる**ということです。ここで第 130 回の問題がそのまま出てきます。別オリジンの画像は `<img>` で表示はできても、ページの JavaScript に中身を読ませてはいけません。社内のサーバにある画像や、ログインした状態でしか見えない画像を、攻撃者のページが `<img>` で読み込み、canvas に描いて画素を送り出せてしまうからです。
+画素を読めるということは、**canvas に描いたものの中身を JavaScript で取り出せる**ということです。ここで第 135 回の問題がそのまま出てきます。別オリジンの画像は `<img>` で表示はできても、ページの JavaScript に中身を読ませてはいけません。社内のサーバにある画像や、ログインした状態でしか見えない画像を、攻撃者のページが `<img>` で読み込み、canvas に描いて画素を送り出せてしまうからです。
 
 そこで canvas のビットマップには **origin-clean** というフラグがあります。最初は true で、CORS で許可されていない別オリジンの画像や動画を `drawImage` すると false になります（[HTML Standard: origin-clean](https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean)）。false の canvas では、`getImageData`、`toDataURL`、`toBlob` が `SecurityError` を投げます（[HTML Standard: getImageData](https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata)）。
 
-描くことは許され、**読むことだけが止められる**。第 130 回で見た「埋め込めるが読めない」という非対称が、canvas でも同じ形で現れます。
+描くことは許され、**読むことだけが止められる**。第 135 回で見た「埋め込めるが読めない」という非対称が、canvas でも同じ形で現れます。
 
 ### 手元で確かめる（3）: CORS と crossOrigin
 
@@ -207,12 +207,12 @@ ctx.getImageData(0, 0, 1, 1)   // ここで SecurityError になるか
 別オリジン、CORS あり            anonymous    成功      255,0,0,255           http://127.0.0.1:18301
 ```
 
-3 行目が要点です。**サーバが CORS のヘッダを返していても、`crossOrigin` を付けない `<img>` は CORS の要求を送らない**ので、canvas は汚れます。サーバのログを見ても、`Origin` ヘッダが付いていません。`crossOrigin` を付けると CORS の要求になり（第 131 回）、許可がなければ画像の読み込みそのものが失敗します。4 行目の失敗の時、コンソールには `has been blocked by CORS policy` が出ていました。
+3 行目が要点です。**サーバが CORS のヘッダを返していても、`crossOrigin` を付けない `<img>` は CORS の要求を送らない**ので、canvas は汚れます。サーバのログを見ても、`Origin` ヘッダが付いていません。`crossOrigin` を付けると CORS の要求になり（第 136 回）、許可がなければ画像の読み込みそのものが失敗します。4 行目の失敗の時、コンソールには `has been blocked by CORS policy` が出ていました。
 
 <Callout type="warn" title="よくある誤解: 「サーバに CORS のヘッダを足したのに、まだ tainted と言われる」">
   画像の側で `crossOrigin = 'anonymous'`（`<img crossorigin>`）を付けないと、ブラウザは CORS の要求を送りません。
   さらに、同じ URL の画像を `crossOrigin` なしで先に読み込んでいると、HTTP キャッシュに CORS のヘッダなしの応答が残ることがあります。
-  第 138 回で見るとおり、応答が要求の `Origin` によって変わるなら `Vary: Origin` を返します。
+  第 143 回で見るとおり、応答が要求の `Origin` によって変わるなら `Vary: Origin` を返します。
 </Callout>
 
 汚れは伝染します。汚れた canvas を別の canvas に `drawImage` すると、描いた先も汚れます。HTML Standard は、`HTMLCanvasElement`、`ImageBitmap`、`OffscreenCanvas` を描く場合、元の origin-clean が false なら描いた先も false になると決めています（[HTML Standard](https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument-is-not-origin-clean)）。
@@ -241,11 +241,11 @@ createImageBitmap(blob) の呼び出しが返るまで      0〜0.2ms
 ImageBitmap を drawImage                       1.2〜1.4ms
 ```
 
-デコードの費用（約 115ms）はどちらの道でも払っています。違いは**どこで払うか**です。`load` の直後に `drawImage` すると、その 115ms はメインスレッドの 1 つのタスクの中に入り、第 117 回で見た長いタスクになります。`createImageBitmap` なら呼び出しはすぐ返り、メインスレッドは待っている間にほかの仕事ができます。`<img>` のままでよいなら、描く前に `await img.decode()` で待つ手もあります（[HTML Standard: decode()](https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode)）。
+デコードの費用（約 115ms）はどちらの道でも払っています。違いは**どこで払うか**です。`load` の直後に `drawImage` すると、その 115ms はメインスレッドの 1 つのタスクの中に入り、第 122 回で見た長いタスクになります。`createImageBitmap` なら呼び出しはすぐ返り、メインスレッドは待っている間にほかの仕事ができます。`<img>` のままでよいなら、描く前に `await img.decode()` で待つ手もあります（[HTML Standard: decode()](https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode)）。
 
 ## 描画を Worker に逃がす: OffscreenCanvas
 
-ここまでの canvas は、すべてメインスレッドで描いていました。第 117 回で見たとおり、メインスレッドは JavaScript、イベント、スタイル、レイアウトを 1 本で回しています。重い処理が 1 つ入れば、canvas のアニメーションも止まります。第 116 回で見たように、`transform` のアニメーションならコンポジタスレッドで続きますが、canvas の中身を描き直すのは JavaScript なので、その道は使えません。
+ここまでの canvas は、すべてメインスレッドで描いていました。第 122 回で見たとおり、メインスレッドは JavaScript、イベント、スタイル、レイアウトを 1 本で回しています。重い処理が 1 つ入れば、canvas のアニメーションも止まります。第 121 回で見たように、`transform` のアニメーションならコンポジタスレッドで続きますが、canvas の中身を描き直すのは JavaScript なので、その道は使えません。
 
 **OffscreenCanvas** は、canvas を DOM から切り離して Worker でも描けるようにしたものです。web.dev は「名前のとおり、DOM と Canvas API を切り離して画面の外に出す」と説明しています（[web.dev: OffscreenCanvas](https://web.dev/articles/offscreen-canvas)）。
 
@@ -296,7 +296,7 @@ OffscreenCanvas で Worker に移せるのは**描く仕事だけ**です。
 - Worker には DOM が無い。文字のレイアウトに DOM を使う手は使えない
 - 転送した canvas は、メインスレッドからは `getContext` できなくなる
 
-**描画が滑らかでも、反応が遅ければ INP は悪いまま**です（第 119 回）。OffscreenCanvas は長いタスクを切る代わりにはなりません。描画の重さとメインスレッドの重さを切り離す道具です。
+**描画が滑らかでも、反応が遅ければ INP は悪いまま**です（第 124 回）。OffscreenCanvas は長いタスクを切る代わりにはなりません。描画の重さとメインスレッドの重さを切り離す道具です。
 
 ## まとめ
 
@@ -310,4 +310,4 @@ OffscreenCanvas で Worker に移せるのは**描く仕事だけ**です。
 - `load` 直後の `<img>` を `drawImage` すると、デコードの時間（手元では約 115ms）がメインスレッドに乗る。`createImageBitmap` や `img.decode()` で先に、非同期に済ませておける
 - OffscreenCanvas と Worker の `requestAnimationFrame` で、メインスレッドが塞がっても描き続けられる。手元ではメインスレッドを 1 秒塞いでも、Worker 側は 60 回描いた。ただし入力はメインスレッドを通る
 
-canvas 2D は、図形を描く命令を 1 つずつ受け取り、ブラウザ（の中の Skia）が画素に変えてくれる API でした。GPU で描かれているとはいえ、GPU に何をさせるかはブラウザが決めています。次の第 125 回では、GPU そのものに近づきます。WebGL では、頂点をどこに置き、画素を何色にするかを、**シェーダという小さなプログラムを自分で書いて GPU に渡します**。
+canvas 2D は、図形を描く命令を 1 つずつ受け取り、ブラウザ（の中の Skia）が画素に変えてくれる API でした。GPU で描かれているとはいえ、GPU に何をさせるかはブラウザが決めています。次の第 130 回では、GPU そのものに近づきます。WebGL では、頂点をどこに置き、画素を何色にするかを、**シェーダという小さなプログラムを自分で書いて GPU に渡します**。

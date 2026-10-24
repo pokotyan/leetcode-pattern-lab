@@ -15,9 +15,9 @@ topics:
   - 鍵のローテーション
   - ARC
 requires:
-  - ll-188-spf
-  - ll-144-signature
-  - ll-145-key-format
+  - ll-197-spf
+  - ll-149-signature
+  - ll-150-key-format
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -32,7 +32,7 @@ import Callout from '../../components/Callout.astro'
 
 > DKIM permits a person, role, or organization that owns the signing domain to claim some responsibility for a message by associating the domain with the message.
 
-**「署名したドメインが、このメッセージに何らかの責任を持つと表明した」**。言っているのはこれだけです。From: のドメインと同じかどうかは、DKIM の関心の外にあります。第 144 回で見た「署名は『この鍵で署名された』としか言わない」の、メール版です。
+**「署名したドメインが、このメッセージに何らかの責任を持つと表明した」**。言っているのはこれだけです。From: のドメインと同じかどうかは、DKIM の関心の外にあります。第 149 回で見た「署名は『この鍵で署名された』としか言わない」の、メール版です。
 
 この回では、署名を手で作って壊しながら、その「これだけ」の中身を正確に見ていきます。
 
@@ -50,7 +50,7 @@ import Callout from '../../components/Callout.astro'
                                   "v=DKIM1; k=rsa; p=..." ─▶ 6. bh と b= を検証
 ```
 
-鍵の持ち主を確かめる仕組み（第 150 回の証明書の連鎖）はありません。**「そのドメインの DNS に置いてある鍵だから、そのドメインの鍵だ」**という、DNS への信頼がそのまま根になります。
+鍵の持ち主を確かめる仕組み（第 155 回の証明書の連鎖）はありません。**「そのドメインの DNS に置いてある鍵だから、そのドメインの鍵だ」**という、DNS への信頼がそのまま根になります。
 
 ## DKIM-Signature を読む
 
@@ -109,7 +109,7 @@ s1.domainkey.u51742174.wl175.sendgrid.net.
 "k=rsa; t=s; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyn3fMCVpb7ry..." "NHjpVw5PtXESA9KBg/evSRk5..."
 ```
 
-1 行目は CNAME です。github.com はこのセレクタの鍵を、**配信サービスの側のゾーンに置かせています**。鍵の生成も入れ替えも配信サービスが行い、github.com は CNAME を 1 行書くだけで済みます。第 193 回で見る「DKIM の CNAME 委任」がこれです。
+1 行目は CNAME です。github.com はこのセレクタの鍵を、**配信サービスの側のゾーンに置かせています**。鍵の生成も入れ替えも配信サービスが行い、github.com は CNAME を 1 行書くだけで済みます。第 202 回で見る「DKIM の CNAME 委任」がこれです。
 
 ### 鍵の記録のタグ
 
@@ -134,9 +134,9 @@ $ dig TXT 20230601._domainkey.gmail.com +noall +answer
 
 RFC 6376 は **`p=` が空なら、その鍵は失効している**と定めています。消すのではなく空にしておけば、「知らないセレクタ」ではなく「取り消した鍵」だとはっきり伝わります。
 
-### p= の中身は第 145 回の SPKI
+### p= の中身は第 150 回の SPKI
 
-`p=` の base64 を戻して、第 145 回の道具で読んでみます。
+`p=` の base64 を戻して、第 150 回の道具で読んでみます。
 
 ```
 $ dig +short TXT s1._domainkey.github.com | grep '"' | tr -d '" \n' \
@@ -153,7 +153,7 @@ Public-Key: (2048 bit)
 アルゴリズムの識別子 `rsaEncryption` から始まる、**SubjectPublicKeyInfo（SPKI）の DER** です。`openssl pkey -pubout` で出した `PUBLIC KEY` の PEM から、先頭と末尾の行と改行を取り除けば、そのまま `p=` になります。
 
 <Callout type="note" title="仕様の本文と実際の形がずれている">
-  RFC 6376 3.6.1 の本文は、RSA の `p=` を「DER にした RSAPublicKey」（第 145 回の PKCS#1 の形）と書いています。
+  RFC 6376 3.6.1 の本文は、RSA の `p=` を「DER にした RSAPublicKey」（第 150 回の PKCS#1 の形）と書いています。
   しかし付録 C の手順が出力するのは SPKI で、実装の多くも SPKI を使っています。
   この食い違いは [Erratum 3017](https://errata.rfc-editor.org/eid3017) として報告され、「文書の改訂時に扱う」という扱いになっています。
   検証側は両方を受け付けるのが無難で、署名側は SPKI を出しておけば困りません。
@@ -222,7 +222,7 @@ invoice -> invoicE（ヘッダの値）         fail            fail            
 
 <Callout type="warn" title="よくある誤解: 正規化しているから、途中で書き換えられても大丈夫">
   正規化が吸収するのは空白と折り返しだけです。
-  件名の先頭に `[list]` を足す、本文の末尾に配信停止の案内を足す、文字コードを変換し直す（第 186 回）、
+  件名の先頭に `[list]` を足す、本文の末尾に配信停止の案内を足す、文字コードを変換し直す（第 195 回）、
   といった書き換えは、どの方式でも署名を壊します。
   後の「転送とメーリングリスト」で、これが実際に大きな問題になっている様子を見ます。
 </Callout>
@@ -233,7 +233,7 @@ invoice -> invoicE（ヘッダの値）         fail            fail            
 
 `h=` に何を並べるかは署名者が決めます。決まっているのは 1 つだけで、**From: は必ず署名する**（[RFC 6376 5.4](https://www.rfc-editor.org/rfc/rfc6376.html#section-5.4)）。そのほか、Subject、Date、To、Cc、Message-ID、Reply-To、MIME 関係のヘッダなど、**意味を持ち、途中で変わらないはずのもの**を並べるのが普通です。
 
-逆に、途中で足されたり書き換えられたりするものは入れません。`Received:` は中継のたびに増え、`Return-Path:` は最後に受け取ったサーバが付けます（第 182 回）。これらを入れると、正しいメールでも壊れます。
+逆に、途中で足されたり書き換えられたりするものは入れません。`Received:` は中継のたびに増え、`Return-Path:` は最後に受け取ったサーバが付けます（第 191 回）。これらを入れると、正しいメールでも壊れます。
 
 ### 同じヘッダが 2 つあるとき
 
@@ -280,7 +280,7 @@ l= なし、本文の後ろに追記:  fail
 
 足したのは「振込先が変わりました」という 1 行です。**`l=` があると、署名の範囲外に何を足しても pass します**。受け取った利用者には、署名されたメールの続きと区別がつきません。
 
-さらに厄介なのは、足すのが文だけではないことです。RFC 6376 [8.2](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.2) は、MIME の構造（第 186 回）を書き換えたり、メールソフトの HTML の緩い解釈を突いたりして、**利用者の目には元の内容を完全に置き換えてしまえる**と述べ、署名者はこのタグの使用に極めて慎重であるべきだとしています。
+さらに厄介なのは、足すのが文だけではないことです。RFC 6376 [8.2](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.2) は、MIME の構造（第 195 回）を書き換えたり、メールソフトの HTML の緩い解釈を突いたりして、**利用者の目には元の内容を完全に置き換えてしまえる**と述べ、署名者はこのタグの使用に極めて慎重であるべきだとしています。
 
 <Callout type="warn" title="よくある誤解: l= を付けておけば転送に強くなって便利">
   `l=` が守るのは「先頭から何バイト」だけで、その後ろは誰でも書き足せます。
@@ -322,11 +322,11 @@ DKIM-Signature: v=1; a=ed25519-sha256; ... s=ed2026; ... h=from : to :
 1. 新しいセレクタ（sel2027）の公開鍵を DNS に足す
 2. TTL（第 74 回）が過ぎるのを待つ
 3. 署名を新しい鍵に切り替える
-4. 古い鍵で署名したメールが届き終わるのを待つ（キューでの再送は数日かかりうる。第 184 回）
+4. 古い鍵で署名したメールが届き終わるのを待つ（キューでの再送は数日かかりうる。第 193 回）
 5. 古いセレクタの p= を空にする（失効）
 ```
 
-第 170 回の JWKS の「足す、待つ、切り替える、待つ、外す」と同じ順番です。**同じセレクタの鍵を上書きする**と、まだ届いていない古い署名のメールが一斉に失敗します。
+第 176 回の JWKS の「足す、待つ、切り替える、待つ、外す」と同じ順番です。**同じセレクタの鍵を上書きする**と、まだ届いていない古い署名のメールが一斉に失敗します。
 
 <Callout type="note" title="失効しても、過去のメールの署名は取り消せない">
   鍵の失効は、この先に届くメールの検証を止めるだけです。
@@ -353,7 +353,7 @@ DKIM-Signature: v=1; a=ed25519-sha256; ... s=ed2026; ... h=from : to :
   メールの詳細ヘッダに `dkim=pass` と書いてあっても、`header.d=` が何のドメインかを見なければ意味がありません。
 </Callout>
 
-最後の行も見落とされがちです。署名されたメールは、**そのまま別の宛先へ何度でも送り直せます**。自分のアカウントから 1 通だけ正規に送ったメールを、宛先だけ変えて大量にばらまいても、署名は壊れません（エンベロープの宛先は署名の外にあるからです。第 182 回）。RFC 6376 も [8.6](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.6) で、署名は再送やスパムの対策にならないと述べています。
+最後の行も見落とされがちです。署名されたメールは、**そのまま別の宛先へ何度でも送り直せます**。自分のアカウントから 1 通だけ正規に送ったメールを、宛先だけ変えて大量にばらまいても、署名は壊れません（エンベロープの宛先は署名の外にあるからです。第 191 回）。RFC 6376 も [8.6](https://www.rfc-editor.org/rfc/rfc6376.html#section-8.6) で、署名は再送やスパムの対策にならないと述べています。
 
 ## 転送とメーリングリスト
 
@@ -405,7 +405,7 @@ from cryptography.hazmat.primitives import serialization as s
 key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 priv = key.private_bytes(s.Encoding.PEM, s.PrivateFormat.TraditionalOpenSSL, s.NoEncryption())
 spki = key.public_key().public_bytes(s.Encoding.DER, s.PublicFormat.SubjectPublicKeyInfo)
-p = base64.b64encode(spki).decode()          # 392 文字。第 145 回の SPKI
+p = base64.b64encode(spki).decode()          # 392 文字。第 150 回の SPKI
 
 ZONE = {b"sel2026._domainkey.example.test.": f"v=DKIM1; k=rsa; p={p}".encode()}
 def dnsfunc(name, timeout=5):
@@ -437,13 +437,13 @@ dkim.verify(m.replace(b"100", b"900"), dnsfunc=dnsfunc)   # False
 
 | 部品 | 役目 | 見た回 |
 | --- | --- | --- |
-| 署名（RSA、Ed25519） | 中身が変わっていないこと、この鍵で署名されたこと | 第 144 回 |
-| 鍵の形式（SPKI、base64） | `p=` に公開鍵を載せる | 第 145 回 |
-| ハッシュ（SHA-256） | 本文を `bh=` に縮める | 第 141 回 |
+| 署名（RSA、Ed25519） | 中身が変わっていないこと、この鍵で署名されたこと | 第 149 回 |
+| 鍵の形式（SPKI、base64） | `p=` に公開鍵を載せる | 第 150 回 |
+| ハッシュ（SHA-256） | 本文を `bh=` に縮める | 第 146 回 |
 | DNS（TXT、CNAME、TTL） | 公開鍵を配る。委任と入れ替え | 第 72 回、第 74 回 |
 | DNSSEC | 引いた鍵が DNS の途中で差し替えられていないこと | 第 75 回 |
-| メッセージの形式 | どのヘッダが 1 つだけか、MIME の構造 | 第 186 回 |
-| DMARC | `d=` と From: を結びつける | 第 190 回 |
+| メッセージの形式 | どのヘッダが 1 つだけか、MIME の構造 | 第 195 回 |
+| DMARC | `d=` と From: を結びつける | 第 199 回 |
 
 DKIM の信頼の根は DNS です。DNSSEC のないゾーンでは、DNS の応答を偽造できる攻撃者が偽の鍵を渡せば、検証は偽の署名を pass させます（第 75 回）。そして、From: と結びつけるまでは、利用者にとって意味のある主張にはなりません。
 
@@ -458,4 +458,4 @@ DKIM の信頼の根は DNS です。DNSSEC のないゾーンでは、DNS の�
 - `rsa-sha1` は禁止、RSA は 2048 ビット以上が推奨。Ed25519 は RSA と並べて付ける。鍵の入れ替えはセレクタを変えて並行運用する
 - **DKIM が言うのは「`d=` のドメインが責任を持つ」ことだけで、From: とは無関係**。再送も防がない。メーリングリストで壊れる問題への継ぎ足しが ARC で、実験的な RFC にとどまる
 
-SPF は MAIL FROM を、DKIM は `d=` を確かめました。どちらも、利用者が画面で見る From: には触れていません。次の第 190 回では、From: のドメインとこの 2 つを「揃える」ことを求めて、初めて差出人の表示と結びつける DMARC を見ます。
+SPF は MAIL FROM を、DKIM は `d=` を確かめました。どちらも、利用者が画面で見る From: には触れていません。次の第 199 回では、From: のドメインとこの 2 つを「揃える」ことを求めて、初めて差出人の表示と結びつける DMARC を見ます。

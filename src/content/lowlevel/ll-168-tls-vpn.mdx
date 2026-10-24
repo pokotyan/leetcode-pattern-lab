@@ -16,9 +16,9 @@ topics:
   - WireGuard
   - IKEv2
 requires:
-  - ll-162-db-tls
-  - ll-154-tls-ops
-  - ll-153-tls13-handshake
+  - ll-167-db-tls
+  - ll-159-tls-ops
+  - ll-158-tls13-handshake
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -29,14 +29,14 @@ import Callout from '../../components/Callout.astro'
 
 では、**TLS を知らないプログラムの通信を、外から TLS で包む**ことはできるでしょうか。さらに進めて、1 本の接続ではなく、**手元の端末から出る IP パケットをまとめて**どこかの網まで運ぶことはできるでしょうか。後者がいわゆる VPN です。
 
-答えはどちらも「できる」ですが、包む単位が大きくなるにつれて、TLS の性質がそのままでは合わなくなります。TLS は第 153 回で見たとおり、**順序どおりに確実に届くバイト列**（TCP）を前提に作られています。一方、IP パケットは、失われても並べ替わってもよいものとして運ばれます。この食い違いを、製品ごとにどう扱っているかがこの回の主題です。
+答えはどちらも「できる」ですが、包む単位が大きくなるにつれて、TLS の性質がそのままでは合わなくなります。TLS は第 158 回で見たとおり、**順序どおりに確実に届くバイト列**（TCP）を前提に作られています。一方、IP パケットは、失われても並べ替わってもよいものとして運ばれます。この食い違いを、製品ごとにどう扱っているかがこの回の主題です。
 
 ## 包む単位で 3 つに分ける
 
 | 包む単位 | 代表例 | 利用者から見えるもの | 中身の宛先を決めるのは |
 | --- | --- | --- | --- |
 | 1 本の TCP 接続 | stunnel | 手元の決まったポート | 設定ファイル（固定） |
-| 接続ごとに宛先を選べる TCP | HTTP CONNECT、SSH の `-D`（第 161 回） | プロキシ | 接続ごとの要求 |
+| 接続ごとに宛先を選べる TCP | HTTP CONNECT、SSH の `-D`（第 166 回） | プロキシ | 接続ごとの要求 |
 | IP パケット | OpenVPN、SSTP、OpenConnect、MASQUE の CONNECT-IP（第 90 回） | 仮想のネットワークインタフェース | 端末の経路表 |
 
 上の 2 段は、プログラムの**接続**を中継します。最後の段は、OS に `tun0` のような**仮想のインタフェース**を作り、そこへ経路表で振り向けられた IP パケットを、まるごとトンネルに入れます（tun はカーネルとユーザ空間のプログラムの間で IP パケットをやり取りする仕組みです）。プログラムは自分が VPN を通っていることを知りません。
@@ -112,7 +112,7 @@ LOG6[0]: Peer temporary key: X25519, 253 bits
 LOG5[0]: Connection closed: 78 byte(s) sent to TLS, 242 byte(s) sent to socket
 ```
 
-第 153 回で見た TLS 1.3 のハンドシェイクが、そのまま行われています。CA の署名をたどり（depth=1 が CA、depth=0 がサーバの証明書）、名前を照合してから、データを流しています。
+第 158 回で見た TLS 1.3 のハンドシェイクが、そのまま行われています。CA の署名をたどり（depth=1 が CA、depth=0 がサーバの証明書）、名前を照合してから、データを流しています。
 
 ### 線の上では何が見えるか
 
@@ -131,11 +131,11 @@ LOG5[0]: Connection closed: 78 byte(s) sent to TLS, 242 byte(s) sent to socket
 
 読み取れることが 3 つあります。
 
-- **ネットワークに出る区間（172.24.0.x）は TLS だけ**で、`GET /` が平文で見えるのはサーバの中のループバック（127.0.0.1）だけです。最初の ClientHello が `TLSv1.2` と表示されるのは、TLS 1.3 でも互換のためにレコードの版を 1.2 と書く決まりのためです（第 153 回）
+- **ネットワークに出る区間（172.24.0.x）は TLS だけ**で、`GET /` が平文で見えるのはサーバの中のループバック（127.0.0.1）だけです。最初の ClientHello が `TLSv1.2` と表示されるのは、TLS 1.3 でも互換のためにレコードの版を 1.2 と書く決まりのためです（第 158 回）
 - サーバ側の stunnel が後ろの `httpd` に接続する（10 番の SYN）のは、**TLS のハンドシェイクが終わった後**です。stunnel の既定では、TLS が成立しない接続は後ろのサービスに届きません
-- `httpd` から見た接続の相手は `127.0.0.1` です。**本当のクライアントの IP アドレスは、後ろのサービスからは見えなくなります**。第 154 回の「TLS を終えた後ろに何を渡すか」と同じ問題で、stunnel にも PROXY protocol を足す設定などがあります
+- `httpd` から見た接続の相手は `127.0.0.1` です。**本当のクライアントの IP アドレスは、後ろのサービスからは見えなくなります**。第 159 回の「TLS を終えた後ろに何を渡すか」と同じ問題で、stunnel にも PROXY protocol を足す設定などがあります
 
-この型は、**TLS を話せない古いサービスに、プログラムを書き換えずに TLS を足す**ときに今も使われます。前回の PostgreSQL のように途中で切り替える型ではなく、接続の最初から TLS なので、第 158 回の分類では「暗黙の TLS」の側に入ります。なお、stunnel には `protocol = smtp` や `pgsql` のように、途中で切り替える型のプロトコルに合わせて最初のやり取りを代行する設定もあります（[stunnel manual](https://www.stunnel.org/manual.html)）。
+この型は、**TLS を話せない古いサービスに、プログラムを書き換えずに TLS を足す**ときに今も使われます。前回の PostgreSQL のように途中で切り替える型ではなく、接続の最初から TLS なので、第 163 回の分類では「暗黙の TLS」の側に入ります。なお、stunnel には `protocol = smtp` や `pgsql` のように、途中で切り替える型のプロトコルに合わせて最初のやり取りを代行する設定もあります（[stunnel manual](https://www.stunnel.org/manual.html)）。
 
 ### クライアント側は、既定では何も確かめない
 
@@ -183,7 +183,7 @@ stunnel は起動時に「`lax` には中間者を防ぐための認証が要る
 
 <Callout type="warn" title="よくある誤解: stunnel で包んだので、経路は守られている">
   確かめない TLS が防ぐのは、経路を**眺めているだけ**の盗聴者です。経路に割り込める相手には、自分の証明書を出されて終わりです。
-  これは第 187 回で見た、証明書を確かめない日和見の STARTTLS と同じ性質です。
+  これは第 196 回で見た、証明書を確かめない日和見の STARTTLS と同じ性質です。
   クライアント側の stunnel を置くときは、`CAfile`（または `CApath`）、`verifyChain = yes`、`checkHost` を必ずそろえます。
   自前の CA でよいので、**「どの名前の、どの CA の証明書なら受け入れるか」を書き下すまでが TLS の設定**です。
 </Callout>
@@ -208,7 +208,7 @@ CONNECT が運べるのは TCP だけです。これを UDP と IP パケット�
 
 ここから VPN の話に入ります。VPN は IP パケットを運ぶので、トンネルの中には利用者のアプリの TCP がそのまま入っています。トンネル自体も TCP（たとえば TCP の上の TLS）で作ると、**TCP の上に TCP が載る**ことになります。
 
-第 161 回で見たとおり、この形では、外側の TCP が失われたパケットを再送している間に、内側の TCP も「届いていない」と判断して自分でも再送を始め、両方のタイマーが互いを悪化させます。IPsec を TCP で包む方式を定めた RFC 9329 も、TCP の中で TCP を動かすことは勧められないとし、**UDP が塞がれているときだけ TCP で包む**ことを推奨しています（[RFC 9329](https://www.rfc-editor.org/rfc/rfc9329.html)）。
+第 166 回で見たとおり、この形では、外側の TCP が失われたパケットを再送している間に、内側の TCP も「届いていない」と判断して自分でも再送を始め、両方のタイマーが互いを悪化させます。IPsec を TCP で包む方式を定めた RFC 9329 も、TCP の中で TCP を動かすことは勧められないとし、**UDP が塞がれているときだけ TCP で包む**ことを推奨しています（[RFC 9329](https://www.rfc-editor.org/rfc/rfc9329.html)）。
 
 そのため、TLS を使う VPN の多くは、次の 2 つのどちらかを選んでいます。
 
@@ -268,7 +268,7 @@ OpenVPN の文書は、TLS の通り道は「双方向の暗号と HMAC の鍵�
 
 ### データチャネルの暗号
 
-データチャネルで使う暗号は、OpenVPN 2.6 の `--data-ciphers` の既定で、ChaCha20-Poly1305 が使えるときは `AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305` です（[OpenVPN 2.6 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html)）。いずれも第 142 回の AEAD です。
+データチャネルで使う暗号は、OpenVPN 2.6 の `--data-ciphers` の既定で、ChaCha20-Poly1305 が使えるときは `AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305` です（[OpenVPN 2.6 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html)）。いずれも第 147 回の AEAD です。
 
 データチャネルの処理は、本来はユーザ空間の `openvpn` プロセスが行います。パケットごとにカーネルとユーザ空間を行き来するので、速度が出にくいことが弱点でした。これをカーネルに移す **DCO**（Data Channel Offload）のドライバ `ovpn` が、Linux 6.16 で取り込まれました（[Phoronix: Linux 6.16 Networking](https://www.phoronix.com/news/Linux-6.16-Networking)）。鍵の取り決め（TLS）はユーザ空間に残し、決まった鍵でパケットを暗号化する部分だけをカーネルが受け持つ形で、2 つのチャネルを分けた設計がそのまま役割の分担になっています。
 
@@ -283,7 +283,7 @@ remote-cert-tls server
 verify-x509-name server.example.com name
 ```
 
-`--remote-cert-tls server` は、相手の証明書に TLS のサーバ用の鍵用途（第 149 回の Extended Key Usage の `serverAuth`）があることを求めます。マニュアルは、これを**中間者攻撃を防ぐための重要な予防策**としています。`--verify-x509-name` は、相手の X.509 の名前が指定したものと等しいときだけ接続を受け入れます（[OpenVPN 2.6 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html)）。stunnel の `checkHost` と同じく、**CA の署名に加えて、名前と用途まで確かめて初めて相手を特定したことになる**という話です。
+`--remote-cert-tls server` は、相手の証明書に TLS のサーバ用の鍵用途（第 154 回の Extended Key Usage の `serverAuth`）があることを求めます。マニュアルは、これを**中間者攻撃を防ぐための重要な予防策**としています。`--verify-x509-name` は、相手の X.509 の名前が指定したものと等しいときだけ接続を受け入れます（[OpenVPN 2.6 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html)）。stunnel の `checkHost` と同じく、**CA の署名に加えて、名前と用途まで確かめて初めて相手を特定したことになる**という話です。
 
 ### tls-auth、tls-crypt、tls-crypt-v2
 
@@ -331,7 +331,7 @@ TLS が成立した後、クライアントは次のような HTTP の要求を�
 
 見ての通り、SSTP は**アプリの TCP を、外側の TCP の上で運ぶ**形です。前の節の TCP の二重化を、そのまま抱えています。
 
-SSTP にはもう 1 つ、**暗号の結び付け**（crypto binding）という仕組みがあります。PPP の認証で得た鍵の材料を使って、TLS のサーバ証明書のハッシュなどを結び付け、中間者が PPP のフレームを別の TLS 接続へ中継できないようにします（[MS-SSTP Overview](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-sstp/70adc1df-c4fe-4b02-8872-f1d8b9ad806a)）。第 156 回の SSH で、公開鍵認証の署名にセッション ID を入れてその接続でしか通用しないようにしていたのと、同じ発想です。**上の層の認証を、下の層の TLS の接続に縛り付ける**ことで、TLS を偽のサーバとの間で張られても、認証の結果を本物へ持ち込めないようにしています。
+SSTP にはもう 1 つ、**暗号の結び付け**（crypto binding）という仕組みがあります。PPP の認証で得た鍵の材料を使って、TLS のサーバ証明書のハッシュなどを結び付け、中間者が PPP のフレームを別の TLS 接続へ中継できないようにします（[MS-SSTP Overview](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-sstp/70adc1df-c4fe-4b02-8872-f1d8b9ad806a)）。第 161 回の SSH で、公開鍵認証の署名にセッション ID を入れてその接続でしか通用しないようにしていたのと、同じ発想です。**上の層の認証を、下の層の TLS の接続に縛り付ける**ことで、TLS を偽のサーバとの間で張られても、認証の結果を本物へ持ち込めないようにしています。
 
 ### OpenConnect / AnyConnect: TLS と DTLS を並べる
 
@@ -353,7 +353,7 @@ CSTP の側では、パケットごとに `S` `T` `F` の 3 文字で始まる 8
   つまり、**認証より前にある Web アプリ**です。ここに脆弱性があれば、ID もパスワードもなしに、社内ネットワークへの入口を取られます。
   2024 年には、Ivanti Connect Secure の CVE-2023-46805、CVE-2024-21887、CVE-2024-21893 が実際に悪用され、CISA などが共同で注意喚起を出しました。
   組み合わせると認証を迂回して高い権限で任意のコマンドを実行でき、CISA の検証では工場出荷状態に戻しても root の足場が残りうることが示されています（[CISA AA24-060B](https://www.cisa.gov/news-events/cybersecurity-advisories/aa24-060b)）。
-  VPN は「中に入れば信頼される」入口なので（第 180 回）、その入口の機器自体の更新と監視が、TLS の設定以上に重要になります。
+  VPN は「中に入れば信頼される」入口なので（第 189 回）、その入口の機器自体の更新と監視が、TLS の設定以上に重要になります。
 </Callout>
 
 ## TLS を使わない VPN との比べ方
@@ -366,7 +366,7 @@ WireGuard は、相手の確認と鍵交換に Noise という枠組みを使い
 
 TLS を使う VPN と違う点は次のとおりです。
 
-- **証明書がない**: 相手は公開鍵そのもので指定する。第 156 回の SSH の `authorized_keys` に近く、誰がどの鍵かの対応は設定で配る
+- **証明書がない**: 相手は公開鍵そのもので指定する。第 161 回の SSH の `authorized_keys` に近く、誰がどの鍵かの対応は設定で配る
 - **方式の交渉がない**: TLS のように一覧から選ぶ段階がなく、ダウングレードの余地もない。代わりに、暗号を入れ替えるには版を上げるしかない
 - **TCP では動かない**: WireGuard は TCP の上のトンネルを明示的にサポートせず、TCP に変換するのは別の難読化の層の仕事だとしています。DPI（通信の中身による識別）を避けることも目的にしていません（[WireGuard Known Limitations](https://www.wireguard.com/known-limitations/)）
 
@@ -389,11 +389,11 @@ IPsec は IP の層そのものを暗号化する標準で、鍵の取り決め�
 - **通りやすさ**: 制限の厳しい網から使うなら、443 番の TLS に見える SSTP や OpenConnect、TCP で動かした OpenVPN が通る。その代わり、TCP の二重化と、認証の前に HTTP を解釈する大きな入口を抱える
 - **単純さと速さ**: 網を自分で選べるなら、UDP だけで交渉もない WireGuard は設定も攻撃面も小さい。IPsec は機器同士（拠点間）の接続で、相互接続性が求められるときに選ばれる
 
-どれを選んでも、VPN が保証するのは**「この端末が、この網に入ってよい鍵を持っている」**ところまでです。入った後にどこへ届くかは、第 180 回で見た VPN とゼロトラストの議論に戻ります。
+どれを選んでも、VPN が保証するのは**「この端末が、この網に入ってよい鍵を持っている」**ところまでです。入った後にどこへ届くかは、第 189 回で見た VPN とゼロトラストの議論に戻ります。
 
 ## 次回へ
 
-この回で見た TLS は、どれも**IP の上で、つながった後に**使われていました。ところが、IP アドレスをもらう前、つまり Wi-Fi に参加してよいかを決める段階でも TLS は使われています。次の第 164 回では、802.1X と EAP-TLS のように IP が使えない段階で TLS を運ぶ方法、古い RADIUS を TLS で守る RadSec、時刻の問い合わせを守る NTS など、目立たない裏方を守っている TLS を見ていきます。
+この回で見た TLS は、どれも**IP の上で、つながった後に**使われていました。ところが、IP アドレスをもらう前、つまり Wi-Fi に参加してよいかを決める段階でも TLS は使われています。次の第 170 回では、802.1X と EAP-TLS のように IP が使えない段階で TLS を運ぶ方法、古い RADIUS を TLS で守る RadSec、時刻の問い合わせを守る NTS など、目立たない裏方を守っている TLS を見ていきます。
 
 ## まとめ
 

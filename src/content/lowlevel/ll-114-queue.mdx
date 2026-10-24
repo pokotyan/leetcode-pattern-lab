@@ -1,0 +1,530 @@
+---
+title: キューの中身：ログ、オフセット、可視性タイムアウト
+description: キューに入れたメッセージは、どこに、どんな形で置かれ、誰がどこまで読んだかを誰が覚えているのか。取り出したら消えるキューと、消えないログという 2 つの作り方を、Kafka のセグメントとオフセット、SQS の可視性タイムアウトと DLQ で、手元で確かめます
+chapter: handoff
+order: 2
+status: published
+topics:
+  - パーティション / セグメント
+  - オフセット
+  - コンシューマグループ
+  - __consumer_offsets
+  - リバランス
+  - ログコンパクション
+  - ISR / acks=all
+  - 冪等プロデューサ / トランザクション
+  - 可視性タイムアウト
+  - ack / prefetch
+  - DLQ / maxReceiveCount
+  - ロングポーリング
+  - FIFO キュー（メッセージグループ / 重複排除 ID）
+requires:
+  - ll-113-retry-idempotency
+  - ll-106-db-replication
+  - ll-48-io-dma
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 「キューに入れた」の、その後
+
+前回は、結果の分からない要求を送り直してよい条件と、送り直されても二重にならない受け手の作り方を見ました。そこでは、送り手と受け手が**同時に生きていて、直接話している**ことが前提でした。受け手が落ちていれば、送り手は待つか、あきらめるしかありません。
+
+その間に、仕事を置いておく場所を挟むのがキューです。送り手は置いたら帰ってよく、受け手は自分の速さで取りに来ます。ここまでは誰もが知っている説明です。この回で見たいのは、その「置いておく場所」の中身です。
+
+- 置かれたメッセージは、**どこに、どんな形で**保存されているのか
+- 受け手が取り出したとき、メッセージは**消えるのか、残るのか**
+- 受け手が途中で落ちたら、誰が**どこまで読んだか**を覚えていて、続きを誰に渡すのか
+
+この答え方で、キューの作り方は大きく 2 つに分かれます。at-least-once や冪等性、DLQ の考え方そのものは、システムデザインの読み物の<a href={`${import.meta.env.BASE_URL}reading/messaging/`}>メッセージングの現実</a>で扱いました。この回は、その下で**何がどう記録されているか**に絞ります。
+
+## 2 つの作り方
+
+| | 取り出して消す | 追記して、位置で読む |
+| --- | --- | --- |
+| 代表 | Amazon SQS、RabbitMQ のキュー | Apache Kafka、Amazon Kinesis Data Streams、RabbitMQ の stream |
+| 置かれる形 | メッセージの集まり。1 件ずつ状態を持つ | パーティションごとの追記専用のログ |
+| 読んだ後 | 受け手が削除（ack）すると消える | 消えない。保持期間か大きさの上限で、古いものから捨てる |
+| どこまで読んだか | ブローカがメッセージごとに「配った / 消した」を持つ | 読み手が**位置（オフセット）1 つ**を覚える |
+| 同じものを読み直す | できない | 位置を戻せばできる |
+| 複数の受け手 | 1 件を誰か 1 人が取る | 読み手の集団ごとに、全件を独立に読める |
+
+第 89 回の MQTT の回の最後で、「配ったものを残さないのが MQTT、ログとして残して読み直せるのが Kafka」と並べました。この回は、その右側の列を中まで開け、左側の SQS と比べます。
+
+## ログ型: 追記して、位置で読む
+
+### パーティションは、ファイルの列
+
+Kafka の **トピック** は、いくつかの **パーティション** に分かれています。1 つのパーティションは、追記しかしない 1 本のログです。ブローカのディスクの上では、パーティションごとに 1 つのディレクトリがあり、その中にログが**セグメント**という一定の大きさのファイルに切られて並んでいます。後の実験で 3 パーティションのトピック `orders` を作ると、ディレクトリはこうなりました。
+
+```
+/tmp/kraft-combined-logs/
+├── orders-0/
+├── orders-1/
+│   ├── 00000000000000000000.log        ← メッセージ本体（追記していく）
+│   ├── 00000000000000000000.index      ← オフセット → ファイル内の位置
+│   ├── 00000000000000000000.timeindex  ← 時刻 → オフセット
+│   ├── leader-epoch-checkpoint
+│   └── partition.metadata
+└── orders-2/
+```
+
+ファイル名の数字は、そのセグメントの**最初のメッセージのオフセット**です。**オフセット** は、パーティションの中でメッセージに 0 から順に振られる通し番号で、文書は「メッセージのオフセットは決して変わらない。ログの中の位置を表す恒久的な識別子だ」と書いています（[Kafka 文書: Design](https://kafka.apache.org/43/design/design/)）。
+
+セグメントが `segment.bytes`（既定 1 GiB）に達するか、`segment.ms`（既定 7 日）が過ぎると、次のセグメントに切り替わります（[Kafka 文書: Topic Configs](https://kafka.apache.org/43/configuration/topic-configs/)）。`.index` は、すべてのメッセージの位置を持つのではなく、およそ `index.interval.bytes`（既定 4096 バイト）ごとに 1 つだけ「オフセット N はファイルの P バイト目」を記録する、**まばらな索引**です。オフセット N から読みたい読み手には、ファイル名でセグメントを選び、索引を二分探索して N 以下の最も近い位置に飛び、そこから先を順に読みます。
+
+### どこまで読んだか: オフセットのコミット
+
+ログ型の要点は、**読んでもログは何も変わらない**ことです。誰がどこまで読んだかは、ログの外に、読み手の側の 1 つの数として置かれます。文書は、消費の状態は「パーティションごとに 1 つの数」で済むので、メッセージごとの確認応答に当たるものがとても安くなる、と書いています（[Kafka 文書: Design](https://kafka.apache.org/43/design/design/)）。
+
+読み手は **コンシューマグループ** という名前の集団を作ります。グループの中では、1 つのパーティションを読むのは 1 人だけです。グループは「パーティションごとに、次に読むオフセット」を**コミット**して覚えておき、メンバが入れ替わっても続きから読めるようにします。そのコミット先は、Kafka 自身の内部トピック `__consumer_offsets` です。つまり「誰がどこまで読んだか」も、また 1 本のログに追記されています。キーは「グループ・トピック・パーティション」の組で、値がオフセットです。同じキーの古い値は要らないので、このトピックは後で見るログコンパクションで、キーごとに最新の値だけを残します。
+
+1 つのトピックを、別のグループがまったく独立に読めることも、この形から来ています。請求を作るグループと、発送を手配するグループは、同じログをそれぞれ自分の位置で読みます。メッセージを複製して配る必要はありません。
+
+### リバランス: パーティションを配り直す
+
+グループにメンバが加わったり抜けたりすると、どのメンバがどのパーティションを読むかを決め直します。これを **リバランス** と呼びます。決め直しの単位がパーティションなので、**1 つのグループで同時に働けるメンバの数は、パーティション数が上限**です。3 パーティションのトピックに 4 人目を足しても、その人には何も割り当たりません。後の実験でそうなりました。
+
+従来のリバランスは、グループの全員がいったん手を止めて割り当てを受け直す方式で、メンバが多いと止まる時間が問題になっていました。Kafka 4.0 では、ブローカ側が割り当てを決め、変わるパーティションだけを動かす新しいプロトコル（KIP-848）が一般提供になり、読み手は `group.protocol=consumer` を設定して使います（[Apache Kafka 4.0.0 リリース告知](https://kafka.apache.org/blog/2025/03/18/apache-kafka-4.0.0-release-announcement/)）。
+
+### 消すのは、時間か大きさで、セグメントごと
+
+読んでも消えないなら、ログはどこかで捨てなければなりません。既定の `cleanup.policy=delete` では、`retention.ms`（既定 7 日）より古いか、パーティションの大きさが `retention.bytes`（既定は上限なし）を超えたときに、**古いセグメントをファイルごと**捨てます（[Kafka 文書: Topic Configs](https://kafka.apache.org/43/configuration/topic-configs/)）。文書が `segment.bytes` の説明で、保持と掃除は 1 ファイルずつ行われるので、大きなセグメントは保持の制御を粗くする、と書いているのはこのためです。
+
+捨てた後は、ログの先頭（log start offset）が進みます。それより前のオフセットを読もうとする読み手は、もう読めません。オフセットを覚えたまま長く止まっていた読み手が戻ってくると、その位置はすでに無いことがあります。そのときどこから読み直すかは、読み手の `auto.offset.reset`（最古から / 最新から / エラーにする）で決まります。
+
+### ログコンパクション: キーごとに最新だけ残す
+
+もう 1 つの捨て方が `cleanup.policy=compact` です。古いセグメントから、**同じキーのより新しい値があるメッセージ**を消していきます。文書の言葉では、コンパクションは「キーごとに、少なくとも最後に分かっている値を必ず残す」ものです（[Kafka 文書: Design](https://kafka.apache.org/43/design/design/)）。残ったメッセージのオフセットは振り直されないので、ログには番号の飛びができます。
+
+利用者のプロフィールのように「今の値」が大事なデータを、変更の履歴の形で流しながら、ログの大きさをキーの数で抑えられます。上で見た `__consumer_offsets` がまさにこれで、グループが何百万回コミットしても、残るのはキーごとの最新のオフセットだけです。
+
+### ページキャッシュと sendfile
+
+Kafka の設計文書の永続化の節は、「ファイルシステムを恐れるな」という見出しで始まります。Kafka はメッセージの保存とキャッシュを**ファイルシステムに大きく頼り**、データは必ずしもディスクまで `fsync` せずにすぐログに書かれ、OS のページキャッシュに任されます（[Kafka 文書: Design](https://kafka.apache.org/43/design/design/)）。自分のプロセスの中にキャッシュを持たないので、ブローカを再起動してもキャッシュは温かいまま残ります。追記と先頭からの順読みしかしないので、ディスクにとって最も予測しやすい読み書きになります。
+
+読み手に送るときは、第 48 回で見た `sendfile` を使います。ログの中身を加工せずにそのまま送れば済む形になっているので、ページキャッシュからソケットへ、ユーザ空間に一度もコピーせずに送れます。文書も、`sendfile` によってこの複製が避けられる、と書いています。これが成り立つのは、**ディスクの上の形式と、線の上の形式と、生産者が送ってきた形式が同じ**だからです。メッセージはバッチの単位で、生産者が作った形のままログに書かれ、そのまま読み手へ流れます。後の実験の `kafka-dump-log` で、1 つのバッチにまとまった 5 件が見えます。
+
+### WAL と同じ形
+
+ここまで来ると、この形には見覚えがあるはずです。
+
+| | PostgreSQL の WAL（第 99 回、第 106 回） | Kafka のパーティション |
+| --- | --- | --- |
+| 記録 | 変更の、順序付きの追記ログ | メッセージの、順序付きの追記ログ |
+| ファイル | 16MB のセグメントが並ぶ | 1GiB（既定）のセグメントが並ぶ |
+| 位置 | LSN | オフセット |
+| 読み手の位置 | レプリケーションスロットの `restart_lsn` | コンシューマグループのコミット済みオフセット |
+| 読み手がいなくなると | スロットがある限り WAL が溜まり続ける | 溜まらない。保持期間が来れば読み手に関係なく捨てる |
+| 読み直し | スロットを作り直せば、残っている WAL から | オフセットを戻せば、残っているログから |
+
+第 106 回の論理レプリケーションは、WAL を「どの表のどの行がどうなったか」に翻訳して、受け手に順に当てさせるものでした。CDC はそれを Kafka に流します。データベースの中のログを、データベースの外のログへ写しているわけです。違いは、**読み手が来なかったとき、どちらを守るか**です。PostgreSQL のスロットは読み手を守って WAL を溜め続け（第 106 回の実験で 3.7GB）、Kafka は書き手とディスクを守って、期限が来れば読み手がいてもいなくても捨てます。
+
+### 複製: ISR と acks=all
+
+1 台のブローカのディスクに頼れないのは、データベースと同じです。パーティションは複数のブローカに複製され、そのうち 1 台が書き込みを受けるリーダで、残りがリーダのログを読んで追いかけるフォロワです。リーダに十分追いついているレプリカの集合を **ISR**（in-sync replicas）と呼びます。
+
+文書によれば、パーティションへの書き込みは、**ISR のすべてが受け取るまでコミットされたとはみなされません**。生産者が `acks=all` なら、確認は ISR の全員が受け取った時点で返ります。ISR が縮んで 1 台だけになると、その 1 台が落ちれば失われるので、`min.insync.replicas` で、ISR がこの数を下回ったら書き込みを受け付けないようにできます（[Kafka 文書: Design](https://kafka.apache.org/43/design/design/)）。生産者の `acks` の既定は `all` です（[Kafka 文書: Producer Configs](https://kafka.apache.org/43/configuration/producer-configs/)）。第 106 回の同期レプリケーションの「誰の返事を何人分待つか」と同じ問いを、パーティションごとに解いています。
+
+## 取り出し型: 見えなくして、消されるのを待つ
+
+### 可視性タイムアウト
+
+取り出し型のキューでは、受け手が取り出したメッセージをすぐに消すわけにはいきません。受け手が処理の途中で落ちれば、そのメッセージは失われます。かといって残したままにすると、別の受け手も同じものを取ってしまいます。
+
+SQS の答えが **可視性タイムアウト** です。受け手がメッセージを受け取ると、メッセージは**キューに残ったまま、一時的に他の受け手から見えなくなります**。受け手はその間に処理して、`DeleteMessage` で明示的に消します。消さないまま時間が来ると、メッセージは再び見えるようになり、同じ受け手か別の受け手がもう一度取れます。既定は 30 秒で、`ChangeMessageVisibility` で受け取った後に延ばしたり縮めたりできます。延ばせるのは最初に受け取ってから最大 12 時間までで、延ばしてもこの 12 時間は数え直されません（[Amazon SQS Developer Guide: Visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)）。
+
+```
+ 受け取る              （見えない間に処理する）          消す
+   │                                                     │
+   ▼                                                     ▼
+ ──●━━━━━━━━━━━━━━━ 可視性タイムアウト ━━━━━━━━━━━━━━━━━━●──→ 消える
+                                   
+ ──●━━━━━━━━━━━━━━━ 可視性タイムアウト ━━━━━━━━━━━━━━━━━━┥ 消されないまま時間切れ
+                                                         └─→ 再び見える → 誰かがまた受け取る
+```
+
+これが **at-least-once の正体**です。処理は終わったのに消す前に落ちた、処理が長引いてタイムアウトを過ぎた、消す要求がネットワークで失われた。どれも同じメッセージがもう一度配られます。文書も、at-least-once の配送モデルなので、可視性タイムアウトの間でも 2 回以上配られないことは保証しない、と書いています。
+
+処理にかかる時間が読めないときは、処理の途中で定期的に `ChangeMessageVisibility` を呼んで延ばし続けます（文書は heartbeat と呼んでいます）。こうすれば、タイムアウトそのものは短めにしておけるので、受け手が本当に落ちたときに早く他の受け手へ回ります。
+
+### RabbitMQ: ack と prefetch
+
+RabbitMQ のキューは、可視性タイムアウトの代わりに**接続**を使います。メッセージは消費者に押し出され（push）、消費者が `basic.ack` を返すと消えます。確認していないメッセージは、それを配ったチャネルか接続が閉じたときに、自動的にキューへ戻されます。戻されたメッセージには `redeliver` の印が付きます（[RabbitMQ: Consumer Acknowledgements and Publisher Confirms](https://www.rabbitmq.com/docs/confirms)）。SQS では時計が「この受け手は落ちた」と判断し、RabbitMQ では TCP 接続の切断がそれを判断する、という違いです。
+
+確認を待たずに送った時点で配送済みとみなす**自動確認**モードもありますが、文書はこれを「fire-and-forget」と呼び、安全ではないと考えるべきだ、と書いています。もう 1 つの調整が **prefetch**（`basic.qos`）で、1 つのチャネルで確認待ちのままにしてよい配送の数の上限です。上限がなければ、ブローカは速い消費者にも遅い消費者にも同じように押し込み、遅い消費者の手元に未処理のメッセージが積み上がります。
+
+接続は切れていないのに消費者が固まっている場合に備えて、RabbitMQ は確認応答にタイムアウトを持ち、既定は 30 分です。超えるとチャネルが閉じられ、確認待ちだった配送はキューに戻されます。4.3 からは、このタイムアウトはクォーラムキューだけが対象です（[RabbitMQ: Consumers](https://www.rabbitmq.com/docs/consumers)）。
+
+Google Cloud Pub/Sub の **ack deadline** も同じ考え方で、期限までに確認しなければ再配送されます。高水準のクライアントライブラリは、確認していないメッセージの期限を `modifyAckDeadline` で自動的に延ばし続けます（[Pub/Sub 文書: Lease management](https://docs.cloud.google.com/pubsub/docs/lease-management)）。
+
+### 何度も戻ってくるメッセージ: DLQ
+
+可視性タイムアウトで戻ってくる仕組みは、受け手が落ちたときには救いですが、**メッセージの側が壊れている**ときには災いになります。何度配っても処理が失敗し、そのたびに戻ってきます。
+
+そこで SQS は、メッセージごとに受け取られた回数（`ApproximateReceiveCount`）を数え、キューの**リドライブポリシー**に書いた `maxReceiveCount` を超えたら、指定した **DLQ**（デッドレターキュー）へ移します（[Amazon SQS Developer Guide: Dead-letter queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)）。数えているのは失敗の回数ではなく**受け取られた回数**なので、処理時間が可視性タイムアウトより長いだけの健全なメッセージも、同じように DLQ へ行きます。タイムアウトと最大受信回数は、組にして決める必要があります。
+
+DLQ の側の保持期間にも注意が要ります。標準キューでは、メッセージの期限は**最初にキューに入った時刻**から数えられ、DLQ に移っても変わりません。元のキューで 1 日過ごしたメッセージは、保持期間 4 日の DLQ では 3 日で消えます。文書は、DLQ の保持期間を元のキューより長くすることを勧めています。
+
+### ロングポーリング
+
+取り出し型のキューは、受け手が取りに来る（pull）形が多く、SQS もそうです。キューが空のとき、`ReceiveMessage` はすぐに空の応答を返します（ショートポーリング）。受け手がこれを繰り返せば、空の応答のために要求を払い続けることになります。
+
+`WaitTimeSeconds` を 1 以上（最大 20 秒）にすると **ロングポーリング** になり、メッセージが来るか時間が尽きるまで、応答を待たせます。文書によれば、ショートポーリングは重み付きの乱択で**一部のサーバだけ**を見るので、メッセージがあっても空が返ることがあり、ロングポーリングは**すべてのサーバ**を見ます（[Amazon SQS Developer Guide: Short and long polling](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-short-and-long-polling.html)）。第 88 回のロングポーリングと同じ形を、キューの受け手が使っているわけです。
+
+## 順序とスループットの交換
+
+### 順序は、1 列の中でしか守られない
+
+Kafka が順序を守るのは、**同じパーティションの中だけ**です。生産者はパーティションを指定しなければ、キーがあればキーのハッシュでパーティションを選びます（[Kafka 文書: Producer Configs](https://kafka.apache.org/43/configuration/producer-configs/)）。同じ注文 ID をキーにすれば、その注文の「作成」「支払い」「発送」は同じパーティションに、送った順に並びます。違うキーどうしの順序は、何も保証されません。
+
+SQS の FIFO キューの **メッセージグループ ID** も同じ役目です。同じグループのメッセージは、厳密な順序で 1 件ずつ処理されます。グループのメッセージが受け取られて見えない間は、**同じグループの次のメッセージは誰にも渡されません**（[Amazon SQS Developer Guide: Message group ID](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagegroupid-property.html)、[Visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)）。Pub/Sub の **ordering key** では、購読側で順序付けを有効にしたうえで、同じキーのメッセージが送った順に届きます。1 つのキーの発行は毎秒 1MB までに制限されています（[Pub/Sub 文書: Ordering messages](https://docs.cloud.google.com/pubsub/docs/ordering)）。
+
+どれも、**順序を守る単位 1 つにつき、同時に処理できるのは 1 人**です。並列度を上げたければ単位を増やすしかなく、Kafka ならパーティション数、FIFO キューならグループの数が並列度の上限になります。
+
+### 1 件が詰まると、後ろが全部止まる
+
+順序を守るということは、前のメッセージが終わるまで後ろに進めないということです。1 件の処理が失敗し続けると、同じパーティションやグループの後ろのメッセージはすべて待たされます。これが **head-of-line ブロッキング** です。第 80 回で、TCP の上の HTTP/2 では 1 つのパケットの損失が後ろの全部のストリームを止めることを見ました。それと同じ形です。
+
+| 仕組み | 詰まり方 |
+| --- | --- |
+| Kafka のパーティション | 読み手がそのオフセットを越えてコミットしない限り、ラグが伸び続ける。飛ばすかどうかはアプリが決める |
+| SQS FIFO のグループ | 失敗したメッセージが戻ってくるたびにグループが止まる。DLQ に移せば後ろが流れるが、順序はそこで崩れる。文書は、順序が意味を持つ処理には DLQ を使わないように、と注意している |
+| Pub/Sub の ordering key | あるメッセージが再配送されると、同じキーの後続のメッセージも、確認済みのものまで含めて再配送される |
+
+順序の要らない仕事にまで順序を付けると、この詰まりを無駄に背負うことになります。順序が必要なのは「同じ対象への操作」であって、全体ではないことがほとんどです。
+
+### キーの選び方で偏る
+
+パーティションやグループへの振り分けは、第 111 回のシャーディングと同じ問題を抱えます。**キーの個数**を均等に分けても、**流量**が均等になるとは限りません。大口のテナントや、フォロワーの多いアカウントをキーにすれば、その 1 つのパーティションだけが溢れます。第 111 回のホットスポットそのものです。
+
+キーの数が少ないと、偏りはもっと単純な形でも起きます。後の実験で 5 つのキーを 3 つのパーティションに送ると、1 つのパーティションには 1 件も入りませんでした。ハッシュで振り分ける以上、キーが少なければ空くパーティションも出ます。そのパーティションを割り当てられたメンバは、何もしていません。
+
+## 配送の保証は、どこで決まるか
+
+### オフセットをいつコミットするか
+
+ログ型では、配送の保証は**読み手がオフセットをいつコミットするか**で決まります。文書は次のように整理しています（[Kafka 文書: Design](https://kafka.apache.org/43/design/design/)）。
+
+| 順序 | 処理の途中で落ちたら | 保証 |
+| --- | --- | --- |
+| 読む → コミット → 処理 | 次の担当はコミット済みの位置から読むので、処理しかけたものは二度と処理されない | at-most-once |
+| 読む → 処理 → コミット | 次の担当は前のコミットの位置から読み直すので、処理済みのものがもう一度処理される | at-least-once |
+
+Java のクライアントの既定は自動コミット（`enable.auto.commit=true`）で、一定間隔で「直前の `poll` で返した分」をコミットします。処理を別のスレッドに渡してすぐ次の `poll` を呼ぶ作りにすると、処理が終わる前にコミットされ、知らないうちに at-most-once の側に寄ります。どちらの保証が要るかを決め、それに合う順序でコミットを書くのが基本です。
+
+取り出し型では、同じことが「削除をいつ呼ぶか」になります。受け取ってすぐ消せば at-most-once、処理してから消せば at-least-once です。RabbitMQ の自動確認モードは、前者を選んでいることになります。
+
+### Kafka の「exactly-once」が閉じている範囲
+
+Kafka は 0.11 から 2 つの仕組みを持っています（[Kafka 文書: Design](https://kafka.apache.org/43/design/design/)）。
+
+- **冪等プロデューサ**: ブローカが生産者に ID を振り、生産者はパーティションごとにメッセージへ通し番号を付ける。送り直しで同じ番号が届くと、ブローカはログに 2 度書かない。現在の版では既定で有効（[Kafka 文書: Producer Configs](https://kafka.apache.org/43/configuration/producer-configs/)）。後の実験の `kafka-dump-log` に出る `producerId` と `sequence` がこれ
+- **トランザクション**: 複数のパーティションへの書き込みを、まとめて見えるか、まとめて見えないかにする。読み手が「入力のオフセットのコミット」も同じトランザクションに入れれば、「読んで、書いて、位置を進める」が 1 つの単位になる
+
+この 2 つで、Kafka から読んで Kafka に書く処理（Kafka Streams など）では exactly-once が成り立ちます。文書は同時に、**他の宛先システムへの exactly-once は、一般にその宛先との協力を必要とする**と書いています。トランザクションがロールバックしても、その途中で送ったメールや、外部の決済 API への請求は取り消されません。
+
+つまり、Kafka の exactly-once は**Kafka の中で閉じた範囲**の話です。読み手が外の世界に副作用を起こすなら、配送は at-least-once のまま、受け手を冪等にするしかありません。前回の冪等性キーを、外部への副作用の手前に置くのはそのためです。メッセージの側に一意な ID を持たせ（Kafka ならトピック・パーティション・オフセットの組がそのまま使えます）、受け手はそれを業務データと同じトランザクションで記録します。
+
+SQS の FIFO キューの **重複排除 ID** は、送る側の重複を消すものです。同じ重複排除 ID のメッセージは、5 分の重複排除間隔の中では、受け付けられたことにはなるものの、受け手には 1 度しか届きません。受け取って消した後も、ID は追跡され続けます（[Amazon SQS Developer Guide: Message deduplication ID](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagededuplicationid-property.html)）。5 分を過ぎた送り直しは、新しいメッセージになります。前回の冪等性キーの「保存期間を過ぎたキーは新しい要求として扱われる」と同じ形です。そしてこれは**送り手とキューの間**の重複を消すだけで、可視性タイムアウトで受け手に 2 度配られることは防ぎません。
+
+<Callout type="note" title="ログ型に、取り出し型の読み方を足す">
+  Kafka 4.0 は、**share group** という新しい読み方を早期アクセスとして入れました（KIP-932）。
+  通常のコンシューマグループと違い、1 つのパーティションを複数のメンバが分け合って読み、メッセージを 1 件ずつ確認します。
+  確認されないまま一定時間が過ぎたメッセージは、他のメンバに配り直されます。可視性タイムアウトと同じ考え方です
+  （[Apache Kafka 4.0.0 リリース告知](https://kafka.apache.org/blog/2025/03/18/apache-kafka-4.0.0-release-announcement/)）。
+  4.2 で本番利用可能とされ、処理に時間がかかるときにこのロックを延ばす `RENEW` という確認の種類も加わりました（[Apache Kafka 4.2.0 リリース告知](https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/)）。
+  パーティション数より多い読み手で並列に処理できる代わりに、パーティションの中の順序は守られません。
+  逆向きの例が RabbitMQ の **stream** で、期限まで何度でも読み直せる追記専用のログとして、任意の位置から読めます（[RabbitMQ: Streams](https://www.rabbitmq.com/docs/streams)）。
+  2 つの作り方は製品の区別ではなく、**読み方の区別**になりつつあります。
+</Callout>
+
+## 手元で確かめる
+
+### 実験の環境
+
+すべて Docker の中で行い、ホストへのポートの公開はしていません。ホストは Apple Silicon の macOS です。
+
+| 役割 | イメージ | 版 |
+| --- | --- | --- |
+| Kafka（KRaft、ブローカとコントローラを兼ねる 1 ノード） | `apache/kafka:4.1.0` | 4.1.0 |
+| SQS 互換のキュー | `softwaremill/elasticmq-native:1.6.14` | ElasticMQ 1.6.14 |
+| SQS の操作 | `amazon/aws-cli:2.27.50`（ElasticMQ のコンテナとネットワーク名前空間を共有） | AWS CLI 2.27.50 |
+| Docker | Docker Engine | 29.4.0 |
+
+Kafka はイメージの既定の設定のまま起動し、付属の CLI（`/opt/kafka/bin/*.sh`）を `docker exec` で動かしました。ElasticMQ は SQS の API を真似た実装で、本物の SQS とは細部が違いうる点に注意してください（たとえば、ショートポーリングが一部のサーバしか見ない、という SQS の性質は再現されません）。
+
+### パーティションの中身
+
+3 パーティションのトピック `orders` を作り、`ユーザ:内容` の形でキー付きのメッセージを 9 件送りました。
+
+```
+$ kafka-topics.sh --create --topic orders --partitions 3 --replication-factor 1
+$ printf 'user-a:a1 created\nuser-b:b1 created\nuser-c:c1 created\nuser-a:a1 paid\n...' \
+    | kafka-console-producer.sh --topic orders --property parse.key=true --property key.separator=:
+```
+
+各パーティションのセグメントを `kafka-dump-log.sh --print-data-log` で読みました（行を短くするため一部の項目を省いています）。
+
+```
+== partition 0
+Log starting offset: 0
+（何も無い）
+
+== partition 1
+baseOffset: 0 lastOffset: 4 count: 5 baseSequence: 0 lastSequence: 4 producerId: 0 producerEpoch: 0
+  isTransactional: false position: 0 size: 170 magic: 2 compresscodec: none
+| offset: 0 keySize: 6 valueSize: 10 sequence: 0 key: user-a payload: a1 created
+| offset: 1 keySize: 6 valueSize: 10 sequence: 1 key: user-b payload: b1 created
+| offset: 2 keySize: 6 valueSize: 7  sequence: 2 key: user-a payload: a1 paid
+| offset: 3 keySize: 6 valueSize: 10 sequence: 3 key: user-a payload: a1 shipped
+| offset: 4 keySize: 6 valueSize: 7  sequence: 4 key: user-b payload: b1 paid
+
+== partition 2
+baseOffset: 0 lastOffset: 3 count: 4 baseSequence: 0 lastSequence: 3 producerId: 0 producerEpoch: 0 ...
+| offset: 0 ... key: user-c payload: c1 created
+| offset: 1 ... key: user-d payload: d1 created
+| offset: 2 ... key: user-e payload: e1 created
+| offset: 3 ... key: user-c payload: c1 cancelled
+```
+
+- `user-a` の「created → paid → shipped」は、同じパーティション 1 の中に、送った順に並んでいます。`user-c` の 2 件はパーティション 2 です。**同じキーは同じパーティションに行き、その中では順序が保たれる**ことが、ファイルの中身で確かめられます
+- 5 つのキーのうち、パーティション 0 に振られたものは 1 つもありませんでした。キーが少なければ、ハッシュによる振り分けでもこれだけ偏ります
+- 5 件が 1 つのバッチ（170 バイト）にまとまって書かれています。生産者が作ったこのバッチの形のまま、ディスクにあり、読み手にも送られます
+- `producerId: 0` と `sequence` は、既定で有効な冪等プロデューサの番号です。送り直しで同じ番号が届けば、ブローカはこれを見て捨てます
+
+### セグメントと索引
+
+セグメントの切り替わりを見るため、`segment.bytes` を許される最小の 1MiB（1048576 バイト。これより小さい値は `Value must be at least 1048576` で断られました）にした 1 パーティションのトピック `events` に、100 バイトのメッセージを 30,000 件送りました。
+
+```
+$ ls -la /tmp/kraft-combined-logs/events-0
+-rw-r--r--     1016  00000000000000000000.index
+-rw-r--r--  1048064  00000000000000000000.log
+-rw-r--r--      636  00000000000000000000.timeindex
+-rw-r--r--     1016  00000000000000009472.index
+-rw-r--r--  1048064  00000000000000009472.log
+-rw-r--r--     1016  00000000000000018944.index
+-rw-r--r--  1048064  00000000000000018944.log
+-rw-r--r-- 10485760  00000000000000028416.index      ← 書き込み中のセグメント。索引は先に大きく確保されている
+-rw-r--r--   175279  00000000000000028416.log
+...
+```
+
+1MiB ごとに 4 つのセグメントに分かれ、ファイル名がそれぞれの先頭のオフセット（0、9472、18944、28416）になっています。2 つ目のセグメントの索引を読むと、こうです。
+
+```
+$ kafka-dump-log.sh --files .../00000000000000009472.index
+offset: 9582 position: 8188
+offset: 9656 position: 16376
+offset: 9730 position: 24564
+offset: 9804 position: 32752
+...
+```
+
+約 1MB のセグメントに対して、索引の項目は 127 個しかありません。バッチ 1 つが 4094 バイトだったので、4096 バイトを超えるたび、つまりバッチ 2 つごとに 1 項目が書かれています。オフセット 9700 を読みたい読み手は、ファイル名から `00000000000000009472.log` を選び、索引から「9656 は 16376 バイト目」を見つけ、そこから先を読みます。
+
+### オフセットとラグ
+
+グループ `billing` で全件を読み、`kafka-consumer-groups.sh --describe` で見ました。
+
+```
+GROUP    TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+billing  orders  0          0               0               0
+billing  orders  1          5               5               0
+billing  orders  2          4               4               0
+```
+
+`CURRENT-OFFSET` はコミット済みの「次に読むオフセット」で、パーティション 1 なら 0〜4 を読み終えたので 5 です。読み手を止めたまま 4 件を追加すると、
+
+```
+GROUP    TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+billing  orders  0          0               0               0
+billing  orders  1          5               6               1
+billing  orders  2          4               7               3
+```
+
+ログの末尾（`LOG-END-OFFSET`）だけが進み、その差が **ラグ** になります。ラグは「グループがどれだけ遅れているか」をパーティションごとに表す数で、ログ型のキューで最初に監視するのはこれです。
+
+このコミットがどこに書かれたかを、`__consumer_offsets` の 50 個のパーティションのうち中身のあった 1 つ（グループ名のハッシュで決まる）で、`kafka-dump-log.sh --offsets-decoder` を使って読みました。
+
+```
+| offset: 1 key: {"type":"2","data":{"group":"billing"}}
+            payload: {"protocolType":"consumer","generation":1,"protocol":"range","leader":"console-consumer-c8dc...", "members":[...]}
+| offset: 2 key: {"type":"1","data":{"group":"billing","topic":"orders","partition":0}} payload: {"offset":0, ...}
+| offset: 3 key: {"type":"1","data":{"group":"billing","topic":"orders","partition":1}} payload: {"offset":5, ...}
+| offset: 4 key: {"type":"1","data":{"group":"billing","topic":"orders","partition":2}} payload: {"offset":4, ...}
+| offset: 5 key: {"type":"1","data":{"group":"billing","topic":"orders","partition":0}} payload: {"offset":0, ...}
+| offset: 6 key: {"type":"1","data":{"group":"billing","topic":"orders","partition":1}} payload: {"offset":5, ...}
+...
+```
+
+グループのメンバ構成（`type 2`）と、パーティションごとのオフセット（`type 1`）が、普通のメッセージと同じ形でログに追記されています。同じキーの記録が何度も書かれていて、コンパクションで最新のものだけが残される対象です。
+
+### リバランス
+
+グループ `shipping` で、読み手を 1 人ずつ足しながら割り当てを見ました（`--describe --members --verbose`）。この CLI の既定は従来のプロトコル（割り当て方式は `range`）です。
+
+```
+（1 人）
+worker-1   #PARTITIONS 3   orders:0,1,2
+
+（2 人目を足す）
+worker-1   #PARTITIONS 2   orders:0,1
+worker-2   #PARTITIONS 1   orders:2
+
+（3 人目と 4 人目を足す）
+worker-1   #PARTITIONS 1   orders:0
+worker-2   #PARTITIONS 1   orders:1
+worker-3   #PARTITIONS 1   orders:2
+worker-4   #PARTITIONS 0   -
+
+（worker-1 を止める）
+worker-2   #PARTITIONS 1   orders:0
+worker-3   #PARTITIONS 1   orders:1
+worker-4   #PARTITIONS 1   orders:2
+```
+
+4 人目は何も割り当てられず、待機しているだけでした。3 パーティションのトピックでは、同じグループで同時に働けるのは 3 人までです。worker-1 が抜けると、待機していた worker-4 にパーティションが回ってきました。しかも、worker-1 は 13 件すべて読んでいたので、割り当てが動いても次の担当は**コミット済みの位置から**続きを読み、同じものを読み直していません。また、`orders:0` は 1 件も入っていないパーティションなので、それを受け持つメンバは何もしていないことになります。
+
+### 巻き戻して読み直す
+
+ログ型の利点は、読み手の位置を戻せば同じメッセージをもう一度読めることです。`billing` のパーティション 2 だけを 3 つ戻しました。
+
+```
+$ kafka-consumer-groups.sh --group billing --topic orders:2 --reset-offsets --shift-by -3 --execute
+GROUP    TOPIC   PARTITION  NEW-OFFSET
+billing  orders  2          4
+
+$ kafka-console-consumer.sh --topic orders --group billing --property print.partition=true --property print.offset=true
+Partition:2  Offset:4  c2 created
+Partition:2  Offset:5  c2 paid
+Partition:2  Offset:6  e1 paid
+```
+
+戻した 3 件だけがもう一度届きました。`--to-earliest` で全パーティションを先頭に戻すと、13 件すべてを読み直しました。バグを直した処理で過去のメッセージを処理し直す、新しいグループを作って最初から読ませる、といった使い方はここから来ています。取り出し型のキューでは、消したメッセージはもう戻りません。
+
+ただし、戻れるのはログに残っている範囲までです。`events` の先頭を `kafka-delete-records.sh` でオフセット 20000 まで進めました。
+
+```
+$ kafka-delete-records.sh --offset-json-file del.json    （events-0 を 20000 まで）
+partition: events-0	low_watermark: 20000
+$ kafka-get-offsets.sh --topic events --time -2           （最古のオフセット）
+events:0:20000
+```
+
+この後、新しいグループで `--from-beginning` で読むと、最初に届いたのは `Offset:20000` でした。グループのオフセットを 100 に戻そうとすると、`NEW-OFFSET` は 20000 に丸められました。0〜19999 はもう存在しません。
+
+ファイルの消え方も見ておきます。ブローカのログによると、先頭を進めた後の確認で、
+
+```
+Deleting segments due to log start offset 20000 breach:
+  LogSegment(baseOffset=0, size=1048064, ...), LogSegment(baseOffset=9472, size=1048064, ...)
+```
+
+と判定され、2 つのセグメントが `.deleted` という名前に変えられ、さらに 60 秒後（`file.delete.delay.ms` の既定）に実際に消されました。オフセット 18944〜28415 のセグメントは、20000 より前のメッセージも含みますが、**20000 以降を含むので丸ごと残りました**。保持による削除はセグメントの単位で行われ、ディスクの上には捨てたはずの範囲が少し残ります。
+
+### ログコンパクション
+
+`cleanup.policy=compact` のトピック `profile` に、`u1` と `u2` の値を 3 回ずつ書き換え、`u3` を書き、少し間をおいて `u4` を書きました（`segment.ms=2000`、`min.cleanable.dirty.ratio=0.01` にして、掃除がすぐ走るようにしています）。約 25 秒後に先頭から読むと、
+
+```
+Offset:4	u1	name=alice v3
+Offset:5	u2	name=bob v3
+Offset:6	u3	name=carol
+Offset:7	u4	name=dave
+```
+
+オフセット 0〜3 の古い値は消え、キーごとの最新の値だけが残りました。**残ったメッセージのオフセットは 4〜7 のままで、0 から振り直されてはいません**。読み手がコミットしたオフセットは、コンパクションの後も同じ意味を持ちます。
+
+### 可視性タイムアウトと DLQ（ElasticMQ）
+
+ここから取り出し型です。可視性タイムアウトを 5 秒、リドライブポリシーを「最大受信回数 3、移動先 `jobs-dlq`」にしたキュー `jobs` に、メッセージを 1 件入れました。受け取っても**削除せず**に、約 7〜9 秒おきに受け取り直しています。各回の直後にもう一度受け取りを試み、キューの属性（見えるメッセージ数、見えないメッセージ数）を見ました。
+
+```
+--- receive #1 at 10:44:17
+resize image 42   ApproximateReceiveCount=1
+    immediately again: （何も返らない）
+    visible=0  not visible=1
+--- receive #2 at 10:44:26
+resize image 42   ApproximateReceiveCount=2
+    immediately again: （何も返らない）
+    visible=0  not visible=1
+--- receive #3 at 10:44:33
+resize image 42   ApproximateReceiveCount=3
+    immediately again: （何も返らない）
+    visible=0  not visible=1
+--- receive #4 at 10:44:41
+    （何も返らない）
+    visible=0  not visible=0
+--- DLQ
+resize image 42
+```
+
+- 受け取った直後は、もう一度受け取ろうとしても返らず、「見えない」の数が 1 になっています。メッセージは消えておらず、**キューの中で見えなくなっているだけ**です
+- 5 秒の可視性タイムアウトが過ぎると、同じメッセージがまた受け取れ、`ApproximateReceiveCount` が 1 ずつ増えました
+- 3 回受け取られた後の 4 回目では、本流のキューからは何も返らず、メッセージは `jobs-dlq` に移っていました
+
+受け取りのたびに返る **受信ハンドル**（receipt handle）も毎回違う値でした。削除にはメッセージ ID ではなくこの受信ハンドルを使います。「どの受け取りに対する削除か」を区別するためです。
+
+次に、受け取って 5 秒以内に削除すると、6 秒待っても何も戻ってこず、キューの「見える」「見えない」はどちらも 0 でした。**削除して初めて、メッセージはキューから消えます。**
+
+処理が長引く場合の延長も試しました。10:45:41 に受け取り、3 秒後の 10:45:44 に `change-message-visibility --visibility-timeout 10` を呼びました。延長しなければ 10:45:46 には再び見えるはずのメッセージが、10:45:50 にはまだ見えず、10:45:57 に再び受け取れました。延長した時点から 10 秒間、見えない状態が続いたことになります。
+
+### ロングポーリング
+
+空のキューに対する受け取りの時間を、AWS CLI の起動込みで測りました。
+
+| 受け取り方 | 状況 | 返るまで |
+| --- | --- | --- |
+| `--wait-time-seconds 0`（ショート） | 空 | 0.48 秒（すぐに空の応答） |
+| `--wait-time-seconds 20`（ロング） | 3 秒後に別のプロセスが 1 件送る | 3.45 秒（届いた直後に `hello` を返す） |
+| `--wait-time-seconds 5`（ロング） | 空のまま | 5.44 秒（時間切れで空の応答） |
+
+ロングポーリングは、来たらすぐ返り、来なければ指定した時間だけ待って空を返します。受け手は空の応答のたびに要求を繰り返さずに済みます。
+
+### FIFO キュー: グループと重複排除
+
+FIFO キュー `orders.fifo` に、メッセージグループ ID（ユーザ）と重複排除 ID を付けて 4 回送りました。4 回目は、2 回目とまったく同じ重複排除 ID での送り直しです。
+
+```
+send a1 created group=user-a dedup=d1 -> b116c035-...   SequenceNumber 0
+send a1 paid    group=user-a dedup=d2 -> 225b7bad-...   SequenceNumber 1
+send b1 created group=user-b dedup=d3 -> a3de0cb1-...   SequenceNumber 2
+send a1 paid    group=user-a dedup=d2 -> 225b7bad-...   SequenceNumber 1   ← 2 回目と同じ ID と番号
+
+ApproximateNumberOfMessages: 3
+```
+
+4 回目の送信は成功として返りましたが、返ってきたメッセージ ID と順序番号は 2 回目のものと同じで、キューの中は 3 件のままでした。送り手から見れば「受け付けられた」ので、送り直しても安全です。
+
+次に、別のキューに `user-a` の 2 件と `user-b` の 2 件を入れ、3 つの受け手が 1 件ずつ（削除せずに）受け取りました。
+
+```
+worker 1 receives (max 1): a1 created
+worker 2 receives (max 1): b1 created
+worker 3 receives (max 1): （何も返らない）
+```
+
+キューには `a1 paid` と `b1 paid` が残っているのに、3 人目には何も渡されませんでした。それぞれのグループの先頭が処理中（見えない状態）なので、**同じグループの次のメッセージは、前が削除されるかタイムアウトするまで出てこない**からです。グループが 2 つしかなければ、受け手を何人に増やしても、同時に働けるのは 2 人です。Kafka でパーティション数を超えた 4 人目が待機していたのと、同じことが起きています。
+
+### 片付け
+
+```
+$ docker stop ll-114-kafka ll-114-sqs
+```
+
+## まとめ
+
+- キューの作り方は 2 つ。取り出して消す（SQS、RabbitMQ のキュー）と、追記したログを位置で読む（Kafka、Kinesis、RabbitMQ の stream）。違いは、読んだ後に消えるかと、どこまで読んだかを誰が持つか
+- Kafka のパーティションは、セグメントのファイルの列。ファイル名は先頭のオフセットで、`.index` は約 4096 バイトごとのまばらな索引。実験では 1MiB のセグメントに 127 項目だった
+- 読み手の状態は、パーティションごとのオフセット 1 つ。コンシューマグループは「次に読む位置」を `__consumer_offsets` という別のログにコミットする。ログとコミット位置の差がラグ
+- グループの中で 1 つのパーティションを読むのは 1 人だけ。並列度の上限はパーティション数で、4 人目は待機した。メンバが増減するとリバランスで配り直す
+- ログは読んでも消えず、保持期間や大きさの上限で、セグメントの単位で捨てる。残っている範囲ならオフセットを戻して読み直せる。コンパクションはキーごとに最新の値を残し、オフセットは振り直さない
+- ページキャッシュに任せた追記と順読み、`sendfile` によるゼロコピー送信は、ディスクと線の上の形式を同じにしたことで成り立っている。形は WAL と同じで、違いは読み手が来ないときに溜め続けるか捨てるか
+- 取り出し型では、受け取ったメッセージは消えずに見えなくなるだけ。削除しなければ可視性タイムアウトの後に戻ってくる。これが at-least-once の正体。RabbitMQ では接続の切断が同じ役目をし、prefetch で確認待ちの数を絞る
+- 受け取られた回数が `maxReceiveCount` を超えると DLQ へ移る。失敗の回数ではないので、可視性タイムアウトと組にして決める
+- 順序が守られるのは、同じパーティション、同じメッセージグループ、同じ ordering key の中だけ。その単位 1 つにつき同時に処理できるのは 1 人で、1 件が詰まれば後ろが止まる。キーの選び方で偏る
+- 配送の保証は、オフセットのコミットや削除を処理の前にするか後にするかで決まる。Kafka の冪等プロデューサとトランザクションによる exactly-once は Kafka の中で閉じた範囲の話で、外部への副作用には前回の冪等性キーを使う。FIFO キューの重複排除は 5 分間、送り手の側の重複だけを消す
+
+キューの中身は、追記したログと、メッセージごとの「見えない期限」と、読み手の位置でした。どれも、データベースの表と行ロックでも表せそうに見えます。次の第 115 回では、新しい部品を足さずに、手元のデータベースの表をキューとして使う方法と、そこで `SKIP LOCKED` が何を解いているのかを見ます。

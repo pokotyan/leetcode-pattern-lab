@@ -277,7 +277,7 @@ XFetch で「期限前に作り直す」と決めた人がさらにロックを�
 
 ### HTTP のキャッシュにも同じ考え方がある
 
-古い値を返しながら裏で作り直す、という考え方は HTTP のキャッシュにもあります。`Cache-Control: max-age=600, stale-while-revalidate=30` は、RFC 5861 の言葉で「the stale-while-revalidate Cache-Control extension indicates that caches MAY serve the response in which it appears after it becomes stale, up to the indicated number of seconds.」です（[RFC 5861](https://www.rfc-editor.org/rfc/rfc5861)）。期限切れから 30 秒の間は、古い応答を返しつつ裏で取り直してよい、という意味になります。低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-138-http-cache-cdn/`}>他人の応答を配るキャッシュ</a>の回では、Varnish がこれを grace という仕組みで既定で行っていることを実測しました。
+古い値を返しながら裏で作り直す、という考え方は HTTP のキャッシュにもあります。`Cache-Control: max-age=600, stale-while-revalidate=30` は、RFC 5861 の言葉で「the stale-while-revalidate Cache-Control extension indicates that caches MAY serve the response in which it appears after it becomes stale, up to the indicated number of seconds.」です（[RFC 5861](https://www.rfc-editor.org/rfc/rfc5861)）。期限切れから 30 秒の間は、古い応答を返しつつ裏で取り直してよい、という意味になります。低レイヤの<a href={`${import.meta.env.BASE_URL}lowlevel/ll-143-http-cache-cdn/`}>他人の応答を配るキャッシュ</a>の回では、Varnish がこれを grace という仕組みで既定で行っていることを実測しました。
 
 ## 無いことも覚える：ネガティブキャッシュ
 

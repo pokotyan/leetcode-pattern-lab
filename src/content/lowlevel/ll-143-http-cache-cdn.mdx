@@ -16,11 +16,11 @@ topics:
   - Web キャッシュデセプション
   - CDN-Cache-Control
 requires:
-  - ll-112-navigation
-  - ll-131-cors
-  - ll-135-security-headers
-  - ll-154-tls-ops
-  - ll-169-session-cookie
+  - ll-117-navigation
+  - ll-136-cors
+  - ll-140-security-headers
+  - ll-159-tls-ops
+  - ll-175-session-cookie
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -44,7 +44,7 @@ HTTP キャッシュの規則（[RFC 9111](https://www.rfc-editor.org/rfc/rfc911
 | **private cache**（専用のキャッシュ） | ブラウザのキャッシュ | 1 人の利用者の応答だけ | 本人が古いものを見る |
 | **shared cache**（共有のキャッシュ） | CDN、リバースプロキシ、社内のプロキシ | **多くの利用者の応答をまとめて** | **他人に個人情報が渡る** |
 
-第 112 回では、キャッシュを「取りに行かずに済ませる」速さの道具として見ました。ブラウザのキャッシュだけを考えるなら、それで十分です。共有のキャッシュでは、同じ仕組みが**情報の境界**になります。
+第 117 回では、キャッシュを「取りに行かずに済ませる」速さの道具として見ました。ブラウザのキャッシュだけを考えるなら、それで十分です。共有のキャッシュでは、同じ仕組みが**情報の境界**になります。
 
 ```
  利用者 A ─┐                                       
@@ -74,7 +74,7 @@ CDN は世界中に**拠点**（PoP）を置き、利用者を近い拠点へ振
 
 ### 確かめ直し: ETag と 304
 
-期限が切れた応答（stale）は、捨てる必要はありません。第 112 回で見たとおり、`ETag` の値を `If-None-Match` に入れて問い合わせ、変わっていなければ本文の無い **304 Not Modified** を受け取って、手元の応答を新しいものとして使い続けます。これを**確かめ直し**（validation）と呼びます。
+期限が切れた応答（stale）は、捨てる必要はありません。第 117 回で見たとおり、`ETag` の値を `If-None-Match` に入れて問い合わせ、変わっていなければ本文の無い **304 Not Modified** を受け取って、手元の応答を新しいものとして使い続けます。これを**確かめ直し**（validation）と呼びます。
 
 期限切れの扱いを調整する指示が、いくつかあります。
 
@@ -93,7 +93,7 @@ CDN は世界中に**拠点**（PoP）を置き、利用者を近い拠点へ振
 | `no-cache` | 保存してよいが、**毎回確かめ直してから**使う | 同じ | [5.2.2.4](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4) |
 | `public` | 通常は保存しない場面（`Authorization` 付きの要求など）でも保存してよい | 同じ | [5.2.2.9](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.9) |
 
-利用者ごとに中身が変わるページは `private` か `no-store` です。第 135 回でも同じ表を見ました。この回では、それを**書き忘れたとき**に何が起きるかを実際に見ます。
+利用者ごとに中身が変わるページは `private` か `no-store` です。第 140 回でも同じ表を見ました。この回では、それを**書き忘れたとき**に何が起きるかを実際に見ます。
 
 ## 手元の環境
 
@@ -173,7 +173,7 @@ must-revalidate だけ        MISS,MISS,MISS (3 回)      MISS,HIT,HIT   (1 回)
 
 <Callout type="warn" title="よくある誤解: 「no-cache を付ければキャッシュされない」">
   `no-cache` の意味は「使う前に毎回オリジンに確かめよ」で、保存は禁じていません（[RFC 9111 5.2.2.4](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4)）。手元の 2 つの実装はたまたま保存しませんでしたが、それに頼る理由はありません。
-  共有のキャッシュに置かせたくないなら `private`、どこにも残したくないなら `no-store` を書きます。逆に、HTML のように「置いてよいが、古いものは出したくない」応答こそ `no-cache` の出番です（第 112 回）。
+  共有のキャッシュに置かせたくないなら `private`、どこにも残したくないなら `no-store` を書きます。逆に、HTML のように「置いてよいが、古いものは出したくない」応答こそ `no-cache` の出番です（第 117 回）。
 </Callout>
 
 ## キャッシュは何で応答を見分けるか
@@ -190,7 +190,7 @@ must-revalidate だけ        MISS,MISS,MISS (3 回)      MISS,HIT,HIT   (1 回)
                                     Accept-Language、User-Agent ...
 ```
 
-応答の中身が要求のヘッダで変わるなら、オリジンは **Vary** でそれを伝えます。`Vary: Accept-Encoding` なら、キャッシュは `Accept-Encoding` の値ごとに別の応答を持ちます（[4.1](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1)）。第 131 回の `Vary: Origin`、第 134 回の Client Hints と `Vary` は、どれもこの仕組みです。
+応答の中身が要求のヘッダで変わるなら、オリジンは **Vary** でそれを伝えます。`Vary: Accept-Encoding` なら、キャッシュは `Accept-Encoding` の値ごとに別の応答を持ちます（[4.1](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1)）。第 136 回の `Vary: Origin`、第 139 回の Client Hints と `Vary` は、どれもこの仕組みです。
 
 ### Authorization 付きの要求には、特別な規則がある
 
@@ -272,7 +272,7 @@ victim1:  <script src="https://evil.example/static/app.js"></script> (#44)  HIT
 victim2:  <script src="https://evil.example/static/app.js"></script> (#44)  HIT
 ```
 
-攻撃者は `X-Forwarded-Host: evil.example` を付けた要求を 1 回送っただけです。その後 60 秒間、普通にページを開いた全員が、**攻撃者のサーバのスクリプトを読み込むページ**を受け取ります。XSS（第 135 回）と違い、被害者に罠のリンクを踏ませる必要がありません。キャッシュが、攻撃者の代わりに配ってくれます。
+攻撃者は `X-Forwarded-Host: evil.example` を付けた要求を 1 回送っただけです。その後 60 秒間、普通にページを開いた全員が、**攻撃者のサーバのスクリプトを読み込むページ**を受け取ります。XSS（第 140 回）と違い、被害者に罠のリンクを踏ませる必要がありません。キャッシュが、攻撃者の代わりに配ってくれます。
 
 直し方は、キーに入らない入力で応答を変えないことです。手元では、nginx が `X-Forwarded-Host` を**自分で上書きして**オリジンへ送るようにしました（`proxy_set_header X-Forwarded-Host $host;`）。
 
@@ -282,7 +282,7 @@ attacker: <script src="https://localhost/static/app.js"></script> (#50)  MISS
 victim:   <script src="https://localhost/static/app.js"></script> (#50)  HIT
 ```
 
-攻撃者の値は、オリジンに届く前に捨てられました。ほかに、オリジンがそのヘッダを信用しない、応答を変えるなら `Vary` に書く、といった方法があります。第 131 回の `Vary: Origin` も、**応答を変える入力はキーに入れる**という同じ原則の 1 つの例です。
+攻撃者の値は、オリジンに届く前に捨てられました。ほかに、オリジンがそのヘッダを信用しない、応答を変えるなら `Vary` に書く、といった方法があります。第 136 回の `Vary: Origin` も、**応答を変える入力はキーに入れる**という同じ原則の 1 つの例です。
 
 ### Web キャッシュデセプション: パスの解釈の違いで個人のページを置かせる
 
@@ -329,7 +329,7 @@ attacker /account/x.css   302 Found  MISS
 
 ### TLS を終えるのは CDN
 
-CDN を使うと、ブラウザとの TLS は CDN の拠点で終わります（第 154 回）。CDN が暗号を解いて HTTP の要求と応答を読めるからこそ、URL をキーにキャッシュでき、`Cache-Control` を読めます。裏返せば、**CDN は全利用者の Cookie と、全利用者向けの応答を平文で見る位置**にいます。ドメインを CDN に CNAME で向けるのも（第 72 回）、使わなくなった CDN の設定に CNAME を残すと乗っ取られうるのも（第 78 回）、この位置の強さの表と裏です。
+CDN を使うと、ブラウザとの TLS は CDN の拠点で終わります（第 159 回）。CDN が暗号を解いて HTTP の要求と応答を読めるからこそ、URL をキーにキャッシュでき、`Cache-Control` を読めます。裏返せば、**CDN は全利用者の Cookie と、全利用者向けの応答を平文で見る位置**にいます。ドメインを CDN に CNAME で向けるのも（第 72 回）、使わなくなった CDN の設定に CNAME を残すと乗っ取られうるのも（第 78 回）、この位置の強さの表と裏です。
 
 ### CDN にだけ効く指示
 
@@ -383,7 +383,7 @@ https://www.google.com/
 
 ## ブラウザの中のキャッシュも、分けられている
 
-共有のキャッシュは利用者の間で応答を共有しますが、ブラウザのキャッシュは 1 人の中で**サイトをまたいで**共有されていました。RFC 9111 も、あるサイトが別のサイトの資源の読み込み時間を測れば、利用者がそのサイトを訪れたかが分かるという問題を挙げ、キャッシュのキーに参照元のサイトを加える **double keying** を対策として挙げています（[7.2](https://www.rfc-editor.org/rfc/rfc9111.html#section-7.2)）。主要なブラウザは、HTTP キャッシュをトップレベルのサイトで分ける方向に進みました（第 132 回）。
+共有のキャッシュは利用者の間で応答を共有しますが、ブラウザのキャッシュは 1 人の中で**サイトをまたいで**共有されていました。RFC 9111 も、あるサイトが別のサイトの資源の読み込み時間を測れば、利用者がそのサイトを訪れたかが分かるという問題を挙げ、キャッシュのキーに参照元のサイトを加える **double keying** を対策として挙げています（[7.2](https://www.rfc-editor.org/rfc/rfc9111.html#section-7.2)）。主要なブラウザは、HTTP キャッシュをトップレベルのサイトで分ける方向に進みました（第 137 回）。
 
 その結果、「有名な CDN の同じ URL のライブラリなら、別のサイトで読み込んだものがキャッシュに残っていて速い」という昔の利点は、今は成り立ちません。CDN の速さは、ブラウザのキャッシュではなく、**近い拠点の共有キャッシュ**から来ています。
 
@@ -395,8 +395,8 @@ https://www.google.com/
 | HTML（誰に対しても同じ） | `no-cache`（ETag 付き）。CDN に持たせるなら `CDN-Cache-Control` か `s-maxage` を別に | 更新時に purge する手段を用意する |
 | ログインした利用者ごとのページ | `private` または `no-store` | **ヘッダを無視して全部キャッシュする規則を作らない** |
 | 認証付きの API（`Authorization`） | `private` または `no-store` | 規則（RFC 9111 3.5）を守らない実装がある。nginx なら `proxy_no_cache` を設定する |
-| `Access-Control-Allow-Origin` を要求で変える API | `Vary: Origin`（第 131 回） | キーに `Origin` を含めるか確かめる |
-| トークン、パスワードのリセットなど | `no-store`（OAuth のトークンの応答は RFC 6749 の要求、第 171 回） | — |
+| `Access-Control-Allow-Origin` を要求で変える API | `Vary: Origin`（第 136 回） | キーに `Origin` を含めるか確かめる |
+| トークン、パスワードのリセットなど | `no-store`（OAuth のトークンの応答は RFC 6749 の要求、第 177 回） | — |
 | プロキシの後ろでホスト名を使ってリンクを作るページ | 独自のヘッダの値を信用しない | `X-Forwarded-Host` などは手前で上書きする |
 
 ## 実装ごとの違い

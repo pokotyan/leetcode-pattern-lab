@@ -16,17 +16,17 @@ topics:
   - セッション固定
   - 第三者 Cookie
 requires:
-  - ll-167-password-mfa
-  - ll-166-authn-authz
-  - ll-141-hash-mac
-  - ll-113-browser-process
+  - ll-173-password-mfa
+  - ll-172-authn-authz
+  - ll-146-hash-mac
+  - ll-118-browser-process
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## ログインの結果は、どこに残るのか
 
-第 166 回で見たとおり、HTTP はステートレスです。パスワードとパスキー（第 167 回）で本人を確かめても、**その結果は、そのリクエストが終わった時点で消えます**。次のリクエストは、同じ人から来たのか、別の人から来たのか、HTTP の層では区別できません。
+第 172 回で見たとおり、HTTP はステートレスです。パスワードとパスキー（第 173 回）で本人を確かめても、**その結果は、そのリクエストが終わった時点で消えます**。次のリクエストは、同じ人から来たのか、別の人から来たのか、HTTP の層では区別できません。
 
 だから、認証の結果を**リクエストをまたいで持ち運ぶ仕組み**が要ります。ブラウザでは、その運び役はほぼ決まって **Cookie** です。この回では、次の 3 つを分けて見ます。
 
@@ -61,7 +61,7 @@ Cookie: sid=V39jXiOj...
 | `HttpOnly` | JavaScript の `document.cookie` から見えなくする。HTTP のリクエストには付く |
 | `SameSite` | 別のサイトから始まったリクエストに付けるかどうか（後述） |
 
-見落とされやすいのが、**Cookie の境界はオリジンではない**ことです。同一オリジンはスキーム・ホスト・ポートの組ですが（オリジンとサイトの違いは第 129 回）、Cookie は**ポートで分かれません**（[RFC 6265 8.5](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.5)）。さらに、`foo.example.com` は `Domain=example.com` の Cookie を設定でき、兄弟の `bar.example.com` の Cookie を上書きできます（[8.6](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.6)）。
+見落とされやすいのが、**Cookie の境界はオリジンではない**ことです。同一オリジンはスキーム・ホスト・ポートの組ですが（オリジンとサイトの違いは第 134 回）、Cookie は**ポートで分かれません**（[RFC 6265 8.5](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.5)）。さらに、`foo.example.com` は `Domain=example.com` の Cookie を設定でき、兄弟の `bar.example.com` の Cookie を上書きできます（[8.6](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.6)）。
 
 これを塞ぐのが**接頭辞**です。名前が `__Host-` で始まる Cookie は、`Secure` 付き、`Path=/`、`Domain` なしでなければブラウザが受け付けません（[6265bis 4.1.3.2](https://www.ietf.org/archive/id/draft-ietf-httpbis-rfc6265bis-22.html#section-4.1.3.2)）。つまり**そのホストが HTTPS で設定したものに限られ、サブドメインから押し込めません**。セッションの Cookie には `__Host-sid` のような名前を付けるのが、いまの定石です。
 
@@ -70,7 +70,7 @@ Cookie: sid=V39jXiOj...
 Python の `http.server` で小さなサーバを書き、127.0.0.1:18100 で動かします。`/login` で次の 6 つの Cookie を返します。
 
 - `sid`: サーバ側セッションの ID（`secrets.token_urlsafe(32)`、256 ビットの乱数）
-- `tok`: 自己完結型トークン。`{"user": ..., "exp": ...}` を Base64URL にし、第 141 回の HMAC-SHA256 を付けたもの
+- `tok`: 自己完結型トークン。`{"user": ..., "exp": ...}` を Base64URL にし、第 146 回の HMAC-SHA256 を付けたもの
 - `c_strict`、`c_lax`、`c_default`（SameSite なし）、`c_none`（`SameSite=None; Secure`）: SameSite の比較用
 
 `/me` は `sid` と `tok` のそれぞれで「誰か」を答え、`/show` は届いた Cookie の名前を返します。curl の `-c` で Cookie を保存し、`-b` で送ります（手元の実行結果）。
@@ -99,7 +99,7 @@ $ echo eyJ1c2VyIjogImFsaWNlIiwgImV4cCI6IDE3OTA1OTU5MzR9 | base64 -d
 {"user": "alice", "exp": 1790595934}
 ```
 
-**MAC（や署名）が守るのは改ざんで、中身の秘密ではありません**（第 140 回の区別）。もう 1 つは、curl は `SameSite=Strict` の Cookie も区別せず送ることです。**SameSite も HttpOnly もブラウザが守る約束で、サーバが強制しているものではありません**。攻撃者が自分の curl で送る分には、何の制限にもなりません。
+**MAC（や署名）が守るのは改ざんで、中身の秘密ではありません**（第 145 回の区別）。もう 1 つは、curl は `SameSite=Strict` の Cookie も区別せず送ることです。**SameSite も HttpOnly もブラウザが守る約束で、サーバが強制しているものではありません**。攻撃者が自分の curl で送る分には、何の制限にもなりません。
 
 <Callout type="note" title="curl が Secure の Cookie を平文の http で送った理由">
   上の `c_none` は `Secure` 付きなのに、`http://127.0.0.1` への要求にも付きました。
@@ -153,7 +153,7 @@ session: None  token: None
   値がすでに盗まれていれば、盗んだ側の手元には残っています。
   ログアウトを「サーバ側でそのセッションを無効にすること」と定義し、保存先から消すまでがログアウトです（[OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)）。
   自己完結型トークンでは、これができないか、失効リストを別に持つことになります。
-  JWT をセッションの代わりに使うときの問題はここから始まり、第 170 回で詳しく見ます。
+  JWT をセッションの代わりに使うときの問題はここから始まり、第 176 回で詳しく見ます。
 </Callout>
 
 ## セッションの寿命
@@ -165,7 +165,7 @@ session: None  token: None
 
 （いずれも [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)）。アイドルタイムアウトは「席を離れた端末」を、絶対タイムアウトは「盗まれた ID が使われ続けること」を縛ります。どちらも**サーバが時刻を記録している**から効くもので、Cookie の `Expires` はブラウザの都合でしか働きません。
 
-セッション ID そのものは、推測されないことが条件です。OWASP は**少なくとも 64 ビットのエントロピー**を求めています。連番や時刻から作った ID は、第 146 回で見た暗号用の乱数に置き換えます。
+セッション ID そのものは、推測されないことが条件です。OWASP は**少なくとも 64 ビットのエントロピー**を求めています。連番や時刻から作った ID は、第 151 回で見た暗号用の乱数に置き換えます。
 
 ## セッション固定
 
@@ -240,7 +240,7 @@ SameSite はブラウザでなければ確かめられません。Playwright で
 
 本来の対策は、**攻撃者のページが知り得ない値を、要求に含めさせる**ことです（同じ Cheat Sheet）。
 
-- **同期トークン**: サーバがセッションに結び付けた乱数をフォームに埋め込み、POST で送り返させて照合する。攻撃者は相手のページを読めない（同一オリジンポリシー、第 113 回）ので、この値を知りようがない
+- **同期トークン**: サーバがセッションに結び付けた乱数をフォームに埋め込み、POST で送り返させて照合する。攻撃者は相手のページを読めない（同一オリジンポリシー、第 118 回）ので、この値を知りようがない
 - **署名付きの二重送信 Cookie**: 保存先を持たない場合に、セッションに結び付けた値を HMAC で署名して Cookie とフォームの両方に入れる。署名しない素朴な形は、兄弟のサブドメインから Cookie を押し込まれると破られる
 - **Fetch Metadata**: ブラウザが付ける `Sec-Fetch-Site`（`same-origin` / `same-site` / `cross-site` / `none`）を見て、状態を変える要求で `cross-site` を拒否する。上のログにもこのヘッダが出ている
 - そもそも **GET で状態を変えない**
@@ -272,11 +272,11 @@ HttpOnly が防ぐのは、その中の 1 つの経路だけです。実験の�
   HttpOnly が変えるのは「値を持ち出して、被害者がページを閉じた後も別の場所から使う」ことができなくなる点で、被害の広がりを縮めるものです。XSS そのものを防ぐ手段（出力のエスケープ、Content-Security-Policy）の代わりにはなりません。
 </Callout>
 
-では、トークンを Cookie ではなく `localStorage` に置いたらどうなるか。`localStorage` は同じオリジンの JavaScript からいつでも読めるので、**XSS のスクリプトはトークンを読んで持ち出せます**。一方、ブラウザが自動では送らないので、CSRF の心配は減ります。つまり、HttpOnly の Cookie と `localStorage` は**守る相手が入れ替わる**関係です。どこに置くかの判断は、JWT と一緒に第 170 回で詳しく見ます。
+では、トークンを Cookie ではなく `localStorage` に置いたらどうなるか。`localStorage` は同じオリジンの JavaScript からいつでも読めるので、**XSS のスクリプトはトークンを読んで持ち出せます**。一方、ブラウザが自動では送らないので、CSRF の心配は減ります。つまり、HttpOnly の Cookie と `localStorage` は**守る相手が入れ替わる**関係です。どこに置くかの判断は、JWT と一緒に第 176 回で詳しく見ます。
 
 ## 第三者 Cookie の制限
 
-ここまでの「別のサイト」とは逆向きに、**別のサイトのページに埋め込まれたときに送る Cookie** を**第三者 Cookie**と呼びます。`news.example` のページが `ads.example` の画像や iframe を読み込んだとき、`ads.example` の Cookie がそれです。広告の追跡に使われてきたため、ブラウザは制限を強めてきました。第三者かどうかの決まり方、CHIPS や Storage Access API は第 132 回で、Safari の ITP をはじめとするブラウザごとの違いは第 133 回で詳しく見ました。ここでは要点だけを並べます。
+ここまでの「別のサイト」とは逆向きに、**別のサイトのページに埋め込まれたときに送る Cookie** を**第三者 Cookie**と呼びます。`news.example` のページが `ads.example` の画像や iframe を読み込んだとき、`ads.example` の Cookie がそれです。広告の追跡に使われてきたため、ブラウザは制限を強めてきました。第三者かどうかの決まり方、CHIPS や Storage Access API は第 137 回で、Safari の ITP をはじめとするブラウザごとの違いは第 138 回で詳しく見ました。ここでは要点だけを並べます。
 
 | ブラウザ | 執筆時点（2026 年 9 月）の既定 |
 | --- | --- |
@@ -284,7 +284,7 @@ HttpOnly が防ぐのは、その中の 1 つの経路だけです。実験の�
 | Firefox | 2022 年 6 月から、Total Cookie Protection でサイトごとに Cookie を分けて保存（[Mozilla](https://blog.mozilla.org/en/mozilla/firefox-rolls-out-total-cookie-protection-by-default-to-all-users-worldwide/)） |
 | Chrome | 廃止の計画を撤回し、2025 年 4 月に、既存の設定で利用者が選ぶ形を続けると発表（[Privacy Sandbox](https://privacysandbox.google.com/blog/privacy-sandbox-next-steps)） |
 
-これは広告だけの話ではありません。**SSO の一部は第三者 Cookie に頼っていました**。たとえば、アプリのページに IdP の iframe を隠して埋め込み、「IdP とのセッションがまだ生きているか」を確かめる方式は、iframe の中の IdP の Cookie が第三者 Cookie になるため、Safari や Firefox では動かなくなりました。SSO が「IdP とのセッション」と「各アプリとのセッション」の 2 段でできていること、そしてこの制限への対応は、第 175 回で見ます。
+これは広告だけの話ではありません。**SSO の一部は第三者 Cookie に頼っていました**。たとえば、アプリのページに IdP の iframe を隠して埋め込み、「IdP とのセッションがまだ生きているか」を確かめる方式は、iframe の中の IdP の Cookie が第三者 Cookie になるため、Safari や Firefox では動かなくなりました。SSO が「IdP とのセッション」と「各アプリとのセッション」の 2 段でできていること、そしてこの制限への対応は、第 182 回で見ます。
 
 ## まとめ
 

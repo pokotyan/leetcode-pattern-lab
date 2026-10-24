@@ -16,7 +16,7 @@ topics:
   - SMTP AUTH（SASL）
   - オープンリレー
 requires:
-  - ll-182-mail-map
+  - ll-191-mail-map
   - ll-66-socket-tcp
   - ll-50-durability
 ---
@@ -128,9 +128,9 @@ S: 250 CHUNKING
 | `SIZE 10240000` | 受け取れる最大の大きさ（バイト）。`MAIL FROM` で先に大きさを申告できる | [RFC 1870](https://www.rfc-editor.org/rfc/rfc1870.html) |
 | `8BITMIME` | 最上位ビットが立ったバイト（8 ビット）を本文に含めてよい | [RFC 6152](https://www.rfc-editor.org/rfc/rfc6152.html) |
 | `PIPELINING` | 応答を待たずに複数のコマンドをまとめて送ってよい | [RFC 2920](https://www.rfc-editor.org/rfc/rfc2920.html) |
-| `STARTTLS` | この接続を TLS に切り替えられる（第 187 回） | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html) |
+| `STARTTLS` | この接続を TLS に切り替えられる（第 196 回） | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html) |
 | `AUTH PLAIN LOGIN` | SASL で利用者を認証できる。方式の一覧が続く | [RFC 4954](https://www.rfc-editor.org/rfc/rfc4954.html) |
-| `SMTPUTF8` | アドレスやヘッダに UTF-8 を使える（第 186 回） | [RFC 6531](https://www.rfc-editor.org/rfc/rfc6531.html) |
+| `SMTPUTF8` | アドレスやヘッダに UTF-8 を使える（第 195 回） | [RFC 6531](https://www.rfc-editor.org/rfc/rfc6531.html) |
 | `CHUNKING` | `DATA` の代わりに `BDAT` で長さを先に示して送れる（本文の終わりの印が要らない） | [RFC 3030](https://www.rfc-editor.org/rfc/rfc3030.html) |
 | `ENHANCEDSTATUSCODES` | 応答に `5.1.1` のような詳しいコードを付ける | [RFC 2034](https://www.rfc-editor.org/rfc/rfc2034.html) |
 | `DSN` | 配送の結果を知らせてほしい条件を指定できる | [RFC 3461](https://www.rfc-editor.org/rfc/rfc3461.html) |
@@ -172,7 +172,7 @@ S: 221 2.0.0 Bye
 
 **3. `DATA` の後の行はコマンドではない。** `354` を受けてから本文の終わりを示す行までは、`From:` も `Subject:` もサーバにとっては**ただの文字列**です。前回見た封筒（エンベロープ）と便箋（ヘッダ）の区別は、この会話の形そのものから来ています。
 
-受け取ったメールボックスでは、サーバが先頭に `Received: from client.example.test (unknown [192.168.65.1]) by mx.example.test ...` という 1 行を足していました。`EHLO` でこちらが名乗った名前と、サーバが実際に見た接続元の IP アドレス（逆引きは引けなかったので `unknown`）を並べて書くのは、名乗りが確かめられていないからです。送信側の身元の話は第 185 回で続けます。
+受け取ったメールボックスでは、サーバが先頭に `Received: from client.example.test (unknown [192.168.65.1]) by mx.example.test ...` という 1 行を足していました。`EHLO` でこちらが名乗った名前と、サーバが実際に見た接続元の IP アドレス（逆引きは引けなかったので `unknown`）を並べて書くのは、名乗りが確かめられていないからです。送信側の身元の話は第 194 回で続けます。
 
 ## 本文の終わりと「ドット詰め」
 
@@ -244,7 +244,7 @@ RFC 5321 は、送る側が**行頭の `.` の前にもう 1 つ `.` を足し**
 <Callout type="warn" title="よくある誤解: エラーが出なかったのだから、届いた">
   メールソフトやアプリが受け取る `250` は、**最初の 1 台のサーバが受け取った**という意味でしかありません。
   その先の中継で 4xx が続けば数日キューに留まり、最後に 5xx で断られれば、そのときに送信者宛ての知らせ（バウンス）が作られます。
-  送信の API が成功を返した後に届かなかったことを知る手段は、このバウンス（と第 193 回で見る配信サービスの通知）しかありません。
+  送信の API が成功を返した後に届かなかったことを知る手段は、このバウンス（と第 202 回で見る配信サービスの通知）しかありません。
   アプリで「送った」と「届いた」を同じ状態として記録していると、ここで食い違います。
 </Callout>
 
@@ -364,7 +364,7 @@ C: AUTH LOGIN
 S: 503 5.5.1 Error: authentication not enabled
 C: STARTTLS
 S: 220 2.0.0 Ready to start TLS
-   （TLS 1.3 のハンドシェイク。第 153 回）
+   （TLS 1.3 のハンドシェイク。第 158 回）
 C: EHLO client.example.test
 S: 250-mx.example.test
 ...
@@ -398,13 +398,13 @@ S: 535 5.7.8 Error: authentication failed: authentication failure
 LOGIN は広く実装されていますが、RFC にはならず、草案の中でも「廃止された方式で、PLAIN を使うべき」とされています（[draft-murchison-sasl-login](https://datatracker.ietf.org/doc/draft-murchison-sasl-login/)）。
 
 <Callout type="warn" title="よくある誤解: Base64 にしてあるから、パスワードは隠れている">
-  Base64 は第 170 回で見たとおり符号化であって、鍵を使いません。上のとおり `base64 -d` で誰でも元に戻せます。
+  Base64 は第 176 回で見たとおり符号化であって、鍵を使いません。上のとおり `base64 -d` で誰でも元に戻せます。
   PLAIN も LOGIN も、**パスワードをそのまま送る方式**です。守っているのは下の TLS だけなので、TLS なしで `AUTH` を許してはいけません。
   `smtpd_tls_auth_only` のような設定は、そのための安全装置です。パスワードそのものを送らない方法として、
-  OAuth 2.0 のトークンを SASL で送る方式があり、第 192 回で見ます。
+  OAuth 2.0 のトークンを SASL で送る方式があり、第 201 回で見ます。
 </Callout>
 
-本来、提出は 25 番ではなく 587 番（[RFC 6409](https://www.rfc-editor.org/rfc/rfc6409.html)）か 465 番（[RFC 8314](https://www.rfc-editor.org/rfc/rfc8314.html)）で受けます。今回の実験は、見やすさのために 1 つのポートで中継と提出の両方の役を兼ねさせています。ポートごとの TLS の違いは第 187 回で比べます。
+本来、提出は 25 番ではなく 587 番（[RFC 6409](https://www.rfc-editor.org/rfc/rfc6409.html)）か 465 番（[RFC 8314](https://www.rfc-editor.org/rfc/rfc8314.html)）で受けます。今回の実験は、見やすさのために 1 つのポートで中継と提出の両方の役を兼ねさせています。ポートごとの TLS の違いは第 196 回で比べます。
 
 ### オープンリレー
 
@@ -422,12 +422,12 @@ SMTP の会話そのものは、誰が送ったかも、途中で読まれてい
 | --- | --- | --- | --- |
 | 確実に届く（失わない） | 250 の責任とキュー | fsync で記憶装置まで書く | 第 50 回 |
 | 相手のサーバに届く | TCP の接続 | 接続の一生、再送 | 第 66 回 |
-| どのサーバへ送るか | 決めない | DNS の MX | 第 72 回、第 185 回 |
-| 途中で読まれない | 平文 | STARTTLS と証明書 | 第 131〜135 回、第 187 回 |
-| 提出してきたのが本人 | 名乗るだけ | SASL と TLS、OAuth | 第 166 回、第 171 回、第 192 回 |
-| 送信元のサーバが正当 | 名乗るだけ | SPF | 第 188 回 |
-| 内容が改ざんされていない | 何もしない | DKIM（署名） | 第 144 回、第 189 回 |
-| 利用者が見る差出人が正しい | 何もしない | DMARC | 第 190 回 |
+| どのサーバへ送るか | 決めない | DNS の MX | 第 72 回、第 194 回 |
+| 途中で読まれない | 平文 | STARTTLS と証明書 | 第 136〜140 回、第 196 回 |
+| 提出してきたのが本人 | 名乗るだけ | SASL と TLS、OAuth | 第 172 回、第 177 回、第 201 回 |
+| 送信元のサーバが正当 | 名乗るだけ | SPF | 第 197 回 |
+| 内容が改ざんされていない | 何もしない | DKIM（署名） | 第 149 回、第 198 回 |
+| 利用者が見る差出人が正しい | 何もしない | DMARC | 第 199 回 |
 
 ## まとめ
 
@@ -440,4 +440,4 @@ SMTP の会話そのものは、誰が送ったかも、途中で読まれてい
 - 届かなかったときのバウンスは `MAIL FROM:<>` で送る。受け取ってから断ると、偽の `MAIL FROM` に向けた backscatter になるので、できるだけ `RCPT` の段階で断る
 - 中継してよいのは、自分宛て、信頼するネットワーク、認証済みの相手だけ。PLAIN と LOGIN はパスワードを Base64 にしただけなので、TLS の上でしか使わない
 
-次の第 185 回では、この会話を始める前の段階、つまり送る側の MTA が「どのサーバに接続すればよいか」を DNS の MX からどう決めるのかを見ます。あわせて、受ける側が接続してきた相手の身元を、名乗った名前と逆引きでどう疑うのかを見ます。
+次の第 194 回では、この会話を始める前の段階、つまり送る側の MTA が「どのサーバに接続すればよいか」を DNS の MX からどう決めるのかを見ます。あわせて、受ける側が接続してきた相手の身元を、名乗った名前と逆引きでどう疑うのかを見ます。

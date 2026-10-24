@@ -16,10 +16,10 @@ topics:
   - FIDO の sk 鍵
   - Git の SSH 署名
 requires:
-  - ll-156-ssh-protocol
-  - ll-144-signature
-  - ll-145-key-format
-  - ll-150-pki-chain
+  - ll-161-ssh-protocol
+  - ll-149-signature
+  - ll-150-key-format
+  - ll-155-pki-chain
   - ll-43-permission
 ---
 
@@ -27,7 +27,7 @@ import Callout from '../../components/Callout.astro'
 
 ## 鍵を配る仕事が残る
 
-第 156 回で、SSH の信頼の置き方を見ました。サーバの鍵は最初の接続で覚え（known_hosts）、ユーザの鍵はサーバ側に並べておきます（authorized_keys）。どちらも**生の公開鍵を 1 本ずつ登録する**方式です。
+第 161 回で、SSH の信頼の置き方を見ました。サーバの鍵は最初の接続で覚え（known_hosts）、ユーザの鍵はサーバ側に並べておきます（authorized_keys）。どちらも**生の公開鍵を 1 本ずつ登録する**方式です。
 
 少人数ならこれで困りません。しかし規模が大きくなると、次の仕事がすべて人手に残ります。
 
@@ -40,7 +40,7 @@ import Callout from '../../components/Callout.astro'
 
 ## ssh-agent: 秘密鍵を持ち、署名だけを引き受ける
 
-第 156 回で見たとおり、公開鍵認証でクライアントがするのは、**セッション ID を含むデータに秘密鍵で署名する**ことだけです。秘密鍵そのものをサーバに送る必要はありません。ssh-agent は、この「署名する」部分だけを別のプロセスに切り出したものです。
+第 161 回で見たとおり、公開鍵認証でクライアントがするのは、**セッション ID を含むデータに秘密鍵で署名する**ことだけです。秘密鍵そのものをサーバに送る必要はありません。ssh-agent は、この「署名する」部分だけを別のプロセスに切り出したものです。
 
 ```
  ssh（クライアント）              ssh-agent（秘密鍵をメモリに保持）
@@ -70,7 +70,7 @@ $ ssh-add -l
 256 SHA256:9DvPmAeyL89K/Za8Q127yNjkwcnPYCMLNYH7syIoZi0 alice@laptop (ED25519-CERT)
 ```
 
-`-t 1h` は、1 時間で agent から鍵を消す指定です。隣に `alice-cert.pub` があったので、後で作る証明書も一緒に読み込まれています。fingerprint（第 145 回）が同じなのは、証明書の中身が同じ公開鍵だからです。
+`-t 1h` は、1 時間で agent から鍵を消す指定です。隣に `alice-cert.pub` があったので、後で作る証明書も一緒に読み込まれています。fingerprint（第 150 回）が同じなのは、証明書の中身が同じ公開鍵だからです。
 
 ## エージェント転送: 鍵は渡らないが、使わせてしまう
 
@@ -161,7 +161,7 @@ agent=none
 
 agent と ProxyJump で「秘密鍵を動かさない」ことはできました。残るのは、authorized_keys と known_hosts を**配る**仕事です。
 
-ここで第 150 回の PKI と同じ発想を持ち込みます。サーバが全員の公開鍵を覚える代わりに、**CA の公開鍵を 1 本だけ**覚え、「CA が署名した鍵なら受け入れる」ことにします。これが OpenSSH の証明書で、OpenSSH 5.4（2010 年 3 月）で入りました（[リリースノート](https://www.openssh.org/txt/release-5.4)）。形式は X.509 ではなく、OpenSSH 独自の簡素なものです（[PROTOCOL.certkeys](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.certkeys)）。
+ここで第 155 回の PKI と同じ発想を持ち込みます。サーバが全員の公開鍵を覚える代わりに、**CA の公開鍵を 1 本だけ**覚え、「CA が署名した鍵なら受け入れる」ことにします。これが OpenSSH の証明書で、OpenSSH 5.4（2010 年 3 月）で入りました（[リリースノート](https://www.openssh.org/txt/release-5.4)）。形式は X.509 ではなく、OpenSSH 独自の簡素なものです（[PROTOCOL.certkeys](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.certkeys)）。
 
 ```
 ssh-ed25519-cert-v01@openssh.com
@@ -178,7 +178,7 @@ ssh-ed25519-cert-v01@openssh.com
   signature          ここまでのすべてへの CA の署名
 ```
 
-第 144 回で見たとおり、署名が保証するのは「この**鍵**で署名された」ことだけでした。証明書は、その鍵に「誰の、何のための、いつまでの鍵か」を CA の署名で結び付けます。第 149 回の X.509 と役割は同じですが、**中間 CA による連鎖はありません**。署名に使う鍵が証明書であってはならない、と明記されています（同文書）。
+第 149 回で見たとおり、署名が保証するのは「この**鍵**で署名された」ことだけでした。証明書は、その鍵に「誰の、何のための、いつまでの鍵か」を CA の署名で結び付けます。第 154 回の X.509 と役割は同じですが、**中間 CA による連鎖はありません**。署名に使う鍵が証明書であってはならない、と明記されています（同文書）。
 
 ### ユーザ証明書を発行する
 
@@ -281,7 +281,7 @@ debug1: Server host certificate: ssh-ed25519-cert-v01@openssh.com SHA256:YSpV...
 debug1: Host '[localhost]:2297' is known and matches the ED25519-CERT host certificate.
 ```
 
-最初の接続でも fingerprint の確認を求められません。**TOFU（第 156 回）が、CA の公開鍵を配る 1 回の作業に置き換わりました**。サーバを作り直してホスト鍵が変わっても、新しい鍵に CA が署名していれば警告は出ません。逆に、CA が署名していても名前が principals に無ければ拒否されます。
+最初の接続でも fingerprint の確認を求められません。**TOFU（第 161 回）が、CA の公開鍵を配る 1 回の作業に置き換わりました**。サーバを作り直してホスト鍵が変わっても、新しい鍵に CA が署名していれば警告は出ません。逆に、CA が署名していても名前が principals に無ければ拒否されます。
 
 ```
 $ ssh -F ssh_config -o UserKnownHostsFile=kh_any -o HostKeyAlias=db1.internal alice@lab true
@@ -292,14 +292,14 @@ Host key verification failed.
 
 <Callout type="warn" title="よくある誤解: 「SSH 証明書は X.509 の証明書と同じもの」">
   考え方（CA が鍵と名前を署名で結び付ける）は同じですが、別の形式です。ASN.1 も DER も使わず、SSH の通常の符号化で書かれ、
-  中間 CA の連鎖、CRL の配布点、OCSP はありません。信頼するルートも OS やブラウザのトラストストア（第 150 回）ではなく、
+  中間 CA の連鎖、CRL の配布点、OCSP はありません。信頼するルートも OS やブラウザのトラストストア（第 155 回）ではなく、
   `TrustedUserCAKeys` と `@cert-authority` に**自分で書いた CA だけ**です。
   そのため Web の公開 CA に SSH 証明書を発行してもらうことはできず、CA は自分たちで持ちます。
 </Callout>
 
 ## 失効: 数えきれるうちは KRL、その先は短命に
 
-長く有効な証明書を発行すれば、失効の問題が戻ってきます（第 151 回で見た、Web の証明書と同じ問題です）。OpenSSH には **KRL（Key Revocation List）** があり、serial、Key ID、公開鍵そのものの単位で失効を書けます（[ssh-keygen(1)](https://man.openbsd.org/ssh-keygen.1) の KEY REVOCATION LISTS）。
+長く有効な証明書を発行すれば、失効の問題が戻ってきます（第 156 回で見た、Web の証明書と同じ問題です）。OpenSSH には **KRL（Key Revocation List）** があり、serial、Key ID、公開鍵そのものの単位で失効を書けます（[ssh-keygen(1)](https://man.openbsd.org/ssh-keygen.1) の KEY REVOCATION LISTS）。
 
 ```
 $ printf 'serial: 1001\n' > revoke.txt
@@ -322,16 +322,16 @@ Authentication key ED25519-CERT SHA256:9DvP... revoked by file /etc/ssh/revoked.
   配らなくてよくなるのは**利用者ごとの公開鍵**だけです。CA の公開鍵は全サーバ（と全クライアント）に配る必要があり、
   CA を替えるときは新旧を併記して移行します。失効も、寿命が長ければ KRL の配布が要ります。
   そして **CA の秘密鍵 1 本が漏れれば、全サーバに誰としてでも入れます**。証明書は配布の手間を、
-  CA の鍵を守る問題（第 146 回の KMS や HSM）に集めて置き換えるものです。
+  CA の鍵を守る問題（第 151 回の KMS や HSM）に集めて置き換えるものです。
 </Callout>
 
 ## SSO と組み合わせる: 短命な証明書と、鍵を配らない方式
 
-短命な証明書を毎日手で発行するのは現実的ではありません。そこで、**会社の IdP（第 20〜21 章）でログインした人に、その場で数時間だけの証明書を発行する**仕組みが使われます。
+短命な証明書を毎日手で発行するのは現実的ではありません。そこで、**会社の IdP（第 21〜22 章）でログインした人に、その場で数時間だけの証明書を発行する**仕組みが使われます。
 
 ```
  利用者 ──(1) ブラウザで SSO ログイン──→ IdP
-   │   ←──(2) ID トークン（第 172 回）──┘
+   │   ←──(2) ID トークン（第 178 回）──┘
    │ ──(3) 公開鍵 + ID トークン ──→ SSH CA
    │                                  IdP の署名を検証し、グループから principals を決め
    │ ←──(4) 8 時間だけのユーザ証明書 ──┘ CA の秘密鍵で署名（KMS や HSM の中）
@@ -351,11 +351,11 @@ Authentication key ED25519-CERT SHA256:9DvP... revoked by file /etc/ssh/revoked.
 | SSM Session Manager | インスタンス上のエージェントがシェルを渡し、sshd の受信ポートを開けずに済む。「受信ポート、踏み台、SSH の鍵が要らない」 | [AWS](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html) |
 | IAP の TCP 転送 | 外部 IP の無い VM への SSH を、IAM で許された利用者にだけトンネルで通す | [Google Cloud](https://docs.cloud.google.com/iap/docs/using-tcp-forwarding) |
 
-上の 3 つは **SSH 証明書を短命に発行する型**、OS Login と EC2 Instance Connect は **authorized_keys の中身をクラウドの IAM から引く型**、下の 2 つは **SSH の入口そのものをクラウドの ID で守る型**です。どれも、長く生きる公開鍵をサーバに置かない点で共通しています。この組み立ては第 180 回で、構成の型の 1 つとしてもう一度見ます。
+上の 3 つは **SSH 証明書を短命に発行する型**、OS Login と EC2 Instance Connect は **authorized_keys の中身をクラウドの IAM から引く型**、下の 2 つは **SSH の入口そのものをクラウドの ID で守る型**です。どれも、長く生きる公開鍵をサーバに置かない点で共通しています。この組み立ては第 189 回で、構成の型の 1 つとしてもう一度見ます。
 
 ## 鍵の種類を選ぶ
 
-利用者の鍵は、執筆時点では **Ed25519** が `ssh-keygen` の既定で（[ssh-keygen(1)](https://man.openbsd.org/ssh-keygen.1)）、短く、速く、署名に乱数を使わない（第 144 回）ので、特に理由がなければこれを選びます。RSA は古いサーバや機器との互換のために残します。
+利用者の鍵は、執筆時点では **Ed25519** が `ssh-keygen` の既定で（[ssh-keygen(1)](https://man.openbsd.org/ssh-keygen.1)）、短く、速く、署名に乱数を使わない（第 149 回）ので、特に理由がなければこれを選びます。RSA は古いサーバや機器との互換のために残します。
 
 さらに一段強くするなら、OpenSSH 8.2（2020 年 2 月）で入った **FIDO の sk 鍵**（`ed25519-sk`、`ecdsa-sk`）です（[リリースノート](https://www.openssh.org/txt/release-8.2)）。
 
@@ -379,19 +379,19 @@ gpgsig -----BEGIN SSH SIGNATURE-----
  U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgP+TvbXJm7nUAjm2aGWSPgF5ncG
 ```
 
-`namespaces="git"` は、この署名が Git のためのものだと示す印で、ログイン用の署名やファイルへの署名と取り違えられないようにしています。ここでも、署名が示すのは「この鍵で署名された」ことだけで、その鍵が alice のものだと言っているのは allowed_signers という**別の仕組み**です（第 144 回）。
+`namespaces="git"` は、この署名が Git のためのものだと示す印で、ログイン用の署名やファイルへの署名と取り違えられないようにしています。ここでも、署名が示すのは「この鍵で署名された」ことだけで、その鍵が alice のものだと言っているのは allowed_signers という**別の仕組み**です（第 149 回）。
 
 ## この部品は何と組み合わさるか
 
 | 部品 | 保証するもの | 保証しないもの | 組み合わせる相手 |
 | --- | --- | --- | --- |
 | ssh-agent | 秘密鍵を持ち出させない | 話しかけられる者に署名させないこと | ファイルの権限（第 43 回）、`ssh-add -t` `-c` `-h` |
-| ProxyJump | 踏み台に鍵も平文も渡さない | 踏み台に入れる人の管理 | 内側のホスト鍵の確認（第 156 回） |
-| ユーザ証明書 | この鍵が、この principals で、この期間使える | 鍵の向こうの人が誰か | CA の鍵の保管（第 146 回）、IdP（第 172 回） |
-| ホスト証明書 | このホスト鍵が、この名前のもの | そのサーバの中身が安全か | `@cert-authority`、第 156 回の鍵交換と署名 |
+| ProxyJump | 踏み台に鍵も平文も渡さない | 踏み台に入れる人の管理 | 内側のホスト鍵の確認（第 161 回） |
+| ユーザ証明書 | この鍵が、この principals で、この期間使える | 鍵の向こうの人が誰か | CA の鍵の保管（第 151 回）、IdP（第 178 回） |
+| ホスト証明書 | このホスト鍵が、この名前のもの | そのサーバの中身が安全か | `@cert-authority`、第 161 回の鍵交換と署名 |
 | KRL / 短命化 | 使わせたくない証明書を止める | 配り損ねたサーバでの失効 | 構成管理、正しい時計 |
 
-第 156 回の SSH のトランスポート（鍵交換、署名、AEAD）の上に、この回の部品が載って、初めて「大勢が、鍵を配らずに、辞めた人を締め出しながら」使える形になります。
+第 161 回の SSH のトランスポート（鍵交換、署名、AEAD）の上に、この回の部品が載って、初めて「大勢が、鍵を配らずに、辞めた人を締め出しながら」使える形になります。
 
 ## まとめ
 
@@ -404,4 +404,4 @@ gpgsig -----BEGIN SSH SIGNATURE-----
 - クラウドには、鍵を IAM から引く型（OS Login、EC2 Instance Connect）や、SSH の入口自体を閉じる型（SSM Session Manager、IAP）もある
 - 鍵は Ed25519 を基本に、より強くするなら FIDO の sk 鍵。同じ鍵で Git のコミットにも署名できる
 
-この章では、第 19 章の部品を組み合わせて、**相手の鍵を確かめて話す**ところまで来ました。TLS ではサーバの鍵を CA の署名で、SSH ではホスト鍵を known_hosts や CA で確かめ、クライアント証明書や SSH の公開鍵認証で相手の鍵も確かめられます。ただ、TLS も SSH も、それだけで使われることはあまりありません。ファイル転送、データベースの接続、VPN、無線の認証など、**別のプロトコルの下に敷かれて**初めて役に立ちます。第 21 章では、その載せ方の型と、型ごとに生まれる弱点を見ていきます。
+この章では、第 20 章の部品を組み合わせて、**相手の鍵を確かめて話す**ところまで来ました。TLS ではサーバの鍵を CA の署名で、SSH ではホスト鍵を known_hosts や CA で確かめ、クライアント証明書や SSH の公開鍵認証で相手の鍵も確かめられます。ただ、TLS も SSH も、それだけで使われることはあまりありません。ファイル転送、データベースの接続、VPN、無線の認証など、**別のプロトコルの下に敷かれて**初めて役に立ちます。第 22 章では、その載せ方の型と、型ごとに生まれる弱点を見ていきます。

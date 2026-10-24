@@ -15,15 +15,15 @@ topics:
   - iframe の sandbox 属性
   - window.opener / noopener
 requires:
-  - ll-129-origin-site
-  - ll-113-browser-process
+  - ll-134-origin-site
+  - ll-118-browser-process
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## 表示はできるのに、読めない
 
-第 129 回で、同一オリジンポリシーは主に「読むこと」を制限する、と書きました。これは実際にやってみると、かなり奇妙なふるまいです。
+第 134 回で、同一オリジンポリシーは主に「読むこと」を制限する、と書きました。これは実際にやってみると、かなり奇妙なふるまいです。
 
 - 別のオリジンの画像は、`<img>` でページに**表示できる**。しかしその画素を JavaScript で**読むことはできない**
 - 別のオリジンへフォームで POST を**送れる**。しかも Cookie が付く。しかし返ってきたページを**読むことはできない**
@@ -65,13 +65,13 @@ import Callout from '../../components/Callout.astro'
 <Callout type="warn" title="よくある誤解: 「同一オリジンポリシーがあるので、別のサイトからリクエストは来ない」">
   同一オリジンポリシーが止めるのは、多くの場合**応答を読むこと**で、**リクエストが届くこと**ではありません。
   フォームの POST も、`img` の GET も、読めない `fetch` も、サーバには届きます（下の実験のサーバのログを見てください）。
-  状態を変える要求が別のサイトから届いてしまう問題が CSRF で、これは第 169 回で詳しく見ます。
-  CORS の設定も同じで、「CORS で弾いたのでサーバは守られている」とは言えません。これは第 131 回で扱います。
+  状態を変える要求が別のサイトから届いてしまう問題が CSRF で、これは第 175 回で詳しく見ます。
+  CORS の設定も同じで、「CORS で弾いたのでサーバは守られている」とは言えません。これは第 136 回で扱います。
 </Callout>
 
 ## 手元で確かめる: 送れるが読めない
 
-Python の `http.server` で同じサーバを 2 つ、127.0.0.1 の 18184 番（以下 A。守りたい側）と 18185 番（以下 B。別のオリジンのページ）で動かします。ポートが違うので**別のオリジン**です（第 129 回）。
+Python の `http.server` で同じサーバを 2 つ、127.0.0.1 の 18184 番（以下 A。守りたい側）と 18185 番（以下 B。別のオリジンのページ）で動かします。ポートが違うので**別のオリジン**です（第 134 回）。
 
 A は次のものを返します。
 
@@ -85,7 +85,7 @@ A は次のものを返します。
 | `/transfer` | POST を受けてログに出す |
 | `/frame.html` | iframe に入れる小さなページ（`postMessage` を受ける） |
 
-B の `/attack.html` は、読み込まれると A に対していろいろな操作を試し、結果を配列に貯めます。A のサーバは、届いたリクエストごとにメソッド、パス、`Origin`、`Sec-Fetch-Mode`、`Sec-Fetch-Dest`、`Cookie` を出力します（`Sec-Fetch-*` は第 134 回で詳しく見ます）。
+B の `/attack.html` は、読み込まれると A に対していろいろな操作を試し、結果を配列に貯めます。A のサーバは、届いたリクエストごとにメソッド、パス、`Origin`、`Sec-Fetch-Mode`、`Sec-Fetch-Dest`、`Cookie` を出力します（`Sec-Fetch-*` は第 139 回で詳しく見ます）。
 
 ブラウザは、playwright-cli で起動したヘッドレスの Chrome（153、メモリ上の独立したプロファイル）です。まず A の `/login` を開いて Cookie を受け取り、次に B の `/attack.html` を開きました（手元の実行結果）。
 
@@ -119,9 +119,9 @@ postMessage reply: http://127.0.0.1:18184 -> {"user":"alice","seen_origin":"http
 **B の側では 1 つも読めていないのに、A にはすべての要求が Cookie 付きで届いています**。1 行ずつ見ていきます。
 
 <Callout type="note" title="なぜ Lax の Cookie が付いたのか">
-  127.0.0.1:18184 と 127.0.0.1:18185 は、別のオリジンですが**同じサイト**です（サイトはポートを見ない。第 129 回）。
+  127.0.0.1:18184 と 127.0.0.1:18185 は、別のオリジンですが**同じサイト**です（サイトはポートを見ない。第 134 回）。
   SameSite はサイトを単位にするので、`SameSite=Lax` の Cookie も付きました。
-  B が `localhost` のような別のサイトなら、POST や `fetch` には付きません（第 169 回の実験）。第三者 Cookie としての扱いは第 132 回で見ます。
+  B が `localhost` のような別のサイトなら、POST や `fetch` には付きません（第 175 回の実験）。第三者 Cookie としての扱いは第 137 回で見ます。
 </Callout>
 
 ### fetch: 届くが、応答は渡されない
@@ -177,20 +177,20 @@ A の応答:     got({"user":"alice","balance":1234567})   ← 実行される�
 1. **呼び出した側は、相手のコードを自分のオリジンで丸ごと実行する**。A が乗っ取られたり悪意を持ったりすれば、B のページで何でもできる
 2. **Cookie が付くので、利用者ごとのデータを返す JSONP は、どのサイトからでも読める**。上の実験の B は、A から見れば赤の他人です
 
-CORS（第 131 回）は、この「読ませてよい相手を、コードを実行させずにデータとして渡す」問題を正面から解くために作られました。
+CORS（第 136 回）は、この「読ませてよい相手を、コードを実行させずにデータとして渡す」問題を正面から解くために作られました。
 
 ### JSON を `<script>` で読むとどうなるか
 
 では、JSONP ではない普通の JSON を `<script src>` で読んだらどうでしょう。実験の `script json: onerror` がそれです。ネットワークの要求は A に届いていますが（ログの `Sec-Fetch-Dest=script` の行）、スクリプト要素には**読み込みの失敗**として報告されました。
 
-これは、**ブラウザが、スクリプトとして読み込まれた応答が JSON のようなデータだと判断して、レンダラに渡す前に遮った**ためと考えられます。ここで効いているのが、第 136 回で詳しく見る CORB と、その後継の ORB（Opaque Response Blocking）です。仕様の案では、不透明な応答について MIME タイプと中身の判定を組み合わせて遮るかどうかを決めます（[ORB の説明](https://github.com/annevk/orb)）。
+これは、**ブラウザが、スクリプトとして読み込まれた応答が JSON のようなデータだと判断して、レンダラに渡す前に遮った**ためと考えられます。ここで効いているのが、第 141 回で詳しく見る CORB と、その後継の ORB（Opaque Response Blocking）です。仕様の案では、不透明な応答について MIME タイプと中身の判定を組み合わせて遮るかどうかを決めます（[ORB の説明](https://github.com/annevk/orb)）。
 
 興味深いことに、ログアウトした状態（本文が `{}`）で同じことをすると、`script json: onload` になりました。`{}` は空のブロックとして JavaScript で正しく実行でき、中身らしいものも無いので、遮られなかったのでしょう。**どの応答を遮るかの判定は中身に依存し、仕様の案とブラウザの実装とで細部が異なる**ので、この結果は執筆時点（2026 年 9 月）の Chrome 153 の挙動として読んでください。
 
 <Callout type="warn" title="よくある誤解: 「読めないのだから、同じプロセスに載っても安全」">
-  JSON を `<script>` で読んだときに遮る必要があるのは、**レンダラのプロセスに届いたデータは、Spectre のような攻撃で読める可能性がある**からです（第 113 回、第 11 回）。
+  JSON を `<script>` で読んだときに遮る必要があるのは、**レンダラのプロセスに届いたデータは、Spectre のような攻撃で読める可能性がある**からです（第 118 回、第 11 回）。
   「JavaScript からは読めない」は、ブラウザの中のプログラムが守る約束にすぎません。
-  本当に守るには、**そもそも別のオリジンのプロセスに届けない**必要があります。これが ORB、CORP、COOP / COEP の出発点で、第 136 回で扱います。
+  本当に守るには、**そもそも別のオリジンのプロセスに届けない**必要があります。これが ORB、CORP、COOP / COEP の出発点で、第 141 回で扱います。
 </Callout>
 
 ## 読めなくても漏れる: XS-Leaks
@@ -218,11 +218,11 @@ A の `/avatar.png` は、ログインしていれば画像を、していなけ
 
 | 対策 | 何を止めるか | 詳しく見る回 |
 | --- | --- | --- |
-| SameSite の Cookie | 別のサイトからの要求に Cookie が付かず、「ログインしている状態」の応答を返さない | 第 169 回 |
-| Fetch Metadata でサーバ側で弾く | `Sec-Fetch-Site: cross-site` の要求に、そもそも中身を返さない | 第 134 回 |
-| ストレージとキャッシュの分割 | 「以前に見たか」をキャッシュで調べる経路を塞ぐ | 第 132 回 |
-| COOP | 開いたウィンドウへの参照を切り、`length` などを数えさせない | 第 136 回 |
-| `frame-ancestors` | iframe に入れさせず、フレームを数えさせない | 第 135 回 |
+| SameSite の Cookie | 別のサイトからの要求に Cookie が付かず、「ログインしている状態」の応答を返さない | 第 175 回 |
+| Fetch Metadata でサーバ側で弾く | `Sec-Fetch-Site: cross-site` の要求に、そもそも中身を返さない | 第 139 回 |
+| ストレージとキャッシュの分割 | 「以前に見たか」をキャッシュで調べる経路を塞ぐ | 第 137 回 |
+| COOP | 開いたウィンドウへの参照を切り、`length` などを数えさせない | 第 141 回 |
+| `frame-ancestors` | iframe に入れさせず、フレームを数えさせない | 第 140 回 |
 
 **どれか 1 つで全部が止まるわけではありません**。漏れの経路ごとに、止める部品が違います。
 
@@ -273,7 +273,7 @@ sandbox="allow-scripts"                    → origin: null                    c
 <Callout type="warn" title="同じオリジンのページに allow-scripts と allow-same-origin を両方付けない">
   HTML Standard は、埋め込むページと同じオリジンのページに `allow-scripts` と `allow-same-origin` を同時に付けると、
   **中のページが自分で `sandbox` 属性を外して読み込み直せるので、sandbox から完全に抜け出せる**と警告しています（[HTML Standard 4.8.5](https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox)）。
-  同じオリジンのスクリプトは親の DOM に触れられるからです。信用しない内容は、別のオリジン（できれば別のサイト）から配信したうえで sandbox に入れます。第 139 回の「サンドボックス用のドメイン」はこのためです。
+  同じオリジンのスクリプトは親の DOM に触れられるからです。信用しない内容は、別のオリジン（できれば別のサイト）から配信したうえで sandbox に入れます。第 144 回の「サンドボックス用のドメイン」はこのためです。
 </Callout>
 
 ## window.opener と noopener
@@ -306,7 +306,7 @@ window.open(A)                          → opener=Window  opener.document:Secur
 
 （[Can I use: implicit noopener](https://caniuse.com/mdn-html_elements_a_implicit_noopener)）
 
-ただし、この既定が変わったのは `a`、`area`、`form` の `target="_blank"` だけです。実験の 1 番めのとおり、**`window.open` で開いた場合は今も opener が残ります**。`window.open(url, "_blank", "noopener")` と書くか、ページ全体の単位で opener との関係を切る COOP（第 136 回）を使います。COOP は逆に、OAuth や決済のポップアップが `opener` 経由で結果を返す作りを壊すことがあり、その話も第 136 回で扱います。
+ただし、この既定が変わったのは `a`、`area`、`form` の `target="_blank"` だけです。実験の 1 番めのとおり、**`window.open` で開いた場合は今も opener が残ります**。`window.open(url, "_blank", "noopener")` と書くか、ページ全体の単位で opener との関係を切る COOP（第 141 回）を使います。COOP は逆に、OAuth や決済のポップアップが `opener` 経由で結果を返す作りを壊すことがあり、その話も第 141 回で扱います。
 
 ## 部品の組み合わせ
 
@@ -314,20 +314,20 @@ window.open(A)                          → opener=Window  opener.document:Secur
 
 | この回の境界 | 残る穴 | 塞ぐ部品 |
 | --- | --- | --- |
-| 応答を読ませない（同一オリジンポリシー） | 要求は届き、状態が変わる（CSRF） | SameSite（第 169 回）、CSRF トークン、Fetch Metadata（第 134 回） |
-| 応答を読ませない | 本当に読ませてよい相手にも読ませられない | CORS（第 131 回） |
-| JavaScript から読ませない | 同じプロセスに載ったデータは Spectre で読めうる | ORB、CORP、COOP / COEP（第 136 回）、サイト分離（第 113 回） |
-| 埋め込みは許す | 自分のページが他人の iframe に入れられる（クリックジャッキング） | `frame-ancestors`、`X-Frame-Options`（第 135 回） |
-| 埋め込みは許す | エラー、フレームの数、時間から情報が漏れる（XS-Leaks） | SameSite、Fetch Metadata、COOP、キャッシュの分割（第 132 回） |
+| 応答を読ませない（同一オリジンポリシー） | 要求は届き、状態が変わる（CSRF） | SameSite（第 175 回）、CSRF トークン、Fetch Metadata（第 139 回） |
+| 応答を読ませない | 本当に読ませてよい相手にも読ませられない | CORS（第 136 回） |
+| JavaScript から読ませない | 同じプロセスに載ったデータは Spectre で読めうる | ORB、CORP、COOP / COEP（第 141 回）、サイト分離（第 118 回） |
+| 埋め込みは許す | 自分のページが他人の iframe に入れられる（クリックジャッキング） | `frame-ancestors`、`X-Frame-Options`（第 140 回） |
+| 埋め込みは許す | エラー、フレームの数、時間から情報が漏れる（XS-Leaks） | SameSite、Fetch Metadata、COOP、キャッシュの分割（第 137 回） |
 | `postMessage` で越える | 相手を確かめないと任意のサイトの命令を受ける | `event.origin` の完全一致、targetOrigin の指定 |
-| `sandbox` で削る | 同じオリジンでは抜けられる | 別のオリジン・別のサイトから配信する（第 139 回） |
+| `sandbox` で削る | 同じオリジンでは抜けられる | 別のオリジン・別のサイトから配信する（第 144 回） |
 
 ## ブラウザごとの違い
 
 この回で見た基本の境界（読み出しの禁止、canvas の汚染、別のオリジンの `Window` で触れるものの一覧、`postMessage`、`sandbox`）は HTML Standard と Fetch Standard で決まっていて、主要なブラウザで共通です。違いが出やすいのは次の点です（執筆時点、2026 年 9 月）。
 
 - **どの応答をスクリプトや画像として届けずに遮るか**（CORB / ORB の実装の細部）は、ブラウザごと、版ごとに異なる。上の `{}` の結果は Chrome 153 のもの
-- **Cookie が付くかどうか**は、SameSite の既定と第三者 Cookie の扱いに左右され、Safari、Firefox、Chrome で大きく違う（第 132 回、第 133 回）。上の実験は同じサイトの中なので、どのブラウザでも Lax の Cookie が付く条件
+- **Cookie が付くかどうか**は、SameSite の既定と第三者 Cookie の扱いに左右され、Safari、Firefox、Chrome で大きく違う（第 137 回、第 138 回）。上の実験は同じサイトの中なので、どのブラウザでも Lax の Cookie が付く条件
 - `target="_blank"` の暗黙の noopener は、上の表の版から
 
 この回の実験はヘッドレスの Chrome だけで行いました。WebKit や Firefox での細部の違いは確かめていません。
@@ -338,7 +338,7 @@ window.open(A)                          → opener=Window  opener.document:Secur
 - 読めない `fetch` も、フォームの POST も、`img` の GET も、**サーバには Cookie 付きで届く**。同一オリジンポリシーはサーバを守る仕組みではない
 - `no-cors` の応答は不透明（status 0、ヘッダなし、本文なし）で、別のオリジンの画像を描いた canvas は汚染されて画素を読めない
 - `<script>` は相手のコードを自分のオリジンで実行する。これを使った JSONP は、コードの実行と、Cookie 付きのデータを誰にでも読ませる危うさを抱え、CORS に置き換えられた
-- ブラウザは JSON のような応答を `<script>` として届けずに遮る。「読めない」だけでは同じプロセスのメモリから守れないため（第 136 回）
+- ブラウザは JSON のような応答を `<script>` として届けずに遮る。「読めない」だけでは同じプロセスのメモリから守れないため（第 141 回）
 - 読めなくても、成功と失敗、フレームの数、大きさ、時間から情報が漏れる（XS-Leaks）。漏れの経路ごとに止める部品が違う
 - `postMessage` は境界を越える正式な窓口で、`event.origin` の完全一致の確認と、targetOrigin の指定が要る
 - `sandbox` は `allow-same-origin` を付けなければ `null` オリジンにする。同じオリジンに `allow-scripts` と一緒に付けると抜けられる

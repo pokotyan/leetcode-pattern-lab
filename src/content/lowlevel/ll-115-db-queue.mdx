@@ -1,0 +1,506 @@
+---
+title: データベースをキューにする
+description: 業務データがすでに PostgreSQL にあるなら、ジョブの表も同じデータベースに置けば、業務の更新とジョブの登録を 1 つのトランザクションにできます。では、複数のワーカーが同じ表から仕事を取り合うと何が起きるのか。SKIP LOCKED、取った後に落ちたときの戻し方、LISTEN / NOTIFY による起床、勧告ロック、表の膨張、トランザクショナル outbox を、手元で測って確かめます
+chapter: handoff
+order: 3
+status: published
+topics:
+  - SKIP LOCKED / NOWAIT
+  - SELECT ... FOR UPDATE
+  - ジョブキューの表
+  - locked_until（リース）
+  - idle_in_transaction_session_timeout
+  - LISTEN / NOTIFY
+  - 勧告ロック
+  - dead tuple / autovacuum
+  - パーティションの DROP
+  - トランザクショナル outbox
+  - pg-boss / River / Que / graphile-worker / Solid Queue
+requires:
+  - ll-114-queue
+  - ll-113-retry-idempotency
+  - ll-100-db-lock
+  - ll-99-db-wal-mvcc
+  - ll-105-db-connection
+  - ll-106-db-replication
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 注文を確定して、メールを送る
+
+注文を受けたら、`orders` 表に行を書き、確認メールを送るとします。メールの送信は遅く、失敗もするので、リクエストの中ではやらずにキューへ積み、ワーカーに任せます。第 114 回で見たキューのどれかを使うなら、コードはこうなります。
+
+```
+BEGIN;
+INSERT INTO orders ...;
+COMMIT;
+queue.send({"type": "order_mail", "order_id": 123})   ← ここで落ちたら？
+```
+
+`COMMIT` の後、キューに送る前にプロセスが落ちると、注文はあるのにメールは永遠に送られません。順番を逆にして先にキューへ送ると、今度は `COMMIT` が失敗したときに、**存在しない注文のメール**が送られます。データベースとキューという 2 つの書き込み先を、1 つの操作のように揃える手段がないからです。第 113 回の冪等性キーは「同じ要求が 2 回届く」問題を解きましたが、「片方にしか届かない」問題は解けません。
+
+業務データがすでに PostgreSQL にあるなら、素朴な答えがあります。**ジョブも同じデータベースの表に書けばよい。**
+
+```sql
+BEGIN;
+INSERT INTO orders ...;
+INSERT INTO jobs (kind, args) VALUES ('order_mail', '{"order_id": 123}');
+COMMIT;
+```
+
+2 つの `INSERT` は、両方コミットされるか、両方なかったことになるかのどちらかです。第 99 回の WAL とコミットの仕組みが、そのまま保証してくれます。新しい部品も増えません。
+
+では、この `jobs` 表から、複数のワーカーが仕事を取り合うとき、何が起きるのでしょうか。この回では、素朴な実装の失敗から始めて、`SKIP LOCKED`、取った後に落ちたときの戻し方、待ち方、表の膨張と順に見ていき、最後に「いつ専用のキューに移すべきか」を、手元で測った数字で考えます。
+
+## 素朴な実装: 読んでから書く
+
+最初に思いつくのは、「まだ誰も取っていない最初のジョブ」を読み、自分のものと印を付けることです。
+
+```sql
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1;   -- 42 が返る
+UPDATE jobs SET status = 'running' WHERE id = 42;
+-- 処理する
+UPDATE jobs SET status = 'done' WHERE id = 42;
+```
+
+1 人で動かしている間は問題ありません。2 人になると、こうなります。
+
+```
+ ワーカー A                               ワーカー B
+ SELECT ... LIMIT 1  → 42
+                                          SELECT ... LIMIT 1  → 42（まだ queued）
+ UPDATE ... SET status='running' WHERE id=42
+                                          UPDATE ... SET status='running' WHERE id=42
+ 42 を処理                                 42 を処理         ← 二重に処理される
+```
+
+`SELECT` と `UPDATE` の間に隙間があり、その間に他人が同じ行を読めます。第 99 回の言葉で言えば、**読んだ値に基づいて書いているのに、読んだ後に変わっていないかを誰も確かめていない**状態です。後の実験では、2000 件のジョブを 4 人で取り合ったところ、**1260 件が 2 回以上処理されました**。
+
+`UPDATE jobs SET status = 'running' WHERE id = 42 AND status = 'queued'` のように条件を付け、更新できた行数が 0 なら諦める、という直し方もあります。これは第 116 回で見る「比較して交換する」書き込みです。二重処理は防げますが、全員が同じ先頭の行を狙って負け続けるので、人数が増えるほど空振りが増えます。
+
+## FOR UPDATE: 全員が先頭の 1 行に並ぶ
+
+隙間をなくすには、読む時点で行ロックを取ります。
+
+```sql
+BEGIN;
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE;
+UPDATE jobs SET status = 'done' WHERE id = 42;
+COMMIT;
+```
+
+第 100 回で見たとおり、PostgreSQL の行ロックはタプルの `xmax` に自分のトランザクション ID を書くことで表され、待つ側は**そのトランザクションの終了を待ちます**。A が 42 をロックしている間、B の `SELECT ... FOR UPDATE` も同じ 42 に行き当たり、A のコミットを待ちます。A がコミットすると、B は 42 を読み直し、もう `queued` ではないので捨てて、次の行に進みます。ところが次の行は、B と一緒に待っていた C がすでにロックしているかもしれません。
+
+二重処理はなくなりますが、**全員が列の先頭の 1 行に並ぶ**ことになります。ワーカーを何人足しても、同時に処理しているのは実質 1 人です。実験では、1 件 5 ms の処理でワーカーを 1 人から 16 人に増やしても、スループットは毎秒 40〜100 件のまま変わらず、ジョブを取るまでの待ちの p99 は 5 秒に達しました。
+
+`NOWAIT` を付ければ、待つ代わりにエラーで返ります（[PostgreSQL 文書: SELECT](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)）。待たなくはなりますが、先頭の行を取れなかった人がエラーを受けてやり直すだけなので、並ぶ問題は解決しません。
+
+## SKIP LOCKED: ロックされている行は飛ばす
+
+キューに欲しいのは、「先頭が取られていたら、次の空いている行をくれ」という動きです。それが `SKIP LOCKED` です。
+
+```sql
+BEGIN;
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;
+...
+COMMIT;
+```
+
+PostgreSQL の文書は、こう説明しています（[PostgreSQL 文書: The Locking Clause](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)）。
+
+- `SKIP LOCKED` では、すぐにロックできない行は飛ばされる
+- ロックされた行を飛ばすので、**見えるデータは一貫しない**。一般の用途には向かないが、**キューのような表を複数の消費者が読むときのロック競合を避ける**のには使える
+- `LIMIT` があれば、必要な行数が返った時点でロックを止める
+
+PostgreSQL では 9.5 で入りました（[PostgreSQL 9.5 リリースノート](https://www.postgresql.org/docs/release/9.5.0/)）。MySQL（InnoDB）も 8.0.1 から `NOWAIT` と `SKIP LOCKED` を持ち（[MySQL 8.0.1 リリースノート](https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-1.html)）、文書には同じく「一貫しない見え方を返すので一般のトランザクションには向かないが、キューのような表を複数のセッションが読むときのロック競合を避けるのに使える」と書かれています。MySQL では、`SKIP LOCKED` を含む文は STATEMENT 形式のレプリケーションでは安全でない、とも注意されています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html)）。第 106 回で見たとおり、どの行を飛ばしたかは実行したタイミング次第で、レプリカで同じ文を流し直しても同じ行を選ぶとは限らないからです。
+
+```
+ status='queued' の行を id 順に並べたところ
+
+ [42 A がロック中] [43 B がロック中] [44] [45] [46] ...
+        ↑ 飛ばす          ↑ 飛ばす      ↑ C はここを取る
+```
+
+実験では、同じ 1 件 5 ms の処理で、ワーカー 1 人で毎秒 65〜89 件、4 人で 104〜268 件、16 人で 860〜1156 件と、人数に応じて伸び、ジョブを取るまでの時間は p99 でも数 ms のままでした。
+
+<Callout type="warn" title="一貫しない、とは何を手放すことか">
+  `SKIP LOCKED` で取る順番は「id の小さい順」に近いだけで、厳密な先入れ先出しではありません。
+  42 を取った A が処理に時間をかけている間に、43 も 44 も終わります。
+  A が失敗して 42 がやり直しになれば、もっと後になります。
+  第 114 回で見た「順序は 1 列の中でしか守られない」のと同じで、
+  順序を守りたい範囲があるなら、後で見る勧告ロックのように、別の仕組みで直列にする必要があります。
+</Callout>
+
+### 取ることと、印を付けることを 1 文にする
+
+実際の実装は、選ぶ `SELECT` と状態を変える `UPDATE` を 1 文にまとめています。たとえば Go の River は、次の形の SQL でジョブを取ります（[River のソース: river_job.sql](https://github.com/riverqueue/river/blob/master/riverdriver/riverpgxv5/internal/dbsqlc/river_job.sql)。一部を省略）。
+
+```sql
+WITH locked_jobs AS (
+    SELECT * FROM river_job
+    WHERE state = 'available' AND queue = @queue AND scheduled_at <= now()
+    ORDER BY priority, scheduled_at, id
+    LIMIT @max_to_lock
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE river_job
+SET state = 'running', attempt = river_job.attempt + 1, attempted_at = now(), ...
+FROM locked_jobs
+WHERE river_job.id = locked_jobs.id
+RETURNING ...
+```
+
+選んでロックした行を、同じ文の中で `running` にして返します。この文が終わってコミットした時点で、ジョブの行には「誰かが取った」ことが書かれています。この「取ったことを行に書いて、トランザクションはすぐ閉じる」作りが、次の節の話につながります。
+
+## 取った後に落ちたら
+
+ワーカーはジョブを取った後、処理の途中で落ちることがあります。そのジョブを、いつ、どうやって他の人に回すのか。やり方は大きく 2 つです。
+
+### 方式 1: トランザクションの中で処理する
+
+`SELECT ... FOR UPDATE SKIP LOCKED` で取ったら、**同じトランザクションを開いたまま**処理し、終わったら `done` にしてコミットします。
+
+```
+ BEGIN
+ SELECT ... FOR UPDATE SKIP LOCKED   ← 行ロックを持つ
+ （メールを送る、など。数秒〜数分）
+ UPDATE jobs SET status = 'done' ...
+ COMMIT                               ← ここでロックが外れる
+```
+
+ワーカーのプロセスが落ちれば、接続が切れ、バックエンドはトランザクションをロールバックし、行ロックが外れます。ジョブは何もしなくても `queued` のまま戻ります。実験では、ワーカーを `kill -9` してから、別のワーカーが同じジョブを取れるまで **10 ms** でした。業務の更新（たとえば `orders` の状態を変える）をジョブの完了と同じトランザクションに入れられるのも、この方式の利点です。
+
+ただし、代償が 2 つあります。
+
+**処理の間ずっとトランザクションが開いている。** 第 99 回で見たとおり、古い版はそれを必要とするスナップショットが 1 つでもある限り消せません。トランザクションの中で外部の API を 1 分待つワーカーが常に何人かいれば、その間に生じた dead tuple はどの表のものも片付けられません。後の実験では、開いたままのトランザクションが 1 本あるだけで、10 万件の処理にかかる時間が 37 秒から 126 秒に延びました。同時に、ワーカー 1 人につき接続を 1 本、処理の間ずっと握ります。第 105 回で見たように、transaction モードのプーラーで接続を束ねる効果も、処理が長いほど薄れます。
+
+**接続が「切れたことに気づけない」と戻らない。** プロセスが落ちれば TCP の接続はすぐ閉じられますが、ワーカーのマシンごとネットワークから消えた場合は、サーバの側からは「何も送ってこないクライアント」に見えるだけです。実験でワーカーのコンテナをネットワークから外したところ、バックエンドは `idle in transaction` のまま、2 分たってもロックを持ち続けました。PostgreSQL の `tcp_keepalives_idle` の既定値 `0` は OS の既定値を使う意味で、Linux では 2 時間です。対策は、トランザクションの中で何もしていない時間に上限を付ける `idle_in_transaction_session_timeout` です（[PostgreSQL 文書](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT)）。10 秒に設定すると、約 10 秒後に `terminating connection due to idle-in-transaction timeout` で切られ、ジョブが戻りました。ただし、設定を変える前からアイドルで止まっていたセッションには効きませんでした。バックエンドがタイマーを仕掛けるのは次の問い合わせを待ち始める時点で、設定の再読み込みはその問い合わせを受け取った後に行われるため、と考えられます。
+
+### 方式 2: 状態と期限を行に書く
+
+もう 1 つは、取った時点で行に**期限**を書き、すぐコミットしてしまう方式です。
+
+```sql
+UPDATE jobs
+SET status = 'running', locked_until = now() + interval '10 seconds', attempts = attempts + 1
+WHERE id = (
+    SELECT id FROM jobs
+    WHERE status = 'queued' OR (status = 'running' AND locked_until < now())
+    ORDER BY id LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, attempts;
+```
+
+処理はトランザクションの外で行い、終わったら `done` にします。落ちたワーカーのジョブは、`locked_until` を過ぎると条件に当てはまるようになり、誰かが取り直します。これは第 114 回の **可視性タイムアウトを、自分で表の上に作った**ものです。取るときに行ロックを使うのは一瞬だけで、長いトランザクションは生まれません。
+
+実験では、ワーカーを `kill -9` してから別のワーカーが同じジョブを取り直すまで **9 秒**かかりました。取ってから 1 秒後に落としたので、期限の 10 秒どおりです。取り直したときの `attempts` は 2 になっていました。
+
+| | 方式 1: トランザクションの中で処理 | 方式 2: 状態列 + 期限 |
+| --- | --- | --- |
+| 落ちたときに戻るまで | 接続が切れた瞬間（実験で 10 ms）。切れたと分からなければ戻らない | 期限が来るまで（実験で 9 秒） |
+| 処理中のトランザクション | 開いたまま。VACUUM を止め、接続を握る | 取るときの一瞬だけ |
+| 業務の更新と完了の記録 | 同じトランザクションにできる | 別々。完了を書く前に落ちれば、やり直しになる |
+| 処理が期限より長引くと | 関係ない | 他の人にも取られる。期限を延ばし続ける（heartbeat）必要がある |
+| 近い実装 | Que（行ロックの代わりにセッション単位の勧告ロックを持ち続ける） | River、pg-boss、graphile-worker。Solid Queue は期限の代わりにプロセスの heartbeat で判断する |
+
+どちらの方式でも、**処理は終わったのに `done` を書く前に落ちた**ジョブは、もう一度実行されます。データベースをキューにしても、配送の保証は第 114 回と同じ at-least-once です。ジョブの処理は、第 113 回の冪等性キーなどで、2 回実行されても困らないように作ります。
+
+<Callout type="warn" title="期限切れの後に、元のワーカーが戻ってくる">
+  方式 2 では、落ちたと思われたワーカーが、実は GC で止まっていただけ、ということがあります。
+  期限が切れて B が取り直した後に A が目を覚まし、`UPDATE jobs SET status = 'done' WHERE id = 42` を実行すると、
+  B がまだ処理中のジョブを「完了」にしてしまいます。
+  完了の更新には `AND locked_by = 'A'` や `AND attempts = 1` のような条件を付け、
+  自分がまだ持ち主であることを確かめる必要があります。
+  この「期限付きの持ち主」と「古い持ち主の書き込みを拒む」仕組みは、次の第 116 回のリースとフェンシングそのものです。
+</Callout>
+
+### 既存の実装は何を選んでいるか
+
+公開されているジョブキューのライブラリは、どれもこの 2 つの方式のどちらか、または組み合わせです。
+
+| 実装 | 言語 | 取り方 | 落ちたワーカーのジョブ |
+| --- | --- | --- | --- |
+| [River](https://riverqueue.com/docs) | Go ほか | `FOR UPDATE SKIP LOCKED` で取り、`running` にしてコミット | 既定で 1 時間たっても `running` のジョブを救出する（[Maintenance services](https://riverqueue.com/docs/maintenance-services)） |
+| [pg-boss](https://github.com/timgit/pg-boss) | Node.js | `FOR UPDATE OF j SKIP LOCKED` | `active` のまま `expireInSeconds`（既定 15 分）を過ぎるとやり直し。heartbeat も選べる（[pg-boss の文書](https://github.com/timgit/pg-boss/blob/master/docs/api/queues.md)） |
+| [graphile-worker](https://worker.graphile.org/) | Node.js | `skip locked` で取り、`locked_at` と `locked_by` を書く | 4 時間以上ロックされたままのジョブを、各ワーカーが 8〜10 分ごとに解放する（[Error handling](https://worker.graphile.org/docs/error-handling)） |
+| [Que](https://github.com/que-rb/que) | Ruby | 行ロックではなく、セッション単位の勧告ロック `pg_try_advisory_lock(id)` | 接続が切れれば勧告ロックが外れ、すぐ他のワーカーが取れる |
+| [Solid Queue](https://github.com/rails/solid_queue) | Ruby（Rails 8 の既定） | `ready_executions` から `FOR UPDATE SKIP LOCKED` で選び、`claimed_executions` に移す | heartbeat が既定で 5 分途絶えたプロセスのジョブを「失敗」にする。自動ではやり直さない |
+
+Que の README は、勧告ロックを選んだ理由として、ワーカーどうしがブロックしないこと、ロックがメモリ上にあるのでジョブを取るたびにディスクへ書かずに済むこと、Ruby のプロセスが死ねばすぐに他のワーカーが取れることを挙げています（[Que の README](https://github.com/que-rb/que)）。第 100 回で見たとおり、`FOR UPDATE` は行に印を書くので WAL が出ますが、勧告ロックは共有メモリのロック表に載るだけです。方式 1 の「落ちたらすぐ戻る」を、長いトランザクションなしで手に入れる工夫です。その代わり、セッション単位の勧告ロックは transaction モードのプーラーと両立しません（第 105 回）。
+
+Solid Queue は MySQL、PostgreSQL、SQLite で動き、`SKIP LOCKED` があれば使います。文書は、最大のスループットには MySQL 8 以降、MariaDB 10.6 以降、PostgreSQL 9.5 以降を勧めています（[Solid Queue の README](https://github.com/rails/solid_queue)）。
+
+## 待ち方: ポーリングと LISTEN / NOTIFY
+
+キューが空のとき、ワーカーはどうやって新しいジョブに気づくのでしょうか。いちばん単純なのは、一定の間隔で取りに行く**ポーリング**です。間隔が遅延の上限を決め、短くするほど空振りの問い合わせが増えます。Solid Queue のワーカーは既定で 0.1 秒、graphile-worker は 2 秒、Que は最大 5 秒ごとにポーリングします。
+
+PostgreSQL なら、第 105 回で見た LISTEN / NOTIFY でワーカーを起こせます。ジョブを入れるトランザクションで `NOTIFY` し、ワーカーは `LISTEN` して待ちます。`NOTIFY` はコミットされたときに配られるので、ワーカーが起きた時点でジョブの行は必ず見えています。
+
+```sql
+BEGIN;
+INSERT INTO orders ...;
+INSERT INTO jobs ...;
+NOTIFY jobs;          -- コミットされたら配られる
+COMMIT;
+```
+
+第 105 回で確かめたとおり、通知は永続化されず、ワーカーが切断している間の通知は失われます。だから**通知は合図で、本体は表から読む**という使い方になります。River の設定の説明もこの位置付けで、新しいジョブは通常 LISTEN / NOTIFY でほぼすぐ拾われ、1 秒（既定）ごとのポーリングは予備だと書いています（[River のソース: client.go](https://github.com/riverqueue/river/blob/master/client.go)）。graphile-worker もジョブの挿入時に `jobs:insert` へ通知し、pg-boss は通知をキューごとに選べる機能にしています。
+
+実験で、ジョブが入ってからワーカーが取るまでの時間を測ると、1 秒ごとのポーリングで中央値 579 ms（最大 1004 ms）、0.1 秒ごとで中央値 39 ms、LISTEN / NOTIFY では中央値 4.4 ms でした。
+
+<Callout type="note" title="LISTEN する接続は別に持つ">
+  `LISTEN` はそれを実行したバックエンドに登録されるので、transaction モードの PgBouncer を通すと通知が届きません（第 105 回）。
+  ワーカーのプロセスごとに LISTEN 専用の接続を 1 本、プーラーを通さずに張り、
+  プロセスの中で各スレッドに配る作りが一般的です。
+</Callout>
+
+## 同じキーは順に、別のキーは並列に
+
+「同じ顧客のジョブは同時に 2 つ動かしたくないが、別の顧客のジョブは並列に動かしたい」ということがあります。同じ口座への入金と出金、同じ記事の再インデックスなどです。`SKIP LOCKED` はジョブの行ごとに排他するだけなので、同じ顧客の 2 件を別々のワーカーが同時に取ってしまいます。
+
+ここで **勧告ロック**（advisory lock）が使えます。番号に意味を持たせるのはアプリで、データベースは番号ごとの排他だけを提供します（[PostgreSQL 文書: Advisory Locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)）。ジョブを取ったら、その顧客の番号で `pg_try_advisory_xact_lock` を試み、取れなければそのジョブは諦めて次の候補に移ります。
+
+```sql
+BEGIN;
+SELECT id, customer_id FROM jobs WHERE status = 'queued'
+ORDER BY id LIMIT 32 FOR UPDATE SKIP LOCKED;
+-- 候補を順に見て、最初に取れた 1 件を処理する
+SELECT pg_try_advisory_xact_lock(customer_id);   -- false なら次の候補へ
+...
+COMMIT;   -- 行ロックも勧告ロックもここで外れる
+```
+
+`_xact_` の付いた版はトランザクションの終わりに自動で外れます。付いていない版はセッション単位で、ロールバックしても外れず、明示的に外すかセッションが終わるまで残ります（同上）。文書は、`LIMIT` の付いた問い合わせの中で直接ロック関数を呼ぶと、`LIMIT` が効く前に余分な行のロックを取ってしまうことがある、と注意しています。上のように候補を先に取り出してから 1 件ずつ試すか、副問い合わせで `LIMIT` を先に効かせます。
+
+実験では、16 人のワーカーで 1 件 20 ms のジョブを処理しました。顧客が 4 人のとき、勧告ロックなしでは同じ顧客のジョブが最大 10 件同時に走っていましたが、勧告ロックを使うと同時に 1 件だけになり、スループットは毎秒 536 件から 79 件に落ちました。顧客が 1 人なら毎秒 31 件で、1 件ずつ順に処理するのと変わりません。**並列度の上限は、ワーカーの数ではなくキーの数で決まる**ようになります。第 114 回で見た、Kafka のパーティションや SQS FIFO のメッセージグループと同じ構図です。
+
+なお、この方法で守られるのは「同時に 2 件動かない」ことだけで、「id の順に処理される」ことまでは守られません。A が 1 件目の行をロックしてから勧告ロックを取るまでの間に、B が 2 件目で先に勧告ロックを取れば、2 件目が先に動きます。順序まで要るなら、「同じキーで自分より前の未処理のジョブがあれば取らない」という条件を足すなど、もう一段の工夫が要ります。
+
+## 表が膨らむ
+
+キューの表は、データベースの中でもっとも過酷な使われ方をする表の 1 つです。行は入ってきて、数秒で更新され、すぐ不要になります。第 99 回で見たとおり、PostgreSQL の `UPDATE` と `DELETE` は古い版を残し、それを片付けるのは VACUUM です。
+
+ジョブを取る問い合わせは「`status = 'queued'` で id の小さい順」なので、部分インデックス `CREATE INDEX ON jobs (id) WHERE status = 'queued'` を使うのが定石です。ところが、処理を終えて `done` にしたジョブの**インデックスの項目は、VACUUM が来るまで残ります**。ジョブを取るたびに、すでに終わった大量の項目を先頭から読み飛ばすことになります。
+
+実験で 10 万件を処理し終えた直後、キューに 1 件だけ残した状態でジョブを取る問い合わせは、インデックスのページを 276 枚読んで 0.3 ms かかりました。`VACUUM` の後は 2 枚、0.02 ms です。それでも 0.3 ms で済んでいるのは、インデックスを走査したときに「この項目の先の行は、もう誰からも見えない」と分かった項目に印（`LP_DEAD`）が付き、以後はヒープを見に行かずに済むからです（[PostgreSQL 文書: B-Tree](https://www.postgresql.org/docs/current/btree.html)）。
+
+**長いトランザクションがあると、話が変わります。** 誰かのスナップショットから見える可能性がある限り、古い版は「誰からも見えない」とは言えず、印も付けられず、VACUUM も消せません。開いたままの REPEATABLE READ のトランザクションを 1 本置いて同じ 10 万件を処理すると、処理に 126 秒（なしでは 37 秒）かかり、ヒープは 2 倍の 10MB に膨らみ、最後のジョブを取る問い合わせは 913 ページを読んで 5 ms かかりました。その間 autovacuum は 2 回走りましたが、何も消せていません。手で `VACUUM VERBOSE` を実行すると、こう報告されます。
+
+```
+tuples: 0 removed, 2000 remain, 1000 are dead but not yet removable
+```
+
+方式 1 の「トランザクションの中で処理する」ワーカーは、まさにこの長いトランザクションを自分で作っています。キューの表だけでなく、同じデータベースの業務の表も、同じ理由で膨らみます。
+
+### autovacuum を、キューの表に合わせる
+
+autovacuum は、dead tuple の数が `autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × 行数` を超えた表を VACUUM します（[PostgreSQL 文書: Routine Vacuuming](https://www.postgresql.org/docs/current/routine-vacuuming.html)）。既定は `50 + 0.2 × 行数` で、各表を見に行く間隔の `autovacuum_naptime` は 1 分です。PostgreSQL 18 では、割合に関係なく固定の数で起動させる `autovacuum_vacuum_max_threshold` も加わりました（[PostgreSQL 18 リリースノート](https://www.postgresql.org/docs/18/release-18.html)）。
+
+行数に比例する閾値は、大きな表をたまに更新する使い方を想定しています。キューの表は行数が少ないまま、更新だけが大量に来るので、表ごとに閾値を下げます。文書も、更新の非常に多い表を数分おきに VACUUM している例に触れ、表ごとに設定を上書きできると書いています。
+
+```sql
+ALTER TABLE jobs SET (
+  autovacuum_vacuum_scale_factor = 0.0,
+  autovacuum_vacuum_threshold    = 5000
+);
+```
+
+ただし、どれだけ頻繁に VACUUM しても、長いトランザクションが残した版は消せません。`pg_stat_activity` で `xact_start` の古いセッションを見張ることと、`idle_in_transaction_session_timeout` を設定することが、キューを DB に置くときの前提になります。
+
+### 消さずに、表ごと捨てる
+
+もう 1 つの方法は、終わったジョブを行単位で消さないことです。日付などで表をパーティションに分けておけば、古い日のパーティションを `DROP TABLE`（または `DETACH PARTITION` してから `DROP`）するだけで、dead tuple を作らずに丸ごと捨てられます。実験では、10 万行を `DELETE` すると 49 ms かかり、ファイルの大きさは 5096kB のまま（中身は dead tuple）でしたが、同じ大きさのパーティションの `DROP TABLE` は 5 ms で、ファイルごと消えました。第 114 回で見た Kafka がセグメントのファイルごとに捨てていたのと、同じ発想です。
+
+pg-boss は、キューごとに専用のパーティションを持たせる `partition` オプションを用意しています。文書は、既定ではすべてのキューのジョブが 1 つの表を共有するので、大きく育ったキューや滞留したキューが他のキューを遅くしうる、と説明しています（[pg-boss の文書: queues](https://github.com/timgit/pg-boss/blob/master/docs/api/queues.md)）。River は完了したジョブを既定で 24 時間、破棄したジョブを 7 日間残してから消し、Solid Queue も完了したジョブを既定で 1 日残して、1 時間ごとにまとめて消します。
+
+## トランザクショナル outbox
+
+ここまでは、ジョブを**同じデータベースの中のワーカー**が処理する話でした。冒頭の問題は、相手が Kafka のような外のキューでも起きます。注文の確定と、「注文が確定した」というイベントの発行を揃えたいときです。
+
+そこで、イベントをいったん同じデータベースの **outbox 表**に書きます。
+
+```sql
+BEGIN;
+UPDATE orders SET status = 'confirmed' WHERE id = 123;
+INSERT INTO outbox (aggregatetype, aggregateid, type, payload)
+VALUES ('order', '123', 'OrderConfirmed', '{"order_id": 123, ...}');
+COMMIT;
+```
+
+別のプロセス（リレー）が outbox 表を読み、外のキューへ送ります。業務の更新と「送るべきもの」の記録が同じトランザクションに入るので、片方だけが残ることはありません。これが **トランザクショナル outbox** で、Chris Richardson のパターン集は、リレーの作り方として**ポーリング**と**トランザクションログの追跡**の 2 つを挙げています（[microservices.io: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html)）。
+
+```
+ アプリ ──(1 トランザクション)──→ orders + outbox
+                                       │
+           ┌───────────────────────────┴────────────────────────┐
+           ▼                                                     ▼
+ ポーリング: outbox を SKIP LOCKED で読み、            ログ追跡: 論理デコーディングで
+ 送ったら消す（この回のキューそのもの）                  outbox への INSERT を読む（第 106 回）
+           │                                                     │
+           └─────────────────→ Kafka などのキュー ←───────────────┘
+```
+
+**ポーリングの場合**、outbox 表はこの回で見たジョブの表そのものです。`SKIP LOCKED` で取り、送ったら消すか印を付けます。dead tuple の問題もそのまま付いてきます。
+
+**ログ追跡の場合**は、第 106 回で見た論理デコーディングを使います。Debezium の outbox イベントルーターは、outbox 表への `INSERT` を WAL から読み、`aggregatetype` の値をもとに送り先のトピックを決めます。文書は、outbox 表への変更は `INSERT` だけであることを前提とし、`DELETE` は自動で取り除くと書いています（[Debezium: Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html)）。WAL から読むので、行を書いた後に消しても、`INSERT` の記録は論理デコーディングで取り出せます。表を膨らませずに済む反面、第 106 回で見たとおり、読み手のいなくなったレプリケーションスロットは WAL を溜め続けます。
+
+どちらでも、リレーは送った後、送ったことを記録する前に落ちることがあります。パターン集も、リレーが同じメッセージを 2 回以上送りうるので、受け手は冪等でなければならないと書いています。ここでも保証は at-least-once です。
+
+## 手元で確かめる
+
+### 実験の環境
+
+すべて Docker の中で行い、ホストへのポート公開はしていません。ワーカーは Python のプロセスで、1 プロセスが 1 本の接続を持ちます。
+
+| 役割 | ソフトウェア | 版 |
+| --- | --- | --- |
+| データベース | `postgres:17` イメージ（設定は既定のまま） | PostgreSQL 17.11（aarch64） |
+| ワーカー | `python:3.13-slim`、psycopg | Python 3.13.17、psycopg 3.3.6 |
+| Docker | Docker Engine（Apple Silicon の macOS 上の VM、8 CPU、16GB） | 29.4.0 |
+
+表は次の形です。`status = 'queued'` の部分インデックスを付けています。
+
+```sql
+CREATE TABLE jobs (
+  id bigserial PRIMARY KEY, k int, payload text,
+  status text NOT NULL DEFAULT 'queued',
+  locked_until timestamptz, attempts int NOT NULL DEFAULT 0);
+CREATE INDEX jobs_queued ON jobs (id) WHERE status = 'queued';
+```
+
+コミットのたびに `fsync` を待つ既定の設定なので、1 件ごとにコミットする今回の作りでは、処理が 0 ms でも 1 人あたり毎秒 260 件ほどが上限でした。同じマシンで他の処理も動いていたため、スループットは同じ条件でも回によって 2 割ほど揺れます。3 回測ったものは範囲で示します。
+
+### (1) 素朴な実装の二重処理
+
+2000 件のジョブを、`SELECT` してから `UPDATE` する素朴なワーカーで処理し、処理したジョブを別の表に記録しました。
+
+```
+naive workers=4:  processed=3312 distinct_jobs=2000 jobs_processed_twice_or_more=1260
+naive workers=16: processed=6347 distinct_jobs=2000 jobs_processed_twice_or_more=1858
+```
+
+4 人で 2000 件のうち 1260 件、16 人では 1858 件が 2 回以上処理されました。処理の合計は 6347 回で、1 件あたり平均 3 回以上です。全員が同じ「先頭の行」を同時に読むので、ぶつかるのが例外ではなく普通になります。
+
+### (2) FOR UPDATE だけ、(3) FOR UPDATE SKIP LOCKED
+
+20 万件を入れた表で、1 件 5 ms の処理（トランザクションの中で眠る）を 5 秒間続け、処理できた件数と、ジョブを取る `SELECT` にかかった時間を測りました。どちらも二重処理は 0 件です。
+
+| ワーカー数 | FOR UPDATE（件 / 秒） | 取るまでの p50 / p99 | SKIP LOCKED（件 / 秒） | 取るまでの p50 / p99 |
+| --- | --- | --- | --- | --- |
+| 1 | 39〜101 | 0.2〜0.4 ms / 1.5〜5.6 ms | 65〜89 | 0.2 ms / 1.3〜2.7 ms |
+| 4 | 70〜98 | 20〜31 ms / 191〜241 ms | 104〜268 | 0.2〜0.3 ms / 2.3〜3.1 ms |
+| 16 | 47〜94 | 24〜47 ms / 5.1〜5.2 秒 | 860〜1156 | 0.3〜0.4 ms / 2.9〜3.9 ms |
+
+`FOR UPDATE` だけでは、人数を増やしても件数は 1 人のときと同じ範囲に留まり、待ち時間だけが伸びました。16 人のときの p99 が 5 秒台なのは、測定時間のほぼ全部を待って終わったワーカーがいたということです。`SKIP LOCKED` は 16 人で 1 人の 10 倍以上になりました。4 人の回で 1 度だけ 104 件に留まったのは、同じマシンの他の負荷による揺れと考えています。処理を 0 ms にすると、`SKIP LOCKED` は 1 人で毎秒 258 件、4 人で 616 件、16 人で 1642 件で、ここではコミットの `fsync` が上限を決めています。
+
+### (4) 処理中のワーカーを kill する
+
+ワーカー A にジョブを取らせ、1 秒後に `kill -9` で止め、ワーカー B が 50 ms ごとに同じジョブを取りに行きました。
+
+```
+（方式 1: トランザクションの中で処理）
+   0.00s worker A holds job 1 (backend pid 484); kill -9 worker A
+   0.01s backend 484 is gone from pg_stat_activity
+   0.01s worker B got job 1 again: (1,)
+
+（方式 2: locked_until = now() + 10 秒）
+   0.00s worker A holds job 1 (backend pid 487); kill -9 worker A
+   0.06s backend 487 is gone from pg_stat_activity
+   9.04s worker B got job 1 again: (1, 2)
+```
+
+方式 1 は、接続が閉じた瞬間にジョブが戻りました。方式 2 は、バックエンドがすぐ消えても、ジョブは期限まで戻らず、取り直したときの `attempts` は 2 でした。
+
+次に、方式 1 のワーカー A を別のコンテナで動かし、ジョブを取った後に `docker network disconnect` でネットワークから外しました。プロセスは生きたまま、パケットが届かなくなった状態です。
+
+```
+（idle_in_transaction_session_timeout = 0、既定）
+   0.02s idle-in-tx backends: 492:idle in transaction
+120s passed, job 1 still locked
+
+（idle_in_transaction_session_timeout = '10s' を設定してから、やり直す）
+   0.00s idle-in-tx backends: 514:idle in transaction
+   6.94s idle-in-tx backends: None
+   6.96s job 1 is claimable again
+LOG（サーバ）: FATAL:  terminating connection due to idle-in-transaction timeout
+```
+
+既定の設定では、2 分たってもジョブはロックされたままでした。タイムアウトを 10 秒にすると、A が最後に問い合わせを送ってから約 10 秒（観察を始めたのは A がジョブを取った約 3 秒後）で接続が切られ、ジョブが戻りました。1 回目の途中で `ALTER SYSTEM` と `pg_reload_conf()` によって 10 秒に変えましたが、すでに `idle in transaction` で止まっていた 492 には、さらに 60 秒待っても効きませんでした。
+
+### (5) 10 万件を処理した後の表
+
+10 万件を 8 人のワーカーで `SKIP LOCKED` で取り、`status = 'done'` に更新して処理しました。最後に 1 件だけ新しいジョブを入れ、それを取る問い合わせを `EXPLAIN (ANALYZE, BUFFERS)` で見ています。dead tuple の数は、統計の `n_dead_tup` と、`pgstattuple` で実際にページを数えた値の両方を示します。
+
+| 状態 | 処理時間 | ヒープ | 主キーの索引 | `n_dead_tup` | pgstattuple の dead | 1 件を取る問い合わせ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 処理前 | | 5096kB | 2208kB | 0 | 0 | |
+| 処理直後（autovacuum 既定） | 36.8 秒 | 5888kB | 2208kB | 100000 | 17 | 276 ページ、0.33 ms |
+| 手で `VACUUM` した後 | | 5888kB | 2208kB | 1 | 0 | 2 ページ、0.02 ms |
+| 長いトランザクションを開いたまま処理した直後 | 125.7 秒 | 10208kB | 4408kB | 100171 | 100000 | 913 ページ、5.1 ms |
+| その状態で `VACUUM` | | 10208kB | 4408kB | 100002 | 100001 | 914 ページ、6.6 ms |
+| 長いトランザクションを終えて `VACUUM` | | 10208kB | 4408kB | 1 | 0 | 2 ページ、0.02 ms |
+
+読み取れることが 3 つあります。
+
+- 長いトランザクションがなければ、処理直後でも `pgstattuple` の dead は 17 しかありませんでした。ページを読んだついでに古い版を片付ける処理（ページの刈り込み）が、ヒープの側はほぼ掃除していたからです。一方、統計の `n_dead_tup` は 10 万のままで、索引の項目も残っていて、1 件を取るのに索引のページを 276 枚読んでいます。37 秒の処理の間、autovacuum は一度も走りませんでした（`autovacuum_naptime` は 1 分）
+- 長いトランザクションが 1 本あるだけで、処理時間は 3.4 倍になりました。10 秒ごとに数えた処理済みの件数は、最初の 10 秒の約 1 万 9000 件から、終盤には 10 秒で約 5000 件に落ちています。進むほど、読み飛ばす版が増えていくからです
+- 長いトランザクションがある間は、手で `VACUUM` しても何も消えません。終わらせてから `VACUUM` すると、すぐに元の速さに戻りました。ただし、一度広がったファイル（10208kB）は縮みません。空きは再利用されるだけです
+
+`DELETE` で消す作りでも、処理直後の `n_dead_tup` は 10 万、1 件を取る問い合わせは 276 ページで、`VACUUM` するとヒープは 0 バイトまで切り詰められました。
+
+### (6) 勧告ロックで、キーごとに直列にする
+
+10 万件のジョブに `k` として顧客番号を振り、16 人のワーカーで 1 件 20 ms の処理を 5 秒間続けました。処理の開始と終了の時刻を記録し、同じ `k` で時間が重なった組を数えています。
+
+```
+keys=4 advisory=False workers=16: 2744 jobs in 5.1s = 536/s overlapping_pairs_same_key=7219 max_concurrency_per_key=10
+keys=4 advisory=True  workers=16:  400 jobs in 5.1s =  79/s overlapping_pairs_same_key=0    max_concurrency_per_key=1
+keys=1 advisory=True  workers=16:  158 jobs in 5.1s =  31/s overlapping_pairs_same_key=0    max_concurrency_per_key=1
+```
+
+勧告ロックなしでは、同じ顧客のジョブが最大 10 件同時に走っていました。勧告ロックを使うと、重なりは 0 件になりました。顧客 4 人で毎秒 79 件、1 人で 31 件です。1 件 20 ms なら 1 本の列で毎秒 50 件が上限なので、4 人なら上限は 200 件ですが、取れなかったワーカーが候補を探し直す空振りの分、そこまでは届いていません。
+
+### (7) 起こし方による遅延
+
+ジョブを 0.1〜0.5 秒の不規則な間隔で 30 件入れ、入れた時刻からワーカーが取るまでの時間を測りました。
+
+| 起こし方 | 中央値 | 最大 |
+| --- | --- | --- |
+| 1 秒ごとのポーリング | 579 ms | 1004 ms |
+| 0.1 秒ごとのポーリング | 39 ms | 103 ms |
+| LISTEN / NOTIFY（予備のポーリングは 5 秒） | 4.4 ms | 12.8 ms |
+
+ポーリングの遅延はおおむね間隔の半分が中央値で、最大は間隔そのものです。NOTIFY はコミットを待ってから配られますが、それでも数 ms で届きました。
+
+## いつ専用のキューに移すか
+
+データベースのキューは、業務の更新とジョブの登録を 1 つのトランザクションにできるという、専用のキューには無い性質を持っています。その代わり、キューの負荷はすべて、業務と同じデータベースにかかります。判断の材料を、測れる形で並べます。
+
+| 観点 | データベースのキューで足りる目安 | 専用のキューを考える兆候 |
+| --- | --- | --- |
+| スループット | 1 件ごとのコミットで、毎秒数百〜数千件（今回の手元では 16 人で約 1600 件） | ジョブの書き込みと完了の更新が、業務の書き込みより多くなる。WAL の量やレプリカの遅れ（第 106 回）がジョブで増える |
+| 表の健全さ | autovacuum が追いつき、`n_dead_tup` が一定の範囲に収まる | 長いトランザクションを避けられない、VACUUM が追いつかない、取る問い合わせの読むページ数が増え続ける |
+| 接続 | ワーカーの数が `max_connections` の一部で済む | ワーカーを増やすたびに接続が足りなくなる。LISTEN の接続も数に入る |
+| ファンアウト | 1 件のジョブを 1 人が処理すれば済む | 同じイベントを複数の別のシステムが、それぞれのペースで読む |
+| 保持と再読み | 終わったジョブは消してよい | 過去のイベントを、位置を戻して読み直したい（第 114 回のログ型） |
+
+最後の 2 つは、量ではなく**形**の問題です。1 つのジョブを誰か 1 人が処理して消す、という使い方なら表で表せますが、同じイベントを何種類もの読み手がそれぞれの位置から読む、という形は、第 114 回のログ型のキューのほうが自然です。そのときも、データベースとキューを揃える部分には、この回の outbox が使えます。
+
+逆に、量が理由で移す判断は、測ってから行えば十分です。今回の手元の環境でも、ジョブを取る 1 文は数百マイクロ秒で、上限を決めていたのはコミットの `fsync` でした。まとめて取る（`LIMIT` を 1 より大きくする）、完了の更新をまとめてコミットする、といった工夫でも上限は動きます。
+
+## まとめ
+
+- 業務データと同じデータベースにジョブの表を置けば、業務の更新とジョブの登録を 1 つのトランザクションにできる。DB とキューの両方に書いて片方だけが残る問題が、構造的に消える
+- `SELECT` してから `UPDATE` する素朴な実装は、同じジョブを複数のワーカーが取る。手元では 4 人で 2000 件のうち 1260 件が二重に処理された
+- `FOR UPDATE` で二重処理はなくなるが、全員が先頭の 1 行に並び、人数を増やしてもスループットは増えない。`SKIP LOCKED`（PostgreSQL 9.5、MySQL 8.0.1 から）はロックされた行を飛ばし、人数にほぼ比例して伸びる。その代わり厳密な順序は手放す
+- 取った後に落ちたときの戻し方は 2 つ。トランザクションの中で処理すれば接続が切れた瞬間に戻るが、長いトランザクションが VACUUM を止め、接続が切れたと分からなければ戻らない（`idle_in_transaction_session_timeout` で上限を付ける）。状態と期限を行に書けば、期限が来たら戻る。表の上に作った可視性タイムアウトで、完了の更新では自分がまだ持ち主かを確かめる
+- どちらでも保証は at-least-once。ジョブは 2 回実行されても困らないように作る
+- 空のキューを待つには、ポーリングか LISTEN / NOTIFY。通知は合図で、本体は表から読む。手元では、1 秒のポーリングで中央値 579 ms、NOTIFY で 4.4 ms
+- 勧告ロックをキーの番号で取れば、同じキーは同時に 1 件、別のキーは並列にできる。並列度の上限はキーの数になる
+- キューの表は dead tuple が溜まりやすい。終わったジョブの索引の項目を読み飛ばすコストが積み上がり、長いトランザクションがあると VACUUM も効かない（手元で処理時間 3.4 倍）。表ごとに autovacuum の閾値を下げ、長いトランザクションを見張り、パーティションごと `DROP` する方法もある
+- 外のキューへ送るときは、トランザクショナル outbox。送るべきものを同じトランザクションで表に書き、リレーがポーリングか論理デコーディング（Debezium など）で外へ流す。ここでも受け手は冪等に作る
+- 専用のキューに移す理由は、量よりも形（ファンアウト、保持と再読み）であることが多い。量は、取る問い合わせのページ数、`n_dead_tup`、接続数、WAL の量を測って判断する
+
+この回のジョブの表では、期限を書いた行が「いまこのジョブを持っているのは誰か」を表していました。次の第 116 回では、それをジョブ 1 件ではなく「いま動いてよいのは 1 人だけ」という役割に広げ、条件付き書き込み、リース、そして期限切れの持ち主の書き込みを拒むフェンシングを見ます。

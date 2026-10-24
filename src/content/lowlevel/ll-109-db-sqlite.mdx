@@ -1,0 +1,537 @@
+---
+title: SQLite：ファイル 1 つのデータベースと、WAL を外に送る複製
+description: サーバを持たず、ファイル 1 つでできているデータベースは、誰が読み書きの順番を決め、どうやって電源断でも壊れずにいるのか。そして、そのファイルを別の場所へどう複製するのか。SQLite のロックとジャーナル、WAL、Litestream の仕組みを手元で確かめます
+chapter: db
+order: 14
+status: published
+topics:
+  - SQLite
+  - ロールバックジャーナル
+  - SHARED / RESERVED / PENDING / EXCLUSIVE
+  - WAL モード
+  - wal-index（-shm）
+  - チェックポイント
+  - SQLITE_BUSY / busy_timeout
+  - BEGIN IMMEDIATE
+  - Litestream
+  - LTX
+  - LiteFS
+  - libSQL / Turso
+requires:
+  - ll-99-db-wal-mvcc
+  - ll-104-db-vectorized
+  - ll-108-db-backup
+---
+
+import Callout from '../../components/Callout.astro'
+
+## サーバのいないデータベースは、誰が順番を決めるのか
+
+第 108 回では、ベースバックアップに WAL を足していけば任意の時点に戻せることを見ました。そこでは、PostgreSQL のサーバが WAL を書き、`archive_command` を呼び、`pg_basebackup` の求めに応じてチェックポイントを取っていました。**サーバという 1 つのプロセスが、ファイルへの読み書きをすべて仕切っている**から成り立つ仕組みです。
+
+第 104 回では、サーバを持たずアプリのプロセスの中で動く DuckDB を見ました。そこで比べた SQLite も同じ組み込み型ですが、DuckDB と違って**複数のプロセスが同じファイルに書けます**。仕切り役のサーバがいないのに、なぜそれができるのでしょうか。
+
+- 何十ものプロセスが同じファイルを開いているとき、誰が「いま書いてよいのは誰か」を決めるのか
+- 書いている途中で電源が落ちたら、ファイルはどうやって元に戻るのか
+- 仕切り役がいないデータベースで、第 108 回の「ベースバックアップ + ログ」をどうやるのか
+
+この回では、SQLite のファイルの中身から始めて、ロックとジャーナル、WAL モード、そして WAL を外のオブジェクトストレージへ送り続ける Litestream までを順に見ます。
+
+## ファイル 1 つの中身
+
+SQLite のデータベースは、文字どおりファイル 1 つです。表も索引もスキーマも、すべてそのファイルの中にあります。中身は、第 96 回と同じく**固定長のページの並び**です。
+
+ページの大きさは 512 から 65536 までの 2 の累乗で、1 つのファイルの中では全ページが同じ大きさです（[SQLite: Database File Format](https://www.sqlite.org/fileformat2.html)）。既定は長く 1024 バイトでしたが、3.12.0（2016 年）から **4096 バイト**になりました（[SQLite: PRAGMA page_size](https://www.sqlite.org/pragma.html#pragma_page_size)）。PostgreSQL の 8KB、InnoDB の 16KB より小さく、OS のページや多くの SSD の書き込み単位と揃っています。
+
+### 先頭の 100 バイト
+
+1 ページ目の先頭 100 バイトは、ファイル全体のヘッダです（[SQLite: Database File Format 1.3](https://www.sqlite.org/fileformat2.html#the_database_header)）。主なものを挙げます。
+
+| 位置 | 大きさ | 中身 |
+| --- | --- | --- |
+| 0 | 16 | 文字列 `SQLite format 3` と NUL 1 バイト |
+| 16 | 2 | ページの大きさ（ビッグエンディアン。値 1 は 65536 を表す） |
+| 18 / 19 | 1 / 1 | 書き込み / 読み取りの形式の版。1 はロールバックジャーナル、2 は WAL |
+| 24 | 4 | ファイル変更カウンタ。変更してロックを外すたびに 1 増える |
+| 28 | 4 | ページ数で表したファイルの大きさ |
+| 56 | 4 | 文字コード（1 なら UTF-8） |
+| 96 | 4 | このファイルを最後に書いた SQLite の版番号 |
+
+ヘッダの中に「WAL モードかどうか」まで書かれているので、ファイルを開いた別のプロセスも、どの方式で読み書きすべきかを知ることができます。
+
+### 表は B+tree、索引は B-tree
+
+ページの上には B-tree が載ります。SQLite には 2 種類あります（[SQLite: Database File Format 1.6](https://www.sqlite.org/fileformat2.html#b_tree_pages)）。
+
+| | table b-tree | index b-tree |
+| --- | --- | --- |
+| キー | 64 ビットの符号付き整数（rowid） | 任意の値（索引の列 + rowid） |
+| データの置き場所 | **葉にだけ**行の中身を置く | データは持たない。キーそのものが中身 |
+| 使い道 | 普通の表 | 索引、`WITHOUT ROWID` の表 |
+
+table b-tree は、内部ノードにキーだけを置いて葉に行を並べるので、B+tree と同じ形です。行が rowid の順に葉に並ぶのは、第 97 回で見た **InnoDB のクラスタ化インデックス**とよく似ています。索引の葉には rowid が入っていて、索引から行を引くには rowid で table b-tree をもう一度たどります。InnoDB のセカンダリインデックスが主キーの値を持つのと同じ形です。
+
+スキーマの置き場所も決まっていて、**1 ページ目は `sqlite_schema` という表の table b-tree の根**です。`CREATE TABLE` の文と、その表の根のページ番号がここに並びます（[SQLite: Database File Format 2.6](https://www.sqlite.org/fileformat2.html#storage_of_the_sql_database_schema)）。ファイルを開いたら 1 ページ目を読めば、すべての表と索引にたどり着けます。
+
+## 調停役はファイルロック
+
+サーバがいない SQLite で、プロセスどうしの順番を決めているのは **OS のファイルロック**です。各プロセスの中の SQLite は、データベースファイルの特定のバイト範囲にロックを掛け合うことで、互いの状態を知ります。既定の方式（ロールバックジャーナル）では、ロックは次の 5 段階です（[SQLite: File Locking And Concurrency](https://www.sqlite.org/lockingv3.html)）。
+
+| ロック | 意味 | 同時に持てる数 |
+| --- | --- | --- |
+| UNLOCKED | 何も持っていない | — |
+| SHARED | 読んでよい。書いてはいけない | いくつでも |
+| RESERVED | いずれ書くつもり。いまは読んでいるだけ | 1 つ。SHARED とは共存できる |
+| PENDING | すぐ書きたい。今いる SHARED が抜けるのを待っている | 1 つ。**新しい SHARED は取れなくなる** |
+| EXCLUSIVE | ファイルに書いている | 1 つ。ほかのロックとは一切共存しない |
+
+段階が細かいのは、書き手が**ファイルを書き換える瞬間だけ**を排他にして、それ以外の時間は読み手と並べたいからです。PENDING は、読み手が次々にやってきて書き手がいつまでも EXCLUSIVE を取れない、という飢餓を防ぐための段です。
+
+### 元のページを先に逃がす
+
+書き手は次の順で動きます（[SQLite: Atomic Commit](https://www.sqlite.org/atomiccommit.html)、[lockingv3 5.0](https://www.sqlite.org/lockingv3.html#writing)）。
+
+```
+ 1. SHARED を取り、ページを読む
+ 2. RESERVED を取る（ほかの書き手はここで締め出される。読み手は続けてよい）
+ 3. 書き換える前のページを、そのまま app.db-journal にコピーする   ← 元のページの退避
+    変更はまだメモリの中だけ。本体のファイルは元のまま
+ 4. ジャーナルを fsync し、ヘッダに「何ページ入っているか」を書いて、もう一度 fsync
+ 5. PENDING → EXCLUSIVE を取る（今いる読み手が抜けるのを待つ）
+ 6. 本体のファイルに変更したページを書き、fsync
+ 7. ジャーナルを削除する                                         ← ここがコミットの瞬間
+ 8. ロックを外す
+```
+
+第 99 回の WAL は「変更を先にログへ書く」方式でした。ロールバックジャーナルは逆で、**「元の状態を先にログへ書き、本体はその場で書き換える」**方式です。第 99 回の言葉でいえば undo だけのログで、redo は持ちません。コミットの時点で本体はすでに書き換え終わっているので、redo は要らないのです。
+
+途中で電源が落ちると、ジャーナルが残ります。次にファイルを開いたプロセスは、RESERVED を誰も持っていないのにジャーナルがある（文書の言葉で **hot journal**）ことに気付き、ジャーナルから元のページを書き戻してから読み始めます（[lockingv3 4.0](https://www.sqlite.org/lockingv3.html#rollback)）。ジャーナルが消えていればコミット済み、残っていれば巻き戻す。**ファイルが 1 つ消えるという、ファイルシステムの 1 回の操作**がコミットの境目になっています。
+
+<Callout type="note" title="fsync は 3 回">
+  文書によると、既定の `synchronous=FULL` では、ジャーナルの中身の後、ジャーナルのヘッダ（ページ数）の後、本体の書き込みの後と、多くの環境で 3 回の flush が要ります。
+  ヘッダのページ数を最後に書くのは、中身が書き終わる前に電源が落ちたとき、壊れたジャーナルを巻き戻さないためです（[SQLite: Atomic Commit 3.7、3.10](https://www.sqlite.org/atomiccommit.html)）。
+  第 99 回の WAL が「末尾への追記と fsync 1 回」でコミットできたのと比べると、ずいぶん重い手順です。
+</Callout>
+
+### 読み手がいると、書き手はコミットできない
+
+手順 5 に注意してください。EXCLUSIVE は、ほかのロックと一切共存しません。**読み取りのトランザクションが 1 つでも開いていれば、書き手は本体を書き換えられず、コミットできません**。そして書き手が PENDING を持った瞬間から、新しく来た読み手は入れなくなります。後の実験 1 で、これをそのまま見ます。
+
+ロールバックジャーナルの方式では、読み手と書き手は「ファイルを書き換える瞬間」を挟んで、互いに待ち合います。第 99 回の MVCC が解いた「読む人を待たせない」は、ここではまだ解けていません。
+
+## WAL モード：本体を書き換えずに追記する
+
+3.7.0（2010 年）から、SQLite には **WAL モード**が入りました（[SQLite: Write-Ahead Logging](https://www.sqlite.org/wal.html)）。`PRAGMA journal_mode=WAL` で切り替え、ファイルのヘッダに記録されるので、以後そのファイルを開く全員が WAL で動きます。
+
+```
+            app.db（本体）         app.db-wal（追記するだけ）            app.db-shm（wal-index）
+          ┌──────────────┐     ┌────┬───────┬───────┬───────┬─────┐   ┌───────────────────┐
+          │ チェックポイント │     │ヘッダ│ フレーム │ フレーム │ フレーム │ ... │   │ ページ番号 → フレーム │
+          │ 済みのページ    │     │32B │ 24B+頁 │ 24B+頁 │ 24B+頁 │     │   │ の対応表（共有メモリ） │
+          └──────────────┘     └────┴───────┴───────┴───────┴─────┘   └───────────────────┘
+                 ▲                                 │ ↑ コミットのフレーム
+                 └──── チェックポイントで書き戻す ───┘
+```
+
+- 書き手は本体を書き換えず、変更したページを **`-wal` ファイルの末尾にフレームとして追記**する。コミットは「コミットを示す印の付いたフレームを追記すること」（[SQLite: WAL](https://www.sqlite.org/wal.html)）
+- フレームは 24 バイトのヘッダとページ 1 枚。ヘッダにはページ番号と、コミットのフレームならコミット後のページ数が入る（[File Format 4.1](https://www.sqlite.org/fileformat2.html#wal_file_format)）
+- 読み手は、読み始めるときに **WAL の中の最後の有効なコミットの位置**を覚える。文書はこれを **end mark** と呼ぶ。以後、そのトランザクションの間は end mark より後のフレームを無視する
+- あるページを読むときは、end mark までの WAL にそのページの新しい版があればそれを、なければ本体のページを読む。どのページが WAL のどこにあるかを探す索引が **wal-index** で、`-shm` ファイルを全プロセスでメモリにマップして共有する
+
+end mark は、第 99 回の**スナップショット**そのものです。書き手が後ろに追記しても、読み手は自分の end mark より前しか見ないので、読み始めた瞬間の状態を読み続けられます。文書の言葉では、WAL モードの SQLite は **snapshot isolation** を示します（[SQLite: Isolation](https://www.sqlite.org/isolation.html)）。古い版を置く場所が、PostgreSQL ではヒープ、InnoDB では undo log でしたが、SQLite の WAL モードでは **本体のファイルそのもの**が古い版で、新しい版が WAL に積まれていきます。
+
+その結果、「読み手は書き手を妨げず、書き手は読み手を妨げない」が手に入ります。ただし文書は続けて、**WAL ファイルは 1 つしかないので、書き手は同時に 1 つだけ**とも書いています（[SQLite: WAL](https://www.sqlite.org/wal.html)）。
+
+### チェックポイント
+
+WAL に積んだページは、いずれ本体に書き戻します。これが SQLite の**チェックポイント**です。既定では、WAL が 1000 ページに達したコミットの後に、自動で `PASSIVE` のチェックポイントが走ります（[PRAGMA wal_autocheckpoint](https://www.sqlite.org/pragma.html#pragma_wal_autocheckpoint)）。
+
+チェックポイントにも、読み手の制約が効いてきます。まだ古い end mark で読んでいる読み手がいれば、その読み手が本体から読むかもしれないページは上書きできません。文書は、**常に誰かが読んでいる状態が続くと、チェックポイントが最後まで進まず、WAL が際限なく伸びる**と注意しています（[SQLite: WAL](https://www.sqlite.org/wal.html)）。第 99 回の「長いトランザクションは全員の敵」が、ここでも同じ形で出てきます。
+
+| モード | 動き（[PRAGMA wal_checkpoint](https://www.sqlite.org/pragma.html#pragma_wal_checkpoint)） |
+| --- | --- |
+| `PASSIVE` | 誰も待たず、書き戻せるところまで書き戻す |
+| `FULL` | 書き手がいなくなり、全読み手が最新のスナップショットで読むまで待つ |
+| `RESTART` | `FULL` に加え、次の書き手が WAL の先頭から書けるよう、読み手が WAL を使い終わるまで待つ |
+| `TRUNCATE` | `RESTART` に加え、WAL を 0 バイトに切り詰める |
+
+チェックポイントが済んでも、WAL ファイルは普通は縮みません。次の書き手が**先頭から上書きして再利用**します（[SQLite: WAL](https://www.sqlite.org/wal.html)）。
+
+### 同じマシンでなければならない理由
+
+wal-index は共有メモリです。**同じマシンの上のプロセスどうしでしか共有できません**。文書ははっきり、WAL を使うプロセスはすべて同じホストにいなければならず、ネットワークファイルシステムの上では WAL は動かないと書いています（[SQLite: WAL](https://www.sqlite.org/wal.html)）。
+
+ロールバックジャーナルなら NFS の上でも動くかというと、それも勧められていません。SQLite は書き込みに排他ロックを頼っていて、一部のネットワークファイルシステムではそのロックが正しく働かず、データベースが壊れた事例があると文書は書いています。複数のマシンから読み書きしたいなら、クライアント・サーバ型のデータベースを使うか、ファイルのあるマシンに中継役を置くように、というのが SQLite 自身の勧めです（[SQLite Over a Network](https://www.sqlite.org/useovernet.html)）。
+
+**サーバを持たないということは、ファイルのあるマシンの外には出られない**ということでもあります。後半で見る複製の仕組みは、どれもこの制約の上に作られています。
+
+## 書き手は 1 つずつ：SQLITE_BUSY と busy_timeout
+
+ロックが取れなかったとき、SQLite は待ちません。すぐに **`SQLITE_BUSY`**（「database is locked」）を返します。待たせたいなら、**busy handler** を設定します。`PRAGMA busy_timeout=5000` なら、最大 5 秒まで間を置きながらロックを取り直します（[PRAGMA busy_timeout](https://www.sqlite.org/pragma.html#pragma_busy_timeout)、[SQLite: Result Codes](https://www.sqlite.org/rescode.html#busy)）。
+
+もう 1 つ大事なのが、トランザクションの始め方です。`BEGIN`（既定の DEFERRED）は、最初の書き込みの文が来るまでロックを取りません。読み取りから始めたトランザクションが後で書こうとして、その間に別の接続がコミットしていると、WAL モードでは **`SQLITE_BUSY_SNAPSHOT`** になります。自分のスナップショットがもう古いので、**待っても解決せず、やり直すしかありません**（[Result Codes: SQLITE_BUSY_SNAPSHOT](https://www.sqlite.org/rescode.html#busy_snapshot)）。
+
+書くと分かっているトランザクションは `BEGIN IMMEDIATE` で始めます。最初に書き手の権利を取りに行くので、`BEGIN IMMEDIATE` 自体は `SQLITE_BUSY` を返しうるものの、成功すればその後 `COMMIT` まで `SQLITE_BUSY` にはならないと文書は保証しています（[Result Codes: SQLITE_BUSY](https://www.sqlite.org/rescode.html#busy)）。待つ場所が先頭の 1 か所にまとまるので、busy_timeout がそこで効きます。
+
+<Callout type="note" title="BEGIN CONCURRENT は本流にない">
+  SQLite には、複数の書き手を同時に進める `BEGIN CONCURRENT` という拡張があります。COMMIT までロックを取らず、ページ単位の楽観的な検査で衝突したトランザクションだけを `SQLITE_BUSY_SNAPSHOT` にする方式です。
+  ただしこれは begin-concurrent という別のブランチにある機能で（[begin_concurrent.md](https://www.sqlite.org/cgi/src/doc/begin-concurrent/doc/begin_concurrent.md)）、sqlite.org が配る通常の SQLite には入っていません。
+  文書自身も「通常、SQLite が同時に進められる書き手は多くて 1 つ」と書き出しています。
+</Callout>
+
+### DuckDB との違い
+
+第 104 回の DuckDB と並べると、どちらも「書き手は 1 つ」ですが、その単位が違います。
+
+| | DuckDB | SQLite（WAL モード） |
+| --- | --- | --- |
+| ファイルを書き込み可能で開けるプロセス | **1 つだけ**。ほかのプロセスは読み取り専用でも開けない | **いくつでも** |
+| 同時に書けるもの | そのプロセスの中なら、複数のスレッドが同時に書ける（行の衝突だけエラー） | **1 つの接続ずつ**。プロセスが違っても同じ |
+| 調停の仕組み | ファイルロックでプロセスを 1 つに絞り、中は MVCC | ファイルロックと共有メモリで、書き込みのトランザクションを 1 つずつ並べる |
+
+DuckDB は「書けるプロセスを 1 つに絞り、その中で並列に書く」、SQLite は「どのプロセスからも書けるが、書き込みは 1 本の列に並ぶ」です。Web アプリのワーカーが 8 プロセスあって、それぞれ短い書き込みをする使い方なら、SQLite は待ち合いながら動きます。SQLite の文書が言う serializable は、**書き込みを本当に 1 つずつ実行することで**作られています（[SQLite: Isolation](https://www.sqlite.org/isolation.html)）。
+
+## WAL を外へ送り続ける：Litestream
+
+ここで第 108 回に戻ります。SQLite のファイルをバックアップしたいとき、動いているファイルを `cp` すると、第 108 回で見たのと同じ理由で壊れたコピーになりえます。WAL モードなら、本体と `-wal` が別々の時点で写るのでなおさらです。
+
+第 108 回の答えは「ベースバックアップ + その後のログ」でした。SQLite の WAL も、変更されたページの順序付きの記録です。ならば、**WAL のフレームを、チェックポイントで消される前に外へ写し続ければよい**。これを、アプリにも SQLite にも手を入れず、横で動く別のプロセスとしてやるのが **Litestream** です。
+
+ここからは、執筆時点の最新版 **v0.5.17**（2026 年 8 月）に基づきます。v0.5 で内部の設計が大きく変わったので、古い記事の説明とは食い違うところがあります。
+
+### チェックポイントを止めて、WAL を読む
+
+仕組みの核は、SQLite のチェックポイントの性質をそのまま使うことです（[Litestream: How it works](https://litestream.io/how-it-works/)）。
+
+1. Litestream は、データベースに**長く続く読み取りトランザクション**を張る。上で見たとおり、古い end mark で読んでいる読み手がいる間は、ほかのプロセスはチェックポイントで WAL を先頭から書き直せない
+2. その間に、WAL に追記された新しいフレームを読み、**LTX** という形式のファイルにまとめる。ファイルには単調に増える **TXID** が付く
+3. LTX をいったんデータベースの隣の隠しディレクトリ（`.app.db-litestream`）に置き、オブジェクトストレージへ上げる
+4. WAL が大きくなったら、**Litestream 自身が**チェックポイントを掛ける。その前に WAL を写し終え、書き込みのロックを取ってから読み取りトランザクションを外し、チェックポイントし、張り直す
+
+ソースを見ると、チェックポイントの閾値は既定で 1000 ページ（約 4MB）での `PASSIVE`、1 分ごとの `PASSIVE`、そして WAL が 121,359 ページ（4KB のページで約 500MB）に達したときの非常用の `TRUNCATE` の 3 段です（[db.go](https://github.com/benbjohnson/litestream/blob/v0.5.17/db.go)）。書き込みのロックは、Litestream が作る `_litestream_lock` という表への `INSERT` で取り、後でロールバックします。SQLite に「書き手の権利だけをくれ」という命令はないので、書き込みを 1 つ始めてそれを手放さない、という形で取っているわけです。
+
+<Callout type="warn" title="アプリ側でやっておくこと">
+  SQLite では、どの接続でもチェックポイントを掛けられます。アプリの自動チェックポイントが Litestream の読む前に WAL を書き戻して先頭から上書きすると、Litestream が変更を取りこぼすおそれがあります。
+  そのため Litestream の文書は、アプリで `PRAGMA wal_autocheckpoint = 0` にして自動チェックポイントを止めること、Litestream がチェックポイントのためにロックを取る間に待てるよう `PRAGMA busy_timeout = 5000` 程度を設定することを勧めています（[Litestream: Tips & Caveats](https://litestream.io/tips/)）。
+</Callout>
+
+### 世代と shadow WAL から、LTX と TXID へ
+
+v0.3 系の Litestream は、ランダムな **generation**（世代）の ID と、WAL を写し取った **shadow WAL** のディレクトリで状態を管理していました。WAL の連続性が途切れる（Litestream が止まっている間に誰かがチェックポイントした、など）と、新しい世代を始めて、スナップショットから取り直していました。v0.5 はこの 2 つをやめ、**TXID の連続した列**に置き換えています（[How it works](https://litestream.io/how-it-works/)、[Litestream v0.5.0 is Here](https://fly.io/blog/litestream-v050-is-here/)）。
+
+LTX は、ページの集合を TXID の範囲付きで持つファイルで、複数の LTX を 1 つにまとめ直せます。Litestream はこれを段階的にまとめます。
+
+| レベル | 中身 | 既定の間隔 |
+| --- | --- | --- |
+| L0 | 同期（既定 1 秒）ごとのバッチ。そのまま | 同期ごと。保持 5 分 |
+| L1 / L2 / L3 | 下のレベルをまとめたもの | 30 秒 / 5 分 / 1 時間 |
+| スナップショット | データベース全体 | 24 時間 |
+
+古い履歴ほど大きなファイルにまとめられるので、どの時点に戻すにも、スナップショット 1 つと少数の LTX を読めば済みます。第 108 回の PostgreSQL 17 の増分バックアップで、ブロック単位の差分を合成したのと似た発想です。
+
+### 戻す
+
+`litestream restore` は、指定した時点を超えない最新のスナップショットを取り、その後の LTX を TXID の順に当てます。TXID が連続しているので、**欠けがあれば戻す前に分かります**（[How it works](https://litestream.io/how-it-works/)）。`-timestamp` を付ければその時刻の手前で止まる、第 108 回の `recovery_target_time` にあたる指定ができます。ただし当てる単位は LTX ファイルで、ファイルの途中では止まりません。L0 が保持期限で消えた後は、戻せる時点が L1 のファイルの境目まで粗くなります。
+
+### 送り手は 1 つでなければならない
+
+Litestream の文書は、**同じバケットの同じパスへ複数のアプリが複製すると、戻せなくなる状況が起きうる**と警告し、そうならないようにするのは利用者の責任だとしています（[Tips & Caveats](https://litestream.io/tips/)）。TXID の列は 1 つのデータベースの 1 本の歴史を前提にしているので、2 つの送り手がそれぞれの歴史で同じ番号を書けば、列そのものが意味を失います。v0.5 は 1 つのデータベースにつきレプリカ先も 1 つに限りました（[v0.5.0 is Here](https://fly.io/blog/litestream-v050-is-here/)）。
+
+そして、WAL モードの SQLite は同じマシンでしか動かないので、**書き込むマシンも 1 台**です。同じマシンの中で複数のプロセスが書くのは構いません（SQLite のロックで 1 つずつ並びます）。Litestream が保証するのは「1 台のマシンの上の 1 つのファイルを、1 秒程度の遅れで外へ送り続ける」ことで、第 106 回のフェイルオーバーのような仕組みは持っていません。マシンが失われたときに失いうるのは、まだ送っていない最後の同期の分です。
+
+## その先：ファイルの外で複製する仕組み
+
+Litestream は「バックアップと時点復旧」を SQLite に持ち込みました。読み取り用のレプリカや、複数台での運用まで進めたものもあります。
+
+**LiteFS** は、Fly.io が開発した FUSE のファイルシステムです。アプリは LiteFS がマウントしたディレクトリの上で普通に SQLite を使い、LiteFS は**ジャーナルと WAL への書き込みをファイルシステムの層で捕まえて**、トランザクションの境目を見つけ、変更したページを LTX にして他のノードへ送ります。書き込めるのはリース（Consul を使う）を持つ 1 台のプライマリだけで、複製は非同期です（[LiteFS: How it works](https://docs.fly.io/litefs/how-it-works)）。サーバを持たない SQLite に、第 106 回のプライマリとレプリカの形を外から被せたものといえます。なお Fly.io の文書は、LiteFS を現在は同社のサポート対象外としています。
+
+**libSQL** は、Turso が保守する SQLite のフォークで、サーバとして動かすことも、アプリの中に **embedded replica**（埋め込みレプリカ）を置くこともできます（[libSQL](https://github.com/tursodatabase/libsql)）。埋め込みレプリカは手元のファイルで、**読み取りは常にローカルから**、**書き込みは既定でリモートのプライマリへ**送られ、`sync()` で差分を取り込みます。書いたレプリカ自身は、自分の書き込みをすぐ読めます（[Turso: Embedded Replicas](https://docs.turso.tech/features/embedded-replicas/introduction)）。読み取りの速さは組み込み型のまま、書き込みの調停役だけを外のサーバに出した形です。
+
+Turso はこれを、**テナント（利用者やプロジェクト）ごとにデータベースを 1 つずつ持つ**使い方と組み合わせて打ち出しています（[Turso: Multi-Tenancy](https://turso.tech/multi-tenancy)）。データベースが小さなファイルなら、何千個あっても 1 つ 1 つは軽く、テナントの分離もファイルの単位で済む、という考え方です。書き手が 1 つずつという制約も、データベースをテナントで分けてしまえば、ほとんどの場合に問題になりません。
+
+<Callout type="note" title="libSQL と Turso Database">
+  Turso は、SQLite と互換の別実装を Rust で新しく書いた Turso Database も開発しています。libSQL の README は、これが SQLite のフォークではなく全く新しい実装であること、新機能はそちらで開発していることを書いています（[libSQL](https://github.com/tursodatabase/libsql)）。
+  執筆時点ではベータです。
+</Callout>
+
+## 実験の環境
+
+すべて Docker のコンテナの中で行いました（Apple silicon の Mac、コンテナは aarch64）。
+
+| 役割 | イメージ / 版 |
+| --- | --- |
+| SQLite（Python の `sqlite3` と CLI） | `python:3.13-alpine` に `apk add sqlite`。どちらも SQLite 3.53.4 |
+| Litestream | GitHub のリリースから取った v0.5.17（linux-arm64） |
+| オブジェクトストレージ | MinIO RELEASE.2025-10-15T17-29-55Z（公式の `minio/minio` イメージが取得できなかったため、手元にあった `coollabsio/minio` を使用） |
+
+2 つのコンテナを同じ Docker ネットワークに入れ、ホストへのポート公開はしていません。実験の表 `t` は `id integer primary key, v text` に 100 文字の値を入れたもので、特に断らない限り 1 万行です。
+
+## 手元で確かめる 1: ロールバックジャーナルで、読み手が書き手を止める
+
+ロールバックジャーナル（既定の `journal_mode=delete`）のファイルに対し、同じプロセスの中で 3 つの接続を開きました。`timeout=0` で、ロックが取れなければすぐエラーにしています。
+
+```
+journal_mode: delete
+after load: [('rb.db', 1118208)]
+writer updated (uncommitted): [('rb.db', 1118208), ('rb.db-journal', 12824)]
+reader sees count of y: 0
+```
+
+書き手が `BEGIN` して 100 行を `UPDATE` した時点で、`rb.db-journal` ができています。12,824 バイトは、セクタ 1 つ分に詰めたヘッダ 512 バイトと、ページ 3 枚分の記録（ページ番号 4 バイト + 元のページ 4096 バイト + チェックサム 4 バイト）の合計です（[File Format 4.0](https://www.sqlite.org/fileformat2.html#the_rollback_journal)）。書き換える 3 ページの**元の中身**が先に逃がされ、本体の大きさは変わっていません。読み手にはまだ変更が見えません。
+
+次に、読み手が `BEGIN` して 1 回読み、読み取りのトランザクションを開いたままにしてから、書き手が `COMMIT` しました。
+
+```
+writer commit: OperationalError('database is locked') SQLITE_BUSY 0.1 ms
+new reader: OperationalError('database is locked') SQLITE_BUSY
+existing reader still reads: 0
+writer commit after reader ended: ok
+files: [('rb.db', 1118208)]
+new reader now: 100
+```
+
+- 読み手が SHARED を持っているので、書き手は EXCLUSIVE を取れず、`COMMIT` が `SQLITE_BUSY` になった
+- その書き手は PENDING を持ったままなので、**3 つ目の接続は読み取りすら始められない**。一方、もとからいた読み手は読み続けられる
+- 読み手がトランザクションを閉じると、書き手の 2 回目の `COMMIT` が通り、ジャーナルが消えた
+
+読み取りのトランザクションを開いたまま放置する接続が 1 つあるだけで、書き込みが止まり、それに続く新しい読み取りまで止まります。
+
+## 手元で確かめる 2: WAL で、読み手は自分の時点を読み続ける
+
+同じ表を WAL モードで作りました。自動チェックポイントは止めています（`wal_autocheckpoint=0`）。1 万行を 1 行ずつ自動コミットで入れた直後と、`TRUNCATE` のチェックポイントの後です。
+
+```
+after load       : {'db': 4096, '-wal': 43437192, '-shm': 98304}
+checkpoint(TRUNCATE): (0, 0, 0) {'db': 1118208, '-wal': 0, '-shm': 98304}
+```
+
+本体はまだ 1 ページ（4096 バイト）だけで、データはすべて WAL にありました。WAL の 43,437,192 バイトは、ヘッダ 32 バイト + 10,543 フレーム × 4,120 バイト（フレームヘッダ 24 + ページ 4096）です。1 万回のコミットのたびに、同じ葉のページが**新しいフレームとして何度も積まれた**ためで、本体の 273 ページ（1,118,208 バイト）の 39 倍になっています。チェックポイントで本体へ書き戻すと、本体は 273 ページになり、WAL は 0 バイトになりました。
+
+次に、読み手が `BEGIN` して読み始めてから、書き手が 1000 行ずつ 5 回コミットしました。各コミットの後、古い読み手と、そのたびに新しく開いた接続で数えています。
+
+```
+reader starts, count y = 0
+writer commit 1: wal=115392  reader sees y = 0  new conn sees y = 1000
+writer commit 2: wal=230752  reader sees y = 0  new conn sees y = 2000
+writer commit 3: wal=346112  reader sees y = 0  new conn sees y = 3000
+writer commit 4: wal=461472  reader sees y = 0  new conn sees y = 4000
+writer commit 5: wal=576832  reader sees y = 0  new conn sees y = 5000
+```
+
+実験 1 と違い、読み手がいても書き手は止まらずにコミットできます。古い読み手はずっと 0 のまま（自分の end mark より後を見ない）、新しい接続は最新を見ます。1000 行の更新ごとに WAL は 115,360 バイト、つまり 28 フレーム増えています。
+
+この状態でチェックポイントを掛けると、戻り値（書き戻せなかったか、WAL のフレーム数、書き戻したフレーム数）は次のとおりでした。
+
+```
+checkpoint(PASSIVE) while reader open: (0, 140, 0)
+checkpoint(TRUNCATE) while reader open: (1, 140, 0) {'db': 1118208, '-wal': 576832, '-shm': 98304}
+reader ended
+checkpoint(PASSIVE): (0, 140, 140) {'db': 1118208, '-wal': 576832, '-shm': 98304}
+after one more small commit: {'db': 1118208, '-wal': 576832, '-shm': 98304}
+checkpoint(TRUNCATE): (0, 0, 0) {'db': 1118208, '-wal': 0, '-shm': 98304}
+```
+
+- 古い読み手がいる間は、140 フレームのうち **1 つも書き戻せない**。読み手の end mark が 140 フレームすべてより前にあるから。`TRUNCATE` は待ちきれずに 1（busy）を返した
+- 読み手が終わると、`PASSIVE` で 140 フレームすべてを書き戻せた。ただし WAL の大きさは 576,832 バイトのまま
+- その後に小さなコミットをしても、WAL は大きくならなかった。書き戻し済みの WAL の**先頭から上書き**しているから
+- `TRUNCATE` で初めて 0 バイトになった
+
+## 手元で確かめる 3: 2 つの書き手と busy_timeout
+
+WAL モードのファイルに、別々のプロセスから書きました。プロセス A が `BEGIN IMMEDIATE` で書き手の権利を取り、1 行入れて 2 秒間コミットせずに持ちます。その 0.3 秒後に、プロセス B が `BEGIN IMMEDIATE` します。B の `busy_timeout` を 0 と 5000 ミリ秒で比べました。
+
+```
+[A pid 53] BEGIN IMMEDIATE ok, holding 2s
+[B] busy_timeout=0: database is locked (SQLITE_BUSY) after 1 ms
+[A] commit
+[A pid 54] BEGIN IMMEDIATE ok, holding 2s
+[A] commit
+[B pid 48] busy_timeout=5000: ok after 1785 ms
+[(1, 'A'), (2, 'A'), (3, 'B')]
+```
+
+（B の出力はバッファの都合で後にまとめて出たので、時刻の順に並べ直しています。）
+
+- `busy_timeout=0` では、B は 1 ミリ秒で `SQLITE_BUSY` になり、B の行は入らなかった
+- `busy_timeout=5000` では、B は A のコミットまで 1,785 ミリ秒待ってから書けた。A が持っていた残りの約 1.7 秒とほぼ同じ
+- 書いたのは別々のプロセス（pid 48、53、54）。DuckDB と違い、**どのプロセスからも書けるが、同時には 1 つだけ**
+
+もう 1 つ、`BEGIN`（DEFERRED）で読み取りから始め、その後に別の接続がコミットしてから書こうとすると、どうなるかを見ました。この接続には `busy_timeout=5000` を設定しています。
+
+```
+[X] upgrade read->write: database is locked (SQLITE_BUSY_SNAPSHOT) after 0 ms
+```
+
+5 秒待つ設定なのに、0 ミリ秒でエラーが返りました。スナップショットが古くなった以上、待っても書けるようにはならないので、busy handler で待つことなく返ってきます。読んだ値をもとに書くトランザクションは `BEGIN IMMEDIATE` で始めるか、このエラーでやり直す作りにしておく必要があります。
+
+## 手元で確かめる 4: Litestream で MinIO へ送り、戻す
+
+Litestream の設定は次のとおりです。認証情報は環境変数 `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY` で渡しました。
+
+```yaml
+dbs:
+  - path: /work/app.db
+    replica:
+      type: s3
+      bucket: backups
+      path: app
+      endpoint: http://ll-109-minio:9000
+      region: us-east-1
+      force-path-style: true
+```
+
+WAL モードで `orders` に 1000 行を入れたファイルに対して `litestream replicate` を起動すると、次のように表示しました（抜粋）。
+
+```
+level=INFO msg="replicating to" type=s3 sync-interval=1s bucket=backups path=app ...
+level=INFO msg="starting L0 retention monitor" system=store interval=15s retention=5m0s
+level=INFO msg="starting compaction monitor" system=store level=1 interval=30s
+level=INFO msg="starting compaction monitor" system=store level=3 interval=1h0m0s
+level=INFO msg="starting compaction monitor" system=store level=9 interval=24h0m0s
+level=INFO msg="starting compaction monitor" system=store level=2 interval=5m0s
+level=INFO msg="snapshot complete" system=store db=app.db txid=0000000000000001 size=11714
+```
+
+同期は 1 秒ごと、L1 / L2 / L3 のまとめ直しが 30 秒 / 5 分 / 1 時間、スナップショットがレベル 9 で 24 時間ごとです。データベースの中を見ると、Litestream が作った表が 2 つ増えていました。
+
+```
+$ sqlite3 app.db "select name from sqlite_schema"
+orders
+_litestream_seq
+_litestream_lock
+```
+
+アプリの側からチェックポイントを掛けてみると、`TRUNCATE` は最後まで進みませんでした。
+
+```
+checkpoint TRUNCATE from app: (1, 4, 4)
+```
+
+4 フレームを書き戻すことはできても、Litestream の読み取りトランザクションがあるので、WAL を空にできず busy の 1 が返ります。Litestream が「チェックポイントを止めている」のが、そのまま見えています。
+
+ここで、2 秒おきに 500 行ずつ 3 回入れて 2500 行にし、時刻を記録してから、誤った `DELETE` で 100 行まで減らしました。
+
+```
+count before delete: 2500
+before_delete: 2026-10-24T10:47:22.664183Z
+count after delete: 100
+```
+
+MinIO のバケットに置かれたオブジェクトです。
+
+```
+app/0000/0000000000000001-0000000000000001.ltx 11714 10:46:52
+app/0000/0000000000000002-0000000000000002.ltx 5051 10:47:11
+app/0000/0000000000000003-0000000000000003.ltx 817 10:47:12
+  ...（中略: 0000000000000004 から 000000000000000b まで同様）
+app/0000/000000000000000c-000000000000000c.ltx 2826 10:47:24
+app/0001/0000000000000001-0000000000000001.ltx 11714 10:47:00
+app/0001/0000000000000002-000000000000000c.ltx 2887 10:47:30
+app/0009/0000000000000001-0000000000000001.ltx 11714 10:46:52
+```
+
+- `0000/` が L0。同期ごとに 1 つ、TXID 1 から 0xc（12）まで。ファイル名は「最初の TXID - 最後の TXID」
+- `0001/` が L1。30 秒ごとのまとめ直しで、TXID 2〜0xc の 11 個が **1 つの 2,887 バイトのファイル**にまとまった
+- `0009/` がスナップショット。TXID 1 の時点のデータベース全体
+- shadow WAL や generation のディレクトリはどこにもない
+
+戻します。まず最新の状態、次に `DELETE` の直前の時刻を指定して、それぞれ別のファイルに戻しました。
+
+```
+$ litestream restore -o /work/r_latest.db /work/app.db
+$ sqlite3 r_latest.db "select count(*) from orders"
+100
+
+$ litestream restore -timestamp 2026-10-24T10:47:22.664183Z -o /work/r_pitr.db /work/app.db
+$ sqlite3 r_pitr.db "select count(*), max(id) from orders; pragma integrity_check"
+2500|2500
+ok
+```
+
+最新に戻せば `DELETE` の後の 100 行、時刻を指定すれば `DELETE` の前の 2500 行です。第 108 回の PostgreSQL の時点復旧と同じことが、サーバを持たないデータベースで、オブジェクトストレージの上のファイルだけから起きています。
+
+最後に、Litestream を止め、`app.db`、`-wal`、`-shm` をすべて消してから、元のパスに戻しました。
+
+```
+$ rm -f /work/app.db /work/app.db-wal /work/app.db-shm
+$ litestream restore /work/app.db
+$ sqlite3 /work/app.db "select count(*), max(id) from orders; pragma integrity_check; pragma journal_mode"
+100|100
+ok
+wal
+```
+
+手元のファイルが失われても、オブジェクトストレージにある LTX から、最後に送った時点のデータベースが戻りました。
+
+<Callout type="warn" title="ファイルだけ消して WAL を残さない">
+  Litestream の文書は、データベースを作り直すときに本体だけを消して `-wal` を残すと、SQLite が古い WAL のページを新しいデータベースに当てようとすると注意しています。
+  本体、`-wal`、`-shm` はまとめて消し、Litestream の側も `litestream reset` で状態を消します（[Tips & Caveats](https://litestream.io/tips/)）。
+</Callout>
+
+## 手元で確かめる 5: ヘッダを読む
+
+実験 1 のファイルの先頭 100 バイトです。
+
+```
+$ xxd -l 100 rb.db
+00000000: 5351 4c69 7465 2066 6f72 6d61 7420 3300  SQLite format 3.
+00000010: 1000 0101 0040 2020 0000 2712 0000 0111  .....@  ..'.....
+00000020: 0000 0000 0000 0000 0000 0001 0000 0004  ................
+00000030: 0000 0000 0000 0000 0000 0001 0000 0000  ................
+00000040: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+00000050: 0000 0000 0000 0000 0000 0000 0000 2712  ..............'.
+00000060: 002e 95cc                                ....
+```
+
+| 位置 | バイト列 | 読み |
+| --- | --- | --- |
+| 0 | `5351 ... 3300` | `SQLite format 3` と NUL |
+| 16 | `1000` | ページの大きさ 0x1000 = 4096 |
+| 18 / 19 | `01 01` | ロールバックジャーナルの形式 |
+| 24 | `0000 2712` | 変更カウンタ 10,002（1 万回の `INSERT`、`CREATE TABLE`、`UPDATE` の分） |
+| 28 | `0000 0111` | 273 ページ。273 × 4096 = 1,118,208 バイトで、ファイルの大きさと一致 |
+| 56 | `0000 0001` | UTF-8 |
+| 96 | `002e 95cc` | 3053004、つまり SQLite 3.53.4 |
+
+WAL モードにした実験 2 のファイルでは、位置 18 / 19 が `02 02` でした。
+
+```
+$ xxd -s 16 -l 4 wal.db
+00000010: 1000 0202                                ....
+```
+
+`dbstat` で、表 `t` の B-tree を見ると、1 万行が根の内部ノード 1 ページと葉 271 ページに収まっていました。スキーマの表は 1 ページ（1 ページ目）だけです。
+
+```
+sqlite_schema|leaf|1
+t|internal|1
+t|leaf|271
+```
+
+WAL ファイルの先頭も読みました。小さな表に 1 行を入れて、接続を開いたまま `-wal` を見ています（4,152 バイト = ヘッダ 32 + フレーム 1 つ 4,120）。
+
+```
+00000000: 377f 0682 002d e218 0000 1000 0000 0000  7....-..........
+00000010: 2967 4bc3 74fd 732a 9832 6a3c 7a8e 3f55  )gK.t.s*.2j<z.?U
+00000020: 0000 0002 0000 0002 2967 4bc3 74fd 732a  ........)gK.t.s*
+00000030: 0945 7b39 f5b5 5877                      .E{9..Xw
+```
+
+- 0x00〜0x1f が WAL のヘッダ。`377f0682` が印、`002de218` が形式の版 3007000、`00001000` がページの大きさ、続いてチェックポイントの番号、salt が 2 つ、チェックサム
+- 0x20 からがフレームのヘッダ。ページ番号 2、その次の `00000002` が 0 でないので**コミットのフレーム**で、コミット後のデータベースは 2 ページ。salt はヘッダと同じ値（`2967 4bc3 74fd 732a`）
+
+salt はチェックポイントで WAL を先頭から使い直すたびに変わります。上書きされずに残った前の周回のフレームは salt が合わないので、読み手にも回復処理にも無視されます。実験 2 で WAL を縮めずに先頭から再利用できたのは、この仕組みのおかげです。
+
+## まとめ
+
+- SQLite のデータベースはファイル 1 つで、中身は既定 4096 バイトのページの並び。先頭 100 バイトのヘッダにページの大きさやジャーナルの方式が書かれ、1 ページ目が `sqlite_schema` の根。表は葉に行を置く table b-tree（B+tree 相当）、索引は index b-tree
+- サーバがいないので、プロセスどうしの調停は OS のファイルロック（SHARED / RESERVED / PENDING / EXCLUSIVE）で行う
+- ロールバックジャーナルは「元のページを先に逃がし、本体を書き換え、ジャーナルを消す」。ジャーナルの削除がコミットの瞬間。読み手が 1 つでもいると書き手はコミットできず、PENDING の間は新しい読み手も入れない
+- WAL モードでは、変更を `-wal` に追記し、読み手は end mark までを見る。読み手と書き手は互いを止めないが、書き手は 1 つずつ。wal-index が共有メモリなので、同じマシンでしか使えない
+- チェックポイントは古い読み手がいると進まない。WAL は縮まずに先頭から再利用される
+- ロックが取れなければ `SQLITE_BUSY`。`busy_timeout` で待ち、書くトランザクションは `BEGIN IMMEDIATE` で始める。`SQLITE_BUSY_SNAPSHOT` は待っても解決しない
+- DuckDB は書けるプロセスが 1 つでその中は並列、SQLite はどのプロセスからも書けるが書き込みは 1 つずつ
+- Litestream は読み取りトランザクションでチェックポイントを止め、WAL のフレームを TXID 付きの LTX にしてオブジェクトストレージへ送り続ける。v0.5 で generation と shadow WAL は廃止された。戻すときはスナップショット + LTX を TXID の順に当てる。送り手は 1 つ、書くマシンも 1 台
+- LiteFS は FUSE で書き込みを捕まえてノード間で複製し、libSQL / Turso は埋め込みレプリカとテナントごとのデータベースで組み込み型を広げている
+
+Litestream も LiteFS も、SQLite が書いたページの変更を**ファイルの外から拾って**送っていました。次の第 110 回では、データベース自身がページではなくログだけをストレージの層へ送り、ページはストレージの側が作るという、計算とストレージを分けた設計を見ます。

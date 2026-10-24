@@ -17,8 +17,8 @@ topics:
   - importExternalTexture
   - MediaStreamTrackProcessor
 requires:
-  - ll-124-canvas-2d
-  - ll-126-webgpu
+  - ll-129-canvas-2d
+  - ll-131-webgpu
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -27,7 +27,7 @@ import Callout from '../../components/Callout.astro'
 
 ここまでの回では、canvas に絵を 1 枚ずつ描いてきました。動画も、中身は**決まった間隔で並んだ絵の列**です。1 枚 1 枚をフレームと呼びます。
 
-まず、圧縮していないフレームの大きさを数えます。第 124 回で見たとおり、canvas のピクセルは 1 画素あたり RGBA の 4 バイトです。
+まず、圧縮していないフレームの大きさを数えます。第 129 回で見たとおり、canvas のピクセルは 1 画素あたり RGBA の 4 バイトです。
 
 | 解像度 | 1 フレーム（RGBA） | 30fps で 1 秒 | 1 フレーム（YUV 4:2:0） | 30fps で 1 秒 |
 | --- | --- | --- | --- | --- |
@@ -72,7 +72,7 @@ YUV にしても、1080p で 1 秒 93MB です。ここからさらに 100 分�
 
 差分を積み重ねると誤差も積み重なるので、ときどきキーフレームを挟んで画をリセットします。シークしたときも、直前のキーフレームから復号し直します（[MDN: Web video codec guide](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs)）。
 
-もう 1 つ、第 155 回で見た DEFLATE や Brotli と違い、動画のコーデックの多くは**非可逆**です。MDN は、ほとんどの動画のコーデックは復号した映像が元と正確には一致しない非可逆の方式で、縮めるほど細部が失われる、と書いています（[MDN: Web video codec guide](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs)）。テキストは 1 ビットでも変われば壊れますが、映像は目に分からない範囲なら捨ててよい。だから桁違いに縮められます。
+もう 1 つ、第 160 回で見た DEFLATE や Brotli と違い、動画のコーデックの多くは**非可逆**です。MDN は、ほとんどの動画のコーデックは復号した映像が元と正確には一致しない非可逆の方式で、縮めるほど細部が失われる、と書いています（[MDN: Web video codec guide](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs)）。テキストは 1 ビットでも変われば壊れますが、映像は目に分からない範囲なら捨ててよい。だから桁違いに縮められます。
 
 符号化と復号は計算が重いので、多くの機械は専用の回路（ハードウェアのエンコーダとデコーダ）を持っています。第 48 回の DMA と同じく、CPU は指示を出すだけで、実際の仕事は別の装置が行います。
 
@@ -170,7 +170,7 @@ M1 Pro は H.264 と HEVC の専用回路を持ち、VP9 は復号だけ、AV1 �
 
 ## 手元で確かめる（3）: 300 枚を符号化する
 
-`OffscreenCanvas`（第 124 回）に 1280 × 720 のアニメーション（色の変わるグラデーションの上を、円が 20 個動く）を描き、1 枚ごとに `VideoFrame` にして符号化しました。300 枚（30fps で 10 秒分）、目標 2Mbps、150 枚ごとにキーフレームを要求しています。
+`OffscreenCanvas`（第 129 回）に 1280 × 720 のアニメーション（色の変わるグラデーションの上を、円が 20 個動く）を描き、1 枚ごとに `VideoFrame` にして符号化しました。300 枚（30fps で 10 秒分）、目標 2Mbps、150 枚ごとにキーフレームを要求しています。
 
 ```js
 const enc = new VideoEncoder({
@@ -281,7 +281,7 @@ GC に任せられないのは、GC が見ているのは JavaScript のヒー�
 
 ここで気になるのは**コピーの回数**です。ハードウェアで復号したフレームは、もともと GPU のメモリにあります。それを CPU に読み出して RGBA に直し、また GPU に送るのは、第 14 回で見たメモリ階層を往復する無駄です。
 
-WebGPU には、そのための専用の入口 `importExternalTexture()` があります（第 126 回）。仕様は `GPUExternalTexture` を、外部の映像のフレームを包んだ、サンプリングできる 2D テクスチャとし、**取り込んだ元をコピーせずに実装できる**（ただし実装の事情による）と書いています（[WebGPU §6.4](https://www.w3.org/TR/webgpu/#gpuexternaltexture)）。中身は RGBA とは限らず、Y と UV のような最大 3 枚の面と、色空間を変換するための情報を持ちうる、とも書いています（同）。WGSL の側では `texture_external` という型で受け、`textureSampleBaseClampToEdge` などで読みます（同）。YUV から RGB への変換は、シェーダがサンプリングするときに行われます。
+WebGPU には、そのための専用の入口 `importExternalTexture()` があります（第 131 回）。仕様は `GPUExternalTexture` を、外部の映像のフレームを包んだ、サンプリングできる 2D テクスチャとし、**取り込んだ元をコピーせずに実装できる**（ただし実装の事情による）と書いています（[WebGPU §6.4](https://www.w3.org/TR/webgpu/#gpuexternaltexture)）。中身は RGBA とは限らず、Y と UV のような最大 3 枚の面と、色空間を変換するための情報を持ちうる、とも書いています（同）。WGSL の側では `texture_external` という型で受け、`textureSampleBaseClampToEdge` などで読みます（同）。YUV から RGB への変換は、シェーダがサンプリングするときに行われます。
 
 ```wgsl
 @group(0) @binding(0) var video: texture_external;
@@ -359,4 +359,4 @@ canvas の `captureStream(30)` のトラックを `MediaStreamTrackProcessor` �
 - WebGPU の `importExternalTexture` は、映像のフレームをコピーせずにテクスチャとして扱える入口。YUV から RGB への変換はサンプリングのときに行われる
 - カメラのフレームは `MediaStreamTrackProcessor` で取り出し、`VideoTrackGenerator` で戻す。仕様と実装の名前・公開先がずれている
 
-ここまでで第 17 章は終わりです。DOM に任せる描き方から始め、Canvas 2D、WebGL、WebGPU、DOM を canvas に描き込む HTML-in-Canvas、そして動画のフレームまで、ブラウザの中で自分で画素を作る道を一通り見ました。どの回にも、**描いた画素を読み戻せるか**という問いが付いて回りました。別のオリジンの画像を描いた canvas が汚染されて `getImageData()` を拒むこと、HTML-in-Canvas が読み戻してよい描画だけを描くこと、汚染された（origin-clean でない）画像や動画から `VideoFrame` を作ろうとすると `SecurityError` になること（[WebCodecs §9.4.2](https://www.w3.org/TR/webcodecs/#videoframe-constructors)）は、どれも同じ規則の現れです。次の第 18 章では、その規則の大元を見ます。ブラウザは、**互いに信用しない多数のサイトのコードを同時に動かしています**。どのサイトがどのサイトのデータを読めるのか、まず第 129 回で、境界を決める 2 本の物差し、オリジンとサイトから始めます。
+ここまでで第 18 章は終わりです。DOM に任せる描き方から始め、Canvas 2D、WebGL、WebGPU、DOM を canvas に描き込む HTML-in-Canvas、そして動画のフレームまで、ブラウザの中で自分で画素を作る道を一通り見ました。どの回にも、**描いた画素を読み戻せるか**という問いが付いて回りました。別のオリジンの画像を描いた canvas が汚染されて `getImageData()` を拒むこと、HTML-in-Canvas が読み戻してよい描画だけを描くこと、汚染された（origin-clean でない）画像や動画から `VideoFrame` を作ろうとすると `SecurityError` になること（[WebCodecs §9.4.2](https://www.w3.org/TR/webcodecs/#videoframe-constructors)）は、どれも同じ規則の現れです。次の第 19 章では、その規則の大元を見ます。ブラウザは、**互いに信用しない多数のサイトのコードを同時に動かしています**。どのサイトがどのサイトのデータを読めるのか、まず第 134 回で、境界を決める 2 本の物差し、オリジンとサイトから始めます。

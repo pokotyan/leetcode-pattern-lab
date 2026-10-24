@@ -17,17 +17,17 @@ topics:
   - Redis / MongoDB / Kafka / AMQPS の TLS
   - PgBouncer
 requires:
-  - ll-161-ssh-tunnels
-  - ll-154-tls-ops
-  - ll-153-tls13-handshake
-  - ll-150-pki-chain
+  - ll-166-ssh-tunnels
+  - ll-159-tls-ops
+  - ll-158-tls13-handshake
+  - ll-155-pki-chain
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## 誰も鍵のマークを見ない区間
 
-前回の第 161 回では、SSH のチャネルに TCP を通して、手元から内側のサービスへ穴を通しました。データベースにつなぐときによく使われる方法の 1 つです。この回では、もう 1 つの方法、**データベースのプロトコルそのものに TLS を載せる**ほうを見ます。
+前回の第 166 回では、SSH のチャネルに TCP を通して、手元から内側のサービスへ穴を通しました。データベースにつなぐときによく使われる方法の 1 つです。この回では、もう 1 つの方法、**データベースのプロトコルそのものに TLS を載せる**ほうを見ます。
 
 ブラウザなら、TLS がつながらなければ警告の画面が出ます。利用者は鍵のマークを見て、少なくとも「つながった相手の証明書は確かめられた」と知ることができます。アプリケーションサーバからデータベースへの接続には、その画面がありません。接続文字列に何を書いたか、ドライバの既定値が何か、サーバが何を許しているかで、次の 3 つのどれになるかが決まります。
 
@@ -50,11 +50,11 @@ import Callout from '../../components/Callout.astro'
 | 証明書の作成、`s_client` | OpenSSL | 3.6.2（手元）、3.5.7 / 3.5.8（コンテナ） |
 | Docker | Docker Engine | 29.2.1 |
 
-証明書は第 150 回と同じ手順で作りました。**CA A**（本物）から `db.example.com` のサーバ証明書と `alice` のクライアント証明書を、**CA B**（攻撃者）から**同じ名前** `db.example.com` のサーバ証明書と、CN が `alice` のクライアント証明書を発行しています。名前だけなら、攻撃者はいくらでも同じものを書けるという前提です。
+証明書は第 155 回と同じ手順で作りました。**CA A**（本物）から `db.example.com` のサーバ証明書と `alice` のクライアント証明書を、**CA B**（攻撃者）から**同じ名前** `db.example.com` のサーバ証明書と、CN が `alice` のクライアント証明書を発行しています。名前だけなら、攻撃者はいくらでも同じものを書けるという前提です。
 
 ## PostgreSQL: 8 バイトで「TLS を話せますか」と聞く
 
-第 158 回で分けた型でいえば、PostgreSQL は**平文で始めて途中で切り替える**型です。ポートは 5432 の 1 つで、平文の接続も TLS の接続も同じポートで受けます。
+第 163 回で分けた型でいえば、PostgreSQL は**平文で始めて途中で切り替える**型です。ポートは 5432 の 1 つで、平文の接続も TLS の接続も同じポートで受けます。
 
 ### SSLRequest と 1 バイトの返事
 
@@ -75,13 +75,13 @@ import Callout from '../../components/Callout.astro'
 
 - 1 つ目がクライアントの SSLRequest です。`00000008` は長さ 8、`04d2162f` は 10 進で 80877103 で、上位 16 ビットが 1234、下位が 5679 という、通常のプロトコル番号とは決して重ならない値です
 - 2 つ目がサーバの返事 `53`、つまり ASCII の `S` です
-- 3 つ目は `16 03 01` で始まる TLS のレコード、第 153 回の ClientHello です。SNI に `db.example.com` が入っているのも見えます。libpq は既定で SNI を送ります（[libpq: sslsni](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLSNI)）
+- 3 つ目は `16 03 01` で始まる TLS のレコード、第 158 回の ClientHello です。SNI に `db.example.com` が入っているのも見えます。libpq は既定で SNI を送ります（[libpq: sslsni](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLSNI)）
 
-この 1 往復は**平文**で、どちらの方向も認証されていません。第 158 回で見た途中で切り替える型の弱点は、すべてここに集まっています。
+この 1 往復は**平文**で、どちらの方向も認証されていません。第 163 回で見た途中で切り替える型の弱点は、すべてここに集まっています。
 
 ### 切り替えの境目に残るバイト
 
-第 158 回では、SMTP の STARTTLS で、切り替える前に送り込まれたバイトが切り替えた後のものとして処理されるコマンド注入（CVE-2011-0411 系）を見ました。PostgreSQL にも、まったく同じ形の脆弱性が 2021 年に見つかっています。
+第 163 回では、SMTP の STARTTLS で、切り替える前に送り込まれたバイトが切り替えた後のものとして処理されるコマンド注入（CVE-2011-0411 系）を見ました。PostgreSQL にも、まったく同じ形の脆弱性が 2021 年に見つかっています。
 
 - [CVE-2021-23214](https://www.postgresql.org/support/security/CVE-2021-23214/): サーバ側。`cert` 認証などを使う設定で、中間者が接続の最初に任意の SQL を差し込めた。説明文自身が「CVE-2011-0411 に似ている」と書いています
 - [CVE-2021-23222](https://www.postgresql.org/support/security/CVE-2021-23222/): クライアント（libpq）側。中間者が最初のいくつかの問い合わせに偽の応答を差し込めた
@@ -216,7 +216,7 @@ C->S plaintext: X....
 psql: error: ... server does not support SSL, but SSL was required
 ```
 
-これは第 158 回の STARTTLS の除去と同じ構図で、第 187 回で見たメールの日和見の暗号化とも同じ弱さです。ただし、メールの中継には「TLS を話せない相手にも届けなければならない」という事情がありました。**データベースの接続には、そういう事情はほとんどありません**。接続先は自分たちで管理しているサーバだからです。
+これは第 163 回の STARTTLS の除去と同じ構図で、第 196 回で見たメールの日和見の暗号化とも同じ弱さです。ただし、メールの中継には「TLS を話せない相手にも届けなければならない」という事情がありました。**データベースの接続には、そういう事情はほとんどありません**。接続先は自分たちで管理しているサーバだからです。
 
 ### パスワードは漏れていないが、なりすましは通った
 
@@ -235,7 +235,7 @@ psql: error: ... channel binding required, but SSL not in use
 
 ## 直接 TLS を始める: sslnegotiation=direct
 
-PostgreSQL 17 で、SSLRequest の往復を省き、**TCP がつながった直後から TLS のハンドシェイクを始める**方式が入りました。クライアントの接続パラメータ `sslnegotiation=direct` で使います（[PostgreSQL 17 リリースノート](https://www.postgresql.org/docs/release/17.0/)）。第 158 回の型でいえば、途中で切り替える型から、**暗黙の TLS の型**へ移る選択肢です。サーバは同じポートで、SSLRequest で始まる接続と、いきなり ClientHello で始まる接続の両方を受け付けます。
+PostgreSQL 17 で、SSLRequest の往復を省き、**TCP がつながった直後から TLS のハンドシェイクを始める**方式が入りました。クライアントの接続パラメータ `sslnegotiation=direct` で使います（[PostgreSQL 17 リリースノート](https://www.postgresql.org/docs/release/17.0/)）。第 163 回の型でいえば、途中で切り替える型から、**暗黙の TLS の型**へ移る選択肢です。サーバは同じポートで、SSLRequest で始まる接続と、いきなり ClientHello で始まる接続の両方を受け付けます。
 
 ```
 $ psql "host=db.example.com ... sslmode=require sslnegotiation=direct"      → t|TLSv1.3
@@ -257,7 +257,7 @@ $ tshark -r direct.pcap -Y "tcp.len>0 && tcp.dstport==5432" -T fields -e tcp.str
 0	1573	16030106200100061c0303cb4d754711439f2dc2103f95e14c277a78f9735ce948af9f3d2...
 ```
 
-ALPN（第 153 回）は、直接の TLS では**必須**です。プロトコルの文書は、プロトコルの取り違え（protocol confusion）の攻撃を防ぐために ALPN を使うことをクライアントに求め、IANA に登録された `postgresql` という名前を指定しています（[PostgreSQL: 54.2.10](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SSL)）。取り違えの攻撃は第 165 回の ALPACA で詳しく見ます。`openssl s_client` で ALPN を付けずに直接つなぐと、TLS のハンドシェイク自体は終わりますが、サーバは次のログを残して接続を閉じました。
+ALPN（第 158 回）は、直接の TLS では**必須**です。プロトコルの文書は、プロトコルの取り違え（protocol confusion）の攻撃を防ぐために ALPN を使うことをクライアントに求め、IANA に登録された `postgresql` という名前を指定しています（[PostgreSQL: 54.2.10](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SSL)）。取り違えの攻撃は第 171 回の ALPACA で詳しく見ます。`openssl s_client` で ALPN を付けずに直接つなぐと、TLS のハンドシェイク自体は終わりますが、サーバは次のログを残して接続を閉じました。
 
 ```
 LOG:  received direct SSL connection request without ALPN protocol negotiation extension
@@ -265,7 +265,7 @@ LOG:  received direct SSL connection request without ALPN protocol negotiation e
 
 `-alpn postgresql` を付けると `ALPN protocol: postgresql` と表示されます。従来の方式は `openssl s_client -starttls postgres` で確かめられ、こちらは `No ALPN negotiated` でした。
 
-直接の TLS の利点は、往復が 1 回減ることのほかに、**普通の TLS を話す道具がそのまま使える**ことです。第 154 回で見た SNI で振り分けるパススルーのロードバランサは、SSLRequest を知らなければ PostgreSQL の接続を振り分けられません。libpq の文書も、SNI を見て振り分けるプロキシは、PostgreSQL のハンドシェイクを知っているのでなければ `sslnegotiation=direct` を必要とする、と書いています（[libpq: sslsni](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLSNI)）。代わりに、サーバもクライアントも 17 以上である必要があります。
+直接の TLS の利点は、往復が 1 回減ることのほかに、**普通の TLS を話す道具がそのまま使える**ことです。第 159 回で見た SNI で振り分けるパススルーのロードバランサは、SSLRequest を知らなければ PostgreSQL の接続を振り分けられません。libpq の文書も、SNI を見て振り分けるプロキシは、PostgreSQL のハンドシェイクを知っているのでなければ `sslnegotiation=direct` を必要とする、と書いています（[libpq: sslsni](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLSNI)）。代わりに、サーバもクライアントも 17 以上である必要があります。
 
 ## サーバ側で強制する: pg_hba.conf
 
@@ -275,7 +275,7 @@ LOG:  received direct SSL connection request without ALPN protocol negotiation e
 
 ### クライアント証明書で利用者を確かめる
 
-逆向き、つまりサーバがクライアントを証明書で確かめるのが、第 154 回の mTLS です。PostgreSQL では 2 通りの書き方があります。
+逆向き、つまりサーバがクライアントを証明書で確かめるのが、第 159 回の mTLS です。PostgreSQL では 2 通りの書き方があります。
 
 - 認証方式 `cert`: クライアント証明書だけで認証する。証明書の CN が、要求された利用者名と一致すればログインを許す（[PostgreSQL: 20.12](https://www.postgresql.org/docs/current/auth-cert.html)）
 - オプション `clientcert=verify-ca` / `verify-full`: パスワードなど別の認証方式に、クライアント証明書の確認を**足す**。`verify-full` は CN と利用者名の一致まで確かめる（[PostgreSQL: 20.1](https://www.postgresql.org/docs/current/auth-pg-hba-conf.html)）
@@ -307,7 +307,7 @@ DETAIL:  Client certificate verification failed at depth 0: unable to get local 
 	Failed certificate data (unverified): subject "/CN=alice", serial number 6912...618, issuer "/CN=Lab DB CA B".
 ```
 
-最後の行が示しているのは、第 154 回の「mTLS は認可ではない」と同じことです。利用者 `app` で `alice` の証明書を出すと、TLS の段階では CA A の証明書として検証が通り、認証は `host` の行のパスワード認証で行われました。**証明書が誰のものかと、どの利用者として入ったかは、`pg_hba.conf` の行が結び付けたときにだけ一致します**。
+最後の行が示しているのは、第 159 回の「mTLS は認可ではない」と同じことです。利用者 `app` で `alice` の証明書を出すと、TLS の段階では CA A の証明書として検証が通り、認証は `host` の行のパスワード認証で行われました。**証明書が誰のものかと、どの利用者として入ったかは、`pg_hba.conf` の行が結び付けたときにだけ一致します**。
 
 ## MySQL: 能力フラグで切り替える
 
@@ -427,11 +427,11 @@ libpq に合わせて書いた接続文字列を Node.js に持っていくと�
   つながってしまったら、その設定は中間者を通します。
 </Callout>
 
-クラウドのマネージドなデータベースでは、事業者が CA の証明書の束を配布しており、それを `sslrootcert` に渡して `verify-full` で接続するのが基本の形です。CA が更新される時期には証明書の束の入れ替えが要るので、第 151 回の証明書の寿命の話がここでも効いてきます。
+クラウドのマネージドなデータベースでは、事業者が CA の証明書の束を配布しており、それを `sslrootcert` に渡して `verify-full` で接続するのが基本の形です。CA が更新される時期には証明書の束の入れ替えが要るので、第 156 回の証明書の寿命の話がここでも効いてきます。
 
 ## 中間層: プーラーとプロキシで区間が分かれる
 
-データベースの前には、コネクションプーラーやプロキシが挟まることがよくあります。第 154 回で HTTPS について立てた問い「**何区間あって、それぞれ誰が終えているか**」が、そのまま当てはまります。
+データベースの前には、コネクションプーラーやプロキシが挟まることがよくあります。第 159 回で HTTPS について立てた問い「**何区間あって、それぞれ誰が終えているか**」が、そのまま当てはまります。
 
 ```
 アプリ ══TLS①══▶ PgBouncer ══TLS②══▶ PostgreSQL
@@ -447,21 +447,21 @@ PgBouncer は PostgreSQL のプロトコルを理解するプロキシなので�
 
 何も設定しなければ、アプリから PgBouncer までは平文、PgBouncer から PostgreSQL までは中間者に無防備な TLS です。PostgreSQL 本体を `hostssl` と `verify-full` で固めても、間に挟んだ 1 台の既定値で両方の区間が崩れます。PgBouncer の `client_tls_sslmode` の `verify-ca` と `verify-full` は「クライアント証明書を確かめる」という意味で、libpq の同じ名前とは向きが逆なのも、取り違えやすい点です（同上）。
 
-中間層を挟むと、もう 1 つ失うものがあります。前の節のチャネルバインディングは、**クライアントと、TLS を終えた相手との間**で効く仕組みです。プーラーが TLS を終えるなら、アプリのチャネルバインディングが確かめられるのはプーラーの証明書までで、その先の PostgreSQL ではありません。第 154 回で見たとおり、TLS を終える機械は必ず秘密鍵を持ち、そこで平文が現れます。プーラーやプロキシは、データベースの全部の問い合わせと結果を平文で見る機械として扱う必要があります。
+中間層を挟むと、もう 1 つ失うものがあります。前の節のチャネルバインディングは、**クライアントと、TLS を終えた相手との間**で効く仕組みです。プーラーが TLS を終えるなら、アプリのチャネルバインディングが確かめられるのはプーラーの証明書までで、その先の PostgreSQL ではありません。第 159 回で見たとおり、TLS を終える機械は必ず秘密鍵を持ち、そこで平文が現れます。プーラーやプロキシは、データベースの全部の問い合わせと結果を平文で見る機械として扱う必要があります。
 
 ## 何と組み合わさって機能するか
 
 | やりたいこと | 組み合わせる部品 |
 | --- | --- |
-| DB への接続を盗聴から守る | TLS（第 153 回）＋クライアントの `require` 以上＋サーバの `hostssl` / `require_secure_transport` |
-| DB への接続を中間者から守る | 上に加えて、CA の証明書の配布（第 150 回）＋ `verify-full` / `VERIFY_IDENTITY` |
+| DB への接続を盗聴から守る | TLS（第 158 回）＋クライアントの `require` 以上＋サーバの `hostssl` / `require_secure_transport` |
+| DB への接続を中間者から守る | 上に加えて、CA の証明書の配布（第 155 回）＋ `verify-full` / `VERIFY_IDENTITY` |
 | パスワードの認証を中間者から守る | SCRAM ＋チャネルバインディング（`channel_binding=require`） |
-| 切り替えの境目を無くす | `sslnegotiation=direct` ＋ ALPN `postgresql`（第 158 回の暗黙の TLS の型） |
-| DB の利用者を証明書で確かめる | mTLS（第 154 回）＋ `cert` / `clientcert` ＋利用者名との対応づけ |
+| 切り替えの境目を無くす | `sslnegotiation=direct` ＋ ALPN `postgresql`（第 163 回の暗黙の TLS の型） |
+| DB の利用者を証明書で確かめる | mTLS（第 159 回）＋ `cert` / `clientcert` ＋利用者名との対応づけ |
 | プーラーを挟んでも守る | 区間ごとの `client_tls_*` / `server_tls_*` の設定＋プーラーを平文を見る機械として扱うこと |
-| TLS に対応しない DB に届く | 第 161 回の SSH の `-L`、または次の第 163 回の stunnel |
+| TLS に対応しない DB に届く | 第 166 回の SSH の `-L`、または次の第 168 回の stunnel |
 
-次の第 163 回では、プロトコルそのものに TLS を載せるのではなく、**TLS で通り道を作り、その中に別のものを流す**方法を見ます。任意の TCP を TLS で包む stunnel、TLS を鍵の交換にだけ使ってデータは独自の形式で運ぶ OpenVPN、そして HTTPS の上に PPP を載せる SSL VPN の製品です。
+次の第 168 回では、プロトコルそのものに TLS を載せるのではなく、**TLS で通り道を作り、その中に別のものを流す**方法を見ます。任意の TCP を TLS で包む stunnel、TLS を鍵の交換にだけ使ってデータは独自の形式で運ぶ OpenVPN、そして HTTPS の上に PPP を載せる SSL VPN の製品です。
 
 ## まとめ
 

@@ -16,12 +16,12 @@ topics:
   - iframe の遅延読み込み
   - Fenced Frames
 requires:
-  - ll-129-origin-site
-  - ll-130-cross-origin
-  - ll-132-third-party-cookie
-  - ll-135-security-headers
-  - ll-136-cross-origin-isolation
-  - ll-113-browser-process
+  - ll-134-origin-site
+  - ll-135-cross-origin
+  - ll-137-third-party-cookie
+  - ll-140-security-headers
+  - ll-141-cross-origin-isolation
+  - ll-118-browser-process
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -34,11 +34,11 @@ import Callout from '../../components/Callout.astro'
 
 この章では、iframe に関わる部品をすでに多く見てきました。ただ、どれも別々の回に分かれています。
 
-- 第 113 回: 別のサイトの iframe は、別のプロセスで描かれる
-- 第 129 回、第 130 回: 別のオリジンの iframe の DOM は読めない。`sandbox` を付けるとオリジンが `null` になる。`postMessage` で境界を越える
-- 第 132 回、第 133 回: iframe の中の Cookie は第三者の Cookie になり、ストレージはトップレベルのサイトごとに分けられる
-- 第 135 回: `frame-ancestors` で、自分のページを他人の iframe に入れさせない
-- 第 136 回: 分離したページは、iframe の中の文書にも COEP を求める
+- 第 118 回: 別のサイトの iframe は、別のプロセスで描かれる
+- 第 134 回、第 135 回: 別のオリジンの iframe の DOM は読めない。`sandbox` を付けるとオリジンが `null` になる。`postMessage` で境界を越える
+- 第 137 回、第 138 回: iframe の中の Cookie は第三者の Cookie になり、ストレージはトップレベルのサイトごとに分けられる
+- 第 140 回: `frame-ancestors` で、自分のページを他人の iframe に入れさせない
+- 第 141 回: 分離したページは、iframe の中の文書にも COEP を求める
 
 この回では、これらを **1 つの iframe に掛かる問い**として並べ直します。あわせて、これまでの回で扱わなかった問い（中の文書のオリジンが URL だけでは決まらないこと、フレームどうしの移動の規則、埋め込む側の CSP、遅延読み込み、Fenced Frames）を手元で確かめます。
 
@@ -59,15 +59,15 @@ import Callout from '../../components/Callout.astro'
 
 | 問い | 決める者 | 使う物差し | 仕組み | 回 |
 | --- | --- | --- | --- | --- |
-| 中の文書のオリジンは何か | ブラウザ（URL と属性から） | オリジン | `src`、`srcdoc`、`sandbox` | 第 129 回、この回 |
-| 親と子は互いに何を読めるか | ブラウザ | オリジン | 同一オリジンポリシー、`postMessage` | 第 129 回、第 130 回 |
+| 中の文書のオリジンは何か | ブラウザ（URL と属性から） | オリジン | `src`、`srcdoc`、`sandbox` | 第 134 回、この回 |
+| 親と子は互いに何を読めるか | ブラウザ | オリジン | 同一オリジンポリシー、`postMessage` | 第 134 回、第 135 回 |
 | この iframe を置いてよいか | 親 | URL | CSP の `frame-src` | この回 |
-| このページを埋め込ませてよいか | 子 | 祖先のオリジン | `frame-ancestors`、`X-Frame-Options` | 第 135 回 |
-| 中のページに何を許すか | 親 | — | `sandbox`、`allow`、`credentialless` | 第 130 回、第 135 回、第 136 回 |
+| このページを埋め込ませてよいか | 子 | 祖先のオリジン | `frame-ancestors`、`X-Frame-Options` | 第 140 回 |
+| 中のページに何を許すか | 親 | — | `sandbox`、`allow`、`credentialless` | 第 135 回、第 140 回、第 141 回 |
 | 誰が誰を移動させられるか | ブラウザ | オリジンと利用者の操作 | フレームのナビゲーションの規則 | この回 |
-| 読み込みの要求に何が付くか | ブラウザ | サイト | Cookie、`Sec-Fetch-*`、`Referer` | 第 132 回、第 134 回 |
-| 中の状態はどこに保存されるか | ブラウザ | トップレベルのサイト | ストレージの分割、CHIPS、Storage Access API | 第 132 回 |
-| どのプロセスで動くか | ブラウザ | サイト | サイト分離、COEP | 第 113 回、第 136 回 |
+| 読み込みの要求に何が付くか | ブラウザ | サイト | Cookie、`Sec-Fetch-*`、`Referer` | 第 137 回、第 139 回 |
+| 中の状態はどこに保存されるか | ブラウザ | トップレベルのサイト | ストレージの分割、CHIPS、Storage Access API | 第 137 回 |
+| どのプロセスで動くか | ブラウザ | サイト | サイト分離、COEP | 第 118 回、第 141 回 |
 
 表の 3 行目と 4 行目に注目してください。iframe には**置く側と置かれる側の 2 者がいて、どちらも拒否できる**ことが、iframe を扱う仕組みの多くに共通する形です。
 
@@ -75,7 +75,7 @@ import Callout from '../../components/Callout.astro'
 
 Python の `http.server` に、受け取った要求のヘッダを記録する処理を足したサーバを 127.0.0.1 の 18301 番と 18302 番で立て、Playwright から手元にインストールされた Chrome 154 をヘッドレスで、毎回まっさらな一時プロファイルで動かしました。
 
-ホスト名には `top.localhost`、`widget.localhost`、`other.localhost`、`evil.localhost` を使いました。Chrome は `*.localhost` をループバックに解決し、**安全な文脈**（secure context）として扱うので、HTTP のままでも `Sec-Fetch-*` のヘッダが送られます。`localhost` は Public Suffix List に無いので、第 129 回の規則どおり最後のラベルが公開接尾辞とみなされ、`top.localhost` と `widget.localhost` は**別のサイト**になります。実際に、後で見る `Sec-Fetch-Site` は `cross-site` でした。
+ホスト名には `top.localhost`、`widget.localhost`、`other.localhost`、`evil.localhost` を使いました。Chrome は `*.localhost` をループバックに解決し、**安全な文脈**（secure context）として扱うので、HTTP のままでも `Sec-Fetch-*` のヘッダが送られます。`localhost` は Public Suffix List に無いので、第 134 回の規則どおり最後のラベルが公開接尾辞とみなされ、`top.localhost` と `widget.localhost` は**別のサイト**になります。実際に、後で見る `Sec-Fetch-Site` は `cross-site` でした。
 
 ## 中の文書のオリジンは、URL だけでは決まらない
 
@@ -94,7 +94,7 @@ src= data: の URL                            null                            da
 src= 親が作った blob: の URL                  http://top.localhost:18301      blob:http://…  読める         ok
 ```
 
-上の 3 行は第 129 回で見たとおりで、オリジンは URL のスキーム・ホスト・ポートで決まります。残りの行は、**URL を見てもオリジンが分からない**例です。
+上の 3 行は第 134 回で見たとおりで、オリジンは URL のスキーム・ホスト・ポートで決まります。残りの行は、**URL を見てもオリジンが分からない**例です。
 
 HTML Standard は、新しい文書のオリジンを次の順で決めます（[HTML Standard: determining the origin](https://html.spec.whatwg.org/#determining-the-origin)）。
 
@@ -112,9 +112,9 @@ HTML Standard は、新しい文書のオリジンを次の順で決めます（
 しかしオリジンは親と同じです。上の実験でも、`srcdoc` の中の文書は `http://top.localhost:18301` を名乗り、親からも中からも互いの DOM を読めました。中で動くスクリプトは、親の `document.cookie`（HttpOnly でないもの）にも、親と同じ `localStorage` にも触れます。
 
 <Callout type="warn" title="よくある誤解: 「利用者の HTML は srcdoc に入れれば隔離できる」">
-  `srcdoc` だけでは、利用者が書いた `<script>` が**自分のオリジンで**動きます。XSS（第 135 回）をそのまま招き入れる形です。
+  `srcdoc` だけでは、利用者が書いた `<script>` が**自分のオリジンで**動きます。XSS（第 140 回）をそのまま招き入れる形です。
   HTML Standard は、ブログのコメント欄の例で `<iframe sandbox srcdoc="...">` と、**`sandbox` を組み合わせて**使う形を示しています（[HTML Standard: an iframe srcdoc document](https://html.spec.whatwg.org/#an-iframe-srcdoc-document)）。
-  スクリプトを動かす必要があるなら `sandbox="allow-scripts"` までにとどめ、`allow-same-origin` は付けません。第 130 回で見たとおり、同じオリジンの内容に `allow-scripts` と `allow-same-origin` を両方付けると、中から `sandbox` を外せます。より強く分けたいなら、第 139 回の「サンドボックス用のドメイン」のように、**別のサイトから配信**します。
+  スクリプトを動かす必要があるなら `sandbox="allow-scripts"` までにとどめ、`allow-same-origin` は付けません。第 135 回で見たとおり、同じオリジンの内容に `allow-scripts` と `allow-same-origin` を両方付けると、中から `sandbox` を外せます。より強く分けたいなら、第 144 回の「サンドボックス用のドメイン」のように、**別のサイトから配信**します。
 </Callout>
 
 ### about:blank は作った側を引き継ぐ
@@ -123,7 +123,7 @@ HTML Standard は、新しい文書のオリジンを次の順で決めます（
 
 ## 親と子が互いに触れるもの
 
-オリジンが同じなら、親と子は互いの DOM、変数、ストレージにすべて触れます。オリジンが違えば、第 130 回で見たとおり、別のオリジンの `Window` で許されるのは `postMessage()`、`length`、`frames`、`parent`、`top` など少数のものと、`location` への**書き込み**だけです。
+オリジンが同じなら、親と子は互いの DOM、変数、ストレージにすべて触れます。オリジンが違えば、第 135 回で見たとおり、別のオリジンの `Window` で許されるのは `postMessage()`、`length`、`frames`、`parent`、`top` など少数のものと、`location` への**書き込み**だけです。
 
 親から別のオリジンの子の `location` を読み、続けて書き込むと、次のとおりでした。
 
@@ -193,7 +193,7 @@ if (top !== self) top.location = self.location
 <Callout type="warn" title="よくある誤解: 「フレームバスティングのスクリプトでクリックジャッキングを防げる」">
   このスクリプトを止めるのは、埋め込む側にとって簡単です。`sandbox="allow-forms"` のように `allow-scripts` を付けずに入れればスクリプトが動かず、`allow-scripts` を付けても `allow-top-navigation` を付けなければトップを移動できません。
   上で見た Chrome の制限も、利用者の操作が無ければ、別のオリジンの子からのトップの移動を止めます。つまり、守る側のフレームバスティングも同じように止まります。
-  埋め込ませないための仕組みは、**ブラウザが応答のヘッダで判断する** `frame-ancestors`（第 135 回）です。中のスクリプトに頼りません。
+  埋め込ませないための仕組みは、**ブラウザが応答のヘッダで判断する** `frame-ancestors`（第 140 回）です。中のスクリプトに頼りません。
 </Callout>
 
 ## 置く側と置かれる側: frame-src と frame-ancestors
@@ -233,8 +233,8 @@ iframe の中の文書を読み込む要求は、ブラウザから見ると**�
                         Referer: http://top.localhost:18301/
 ```
 
-- `Sec-Fetch-Dest: iframe` は、**この要求が iframe の中に表示されるためのもの**だとサーバに伝えます。第 134 回で見た Fetch Metadata を使えば、埋め込ませたくないページは、ここを見て応答の本文を作る前に断れます
-- `Referer` は、別のサイトに対してはオリジンだけに削られています。第 134 回で見た既定の `strict-origin-when-cross-origin` のとおりです
+- `Sec-Fetch-Dest: iframe` は、**この要求が iframe の中に表示されるためのもの**だとサーバに伝えます。第 139 回で見た Fetch Metadata を使えば、埋め込ませたくないページは、ここを見て応答の本文を作る前に断れます
+- `Referer` は、別のサイトに対してはオリジンだけに削られています。第 139 回で見た既定の `strict-origin-when-cross-origin` のとおりです
 
 Cookie は、子のサイト（`widget.localhost`）に、トップレベルで訪れたときに `SameSite=None; Secure` と `SameSite=Lax` の 2 つを置いてから、`top.localhost` の中に iframe で入れて調べました。
 
@@ -243,7 +243,7 @@ Cookie は、子のサイト（`widget.localhost`）に、トップレベルで�
 credentialless の iframe   Cookie なし
 ```
 
-`SameSite=None` の Cookie が付いたのは、Chrome が執筆時点で第三者 Cookie を既定では遮断していないからです。Safari と Firefox では、同じ構成でもこの Cookie は付かないか、トップレベルのサイトごとに分けられます（第 132 回、第 133 回）。
+`SameSite=None` の Cookie が付いたのは、Chrome が執筆時点で第三者 Cookie を既定では遮断していないからです。Safari と Firefox では、同じ構成でもこの Cookie は付かないか、トップレベルのサイトごとに分けられます（第 137 回、第 138 回）。
 
 ## 中のページに何を許すか
 
@@ -251,9 +251,9 @@ credentialless の iframe   Cookie なし
 
 | 属性 | 向き | 例 | 回 |
 | --- | --- | --- | --- |
-| `sandbox` | **削る**。スクリプト、フォーム、ポップアップ、トップの移動、オリジンをまとめて禁じ、キーワードで 1 つずつ戻す | `sandbox="allow-scripts allow-forms"` | 第 130 回 |
-| `allow` | **与える**。カメラ、位置情報、決済などの強い機能を、ページの `Permissions-Policy` が許す範囲で中に渡す | `allow="payment; geolocation"` | 第 135 回 |
-| `credentialless` | **資格情報を外す**。中を、その時だけの空の Cookie とストレージで動かす | `<iframe credentialless>` | 第 136 回 |
+| `sandbox` | **削る**。スクリプト、フォーム、ポップアップ、トップの移動、オリジンをまとめて禁じ、キーワードで 1 つずつ戻す | `sandbox="allow-scripts allow-forms"` | 第 135 回 |
+| `allow` | **与える**。カメラ、位置情報、決済などの強い機能を、ページの `Permissions-Policy` が許す範囲で中に渡す | `allow="payment; geolocation"` | 第 140 回 |
+| `credentialless` | **資格情報を外す**。中を、その時だけの空の Cookie とストレージで動かす | `<iframe credentialless>` | 第 141 回 |
 
 `credentialless` は、実験でも Cookie が付かず、中の `document.cookie` も空でした。中の `localStorage` は使えますが、トップレベルの文書が続く間だけの一時的な領域です。MDN は、この仕組みが本来のオリジンの Cookie やストレージに触れない代わりに、COEP を付けたページでも COEP の無い第三者の文書を埋め込めるようにするものだと説明しています（[MDN: IFrame credentialless](https://developer.mozilla.org/en-US/docs/Web/Security/IFrame_credentialless)）。MDN はこの機能を、主要なブラウザの一部で動かないとして Baseline に入れていません。ログインが要る埋め込み（決済、利用者ごとのウィジェット）には使えません。
 
@@ -263,7 +263,7 @@ iframe はそれ自体が 1 つのページなので、読み込みは重い処�
 
 実験では、5000 ピクセルの空白の下に `loading="lazy"` の iframe を置きました。ページを読み込んだ時点では、普通の iframe と `credentialless` の iframe の要求だけがサーバに届き、遅延の iframe の要求は**下までスクロールした後**に初めて届きました。
 
-MDN は、遅延読み込みが**スクリプトが有効なときに限られる**と書いています。スクリプトを無効にしたブラウザで遅延読み込みが働くと、サーバは iframe の要求の時期から利用者のスクロールの位置を知ることができ、スクリプトを無効にした意味が失われるからです（[MDN: iframe の loading 属性](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe#loading)）。**要求の時期そのものが情報になる**という点は、第 130 回の XS-Leaks と同じ形です。
+MDN は、遅延読み込みが**スクリプトが有効なときに限られる**と書いています。スクリプトを無効にしたブラウザで遅延読み込みが働くと、サーバは iframe の要求の時期から利用者のスクロールの位置を知ることができ、スクリプトを無効にした意味が失われるからです（[MDN: iframe の loading 属性](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe#loading)）。**要求の時期そのものが情報になる**という点は、第 135 回の XS-Leaks と同じ形です。
 
 対応は、画像と iframe をまとめた数字で Chrome 77、Firefox 121、Safari 16.4 からです（[Can I use](https://caniuse.com/loading-lazy-attr)）。
 
@@ -273,7 +273,7 @@ MDN は、遅延読み込みが**スクリプトが有効なときに限られ�
 
 しかし Google は、第三者 Cookie を廃止しないと決めた後、2025 年 10 月にPrivacy Sandbox の技術の大半を引き上げると発表しました（[Update on Plans for Privacy Sandbox Technologies](https://privacysandbox.google.com/blog/update-on-plans-for-privacy-sandbox-technologies)）。それを受けて 2026 年 8 月、Fenced Frames の要素と `window.fence` の API を取り除く提案が出されています。提案では、Chrome 154 で `window.fence` を取り除いて要素を中身の無い形だけ残し、155 から要素自体の削除を段階的に進める予定です（[Intent to Ship: Remove FencedFrame element and window.fence APIs](https://groups.google.com/a/chromium.org/g/blink-dev/c/c9w5uH3eSuo/m/KcvocvF1DQAJ)）。手元の Chrome 154 でも、`HTMLFencedFrameElement` はまだ存在していました。
 
-Fenced Frames は、**埋め込みを使った追跡を、枠の側で断つ**という発想でした。第三者 Cookie が残ることになり、その前提が無くなったので、iframe とストレージの分割（第 132 回）が引き続き埋め込みの基本の形です。
+Fenced Frames は、**埋め込みを使った追跡を、枠の側で断つ**という発想でした。第三者 Cookie が残ることになり、その前提が無くなったので、iframe とストレージの分割（第 137 回）が引き続き埋め込みの基本の形です。
 
 ## 用途別の組み合わせ
 
@@ -281,12 +281,12 @@ Fenced Frames は、**埋め込みを使った追跡を、枠の側で断つ**�
 
 | 場面 | 置く側でやること | 置かれる側でやること |
 | --- | --- | --- |
-| 利用者が書いた HTML を表示する | **別のサイト**から配信し、`sandbox="allow-scripts"`（`allow-same-origin` は付けない）。`srcdoc` だけで済ませない | 配信用のドメインに CSP を付ける（第 135 回） |
-| 決済や地図など、第三者の部品を埋め込む | `frame-src` で相手を限る。`sandbox` と `allow` は必要な分だけ。`postMessage` の `event.origin` を完全一致で確かめる（第 130 回） | 親が期待どおりのオリジンかを `event.origin` で確かめる |
+| 利用者が書いた HTML を表示する | **別のサイト**から配信し、`sandbox="allow-scripts"`（`allow-same-origin` は付けない）。`srcdoc` だけで済ませない | 配信用のドメインに CSP を付ける（第 140 回） |
+| 決済や地図など、第三者の部品を埋め込む | `frame-src` で相手を限る。`sandbox` と `allow` は必要な分だけ。`postMessage` の `event.origin` を完全一致で確かめる（第 135 回） | 親が期待どおりのオリジンかを `event.origin` で確かめる |
 | 広告を埋め込む | `sandbox` に `allow-top-navigation-by-user-activation` を使い、`allow-top-navigation` は付けない | — |
-| 自分のページを他社のサイトに埋め込んでもらう（ウィジェット） | — | `frame-ancestors` で相手を限る。Cookie は CHIPS や Storage Access API（第 132 回、第 139 回）。`postMessage` の送り先を指定する |
+| 自分のページを他社のサイトに埋め込んでもらう（ウィジェット） | — | `frame-ancestors` で相手を限る。Cookie は CHIPS や Storage Access API（第 137 回、第 144 回）。`postMessage` の送り先を指定する |
 | どこにも埋め込ませない | — | `frame-ancestors 'none'`（古いブラウザ向けに `X-Frame-Options: DENY`）。`Sec-Fetch-Dest: iframe` の要求を断る |
-| 分離したページに第三者の部品を入れる | `credentialless`、または相手に CORP と COEP を付けてもらう（第 136 回） | COEP を付ける（`credentialless` でない場合） |
+| 分離したページに第三者の部品を入れる | `credentialless`、または相手に CORP と COEP を付けてもらう（第 141 回） | COEP を付ける（`credentialless` でない場合） |
 
 ## ブラウザごとの違い
 
@@ -298,7 +298,7 @@ Fenced Frames は、**埋め込みを使った追跡を、枠の側で断つ**�
 - `credentialless` は Baseline に入っていない
 - `loading="lazy"` の iframe は、Firefox が 121、Safari が 16.4 から
 - Fenced Frames は Chrome が削除を進めている
-- 第三者の iframe に Cookie が付くかは、Chrome、Safari、Firefox で大きく違う（第 133 回）
+- 第三者の iframe に Cookie が付くかは、Chrome、Safari、Firefox で大きく違う（第 138 回）
 
 ## まとめ
 

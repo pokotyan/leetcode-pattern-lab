@@ -15,8 +15,8 @@ topics:
   - fingerprint
   - 鍵のペアの確認
 requires:
-  - ll-144-signature
-  - ll-143-public-key
+  - ll-149-signature
+  - ll-148-public-key
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -31,7 +31,7 @@ server.key   server.crt   bundle.pem   id_deploy   id_deploy.pub   jwks.json
 
 `server.key` は RSA なのか EC なのか。`bundle.pem` の 1 つ目は本当にサーバの証明書なのか。`id_deploy.pub` はこの秘密鍵と組なのか。拡張子を見ても、どれも分かりません。
 
-第 143 回と第 144 回では、鍵を「数」として扱いました。この回は、その数が**ファイルとしてどう書かれているか**を見ます。形式の層を分けて読めるようになれば、「このファイルは何か」と「この 2 つはペアか」は、どちらも数行のコマンドで確かめられます。
+第 148 回と第 149 回では、鍵を「数」として扱いました。この回は、その数が**ファイルとしてどう書かれているか**を見ます。形式の層を分けて読めるようになれば、「このファイルは何か」と「この 2 つはペアか」は、どちらも数行のコマンドで確かめられます。
 
 ## 鍵の種類: アルゴリズムと用途
 
@@ -57,7 +57,7 @@ server.key   server.crt   bundle.pem   id_deploy   id_deploy.pub   jwks.json
 | JWK の `crv` | `P-256` | `P-384` |
 | OID | 1.2.840.10045.3.1.7 | 1.3.132.0.34 |
 
-どれも同じ曲線です。似た名前の **secp256k1**（ビットコインの曲線。第 148 回）は**別物**なので、取り違えると読めません。
+どれも同じ曲線です。似た名前の **secp256k1**（ビットコインの曲線。第 153 回）は**別物**なので、取り違えると読めません。
 
 <Callout type="warn" title="よくある誤解: Ed25519 と X25519 は同じ鍵">
   どちらも Curve25519 という同じ系統の曲線を使うので、名前も長さ（32 バイト）もそっくりです。
@@ -69,7 +69,7 @@ $ openssl pkeyutl -sign -inkey x25519.pem -rawin -in m.txt
 error:03000096:digital envelope routines:do_sigver_init:operation not supported for this keytype
 ```
 
-  第 143 回の鍵交換と第 144 回の署名は、別の部品です。1 つの鍵を両方に使い回す設計は避けます。
+  第 148 回の鍵交換と第 149 回の署名は、別の部品です。1 つの鍵を両方に使い回す設計は避けます。
 </Callout>
 
 ## 形式の層を分ける
@@ -98,7 +98,7 @@ error:03000096:digital envelope routines:do_sigver_init:operation not supported 
 | `EC PRIVATE KEY` | SEC1 ECPrivateKey | EC の秘密鍵だけ | [RFC 5915](https://www.rfc-editor.org/rfc/rfc5915.html) |
 | `PUBLIC KEY` | SubjectPublicKeyInfo（SPKI） | どのアルゴリズムの公開鍵でも | [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1) |
 | `RSA PUBLIC KEY` | PKCS#1 RSAPublicKey | RSA の公開鍵だけ | [RFC 8017 A.1.1](https://www.rfc-editor.org/rfc/rfc8017.html#appendix-A.1.1) |
-| `CERTIFICATE` | X.509 Certificate | 公開鍵 + 名前 + CA の署名 | RFC 5280（第 149 回） |
+| `CERTIFICATE` | X.509 Certificate | 公開鍵 + 名前 + CA の署名 | RFC 5280（第 154 回） |
 | `CERTIFICATE REQUEST` | PKCS#10 CSR | 公開鍵 + 名前 + 自分の署名 | [RFC 2986](https://www.rfc-editor.org/rfc/rfc2986.html) |
 | `OPENSSH PRIVATE KEY` | OpenSSH 独自 | SSH の秘密鍵 | [PROTOCOL.key](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key) |
 
@@ -251,7 +251,7 @@ $ openssl asn1parse -in ec-enc.pem
   100:d=1  hl=3 l= 144 prim: OCTET STRING      [HEX DUMP]:D9F0C13A...   ← 暗号化された PKCS#8
 ```
 
-`openssl pkcs8 -topk8 -scrypt` とすれば、PBKDF2 の代わりに scrypt も選べます。パスワードから鍵を作る関数の違いは第 146 回で扱います。
+`openssl pkcs8 -topk8 -scrypt` とすれば、PBKDF2 の代わりに scrypt も選べます。パスワードから鍵を作る関数の違いは第 151 回で扱います。
 
 古い PKCS#1 形式にも暗号化はありますが、PEM のヘッダ行（`Proc-Type: 4,ENCRYPTED` と `DEK-Info:`）で表す独自の方式で、OpenSSL の文書によれば**鍵の導出は MD5 を 1 回かけるだけ**です（[OpenSSL PEM_read_bio_PrivateKey](https://docs.openssl.org/3.6/man3/PEM_read_bio_PrivateKey/)）。パスフレーズを総当たりされやすいので、使う理由がなければ PKCS#8 に移します。
 
@@ -289,7 +289,7 @@ $ sed '1d;$d' id_ed25519 | base64 -d | xxd | head -3
 
 ## JWK と PKCS#12
 
-**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 170 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
+**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 176 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
 
 ```
 $ node -e 'const c=require("crypto"),fs=require("fs");
@@ -406,7 +406,7 @@ other key   :     1l1lVkoi4GA4tRxwT6pI7FZ56Sip88RKitTeauz8l3c   ← ec2.pem: 不
 
 ### 署名して確かめる、との違い
 
-もう 1 つの確かめ方は、秘密鍵で署名し、公開鍵で検証することです（第 144 回）。
+もう 1 つの確かめ方は、秘密鍵で署名し、公開鍵で検証することです（第 149 回）。
 
 ```
 $ openssl dgst -sha256 -sign rsa.pem -out m.sig m.txt
@@ -416,9 +416,9 @@ $ openssl dgst -sha256 -verify rsa2.pub -signature m.sig m.txt
 Verification failure
 ```
 
-結果は公開鍵の比較と同じですが、**意味が違います**。公開鍵の比較は「この 2 つのファイルは同じ鍵を指している」ことを、手元で静かに確かめるだけです。署名の検証は「**今この瞬間、秘密鍵を持っている誰かが応答した**」ことを示します。後者は、秘密鍵を見せられない相手に対して「持っている」ことを示す手段で、プロトコルが使うのはこちらです。CSR に自分の署名が付いているのも（`openssl req -verify` で `self-signature verify OK`）、TLS の CertificateVerify（第 153 回）も、SSH の公開鍵認証（第 156 回）も同じ考え方です。
+結果は公開鍵の比較と同じですが、**意味が違います**。公開鍵の比較は「この 2 つのファイルは同じ鍵を指している」ことを、手元で静かに確かめるだけです。署名の検証は「**今この瞬間、秘密鍵を持っている誰かが応答した**」ことを示します。後者は、秘密鍵を見せられない相手に対して「持っている」ことを示す手段で、プロトコルが使うのはこちらです。CSR に自分の署名が付いているのも（`openssl req -verify` で `self-signature verify OK`）、TLS の CertificateVerify（第 158 回）も、SSH の公開鍵認証（第 161 回）も同じ考え方です。
 
-秘密鍵を HSM や KMS から取り出せない場合（第 146 回）は、公開鍵をそこから取り出して比べるか、署名を 1 回頼んで検証するかのどちらかになります。
+秘密鍵を HSM や KMS から取り出せない場合（第 151 回）は、公開鍵をそこから取り出して比べるか、署名を 1 回頼んで検証するかのどちらかになります。
 
 ## 形式を変換する
 
@@ -455,7 +455,7 @@ error setting private key
 error:05800074:x509 certificate routines:ossl_x509_check_private_key:key values mismatch
 ```
 
-**中間証明書と取り違える。** 上の `wrong-chain.pem` のように、連結の順番を逆にすると、先頭の中間 CA の証明書と秘密鍵を比べることになり、同じ `key values mismatch` になります。証明書のファイルは**サーバ証明書を先頭に**置きます（チェーンは第 150 回）。
+**中間証明書と取り違える。** 上の `wrong-chain.pem` のように、連結の順番を逆にすると、先頭の中間 CA の証明書と秘密鍵を比べることになり、同じ `key values mismatch` になります。証明書のファイルは**サーバ証明書を先頭に**置きます（チェーンは第 155 回）。
 
 **改行コードと BOM。** Windows で編集したファイルは、行末が CRLF になったり、先頭に BOM（UTF-8 であることを示す 3 バイト `EF BB BF`）が付いたりします。手元で試すと、読めるかどうかは道具によって分かれました。
 
@@ -475,12 +475,12 @@ error:05800074:x509 certificate routines:ossl_x509_check_private_key:key values 
 
 | 鍵が入る場所 | 「誰の鍵か」を示すもの | 回 |
 | --- | --- | --- |
-| 証明書の SPKI | CA の署名 | 第 131〜133 回 |
-| TLS のサーバの秘密鍵 | 証明書 + CertificateVerify の署名 | 第 153 回 |
-| SSH のホスト鍵・ユーザ鍵 | known_hosts / authorized_keys（fingerprint） | 第 137〜138 回 |
-| JWKS の公開鍵 | TLS で守られた IdP の URL と `kid` | 第 150、153 回 |
+| 証明書の SPKI | CA の署名 | 第 136〜138 回 |
+| TLS のサーバの秘密鍵 | 証明書 + CertificateVerify の署名 | 第 158 回 |
+| SSH のホスト鍵・ユーザ鍵 | known_hosts / authorized_keys（fingerprint） | 第 142〜143 回 |
+| JWKS の公開鍵 | TLS で守られた IdP の URL と `kid` | 第 155、158 回 |
 
-どの場合も、確かめているのは第 144 回で見たとおり「**この鍵**で署名された」ことだけです。その鍵が本物かどうかは、ペアの確認とは別に、それぞれの仕組みが引き受けています。
+どの場合も、確かめているのは第 149 回で見たとおり「**この鍵**で署名された」ことだけです。その鍵が本物かどうかは、ペアの確認とは別に、それぞれの仕組みが引き受けています。
 
 ## まとめ
 
@@ -493,4 +493,4 @@ error:05800074:x509 certificate routines:ossl_x509_check_private_key:key values 
 - 署名して検証する方法は、比較ではなく「今、秘密鍵を持つ者が応答した」ことの証明で、プロトコルはこちらを使う
 - 事故の多くは、形式違い、証明書と鍵の取り違え、連結順の誤り、BOM で起きる
 
-この回で、鍵がファイルとしてどう書かれ、どう照合できるかを見ました。では、その鍵の元になる乱数はどこから来て、できた鍵はどこに置けばよいのか。次の第 146 回で、乱数と鍵の管理を見て、この章を締めます。
+この回で、鍵がファイルとしてどう書かれ、どう照合できるかを見ました。では、その鍵の元になる乱数はどこから来て、できた鍵はどこに置けばよいのか。次の第 151 回で、乱数と鍵の管理を見て、この章を締めます。

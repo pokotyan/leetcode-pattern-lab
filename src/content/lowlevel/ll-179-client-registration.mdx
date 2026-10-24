@@ -1,0 +1,526 @@
+---
+title: 先に何を登録しておくのか：クライアント登録と信頼の向き
+description: OAuth や OpenID Connect の流れは、どれも「相手がすでに登録されている」ところから始まります。何を、誰が、誰に登録しているのか。認可サーバがクライアントを覚える向きと、依拠する側が IdP を覚える向きを分け、redirect_uri の照合、ループバックのポート、動的な登録と Client ID Metadata Document までを Keycloak で確かめます
+chapter: identity
+order: 8
+status: published
+topics:
+  - クライアント登録
+  - 機密クライアントと公開クライアント
+  - redirect_uri の完全一致
+  - ループバックのリダイレクト
+  - private_key_jwt
+  - 信頼の向き
+  - Workload Identity 連携のプロバイダ
+  - SAML メタデータ
+  - Dynamic Client Registration
+  - 初期アクセストークン
+  - Client ID Metadata Document
+requires:
+  - ll-178-oidc
+  - ll-177-oauth
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 流れが始まる前に、もう済んでいること
+
+第 178 回では、Keycloak に `webapp` というクライアントを作り、戻り先の URL を 1 つ書いてから、ログインの流れを curl で通しました。第 177 回の模型でも、`photo-printer` は最初からサーバのコードの中に書かれていました。
+
+認可コードフローの最初の要求には `client_id=webapp` が載っています。認可サーバはこの文字列を見て、戻り先が正しいか、秘密が合っているかを確かめます。つまり、**確かめるための材料は、流れが始まる前に認可サーバの手元に置かれていた**ことになります。
+
+RFC 6749 は、この事前の手続きを**クライアント登録**と呼び、その手段は仕様の範囲外だとしています。そのうえで、登録のときにクライアントの開発者は、**クライアントの種類**と**リダイレクト URI** と、名前やロゴなど認可サーバが求めるその他の情報を伝えることになっています（[RFC 6749 2](https://www.rfc-editor.org/rfc/rfc6749.html#section-2)）。
+
+登録はクライアントの側だけの話ではありません。第 178 回の RP は、IdP の issuer の URL を設定に書いていました。クラウドに GitHub Actions のトークンを受け入れさせるには、GitHub の発行者をクラウドに登録します（第 187 回で扱います）。設定画面を開くたびに「誰が、誰について、何を登録しているのか」が違うので、混乱しやすいところです。この回は、その登録の手続きだけを取り出して見ます。
+
+## 登録で決めている 4 つのこと
+
+どの登録画面も、突き詰めると次の 4 つを相手に預けています。
+
+| 決めること | OAuth のクライアント登録 | OIDC の RP が IdP を登録 | SAML | クラウドのワークロード連携 |
+| --- | --- | --- | --- | --- |
+| 識別子 | `client_id` | IdP の `issuer` | `entityID` | 発行者の `issuer` |
+| 検証の手段 | `client_secret`、公開鍵（`jwks` / `jwks_uri`）、クライアント証明書 | IdP の JWKS の取得先 | メタデータに入れた署名用の証明書 | JWKS の取得先、または公開鍵の直接登録 |
+| 宛先 | `redirect_uri` | トークンの `aud` に入るべき自分の `client_id` | ACS（アサーションを受け取る URL）と `Audience` | 許可する `aud` |
+| 許可する範囲 | 使ってよいグラントとスコープ | どのクレームを利用者の属性に写すか | どの属性を受け入れるか | 属性の条件（`sub` などの条件式） |
+
+**識別子**は、相手が名乗る名前です。**検証の手段**は、その名乗りが本物かを確かめる材料で、共有の秘密か、公開鍵か、証明書のどれかです。**宛先**は、結果を届けてよい場所、またはトークンが自分宛てかを判定する値です。**許可する範囲**は、本物で自分宛てでも、どこまで認めるかの線です。4 つのうち 1 つでも緩いと、残りが正しくても破られます。第 187 回で見る、`sub` の条件を書き忘れたロールは、「許可する範囲」が抜けた例です。この回では「宛先」が緩い例を、Keycloak で再現します。
+
+## 信頼の向きは 2 つある
+
+4 つの項目は同じでも、**誰が誰を覚えるか**には 2 つの向きがあります。
+
+```
+ 向き 1: 認可サーバ（IdP）がクライアントを覚える
+   クライアントの開発者 ──登録──▶ 認可サーバ
+                                  client_id、秘密や公開鍵、redirect_uri、種類
+   以後、認可サーバは「このクライアントには、この戻り先にだけ、コードを渡す」
+
+ 向き 2: 依拠する側（RP、SP、クラウド）が IdP を覚える
+   依拠する側の管理者 ──登録──▶ 依拠する側の設定
+                                  issuer、JWKS の取得先や証明書、受け入れる aud、属性の条件
+   以後、依拠する側は「この発行者が、自分宛てに署名したものだけ、受け入れる」
+```
+
+向き 1 は**出す側が、渡す相手を限る**登録、向き 2 は**受け取る側が、信じる相手を限る**登録です。Google Cloud のコンソールには、この 2 つが別の画面として並んでいます。
+
+| 画面 | 誰が出す側か | 誰が受け取る側か | 向き |
+| --- | --- | --- | --- |
+| 「OAuth クライアント ID の作成」（アプリの種類を選び、リダイレクト URI を書く） | Google（認可サーバ） | 自分のアプリ | 向き 1。自分のアプリを Google に登録する |
+| Workload Identity 連携の「プール」と「プロバイダ」の作成（issuer、許可する audience、属性の条件を書く） | 外部の IdP（GitHub など） | Google Cloud（STS） | 向き 2。外部の IdP を Google Cloud に登録する |
+
+前者では Google が**信じられる側**で、自分のアプリが Google に覚えてもらいます。後者では Google が**信じる側**で、Google が GitHub を覚えます。同じコンソールで同じ「OIDC」の言葉が出てきても、矢印は逆です。
+
+## 向き 1: 認可サーバがクライアントを覚える
+
+### アプリの種類を選ばせる理由
+
+Google の OAuth クライアントを作ると、最初に「アプリケーションの種類」を選ばされます。種類ごとに、入力欄が違います（[Google Cloud Console ヘルプ](https://support.google.com/cloud/answer/15549257)）。
+
+| 種類 | 登録で求められるもの |
+| --- | --- |
+| ウェブ アプリケーション | 承認済みの JavaScript 生成元、承認済みのリダイレクト URI |
+| Android | パッケージ名と、署名証明書の SHA-1 フィンガープリント |
+| iOS | バンドル ID（App Store ID と Team ID は任意） |
+| Chrome 拡張機能 | 拡張機能の ID |
+| テレビと入力が限られたデバイス | 追加の入力なし（第 177 回のデバイスフロー） |
+| デスクトップ アプリ | 追加の入力なし |
+
+種類を選ばせているのは、次の 2 つを認可サーバが知るためです。
+
+1. **秘密を守れるか。** RFC 6749 は、資格情報の機密を保てるクライアントを機密クライアント、保てないものを公開クライアントと定義しています（[RFC 6749 2.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.1)）。第 177 回で見た区別です。Google の文書も、デスクトップアプリは公開クライアントで秘密を守れないと書いています（[Google: OAuth 2.0 for iOS & Desktop Apps](https://developers.google.com/identity/protocols/oauth2/native-app)）。
+2. **リダイレクトをどう受け取るか。** サーバなら `https://` の URL で受けられます。スマートフォンのアプリやデスクトップのアプリには、外から届く URL がありません。種類によって、戻り先の形と、その戻り先が本物かを確かめる材料（パッケージ名と署名証明書、バンドル ID）が変わります。
+
+なお、草案の OAuth 2.1 は、機密クライアントを「認可サーバに対する資格情報を持つクライアント」と言い直しています（[draft-ietf-oauth-v2-1-16 2.1](https://www.ietf.org/archive/id/draft-ietf-oauth-v2-1-16.html#section-2.1)）。秘密を守れるかという能力ではなく、登録の時点で資格情報を割り当てたかどうかで分ける書き方です。
+
+<Callout type="warn" title="よくある誤解: client_id は合言葉だから隠しておく">
+  `client_id` は、利用者のブラウザのアドレスバーにそのまま出ます。RFC 6749 も、クライアント識別子は**秘密ではなく**、それだけでクライアント認証に使ってはならないとしています（[RFC 6749 2.2](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.2)）。
+  公開クライアントでは、`client_id` を知っている者なら誰でもそのクライアントとしてフローを始められます。それでも安全でいられるのは、**登録した戻り先にしかコードが届かない**ことと、PKCE（第 177 回）のおかげです。
+  隠すべきなのは `client_secret` のほうで、Google のコンソールでも、2025 年からクライアントの秘密は作成した時にしか表示・ダウンロードできなくなりました（[Google Cloud Console ヘルプ](https://support.google.com/cloud/answer/15549257)）。
+</Callout>
+
+### 検証の手段: 秘密を預けるか、公開鍵を預けるか
+
+機密クライアントは、トークンエンドポイントで自分を認証します。そのための材料も登録で決めます。手元の Keycloak の Discovery の `token_endpoint_auth_methods_supported` には、次の表の 5 つが並んでいました。
+
+| 方式 | 登録で認可サーバに預けるもの | 漏れたら困るものがどこにあるか |
+| --- | --- | --- |
+| `client_secret_basic` / `_post` | 共有の秘密そのもの | クライアントと認可サーバの**両方** |
+| `client_secret_jwt` | 共有の秘密（HMAC の鍵） | 両方 |
+| `private_key_jwt` | 公開鍵（`jwks`）か、公開鍵の置き場所（`jwks_uri`） | クライアントだけ |
+| `tls_client_auth` | クライアント証明書の識別名など（[RFC 8705](https://www.rfc-editor.org/rfc/rfc8705.html)） | クライアントだけ |
+
+`private_key_jwt` では、クライアントが自分の秘密鍵で署名した短命な JWT を送り、認可サーバは登録された公開鍵で確かめます（[RFC 7523 2.2](https://www.rfc-editor.org/rfc/rfc7523.html#section-2.2)、[OIDC Core 9](https://openid.net/specs/openid-connect-core-1_0.html#ClientAuthentication)）。第 149 回の署名そのものです。**認可サーバ側の登録情報が漏れても、なりすましには使えません**。`jwks_uri` を登録しておけば、鍵の入れ替えもクライアントの側だけで済みます。
+
+### 宛先: なぜ「登録した戻り先」だけなのか
+
+認可サーバは、利用者が許可した結果のコードを、`redirect_uri` に向けてブラウザごと送り出します。第 177 回で見たとおり、ここで攻撃者の URL を通してしまえば、コードは攻撃者に届きます。だから戻り先は**要求に書かれた値ではなく、登録された値**で決める必要があります。RFC 6749 は、公開クライアントには戻り先の登録を必須とし、すべてのクライアントに求めるべきだとしています（[RFC 6749 3.1.2.2](https://www.rfc-editor.org/rfc/rfc6749.html#section-3.1.2.2)）。
+
+照合の仕方も問題になります。RFC 9700 は、`https://*.somesite.example/*` のようなパターンで登録させた場合の事故を挙げています（[RFC 9700 4.1.1](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.1.1)）。
+
+- ワイルドカードの `*` を「ドメイン名に使える文字」ではなく「何でもよい」と解釈する実装では、`attacker.example/.somesite.example` のような値が通ってしまう
+- 正しく解釈しても、攻撃者が `somesite.example` の下に 1 つでもホストを持てば（放置されたサブドメインの乗っ取りなど）、そこが正規の戻り先になる
+- パスにワイルドカードを許すと、同じサイトの**どこか 1 ページ**にでも任意の URL へ転送する箇所（オープンリダイレクタ）があれば、そこを経由してコードが外へ出る
+
+そのため RFC 9700 は、ネイティブアプリの `localhost` のポート番号を除き、**文字列の完全一致**で照合しなければならないとしています（[RFC 9700 2.1](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1)、[4.1.3](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.1.3)）。草案の OAuth 2.1 も、パスを含む完全な URI の登録と完全一致を求め、例外はループバックのポートだけです（[draft-ietf-oauth-v2-1-16 2.3.1](https://www.ietf.org/archive/id/draft-ietf-oauth-v2-1-16.html#section-2.3.1)）。完全一致なら、登録した 1 つの URL の持ち主だけを信じれば済み、同じサイトの他のページの出来を問わずに済みます。
+
+### ネイティブアプリ: 戻り先の 3 つの形と、登録するもの
+
+ネイティブアプリの戻り先は RFC 8252 が 3 つの形を決めています。構成の型としての使い分けは第 189 回で扱うので、ここでは**認可サーバに何を登録するか**に絞ります。
+
+| 形 | 登録する値の例 | 戻り先が本物だと言える根拠 |
+| --- | --- | --- |
+| アプリに結び付けた https の URL（[RFC 8252 7.2](https://www.rfc-editor.org/rfc/rfc8252.html#section-7.2)） | `https://app.example.com/oauth/cb` | OS が、そのドメインに置かれたファイルでアプリとの結び付きを確かめる |
+| アプリ専用の URI スキーム（[7.1](https://www.rfc-editor.org/rfc/rfc8252.html#section-7.1)） | `com.example.app:/oauth/cb` | 自分のドメイン名を逆順にしたスキームを使う決まりだけ。`myapp` のような名前は要件を満たさない |
+| ループバック（[7.3](https://www.rfc-editor.org/rfc/rfc8252.html#section-7.3)） | `http://127.0.0.1/oauth/cb` | 同じ端末の中でしか届かない。ポートは要求のたびに変わってよい |
+
+RFC 8252 は、https の形を使えるならそれを優先すべきだとしています（7.2）。アプリ専用のスキームは、別のアプリが同じスキームを名乗れるので、PKCE が欠かせません。Google は、なりすましの危険を理由に、Android と Chrome アプリではアプリ専用のスキームを受け付けなくなり、Android、Chrome アプリ、iOS の種類ではループバックも非推奨にしています（[Google: OAuth 2.0 for iOS & Desktop Apps](https://developers.google.com/identity/protocols/oauth2/native-app)）。
+
+https の URL では、Web アプリの戻り先と見分けがつきません。そこで RFC 8252 は、登録の時点で**クライアントの種類を記録する**ことを求め、ネイティブアプリは公開クライアントとして登録しなければならないとしています（[RFC 8252 8.4](https://www.rfc-editor.org/rfc/rfc8252.html#section-8.4)）。アプリの種類を選ばせる理由は、ここにもあります。
+
+### ループバックだけ、ポートが自由な理由
+
+RFC 8252 は、ループバックの戻り先について、**認可サーバは要求の時点で任意のポートを指定できるようにしなければならない**と定めています。理由は、クライアントが要求のたびに OS から空いている一時的なポートをもらうからです（[RFC 8252 7.3](https://www.rfc-editor.org/rfc/rfc8252.html#section-7.3)）。デスクトップのアプリが固定のポート、たとえば 8400 で待ち受けると決めておくと、その端末で別のプログラムがすでに 8400 を使っていれば起動できません。かといって、ありうるポートをすべて登録するわけにもいきません。だからポートは要求のたびに決めてよく、照合は**ポート以外の完全一致**になります（8.4）。
+
+ポートを緩めても困らないのは、`127.0.0.1` に向けたリダイレクトが**その端末の外へ出ない**からです。コードが届く範囲は、利用者自身の端末の中に限られます。残る危険は同じ端末の別のプロセスが先に待ち受けることで、これは PKCE で防ぎます。RFC 8252 は `localhost` という名前ではなく IP アドレスの `127.0.0.1` や `[::1]` を使うよう勧めています。名前の解決しだいで、意図しないネットワークのインターフェースで待ち受けてしまうことがあるからです（[8.3](https://www.rfc-editor.org/rfc/rfc8252.html#section-8.3)）。
+
+## 手元で確かめる: 登録と違う戻り先
+
+### 実験の環境
+
+Keycloak 26.8.1（`quay.io/keycloak/keycloak:latest` を開発用の `start-dev` で起動）を Docker で動かしました。ホストにはポートを公開せず、専用の Docker ネットワーク `ll-179-net` に置いた alpine 3.20 のコンテナから curl で話しかけています。Keycloak のホスト名は `kc` です。
+
+管理 API で realm `shop` を作り、クライアントを 2 つ登録しました。
+
+```
+webapp    機密クライアント  secret=webapp-secret   redirectUris=["https://app.example.com/callback"]
+cli-tool  公開クライアント  （秘密なし、PKCE は S256 を必須）  redirectUris=["http://127.0.0.1/callback"]
+```
+
+`app.example.com` には何も待ち受けていません。認可サーバが戻り先を受け入れたかどうかは、認可要求に対してログイン画面（200）が返るか、エラー画面（400）が返るかで分かります。
+
+### 完全一致: 1 文字でも違えば断る
+
+`webapp` に対して、`redirect_uri` だけを変えて認可要求を送りました。
+
+```
+200  https://app.example.com/callback                 Sign in to shop
+400  https://app.example.com/callback/                Invalid parameter: redirect_uri
+400  https://app.example.com/callback/extra           Invalid parameter: redirect_uri
+400  https://app.example.com/callback?next=/admin     Invalid parameter: redirect_uri
+400  https://APP.example.com/callback                 Invalid parameter: redirect_uri
+400  https://app.example.com:443/callback             Invalid parameter: redirect_uri
+400  http://app.example.com/callback                  Invalid parameter: redirect_uri
+400  https://app.example.com/callback/../evil         Invalid parameter: redirect_uri
+400  https://evil.example/callback                    Invalid parameter: redirect_uri
+```
+
+末尾のスラッシュ 1 つ、パスの追加、クエリの追加で断られます。ホスト名の大文字や、既定のポート `:443` を明示しただけの URL も、URL としては同じ場所を指しますが、**文字列としては違う**ので断られています。完全一致とは、ここまで厳しいということです。登録した戻り先と、アプリが実際に送る値を 1 文字ずつ揃える必要があります。
+
+断った要求は、リダイレクトせずにその場でエラー画面を返しています。戻り先が信用できないので、エラーさえそこへ送ってはいけないからです（第 177 回）。Keycloak のログには `error="invalid_redirect_uri"` と、断った `redirect_uri` の値が残ります。
+
+### ワイルドカードで登録すると
+
+Keycloak は、末尾に `*` を付けた登録を受け付けます。`https://app.example.com/*` で登録したクライアント `loose` に同じことをしました。
+
+```
+200  https://app.example.com/callback                 Sign in to shop
+200  https://app.example.com/callback/extra           Sign in to shop
+200  https://app.example.com/redirect?to=https://evil.example/ Sign in to shop
+400  https://app.example.com/callback/../evil         Invalid parameter: redirect_uri
+400  https://app.example.com.evil.example/x           Invalid parameter: redirect_uri
+400  https://evil.example/https://app.example.com/    Invalid parameter: redirect_uri
+```
+
+ホスト名をずらす攻撃は止まっていますが、3 行目が通っています。`app.example.com` のどこかに「`to` に書かれた URL へ転送する」ページがあれば、コードは `/redirect?to=...&code=...` に届き、そこから攻撃者のサイトへ転送されます。転送先の URL や `Referer` にコードが載ります。アプリの側で 1 ページ作り損ねただけで、認可サーバの守りが外れるわけです。
+
+Keycloak には、登録できる戻り先を制限する仕組みもあります。realm の**クライアントポリシー**に `secure-redirect-uris-enforcer` という実行器があり、ワイルドカードや URL の断片を禁じる「OAuth 2.0 Compliant」、さらに `localhost` も禁じて https を求める「OAuth 2.1 Compliant」の設定を選べます（手元の Keycloak の `/admin/serverinfo` で確認しました）。既定ではどちらも OFF です。
+
+## 手元で確かめる: ループバックのポート
+
+`cli-tool` は `http://127.0.0.1/callback` を、ポートを書かずに登録しています。比べるため、ポートを書いて登録した `cli-port`（`http://127.0.0.1:8400/callback`）と、`localhost` で登録した `cli-localhost`（`http://localhost/callback`）も作りました。
+
+```
+== cli-tool (登録: http://127.0.0.1/callback)
+200  http://127.0.0.1/callback                        Sign in to shop
+200  http://127.0.0.1:53817/callback                  Sign in to shop
+200  http://127.0.0.1:8400/callback                   Sign in to shop
+400  http://127.0.0.1:53817/other                     Invalid parameter: redirect_uri
+400  http://[::1]:53817/callback                      Invalid parameter: redirect_uri
+400  http://localhost:53817/callback                  Invalid parameter: redirect_uri
+400  http://127.0.0.2:53817/callback                  Invalid parameter: redirect_uri
+== cli-port (登録: http://127.0.0.1:8400/callback)
+200  http://127.0.0.1:8400/callback                   Sign in to shop
+400  http://127.0.0.1:53817/callback                  Invalid parameter: redirect_uri
+== cli-localhost (登録: http://localhost/callback)
+200  http://localhost/callback                        Sign in to shop
+200  http://localhost:53817/callback                  Sign in to shop
+400  http://127.0.0.1:53817/callback                  Invalid parameter: redirect_uri
+```
+
+ポートを書かずに登録すると、どのポートでも通ります。パスやホストの表記が違えば断られます。`127.0.0.1` と `[::1]` と `localhost` は、互いに別の文字列として扱われています。ポートを書いて登録すると、そのポートだけになります。
+
+Keycloak の実装を読むと、仕組みは単純です。戻り先のスキームが `http` で、ホストが `localhost`、`127.0.0.1`、`[::1]` のいずれかのとき、まず通常どおり照合し、一致しなければ**ポートを 80（http の既定のポート）に置き換えてもう一度照合**します（[Keycloak: RedirectUtils.java](https://github.com/keycloak/keycloak/blob/main/services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java)）。ポートを書かない登録は `:80` と同じ意味なので、どのポートの要求も「80 に直せば一致する」ことになります。ポートを書いた登録では、80 に直すと一致しなくなるので、そのポートしか通りません。
+
+## 手元で確かめる: 公開と機密で、トークンエンドポイントは何を見るか
+
+登録した種類の違いは、トークンエンドポイントで表れます。どちらのクライアントでも、利用者 `alice` でログインしてコードを取り、交換の要求だけを変えました。
+
+```
+== webapp(機密): secret なし
+{"error":"unauthorized_client","error_description":"Invalid client or Invalid client credentials"} [401]
+== webapp(機密): secret 違い
+{"error":"unauthorized_client","error_description":"Invalid client or Invalid client credentials"} [401]
+== webapp(機密): secret 正
+{"access_token":"eyJ...(略)","expires_in":300,...,"id_token":"eyJ...(略)",...}
+== cli-tool(公開): client_id だけ
+{"access_token":"eyJ...(略)","expires_in":300,...,"id_token":"eyJ...(略)",...}
+== cli-tool(公開): verifier なし
+{"error":"invalid_grant","error_description":"PKCE code verifier not specified"} [400]
+== cli-tool(公開): 別ポートの redirect_uri で交換
+{"error":"invalid_grant","error_description":"Incorrect redirect_uri"} [400]
+== cli-tool(公開): client_credentials
+{"error":"unauthorized_client","error_description":"Public client not allowed to retrieve service account"} [401]
+```
+
+機密クライアントは、**登録した秘密を出せなければ**、正しいコードを持っていても交換できません。公開クライアントは `client_id` だけで交換でき、代わりに PKCE の `code_verifier` がなければ断られます。登録の「機密か公開か」の 1 項目が、ここで「何を本人確認の根拠にするか」を切り替えています。
+
+6 行目は、認可要求ではポート 53817 で始めたフローを、交換のときに別のポートの `redirect_uri` で引き換えようとしたものです。ポートが自由なのは**認可要求の時点で選ぶ**ことであって、交換のときは同じフローの認可要求と同じ値でなければなりません（[RFC 6749 4.1.3](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1.3)）。最後の行のとおり、公開クライアントは client credentials（利用者なしでクライアント自身の権限をもらう流れ）も使えません。根拠にできるのがクライアント認証だけの流れだからです。
+
+なお、RFC 6749 はクライアント認証の失敗を `invalid_client` と決めていますが（[RFC 6749 5.2](https://www.rfc-editor.org/rfc/rfc6749.html#section-5.2)）、Keycloak 26.8.1 は `unauthorized_client`（401）を返しました。エラーの名前で処理を分けるなら、相手の実際の応答を確かめておく必要があります。
+
+## 向き 2: 依拠する側が IdP を覚える
+
+ここからは逆の向きです。トークンやアサーションを**受け取る側**が、どの発行者を信じるかを登録します。
+
+### 何を入れるのか
+
+| 項目 | OIDC の RP | SAML の SP | Google Cloud の Workload Identity 連携 |
+| --- | --- | --- | --- |
+| 識別子 | IdP の issuer | IdP の `entityID` | プロバイダの issuer の URL（`https://` で始まる） |
+| 検証の手段 | Discovery から得た `jwks_uri` | IdP のメタデータに入った署名用の証明書 | issuer の Discovery から JWKS を取る。公開されていない IdP なら JWKS を直接アップロード（最大 8 本） |
+| 宛先 | `aud` が自分の `client_id` であること | `Audience` が自分の `entityID`、`Recipient` が自分の ACS | 許可する audience の一覧。空なら、プロバイダ自身のリソース名 |
+| 許可する範囲 | どのクレームを利用者の属性に写すか | どの属性を受け入れるか | 属性の対応づけ（`google.subject=assertion.sub` など）と、CEL の条件式 |
+
+Google Cloud の項目は、文書とリファレンスで確かめました（[Google Cloud: Workload Identity Federation with other providers](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-providers)、[REST リファレンス](https://docs.cloud.google.com/iam/docs/reference/rest/v1/projects.locations.workloadIdentityPools.providers)）。許可する audience を空にしておくと、トークンの `aud` は `//iam.googleapis.com/projects/番号/locations/global/workloadIdentityPools/プール/providers/プロバイダ` という形のプロバイダ自身の名前でなければなりません。属性の条件は省略できますが、GitHub のように複数の組織で共有される発行者では必須とされています（同リファレンス）。条件が何を守っているかは第 187 回で見ます。
+
+### 片方向だけの登録と、両方向の登録
+
+向き 2 の登録には、**向き 1 を伴うもの**と、**伴わないもの**があります。
+
+- **OIDC の RP** は、IdP の issuer を自分の設定に書く（向き 2）だけでなく、IdP に自分をクライアントとして登録します（向き 1）。IdP は RP の `client_id` と戻り先を知っており、`aud` に RP の `client_id` を入れて ID トークンを出します
+- **SAML の SP** も同じで、IdP のメタデータ（`entityID`、ログインの URL、署名用の証明書）を SP に取り込み（向き 2）、SP のメタデータ（`entityID`、ACS の URL、必要なら署名用の証明書）を IdP に取り込みます（向き 1）。第 182 回で、IdP のメタデータを SP に読ませる場面を見ます。メタデータの形式は SAML 2.0 の Metadata 仕様が決めています（[OASIS: SAML 2.0 Metadata](https://docs.oasis-open.org/security/saml/v2.0/saml-metadata-2.0-os.pdf)）
+- **ワークロード連携**では、GitHub は Google Cloud を**クライアントとして知りません**。ジョブがトークンを要求するときに `audience` を指定するだけです（第 187 回）。登録は Google Cloud の側の向き 2 だけで、`aud` と属性の条件が、向き 1 の登録が担っていた「誰に宛てたか」「誰に渡すか」を受け取る側で代わりに判定しています
+
+最後の型は、IdP の協力なしに一方的に信頼を設定できる代わりに、**受け取る側の条件だけが頼り**です。第 187 回で扱う `sub` の条件の書き忘れが致命的になるのは、このためです。
+
+## 手元で確かめる: 別の realm を IdP として登録する
+
+両方向の登録を 1 つのログインの中で見るため、同じ Keycloak に realm `partner` を作り、それを `shop` の外部 IdP として登録しました。Keycloak の identity brokering（他の IdP のログイン結果を受け取って、自分の名前でトークンを出し直す仕組み。第 183 回で扱います）を使います。
+
+```
+ ブラウザ ── webapp ── shop（RP として partner を信じる / webapp には IdP）── partner（IdP）
+                         │                                                      │
+                         │ 向き 2: shop に partner を登録                       │ 向き 1: partner に shop を登録
+                         │   issuer = http://kc:8080/realms/partner            │   clientId = shop-broker
+                         │   jwksUrl = .../realms/partner/.../certs            │   secret   = broker-secret
+                         │   clientId / clientSecret（向き 1 で受け取った値）   │   redirectUris =
+                         │                                                      │     .../realms/shop/broker/partner-idp/endpoint
+```
+
+まず `partner` の側で、`shop` を機密クライアント `shop-broker` として登録します。戻り先は、`shop` が外部 IdP からの応答を受ける URL です。これが向き 1 です。
+
+次に `shop` の側で、`partner` を IdP として登録します（向き 2）。Keycloak の管理 API には、Discovery の URL を渡すと設定を読み込む口（`identity-provider/import-config`）があり、`issuer`、`jwksUrl`、各エンドポイントはそこから埋まりました。埋まらないのは、**向き 1 で `partner` から受け取った `clientId` と `clientSecret`** です。これを足して登録した設定の抜粋です。
+
+```
+{
+  "issuer": "http://kc:8080/realms/partner",                                ← Discovery から
+  "jwksUrl": "http://kc:8080/realms/partner/protocol/openid-connect/certs",  ← Discovery から
+  "useJwksUrl": "true", "validateSignature": "true",
+  "clientId": "shop-broker", "clientSecret": "**********",                  ← 向き 1 で受け取った値
+  "clientAuthMethod": "client_secret_basic", "pkceEnabled": "true", ...
+}
+```
+
+`webapp` の認可要求に `kc_idp_hint=partner-idp` を付けて、`partner` の利用者 `bob` でログインしました。リダイレクトを 1 つずつたどった結果です。
+
+```
+== 1. shop の webapp で認可要求（kc_idp_hint=partner-idp）
+  303 http://kc:8080/realms/shop/protocol/openid-connect/auth
+  303 http://kc:8080/realms/shop/broker/partner-idp/login
+  200 http://kc:8080/realms/partner/protocol/openid-connect/auth
+<title>Sign in to partner
+== 2. partner のログイン画面に bob のパスワードを送る
+  302 -> http://kc:8080/realms/shop/broker/partner-idp/endpoint
+  302 http://kc:8080/realms/shop/broker/partner-idp/endpoint
+  302 http://kc:8080/realms/shop/login-actions/first-broker-login
+  302 http://kc:8080/realms/shop/broker/after-first-broker-login
+final: https://app.example.com/callback?state=st&session_state=...&iss=http%3A%2F%2Fkc%3A8080%2Frealms%2Fshop&code=aef2d9eb...
+== shop が webapp に出した ID トークン
+{"iss":"http://kc:8080/realms/shop","aud":"webapp","sub":"5773d9c1-...","preferred_username":"bob","email":"bob@partner.example"}
+```
+
+`shop` は `partner` に対してはクライアントとして振る舞い（`/broker/partner-idp/endpoint` でコードを受け、`shop-broker` として交換する）、`webapp` に対しては IdP として振る舞っています。`webapp` が受け取る ID トークンの `iss` は `shop` で、`webapp` は `partner` の存在を知りません。
+
+それぞれの向きの登録を 1 つずつ壊すと、どこで止まるかが分かれます。
+
+```
+--- shop に登録した issuer を http://kc:8080/realms/other に変える（向き 2 が合わない）
+  302 -> http://kc:8080/realms/shop/broker/partner-idp/endpoint
+  502 http://kc:8080/realms/shop/broker/partner-idp/endpoint
+(docker logs) IdentityBrokerException: Wrong issuer from token.
+              Got: http://kc:8080/realms/partner expected: http://kc:8080/realms/other
+
+--- shop に登録した clientSecret を wrong-secret に変える（向き 1 の資格情報が合わない）
+  302 -> http://kc:8080/realms/shop/broker/partner-idp/endpoint
+  502 http://kc:8080/realms/shop/broker/partner-idp/endpoint
+(docker logs) Unexpected response from token endpoint http://kc:8080/realms/partner/protocol/openid-connect/token.
+              status=401, response={"error":"unauthorized_client","error_description":"Invalid client or Invalid client credentials"}
+```
+
+どちらも、`bob` は `partner` で正しくログインできています。issuer を変えたときは、`partner` は ID トークンを出したのに、**`shop` が受け取りを拒みました**。秘密を変えたときは、**`partner` が `shop` をクライアントとして認めず**、ID トークン自体が出ませんでした。前者は受け取る側の登録、後者は出す側の登録の問題で、エラーの出る場所が違います。連携がつながらないときは、どちらの向きの登録が合っていないのかを先に切り分けると、調べる場所を半分にできます。
+
+## 手で登録しない: Dynamic Client Registration
+
+ここまでの登録は、どれも管理者が画面か管理 API で行いました。しかし、クライアントと認可サーバが事前に知り合いでない場合があります。メールのクライアントが、利用者の指定した任意のメールサーバの認可サーバとつなぐ場合などです。
+
+**Dynamic Client Registration**（[RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html)、2015 年）は、クライアントが認可サーバの**登録エンドポイント**に JSON を POST して、自分で登録する手順です。登録エンドポイントの場所は、認可サーバのメタデータの `registration_endpoint` で公開されます（[RFC 8414 2](https://www.rfc-editor.org/rfc/rfc8414.html#section-2)、[OIDC Discovery 3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata)）。
+
+登録の要求に書けるのは、この回の冒頭の 4 つそのものです。`redirect_uris`（宛先）、`token_endpoint_auth_method` と `jwks` / `jwks_uri`（検証の手段）、`grant_types` と `scope`（許可する範囲）です。`token_endpoint_auth_method` に `none` と書けば公開クライアントになります（[RFC 7591 2](https://www.rfc-editor.org/rfc/rfc7591.html#section-2)）。
+
+登録エンドポイントの守り方は 2 通りです。誰でも登録できる**開かれた登録**と、別の経路で配られた**初期アクセストークン**を持つ者だけが登録できる**守られた登録**です。RFC 7591 は、認可なしの登録要求を受け付けるべきだとしています（[3](https://www.rfc-editor.org/rfc/rfc7591.html#section-3)、[付録 A.1](https://www.rfc-editor.org/rfc/rfc7591.html#appendix-A.1)）。OIDC の Dynamic Client Registration 1.0 も同じ形です（[OIDC Registration 3](https://openid.net/specs/openid-connect-registration-1_0.html#ClientRegistration)）。
+
+登録した後の読み出し、更新、削除は、別の RFC 7592 が決めています。登録の応答に入る `registration_client_uri` に、`registration_access_token` を付けて GET、PUT、DELETE します（[RFC 7592](https://www.rfc-editor.org/rfc/rfc7592.html)）。RFC 7592 は標準化の文書ではなく、**Experimental**（実験的）の位置付けです。
+
+### 開かれた登録の問題
+
+開かれた登録には、構造的な問題が 2 つあります。
+
+**1. 登録の中身は自己申告にすぎない。** RFC 7591 は、署名されたソフトウェアステートメント（第三者が署名した JWT）に入っていない限り、クライアントのメタデータはすべて**自己申告として扱わなければならない**としています。偽のクライアントが、なりすましたい正規のクライアントの名前とロゴを使うかもしれない、とも書いています（[RFC 7591 5](https://www.rfc-editor.org/rfc/rfc7591.html#section-5)）。同意画面に「Photo Printer があなたの写真へのアクセスを求めています」と出ても、その名前を書いたのは登録した本人です。
+
+**2. 登録が溜まり続ける。** 同じソフトウェアでも、端末ごと、利用者ごとに登録すれば、そのたびに新しい `client_id` ができます。使われなくなった登録を消す手段が、認可サーバ側にはありません。後で見る Client ID Metadata Document の草案も、動的な登録には登録情報の管理と、使われなくなったクライアントの掃除という課題が増えると書いています（[draft-ietf-oauth-client-id-metadata-document-02 1](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document)）。
+
+## 手元で確かめる: Keycloak の登録エンドポイント
+
+Keycloak の OIDC 用の登録エンドポイントは `/realms/<realm>/clients-registrations/openid-connect` です（[Keycloak: Client registration](https://www.keycloak.org/securing-apps/client-registration)）。Discovery の `registration_endpoint` にも、この URL が出ていました。
+
+`client_name` を `Photo Printer`、`redirect_uris` を `["https://printer.example/cb"]` にした JSON を、初期アクセストークンを持たずに POST しました。
+
+```
+== 匿名で登録
+{"error":"insufficient_scope","error_description":"Policy 'Trusted Hosts' rejected request to
+ client-registration service. Details: Host not trusted."} [403]
+```
+
+Keycloak は匿名の登録を受け付けますが、**信頼するホスト**のポリシーで送り元を絞っていて、既定では信頼するホストが 1 つもないので、事実上すべて断られます（同文書）。
+
+次に、管理者が初期アクセストークンを 1 回分（`count: 1`、有効 600 秒）発行し、それを付けて登録しました。
+
+```
+== 初期アクセストークン付きで登録
+{
+  "client_id": "e9281e78-aef4-438f-bdf0-b6b04495c83f",
+  "client_secret": "IlmFyxeh...",
+  "client_id_issued_at": 1792838827,
+  "client_secret_expires_at": 0,
+  "redirect_uris": ["https://printer.example/cb"],
+  "token_endpoint_auth_method": "client_secret_basic",
+  "registration_client_uri": "http://kc:8080/realms/shop/clients-registrations/openid-connect/e9281e78-...",
+  "registration_access_token": "eyJhbGciOiJIUzUx..."
+}
+== 同じ初期アクセストークンで 2 回目
+{"error":"invalid_token","error_description":"No remaining count on initial access token"} [401]
+```
+
+`client_id` と `client_secret` は、認可サーバが決めて返します。`client_secret_expires_at` の 0 は「期限なし」です（[RFC 7591 3.2.1](https://www.rfc-editor.org/rfc/rfc7591.html#section-3.2.1)）。初期アクセストークンは回数を使い切ると断られます。登録アクセストークンで設定を更新すると、応答に新しい登録アクセストークンが入り、古いものは 401 で断られるようになりました（読み出しでは変わりませんでした）。登録アクセストークンは、そのクライアントの戻り先を書き換えられる鍵なので、長く同じものを使わせない作りです（同文書）。
+
+最後に、信頼するホストに `curl` のコンテナのアドレスと `printer.example` を加えて、**開かれた登録**の状態にしました。
+
+```
+== 匿名で登録（信頼するホストから）
+{"client_id":"b5e0eb2d-...","client_name":"Photo Printer","token_endpoint_auth_method":"client_secret_basic"}
+== 匿名で登録（redirect_uris が信頼するホストの外）
+{"error":"insufficient_scope","error_description":"Policy 'Trusted Hosts' rejected request to
+ client-registration service. Details: URI doesn't match any trusted host or trusted domain"} [403]
+== 同じ名前で 5 回登録
+c80ad686-ccb0-401a-b761-b63e174886a4
+a1b7efe5-aa18-4748-9efc-36f3553d36cb
+f5270c57-934b-4afa-9f15-705bb87b8bfa
+95d5b270-2530-433d-9937-25c2b805ff5f
+b3e8dcd4-d96c-4db5-817c-438c614bb717
+== client_name が Photo Printer のクライアントの数
+7
+```
+
+同じ名前、同じ戻り先の要求が、そのたびに別の `client_id` になりました。realm には `Photo Printer` という名前のクライアントが 7 つあり、どれが本物かは名前からは分かりません。Keycloak は、匿名の登録の上限（既定で 200）や、匿名で登録したクライアントに同意画面を必ず出すポリシーを既定で掛けています（同文書）。開かれた登録を安全にするには、こうした上限と同意を認可サーバの側で足す必要があるということです。
+
+## client_id を URL にする: Client ID Metadata Document
+
+登録を溜めずに、知らない相手のクライアントを受け入れる方法として、IETF の OAuth 作業部会で議論されているのが **OAuth Client ID Metadata Document**（以下 CIMD）です。執筆時点（2026 年 10 月）の最新版は 2026 年 7 月 6 日の draft-ietf-oauth-client-id-metadata-document-02 で、IESG の審査にはまだ進んでいない Internet-Draft です（[IETF Datatracker](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/)）。
+
+発想は単純です。**`client_id` を URL にし、登録の中身をその URL に置きます。**クライアントの開発者は `https://app.example.com/oauth/client.json` のような URL に、`client_id`、`client_name`、`redirect_uris` などを書いた JSON を置き、認可要求の `client_id` にその URL を書きます。認可サーバはその URL を取りに行き、中の `client_id` が URL と一致するか、`redirect_uri` が載っているかを確かめます。
+
+草案の主な決まりは次のとおりです（[draft-02](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document)）。
+
+| 決まり | 内容 |
+| --- | --- |
+| URL の形 | `https` で、パスを含み、断片（`#`）を含まない。比較は単純な文字列の比較（3） |
+| 文書の中身 | `client_id` を持ち、その値は URL と一致しなければならない（4） |
+| 戻り先 | 文書の `redirect_uris` に登録し、認可要求の値と完全一致で照合する（4.2） |
+| 秘密 | 共有の秘密を使う方式（`client_secret_basic` など）は書けない。クライアント認証をするなら `private_key_jwt` で、公開鍵を文書か `jwks_uri` に置く（4.1、8.2） |
+| 取得 | リダイレクトを自動で追わない。HTTP のキャッシュヘッダに従い、エラーや不正な文書はキャッシュしない（5、5.2） |
+| 表示 | 同意画面に `client_id` のホスト名を出すべき（8.5） |
+| SSRF | 利用者が渡した URL をサーバが取りに行くので、内部のアドレスを取りに行かせない対策が要る（8.6） |
+
+この仕組みで変わるのは、**登録情報の持ち主**です。動的な登録では、クライアントが申告した中身を認可サーバが保存しました。CIMD では、中身はクライアントの開発者のサイトにあり、認可サーバは必要なときに読みに行くだけです。登録は溜まりません。そして、`client_id` の URL のホスト名が、TLS の証明書（第 155 回）で確かめられる**ドメインの持ち主**を指します。同意画面に `app.example.com` と出れば、少なくともその文書をそのドメインの持ち主が置いたことは言えます。名前とロゴしか見せられなかった動的な登録との違いです。
+
+ただし、CIMD だけでは防げないものもあります。公開クライアントで戻り先がループバックなら、攻撃者は**正規のクライアントの URL を `client_id` に書き**、自分の端末の任意のポートで待ち受けられます。認可サーバが読むのは正規の文書で、利用者に見えるのも正規の名前です。MCP の仕様は、この `localhost` のなりすましを CIMD 単独では防げないと明記し、ループバックだけを戻り先にするクライアントには追加の警告を出すよう求めています（[MCP Specification 2025-11-25: Authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)）。
+
+<Callout type="note" title="AI エージェントの接続で、この違いが効いてくる">
+  MCP（Model Context Protocol）の認可の仕様は、クライアントの登録方法に優先順位を付けています。2025-11-25 版では、事前の登録があればそれを使い、なければ CIMD（クライアントと認可サーバは対応すべき、SHOULD）、それもなければ動的な登録（対応してもよい、MAY。以前の版との互換のため）でした（[MCP Specification 2025-11-25: Authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)）。続く 2026-07-28 版では、動的な登録は CIMD に置き換えるものとして非推奨になりました（[2026-07-28 Key Changes](https://modelcontextprotocol.io/specification/2026-07-28/changelog)）。
+  利用者が任意の MCP サーバをつなぐので、クライアントと認可サーバが事前に知り合いでないのが普通だからです。
+  この続きは第 188 回「AI エージェントに権限を渡す：MCP の認可」で扱います。
+</Callout>
+
+## 手元で確かめる: Keycloak の実験的な CIMD
+
+Keycloak 26.8.1 には、CIMD が実験的な機能（`--features=cimd`）として入っています。文書は、将来の版で互換性のない変更がありうるとしています（[Keycloak: Integrating with Model Context Protocol](https://www.keycloak.org/securing-apps/mcp-authz-server)）。2 台目の Keycloak（ホスト名 `kc2`）をこの機能付きで起動し（起動時のログに `Experimental features enabled: cimd:v1`）、文書を置く Web サーバとして busybox 1.36 の httpd（ホスト名 `meta`）を同じネットワークに立てました。
+
+realm `mcp` のクライアントポリシーに、`client_id` が URL の要求に当てはまる条件（`client-id-uri`）と、文書を取りに行って検証する実行器（`client-id-metadata-document`）を設定しました。実験のため **http を許し**、信頼するドメインを `meta` と `127.0.0.1` に絞っています。草案は https を求めているので、http を許すのは手元の実験だけです。Discovery には `"client_id_metadata_document_supported":true` が出ました。
+
+`meta` に置いた文書です。Keycloak の管理画面では、何も登録していません。
+
+```json
+{
+  "client_id": "http://meta/printer/client.json",
+  "client_name": "Photo Printer CLI",
+  "redirect_uris": ["http://127.0.0.1/callback"],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+この URL を `client_id` にして認可要求を送りました。比べるため、中の `client_id` が URL と食い違う文書（`/bad/client.json`）、存在しない URL、信頼するドメインの外の URL も試しています。
+
+```
+== 認可要求（client_id は URL）
+200  http://127.0.0.1:53817/callback                  Sign in to mcp
+400  http://127.0.0.1:53817/other                     Invalid parameter: redirect_uri
+400  https://evil.example/callback                    Invalid parameter: redirect_uri
+== client_id と文書の中身が食い違う
+400  http://127.0.0.1:53817/callback                  Sign in to mcp
+== 文書が無い
+400  http://127.0.0.1:53817/callback                  Sign in to mcp
+== 信頼するドメインの外
+400  http://127.0.0.1:53817/callback                  Sign in to mcp
+```
+
+各行は `redirect_uri` の値です。後ろの 3 つも 400 のエラー画面で、Keycloak のログにそれぞれの理由が出ていました。
+
+```
+redirect_uri parameter does not exactly match the one of redirect_uris property in client metadata:
+  redirectUri = http://127.0.0.1:53817/other
+client_id property in client metadata does not exactly match client_id parameter in authorization request.
+  property = http://meta/printer/client.json, parameter = http://meta/bad/client.json
+fetching client metadata for the first time failed: clientId = http://meta/none/client.json
+not trusted domain: host = kc
+```
+
+最初の要求では、ポートを書いていない `http://127.0.0.1/callback` の登録に対して、ポート 53817 が通っています。ループバックのポートの扱いは、文書から読んだ登録にも同じように効いています。
+
+ログインすると、同意画面が出ました。見出しは文書の `client_name` を使った「Grant Access to Photo Printer CLI」で、許可する項目の下に「The client's hostname is meta」という 1 行がありました。これが、草案の「`client_id` のホスト名を見せる」に当たる表示です。同意してコードを受け取り、`client_id` に URL を入れて交換すると、ID トークンが返りました。
+
+```
+{"token_type":"Bearer","expires_in":300,"has_id_token":true}
+{"iss":"http://kc2:8080/realms/mcp","aud":"http://meta/printer/client.json",
+ "azp":"http://meta/printer/client.json","preferred_username":"alice"}
+```
+
+`aud` が URL そのものになっています。管理 API でクライアントの一覧を見ると、Keycloak は取得した文書から内部のクライアント（`publicClient: true`、`consentRequired: true`）を作り、キャッシュの期限を `cimd.cache.expiry.time.in.sec` という属性に記録していました。記録は残りますが、中身の出どころは文書の URL で、期限が来れば読み直されます。動的な登録と違い、`client_id` は何度使っても同じ URL 1 つです。
+
+## 3 つの登録の仕方を並べる
+
+| | 事前の登録 | Dynamic Client Registration | Client ID Metadata Document |
+| --- | --- | --- | --- |
+| 登録するのは | 管理者が、画面か管理 API で | クライアントが、登録エンドポイントに POST して | クライアントの開発者が、自分のサイトに文書を置いて |
+| 登録情報の置き場所 | 認可サーバ | 認可サーバ | クライアントのサイト（認可サーバはキャッシュするだけ） |
+| `client_id` | 認可サーバが決める | 認可サーバが決める。登録のたびに別の値 | 文書の URL。いつも同じ |
+| 検証の手段 | 秘密、公開鍵、証明書のどれでも | 秘密を返してもらえる。公開鍵も登録できる | 公開鍵だけ。共有の秘密は使えない |
+| 名前の信頼性 | 管理者が確かめた | 自己申告 | 自己申告。ただしドメインの持ち主は分かる |
+| 向いている場面 | 相手が決まっている | 相手が決まっていない。初期アクセストークンで絞れるなら | 相手が決まっていない。クライアントが自分のドメインを持つ |
+| 標準の状態 | RFC 6749 は手段を決めていない | RFC 7591（管理の RFC 7592 は Experimental） | 草案（draft-02） |
+
+## まとめ
+
+- OAuth と OIDC の流れは、どれも事前の登録を前提に始まる。RFC 6749 は登録の手段を決めておらず、種類とリダイレクト URI を伝えることだけを求めている
+- 登録で決めているのは、識別子、検証の手段、宛先、許可する範囲の 4 つ。どれか 1 つが緩いと、残りが正しくても破られる
+- 向き 1 は認可サーバがクライアントを覚える登録（Google の OAuth クライアント）、向き 2 は依拠する側が IdP を覚える登録（Workload Identity 連携のプロバイダ）。同じ画面に並んでいても矢印は逆
+- アプリの種類を選ばせるのは、秘密を守れるかと、リダイレクトをどう受け取るかを認可サーバが知るため。`client_id` は秘密ではない
+- `redirect_uri` は完全一致。Keycloak 26.8.1 では末尾のスラッシュ、ホスト名の大文字、`:443` の明示でも断られ、ワイルドカードで登録すると同じサイトの転送用のページを通した
+- ループバックだけはポートが自由。OS が空いているポートを毎回割り当てるからで、通信は端末の外に出ない。Keycloak はポートを 80 に直して照合し直していた
+- OIDC の RP と SAML の SP は両方向の登録を持ち、ワークロード連携は受け取る側の登録だけで成り立つ。だから受け取る側の条件だけが頼りになる。Keycloak の連携では、issuer の不一致は受け取る側で、秘密の不一致は出す側で止まった
+- Dynamic Client Registration は、中身が自己申告で、登録が溜まる。Keycloak は既定で匿名の登録を断り、初期アクセストークンの回数と登録アクセストークンの入れ替えで絞っていた
+- Client ID Metadata Document は `client_id` を URL にし、登録の中身をクライアントのサイトに置く。共有の秘密は使えず、同意画面にはホスト名が出る。まだ草案で、ループバックのなりすましは単独では防げない
+
+ここまでで、誰が誰を信じるかは登録として決まりました。次の第 180 回では、こうして信じた相手から届いたアクセストークンを、受け取った API の側が何を確かめなければならないかを見ます。

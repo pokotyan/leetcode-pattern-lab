@@ -2,7 +2,7 @@
 title: メモリはどこへ消えたか
 description: free が少ないのは異常なのか。free の 6 つの列、RSS と PSS、malloc しただけでは増えないメモリ、スワップの si と so、コンテナの中で嘘をつく free、そして OOM killer が誰をどう選ぶのかを、実際に動かして読みます
 chapter: observe
-order: 7
+order: 8
 status: published
 topics:
   - free
@@ -19,8 +19,8 @@ topics:
   - OOM killer のログ
 requires:
   - ll-24-mmap-cow
-  - ll-210-limits
-  - ll-224-measure
+  - ll-219-limits
+  - ll-233-measure
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -30,7 +30,7 @@ import MemoryAccounting from '../../components/sim/problems/MemoryAccounting'
 
 監視画面で free が 1 割を切っている。コンテナが前触れなく再起動を繰り返す。プロセスの RSS を全部足したら、搭載量を超えていた。どれも「メモリが足りないのでは」という相談の入口としてよく出てきますが、本当に足りないのはこのうち一部だけです。
 
-第 24 回で、`malloc` は約束をするだけで、触ったときに初めて物理ページが割り当てられることを見ました。第 210 回では、コンテナの `--memory` が cgroup の `memory.max` になり、超えると殺されることを見ました。この回では、それらの仕組みが**数字としてどこに現れるか**を読む側に回ります。調べる順番は、次の 3 つの問いです。
+第 24 回で、`malloc` は約束をするだけで、触ったときに初めて物理ページが割り当てられることを見ました。第 219 回では、コンテナの `--memory` が cgroup の `memory.max` になり、超えると殺されることを見ました。この回では、それらの仕組みが**数字としてどこに現れるか**を読む側に回ります。調べる順番は、次の 3 つの問いです。
 
 1. マシン全体で、まだ使える量はどれだけあるか（`free` の `available`）
 2. 誰が使っているのか（プロセスの RSS と PSS、cgroup の `memory.stat`）
@@ -145,7 +145,7 @@ malloc(512 MiB) 後     VmSize:	  526572 kB  VmRSS:	    1324 kB  Committed_AS:  
 
 ### 共有されたページと PSS
 
-RSS には、他のプロセスと共有しているページも全部入ります。第 224 回で触れたとおり、全プロセスの RSS を足すと物理メモリを超えることがあります。これを実際に起こしてみます。
+RSS には、他のプロセスと共有しているページも全部入ります。第 233 回で触れたとおり、全プロセスの RSS を足すと物理メモリを超えることがあります。これを実際に起こしてみます。
 
 親が 256 MiB を確保して全部に書き、`fork` で子を 3 つ作ります。どの子も書き込まずに止まっているので、第 24 回のコピーオンライトにより、4 つのプロセスが同じ物理ページを共有します。その後、子 1 だけに 256 MiB 全部を書かせます。それぞれの時点で、4 プロセスの `/proc/<pid>/smaps_rollup` と `free -m` を取りました。
 
@@ -227,7 +227,7 @@ memory.max=134217728
 Mem:           16040        5236        9906         142        1285       10804
 ```
 
-total は 16 GiB のままです。`/proc/meminfo` は名前空間で分けられていないので、**コンテナの中の `free` や `top` には、VM 全体の値が出ます**。このコンテナが使えるのは 128 MiB なのに、available は 10 GiB と表示されます。第 210 回の「ランタイムが制限に気づかない」と同じ問題で、`free` を見てメモリに余裕があると判断してはいけません。
+total は 16 GiB のままです。`/proc/meminfo` は名前空間で分けられていないので、**コンテナの中の `free` や `top` には、VM 全体の値が出ます**。このコンテナが使えるのは 128 MiB なのに、available は 10 GiB と表示されます。第 219 回の「ランタイムが制限に気づかない」と同じ問題で、`free` を見てメモリに余裕があると判断してはいけません。
 
 コンテナの使用量は、cgroup のファイルで見ます。同じコンテナで 512 MiB のファイルを書いてから読み、`memory.stat` の `anon` と `file`、`memory.current` を取りました。
 
@@ -245,7 +245,7 @@ oom_kill 0
 
 cgroup v2 の文書は、`anon` を「Amount of memory used in anonymous mappings such as brk(), sbrk(), and mmap(MAP_ANONYMOUS).」、`file` を「Amount of memory used to cache filesystem data, including tmpfs and shared memory.」と説明しています（[Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)）。
 
-このコンテナはプロセスとしては何も確保していないのに、`memory.current` は上限ぎりぎりの 127 MiB です。全部がページキャッシュ（`file`）です。第 210 回で「ページキャッシュも数えられる」と書いたのは、この状態のことです。
+このコンテナはプロセスとしては何も確保していないのに、`memory.current` は上限ぎりぎりの 127 MiB です。全部がページキャッシュ（`file`）です。第 219 回で「ページキャッシュも数えられる」と書いたのは、この状態のことです。
 
 それでも殺されてはいません。`memory.events` の 3 つの欄の意味は、文書によると次のとおりです。
 
@@ -328,7 +328,7 @@ oom 1
 oom_kill 1
 ```
 
-112 MiB まで書いたところで殺され、終了コードは 137（128 + `SIGKILL` の 9、第 210 回）でした。`memory.events` の `oom` と `oom_kill` が 1 ずつ増えています。カーネルのログ（`dmesg`）には、次の 2 行が残りました。1 行目は長いので、cgroup のパスを途中で省いています。
+112 MiB まで書いたところで殺され、終了コードは 137（128 + `SIGKILL` の 9、第 219 回）でした。`memory.events` の `oom` と `oom_kill` が 1 ずつ増えています。カーネルのログ（`dmesg`）には、次の 2 行が残りました。1 行目は長いので、cgroup のパスを途中で省いています。
 
 ```text
 [955919.765017] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=424effdacfd8…,mems_allowed=0,oom_memcg=/scon/container/…/docker/424effdacfd8…,task_memcg=/scon/container/…/docker/424effdacfd8…,task=grow,pid=3227256,uid=0
@@ -356,7 +356,7 @@ oom_kill 1
 | 見えている形 | 疑うもの | 次にやること |
 | --- | --- | --- |
 | `memory.current` や buff/cache が高いが、`anon` や RSS は低い | ページキャッシュ。問題ではない | available と `memory.events` の `oom_kill` を確かめて終わる |
-| 負荷が一定なのに、RSS が時間とともに単調に増える | メモリリーク。解放し忘れた確保が溜まっている | ヒープのプロファイラで、どこで確保されたものが残っているかを見る（第 224 回の `heaptrack`、`valgrind`） |
+| 負荷が一定なのに、RSS が時間とともに単調に増える | メモリリーク。解放し忘れた確保が溜まっている | ヒープのプロファイラで、どこで確保されたものが残っているかを見る（第 233 回の `heaptrack`、`valgrind`） |
 | 負荷の山で RSS が増え、山が過ぎても下がらないが、それ以上は増えない | アロケータが解放されたメモリを OS に返していない、あるいは断片化（第 25 回） | アロケータの統計（glibc なら `malloc_stats`）でヒープの使用中の量と RSS の差を見る |
 | GC のある言語で、上限に近づいてから OOM kill される | GC が上限を知らず、ゴミを溜めている（第 26 回） | ランタイムのヒープ統計を見て、`GOMEMLIMIT` や `-XX:MaxRAMPercentage` で上限を教える |
 

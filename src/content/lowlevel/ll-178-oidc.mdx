@@ -15,14 +15,14 @@ topics:
   - iss と sub
   - トークンの差し替え
 requires:
-  - ll-171-oauth
-  - ll-170-jwt
-  - ll-166-authn-authz
+  - ll-177-oauth
+  - ll-176-jwt
+  - ll-172-authn-authz
 ---
 
 import Callout from '../../components/Callout.astro'
 
-第 171 回で見たとおり、OAuth 2.0 は**委任**の仕組みです。利用者が「このアプリに、私の予定表を読むことを許す」と決め、その結果としてアプリはアクセストークンを受け取ります。
+第 177 回で見たとおり、OAuth 2.0 は**委任**の仕組みです。利用者が「このアプリに、私の予定表を読むことを許す」と決め、その結果としてアプリはアクセストークンを受け取ります。
 
 では、「Google でログイン」ボタンは何をしているのでしょうか。アプリが知りたいのは予定表の中身ではなく、**いまブラウザの前にいるのが誰か**です。OAuth のアクセストークンを受け取った時点で、それは分かったことになるのでしょうか。
 
@@ -30,7 +30,7 @@ import Callout from '../../components/Callout.astro'
 
 ## OAuth だけでログインを作ると何が欠けるか
 
-アクセストークンは、**リソースサーバ（API）に見せるための札**です。受け取ったクライアントが中身を読むことは想定されていません（第 171 回で見たとおり、形式すら規定されていません）。OAuth の解説サイトは、この点を最初に断っています。「OAuth 2.0 is not an authentication protocol.」（[oauth.net: End User Authentication with OAuth 2.0](https://oauth.net/articles/authentication/)）。
+アクセストークンは、**リソースサーバ（API）に見せるための札**です。受け取ったクライアントが中身を読むことは想定されていません（第 177 回で見たとおり、形式すら規定されていません）。OAuth の解説サイトは、この点を最初に断っています。「OAuth 2.0 is not an authentication protocol.」（[oauth.net: End User Authentication with OAuth 2.0](https://oauth.net/articles/authentication/)）。
 
 それでも OAuth だけで「ログイン」を作ろうとすると、よくある形はこうなります。
 
@@ -68,7 +68,7 @@ OIDC は OAuth を置き換えるのではなく、**OAuth のフローの上に
 | `at_hash` | 一緒に発行されたアクセストークンのハッシュ。トークンの組を結ぶ |
 | UserInfo エンドポイント | アクセストークンで利用者の属性を引く API |
 | Discovery | IdP の設定を `/.well-known/openid-configuration` で公開する |
-| JWKS | ID トークンを検証する公開鍵の一覧（第 170 回） |
+| JWKS | ID トークンを検証する公開鍵の一覧（第 176 回） |
 
 OIDC の用語では、認可サーバを **OP**（OpenID Provider）、クライアントを **RP**（Relying Party、認証結果を信頼する側）と呼びます。この回では IdP と RP という呼び方も混ぜて使います。
 
@@ -76,13 +76,13 @@ OIDC の用語では、認可サーバを **OP**（OpenID Provider）、クラ�
 
 | 部品 | どこで見たか | OIDC の中での役目 |
 | --- | --- | --- |
-| OAuth のコードフロー + PKCE | 第 171 回 | ブラウザを経由して、IdP から RP に結果を渡す道 |
-| JWT（JWS） | 第 170 回 | ID トークンの形式 |
-| 署名（RS256 / ES256） | 第 144 回 | ID トークンが IdP の出したものであることの保証 |
-| JWK / JWKS | 第 145 回、第 170 回 | 署名を確かめる公開鍵をどう手に入れるか |
-| TLS と証明書 | 第 20 章 | Discovery と JWKS を取りに行く先が本物の IdP であること |
-| ハッシュ | 第 141 回 | PKCE の `S256`、`at_hash` |
-| セッションと Cookie | 第 169 回 | ID トークンを確かめた後、RP 自身のログイン状態を保つ |
+| OAuth のコードフロー + PKCE | 第 177 回 | ブラウザを経由して、IdP から RP に結果を渡す道 |
+| JWT（JWS） | 第 176 回 | ID トークンの形式 |
+| 署名（RS256 / ES256） | 第 149 回 | ID トークンが IdP の出したものであることの保証 |
+| JWK / JWKS | 第 150 回、第 176 回 | 署名を確かめる公開鍵をどう手に入れるか |
+| TLS と証明書 | 第 21 章 | Discovery と JWKS を取りに行く先が本物の IdP であること |
+| ハッシュ | 第 146 回 | PKCE の `S256`、`at_hash` |
+| セッションと Cookie | 第 175 回 | ID トークンを確かめた後、RP 自身のログイン状態を保つ |
 
 最後の行は見落とされがちです。**ID トークンはログインの「証拠」であって、ログイン状態そのものではありません。** RP は ID トークンを確かめたら、自分のセッションを作り、以後は Cookie で利用者を識別します。
 
@@ -133,7 +133,7 @@ response_types_supported ["code","none","id_token","token","id_token token","cod
 
 （抜粋。実物は 56 項目ありました）
 
-Discovery の仕様は、**返ってきた `issuer` が、取りに行った URL の前半と完全に一致しなければならず、ID トークンの `iss` とも一致しなければならない**と定めています（[OpenID Connect Discovery 1.0 4.3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation)）。これで「設定文書を取った先」と「トークンを出した者」が同じだと言えます。その前提は、TLS でこの URL の持ち主を確かめられることです（第 150 回）。この回の手元の例は HTTP ですが、本番では必ず HTTPS です。
+Discovery の仕様は、**返ってきた `issuer` が、取りに行った URL の前半と完全に一致しなければならず、ID トークンの `iss` とも一致しなければならない**と定めています（[OpenID Connect Discovery 1.0 4.3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation)）。これで「設定文書を取った先」と「トークンを出した者」が同じだと言えます。その前提は、TLS でこの URL の持ち主を確かめられることです（第 155 回）。この回の手元の例は HTTP ですが、本番では必ず HTTPS です。
 
 `jwks_uri` の先には公開鍵が並びます。
 
@@ -143,7 +143,7 @@ $ curl -s http://localhost:18103/realms/demo/protocol/openid-connect/certs | jq 
 { "kid": "uoUsQoFXufMQNdw39SJA3tT6jpYiwxdbnNlbSVBWM5w", "kty": "RSA", "alg": "RSA-OAEP", "use": "enc" }
 ```
 
-署名用（`use: sig`）と暗号化用（`use: enc`）の鍵が別にあります。第 145 回で見た JWK の形そのものです。
+署名用（`use: sig`）と暗号化用（`use: enc`）の鍵が別にあります。第 150 回で見た JWK の形そのものです。
 
 比べるために、公開されている IdP の Discovery も見ておきます。
 
@@ -164,7 +164,7 @@ id_token_signing_alg_values_supported ["RS256"]
 
 ## curl だけでコードフロー + PKCE を通す
 
-第 171 回で見た認可コードフローに、OIDC の `openid` スコープと `nonce` を足します。作業ファイルの `flow.sh` の要点です。
+第 177 回で見た認可コードフローに、OIDC の `openid` スコープと `nonce` を足します。作業ファイルの `flow.sh` の要点です。
 
 ```bash
 KC=http://localhost:18103/realms/demo/protocol/openid-connect
@@ -218,7 +218,7 @@ code_verifier が無い  → {"error":"invalid_grant","error_description":"PKCE 
 
 ## ID トークンの中身
 
-第 170 回と同じく、ピリオドで区切って Base64URL を戻せば中身が読めます。**ID トークンも署名されているだけで、暗号化されていません。**
+第 176 回と同じく、ピリオドで区切って Base64URL を戻せば中身が読めます。**ID トークンも署名されているだけで、暗号化されていません。**
 
 ```
 header:  {"alg": "RS256", "typ": "JWT", "kid": "i6OZQ-BFYPxzXvxk_65cJ0JDH1YgPN6QaYQYLKlY6Ao"}
@@ -249,7 +249,7 @@ payload: {
 | `auth_time` | 利用者が実際に認証した時刻 |
 | `nonce` | 認可リクエストで RP が送った値がそのまま入る |
 | `at_hash` | 同時に発行されたアクセストークンのハッシュの左半分 |
-| `acr` | 認証の強さの区分（第 173 回のステップアップ認証で使う） |
+| `acr` | 認証の強さの区分（第 180 回のステップアップ認証で使う） |
 | `azp` | 発行を受けたクライアント。仕様は拡張を使わない限り気にしなくてよいとしている |
 
 `typ: "ID"` と `sid` は Keycloak が独自に足したものです。
@@ -299,7 +299,7 @@ WWW-Authenticate: Bearer realm="demo", error="invalid_token", error_description=
 
 ## 手元で: ID トークンを検証する
 
-検証の手順は Core 3.1.3.7 に番号付きで並んでいます。コードフローで使う主なものは、**`iss` が一致する、`aud` に自分の `client_id` が入っている、決めたアルゴリズムで署名を確かめる、`exp` が過ぎていない、送った `nonce` と一致する**、です（[Core 3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation)）。第 170 回の手順に、`nonce` が加わった形です。
+検証の手順は Core 3.1.3.7 に番号付きで並んでいます。コードフローで使う主なものは、**`iss` が一致する、`aud` に自分の `client_id` が入っている、決めたアルゴリズムで署名を確かめる、`exp` が過ぎていない、送った `nonce` と一致する**、です（[Core 3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation)）。第 176 回の手順に、`nonce` が加わった形です。
 
 作業ディレクトリの venv に PyJWT 2.15.0 と cryptography を入れ、次のように書きました（`verify.py` の要点）。
 
@@ -317,7 +317,7 @@ at_hash = base64.urlsafe_b64encode(digest[:16]).rstrip(b"=").decode()
 print("user =", (claims["iss"], claims["sub"]))
 ```
 
-`algorithms` を固定し、`aud` と `iss` を必ず渡すのが第 170 回の教訓です。`leeway=30` は時計のずれ（第 200 回）の許容です。
+`algorithms` を固定し、`aud` と `iss` を必ず渡すのが第 176 回の教訓です。`leeway=30` は時計のずれ（第 209 回）の許容です。
 
 ```
 at_hash expected U6wOFA7h05XgCn74zGe0tQ got U6wOFA7h05XgCn74zGe0tQ True
@@ -391,22 +391,22 @@ RP の利用者テーブル（よい例）
 <Callout type="warn" title="よくある誤解: email は一意だから、email で利用者を紐付ければよい">
   社内の常識では email は 1 人に 1 つなので、鍵にしたくなります。しかし RP が受け取る email は、**その IdP が「この人の email はこれだ」と言っている値**にすぎません。
   利用者が自分で自由に email を設定できる IdP や、検証していない email を返す IdP があれば、他人の email を名乗って、その人の既存アカウントに入り込めます。
-  `email_verified` が `true` でも、それは「その IdP が確かめた」という意味で、別の IdP のアカウントと同一人物だという保証ではありません。複数の IdP をまたぐ突き合わせの事故は、第 176 回で詳しく見ます。
+  `email_verified` が `true` でも、それは「その IdP が確かめた」という意味で、別の IdP のアカウントと同一人物だという保証ではありません。複数の IdP をまたぐ突き合わせの事故は、第 183 回で詳しく見ます。
 </Callout>
 
 ## OIDC が保証しないもの
 
 最後に、OIDC の範囲の外にあるものを確かめておきます。
 
-- **何をしてよいか。** ID トークンは「誰か」を伝えるだけです。その人に何を許すかは、RP 自身の認可の仕組みです（第 174 回）
-- **RP のログイン状態。** ID トークンの `exp` は 300 秒でしたが、RP のセッションはそれとは別に RP が決めます。IdP でログアウトしても、RP のセッションは自動的には消えません（第 175 回）
-- **IdP そのものの正しさ。** RP は IdP を信頼する前提です。署名鍵が漏れれば、偽の ID トークンが検証を通ります。鍵の管理とローテーションは第 178 回で見ます
+- **何をしてよいか。** ID トークンは「誰か」を伝えるだけです。その人に何を許すかは、RP 自身の認可の仕組みです（第 181 回）
+- **RP のログイン状態。** ID トークンの `exp` は 300 秒でしたが、RP のセッションはそれとは別に RP が決めます。IdP でログアウトしても、RP のセッションは自動的には消えません（第 182 回）
+- **IdP そのものの正しさ。** RP は IdP を信頼する前提です。署名鍵が漏れれば、偽の ID トークンが検証を通ります。鍵の管理とローテーションは第 185 回で見ます
 - **TLS の代わり。** Discovery と JWKS の取得先が偽物なら、偽の鍵で検証してしまいます。署名の検証は、鍵の入手経路が安全であって初めて意味を持ちます
 
 ## まとめ
 
 - OAuth のアクセストークンは API に宛てた札で、クライアントはそれが自分宛てかを見分けられない。OAuth だけでログインを作ると、他のアプリのトークンを持ち込まれる（混乱した代理人）
-- OIDC は OAuth の上に、`openid` スコープ、ID トークン、`nonce`、`at_hash`、UserInfo、Discovery を足した。署名は第 144 回、形式は第 170 回の JWT、鍵は JWKS、取得経路は TLS に頼る
+- OIDC は OAuth の上に、`openid` スコープ、ID トークン、`nonce`、`at_hash`、UserInfo、Discovery を足した。署名は第 149 回、形式は第 176 回の JWT、鍵は JWKS、取得経路は TLS に頼る
 - ID トークンの `aud` は RP、アクセストークンの `aud` は API。**ID トークンは API に送らない。アクセストークンでログインを判断しない**
 - ID トークンの検証は、アルゴリズムを固定して署名、`iss`、`aud`、`exp`、`nonce`。署名が正しくても `aud` で落ちるトークンがある
 - `state` は RP が戻りで、PKCE は IdP がトークンエンドポイントで、`nonce` は RP が ID トークンで照合する。いずれも要求ごとに作り、ブラウザに結びつける
@@ -414,4 +414,4 @@ RP の利用者テーブル（よい例）
 - UserInfo の `sub` は ID トークンの `sub` と照合する。利用者の識別子は `iss` と `sub` の組で、email ではない
 - 基本のフローは認可コード + PKCE。Discovery に implicit が並んでいても、推奨ではない
 
-RP は ID トークンで「誰か」を知り、API にはアクセストークンを送るようになりました。次の第 173 回では、そのアクセストークンを受け取った API の側が、何を確かめなければならないかを見ます。
+RP は ID トークンで「誰か」を知り、API にはアクセストークンを送るようになりました。ただしこの回の流れは、`webapp` というクライアントを Keycloak に先に作っておくところから始まっていました。次の第 179 回では、その**先に済ませてある登録**で、誰が誰に何を覚えさせているのかを見ます。

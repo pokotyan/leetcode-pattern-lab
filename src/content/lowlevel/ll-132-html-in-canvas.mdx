@@ -17,16 +17,16 @@ topics:
   - read-back-allowed rendering
   - Origin Trial
 requires:
-  - ll-124-canvas-2d
-  - ll-125-webgl
-  - ll-117-event-loop
+  - ll-129-canvas-2d
+  - ll-130-webgl
+  - ll-122-event-loop
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## canvas に描くと失うもの
 
-第 124 回から第 126 回まで、canvas に自分で描く方法を見てきました。Canvas 2D でも WebGL でも WebGPU でも、canvas の中身は**ピクセルの格子**でしかありません。ブラウザから見ると、そこには文字も、ボタンも、段落もありません。
+第 129 回から第 131 回まで、canvas に自分で描く方法を見てきました。Canvas 2D でも WebGL でも WebGPU でも、canvas の中身は**ピクセルの格子**でしかありません。ブラウザから見ると、そこには文字も、ボタンも、段落もありません。
 
 そのため、DOM なら黙っていてもブラウザがしてくれていた仕事を、canvas では全部自分で引き受けることになります。
 
@@ -60,7 +60,7 @@ HTML-in-Canvas の考え方は単純です。
 
 1. canvas の子として、**本物の DOM** を置く
 2. ブラウザはその DOM を普段どおりにスタイル計算・レイアウト・ペイントする。ただし画面には直接出さない
-3. ペイントの結果（第 115 回で見た表示リスト）を**スナップショット**として取っておく
+3. ペイントの結果（第 120 回で見た表示リスト）を**スナップショット**として取っておく
 4. 開発者は、そのスナップショットを好きな位置・好きな変形で canvas やテクスチャに描く
 
 ```
@@ -193,7 +193,7 @@ paint の後の requestAnimationFrame の中で描く     -> 成功
 
 ## paint イベントは、レンダリングの更新のどこで来るか
 
-第 117 回で、イベントループの 1 周の中で描画の機会が来ると、requestAnimationFrame、スタイルとレイアウト、ResizeObserver と IntersectionObserver、そしてペイントの順に進むことを見ました（[HTML Living Standard](https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering)）。`paint` イベントをこのどこに入れるかが、この提案のいちばん難しい設計でした。
+第 122 回で、イベントループの 1 周の中で描画の機会が来ると、requestAnimationFrame、スタイルとレイアウト、ResizeObserver と IntersectionObserver、そしてペイントの順に進むことを見ました（[HTML Living Standard](https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering)）。`paint` イベントをこのどこに入れるかが、この提案のいちばん難しい設計でした。
 
 提案書は 3 つの案を比べ、**ペイントの直後に 1 回だけ発火する**案（Option C）を選んでいます（[WICG/html-in-canvas](https://github.com/WICG/html-in-canvas)）。
 
@@ -205,7 +205,7 @@ paint の後の requestAnimationFrame の中で描く     -> 成功
   ├─ IntersectionObserver
   ├─ ペイント（drawable の子のスナップショットを記録）
   ├─ paint イベント      ← ここで canvas に描いた内容は、このフレームに出る
-  └─ 合成へ渡す（第 116 回の commit）
+  └─ 合成へ渡す（第 121 回の commit）
                           ← ここで DOM を変えても、反映は次のフレーム
 ```
 
@@ -225,7 +225,7 @@ rAF#3             canvas=0,0,255
 各フレームで requestAnimationFrame が先、`paint` が後に来ていること、`paint` の中の変更は次のフレームの `paint` で初めて反映されることが分かります。
 
 <Callout type="note" title="スクロールとアニメーションは、まだメインスレッド待ち">
-  第 116 回で、スクロールや transform のアニメーションは、コンポジタスレッドだけで進められると見ました。
+  第 121 回で、スクロールや transform のアニメーションは、コンポジタスレッドだけで進められると見ました。
   canvas に描いた DOM は違います。描くのは `paint` イベントの JavaScript なので、メインスレッドが塞がると止まります。
   Chrome のブログは、現状の制限として、スクロールとアニメーションが JavaScript から独立して更新できないことを挙げています（[Chrome for Developers](https://developer.chrome.com/blog/html-in-canvas-origin-trial)）。
   提案書には、描画の命令を canvas に保持させ、スクロールやアニメーションのたびにブラウザが再生し直す「自動で更新される canvas」という将来の案が書かれています。
@@ -266,7 +266,7 @@ WebGL と WebGPU では、テクスチャがどの面にどう貼られたかを
 
 canvas は、描いた後に `getImageData` でピクセルを読めます。WebGL と WebGPU では、テクスチャの読み出しは常にできます。ということは、DOM のスナップショットに**ページが知ってはいけない情報**が写っていたら、それはそのまま漏れます。
 
-第 124 回で見たとおり、Canvas 2D は別オリジンの画像を描くと canvas を汚染（tainted）し、それ以降の読み出しを禁じて守っていました。HTML-in-Canvas は別の方法を取ります。**そもそも危ないものを描かない**のです。提案書はこれを read-back-allowed rendering（読み出してよい描画）と呼び、描画にも `paint` の発火の有無にも、機微な情報を含めないと定めています（[WICG/html-in-canvas](https://github.com/WICG/html-in-canvas)）。描かれない情報として挙げられているのは次のものです。
+第 129 回で見たとおり、Canvas 2D は別オリジンの画像を描くと canvas を汚染（tainted）し、それ以降の読み出しを禁じて守っていました。HTML-in-Canvas は別の方法を取ります。**そもそも危ないものを描かない**のです。提案書はこれを read-back-allowed rendering（読み出してよい描画）と呼び、描画にも `paint` の発火の有無にも、機微な情報を含めないと定めています（[WICG/html-in-canvas](https://github.com/WICG/html-in-canvas)）。描かれない情報として挙げられているのは次のものです。
 
 - 埋め込まれた別オリジンの内容（`iframe`、`img`）、`background-image` などの URL 参照、汚染された canvas、SVG の `use` などの参照
 - システムの色、テーマ、設定
@@ -291,20 +291,20 @@ canvas の getImageData                       成功（汚染されない）
 
 別オリジンの画像は、画像そのものは読み込まれているのに、スナップショットからは抜け落ちていました。訪問済みのリンクは、外では訪問済みの赤で表示されるのに、canvas の中では未訪問の青で描かれました。どちらも canvas は汚染されず、読み出しは成功しています。
 
-Canvas 2D の `drawImage` は「描いてから、読ませない」、HTML-in-Canvas は「読ませてよいものだけを描く」という対になった守り方です。後者は読み出しを止めないので、WebGL や WebGPU にもそのまま使えます。代わりに、別オリジンの `iframe` の中身は描けません。Chrome のブログも、この API は別オリジンの iframe の内容では動かないことを制限に挙げています（[Chrome for Developers](https://developer.chrome.com/blog/html-in-canvas-origin-trial)）。次の章の第 130 回で見る「埋め込めるが、中身は読めない」という境界を、描画の側でも守っているわけです。
+Canvas 2D の `drawImage` は「描いてから、読ませない」、HTML-in-Canvas は「読ませてよいものだけを描く」という対になった守り方です。後者は読み出しを止めないので、WebGL や WebGPU にもそのまま使えます。代わりに、別オリジンの `iframe` の中身は描けません。Chrome のブログも、この API は別オリジンの iframe の内容では動かないことを制限に挙げています（[Chrome for Developers](https://developer.chrome.com/blog/html-in-canvas-origin-trial)）。次の章の第 135 回で見る「埋め込めるが、中身は読めない」という境界を、描画の側でも守っているわけです。
 
 <Callout type="warn" title="よくある誤解: 「DOM を canvas に描けるなら、スクリーンショットが撮れる」">
   撮れるのは、**そのページがもともと JavaScript で知りうる内容だけ**です。
   別オリジンの画像や iframe、訪問履歴、システムの配色、スペルチェックの結果は写りません。
   提案書の質問票も、新しいセキュリティ上の情報を一切出さないことを設計の要件にしていると書いています（[Security and Privacy Questionnaire](https://github.com/WICG/html-in-canvas/blob/main/security-privacy-questionnaire.md)）。
-  第 137 回で見る iframe の境界を、この API で越えることはできません。
+  第 142 回で見る iframe の境界を、この API で越えることはできません。
 </Callout>
 
 ## 手元で確かめる（4）: Worker と GPU に渡す
 
 ### ElementImage を Worker に送る
 
-`captureElementImage()` は、直近のスナップショットを `ElementImage` という転送可能なオブジェクトとして取り出します。これを Worker に送れば、第 124 回で見た OffscreenCanvas の上で描けます（[WICG/html-in-canvas](https://github.com/WICG/html-in-canvas)）。
+`captureElementImage()` は、直近のスナップショットを `ElementImage` という転送可能なオブジェクトとして取り出します。これを Worker に送れば、第 129 回で見た OffscreenCanvas の上で描けます（[WICG/html-in-canvas](https://github.com/WICG/html-in-canvas)）。
 
 ```js
 const off = c.transferControlToOffscreen()
@@ -321,7 +321,7 @@ ctx.reset(); ctx.drawElementImage(e.data.img, 50, 30)
 
 Worker の中で `(50, 30)` に描くと、緑の `div` のピクセルが Worker の OffscreenCanvas から読めました。少し遅れてメインスレッドに `elementgeometryupdate` イベントが届き、要素の `getBoundingClientRect` は `(58, 38)` になりました。canvas が body の余白 8px の位置にあるので、描いた位置と一致しています。
 
-Worker は DOM に触れません（第 117 回）。そのため Worker からの位置の更新はまとめてメインスレッドに送られ、反映し終えたところでイベントが来る、という非同期の形になっています（同じ提案書）。
+Worker は DOM に触れません（第 122 回）。そのため Worker からの位置の更新はまとめてメインスレッドに送られ、反映し終えたところでイベントが来る、という非同期の形になっています（同じ提案書）。
 
 ### WebGL と WebGPU のテクスチャに描く
 
@@ -350,7 +350,7 @@ g.onpaint = () => device.queue.drawElementImageToTexture({ source: q }, { textur
 
 逆に、普通のページの効果に使うものではありません。
 
-- CSS の `filter`、`transform`、View Transitions で足りるなら、そちらはコンポジタスレッドで動き、メインスレッドを待ちません（第 116 回）
+- CSS の `filter`、`transform`、View Transitions で足りるなら、そちらはコンポジタスレッドで動き、メインスレッドを待ちません（第 121 回）
 - 描き写すたびに、スナップショットのラスタライズとテクスチャへの転送が起きます
 - Chromium だけの、名前の変わり続けている API です。Origin Trial のトークンは期限があり、更新を忘れると機能が消えます（[Chrome for Developers](https://developer.chrome.com/blog/html-in-canvas-ot-changes)）
 
@@ -366,4 +366,4 @@ g.onpaint = () => device.queue.drawElementImageToTexture({ source: q }, { textur
 - 別オリジンの画像、訪問済みリンクの色、システムの配色などは描かれない。汚染で読み出しを止めるのではなく、読ませてよいものだけを描く
 - 2026 年 10 月時点で Chromium だけの実験中の API。Chrome 155 の安定版と Canary 158 では通る名前が違った。機能の有無を調べてから使う
 
-ここまでで、ブラウザの中で描く手段を一通り見ました。残るのは、**自分では描かない絵**、つまり動画です。動画の 1 フレームは、デコーダが GPU のメモリに作った画像で、canvas にも WebGL にも WebGPU にも渡せます。次の第 128 回では、`video` 要素から canvas に写す方法と、WebCodecs でフレームを 1 枚ずつ扱う方法、そしてそのときのコピーとメモリの扱いを見ます。
+ここまでで、ブラウザの中で描く手段を一通り見ました。残るのは、**自分では描かない絵**、つまり動画です。動画の 1 フレームは、デコーダが GPU のメモリに作った画像で、canvas にも WebGL にも WebGPU にも渡せます。次の第 133 回では、`video` 要素から canvas に写す方法と、WebCodecs でフレームを 1 枚ずつ扱う方法、そしてそのときのコピーとメモリの扱いを見ます。

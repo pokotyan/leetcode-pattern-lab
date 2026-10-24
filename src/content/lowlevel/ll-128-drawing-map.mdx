@@ -14,15 +14,15 @@ topics:
   - Long Animation Frames
   - 描画手段の選び方
 requires:
-  - ll-115-rendering-pipeline
-  - ll-116-compositing
+  - ll-120-rendering-pipeline
+  - ll-121-compositing
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## 前の章では、絵を描いていたのはブラウザだった
 
-第 16 章では、HTML と CSS が画面のピクセルになるまでを追いました。DOM からスタイルを決め、レイアウトで位置を決め、ペイントで描画命令の列（表示リスト）を作り、ラスタライズと合成で画面に出す（第 90・91 回）。この流れの中で、**何をどこに描くかを決めていたのは、すべてブラウザ**でした。開発者は「こういう文書です」と宣言するだけで、どの画素を何色にするかには関わりません。
+第 17 章では、HTML と CSS が画面のピクセルになるまでを追いました。DOM からスタイルを決め、レイアウトで位置を決め、ペイントで描画命令の列（表示リスト）を作り、ラスタライズと合成で画面に出す（第 90・91 回）。この流れの中で、**何をどこに描くかを決めていたのは、すべてブラウザ**でした。開発者は「こういう文書です」と宣言するだけで、どの画素を何色にするかには関わりません。
 
 この章では逆に、**開発者が自分で画素を作る**手段を見ます。グラフ、地図、ゲーム、デザインツール、動画編集。DOM の要素として並べるには数が多すぎるもの、あるいは CSS では表せない見た目のものです。
 
@@ -61,7 +61,7 @@ import Callout from '../../components/Callout.astro'
 └──────────────────────────────┘        └──────────────────────────────┘
 ```
 
-DOM の木は、ブラウザが持つ巨大なシーングラフです。`<circle>` の `cx` を書き換えると、ブラウザはその要素だけが変わったことを知っており、必要な段（第 115 回の style、layout、paint）だけをやり直します。
+DOM の木は、ブラウザが持つ巨大なシーングラフです。`<circle>` の `cx` を書き換えると、ブラウザはその要素だけが変わったことを知っており、必要な段（第 120 回の style、layout、paint）だけをやり直します。
 
 Canvas は違います。HTML Standard は `canvas` 要素を、スクリプトに**解像度に依存したビットマップのキャンバス**を与えるもの、と定義しています（[HTML Standard](https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element)）。`ctx.arc()` で円を描いた瞬間に、それは画素に溶けて消えます。ブラウザに残るのは「何色の画素が並んでいるか」だけで、「そこに円がある」という事実はどこにも残りません。円を動かしたければ、消して、別の場所に描き直すしかありません。
 
@@ -72,7 +72,7 @@ Canvas は違います。HTML Standard は `canvas` 要素を、スクリプト�
 ```
             JS ─ style ─ layout ─ paint ─ raster ─ 合成
 DOM/CSS     ●     ●       ●        ●       ●       ●     要素ごとにブラウザが全段を回す
-transform   ●                                      ●     合成だけで済む（第 116 回）
+transform   ●                                      ●     合成だけで済む（第 121 回）
 SVG         ●     ●       ●        ●       ●       ●     中身は DOM。要素が増えれば全段が重くなる
 Canvas 2D   ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●  →  ●     画素は自分で作る。ブラウザから見れば 1 つの画像
 WebGL       ●（命令を積む）──── GPU が描く ──────  →  ●     画素を作るのは GPU。JS は命令と数値を渡すだけ
@@ -83,13 +83,13 @@ WebGPU      ●（命令を積む）──── GPU が描く ─────�
 
 その箱の中身の画素を、誰がどこで作るかが、Canvas 2D と WebGL・WebGPU の違いです。
 
-- **Canvas 2D** は、JavaScript から「この円を塗れ」という命令を 1 つずつ出す。Chrome は 2D の命令も GPU で実行できますが（第 124 回で見ます）、命令を作る仕事はメインスレッドの JavaScript に残る
+- **Canvas 2D** は、JavaScript から「この円を塗れ」という命令を 1 つずつ出す。Chrome は 2D の命令も GPU で実行できますが（第 129 回で見ます）、命令を作る仕事はメインスレッドの JavaScript に残る
 - **WebGL・WebGPU** は、頂点の座標の配列とシェーダ（GPU で動く小さなプログラム）を渡し、「これで 10 万個描け」と 1 回だけ頼める。画素ごと・頂点ごとの計算は GPU が並列にやる。第 12 回の SIMD を数千本並べた装置が GPU でした
 
-どちらの場合も、実際に GPU のドライバに命令を出すのは**GPU プロセス**です（第 113 回）。レンダラの中の WebGL の呼び出しは、命令の列としてまとめられ、GPU プロセスに送られて実行されます。この「別プロセスに命令を送る」構造が、第 125 回の WebGL と第 126 回の WebGPU の設計の違いを理解する鍵になります。
+どちらの場合も、実際に GPU のドライバに命令を出すのは**GPU プロセス**です（第 118 回）。レンダラの中の WebGL の呼び出しは、命令の列としてまとめられ、GPU プロセスに送られて実行されます。この「別プロセスに命令を送る」構造が、第 130 回の WebGL と第 131 回の WebGPU の設計の違いを理解する鍵になります。
 
 <Callout type="note" title="CSS のアニメーションも View Transitions も保持モードの側">
-  `transform` と `opacity` のアニメーションが軽いのは、ブラウザがレイヤという場面を覚えていて、重ね方だけを変えればよいからでした（第 116 回）。
+  `transform` と `opacity` のアニメーションが軽いのは、ブラウザがレイヤという場面を覚えていて、重ね方だけを変えればよいからでした（第 121 回）。
   View Transitions も同じ発想です。MDN の説明では、`::view-transition-old()` は遷移前の**静止したスナップショット**、`::view-transition-new()` は遷移後の**生きた表示**で、
   それらが画面の上に重ねた疑似要素の木の中でアニメーションします（[MDN](https://developer.mozilla.org/en-US/docs/Web/API/View_Transition_API)）。
   JavaScript から同じ仕組みを操作する Web Animations API（[MDN](https://developer.mozilla.org/en-US/docs/Web/API/Web_Animations_API)）も含めて、
@@ -116,14 +116,14 @@ HTML Standard 自身が、canvas の使いどころを強く制限していま�
 <Callout type="warn" title="よくある誤解: 「canvas に描いた文字も、ブラウザは文字として扱っている」">
   `fillText` で描いた文字は、描いた瞬間に画素になります。ブラウザは、そこに「支払いへ進む」と書いてあることを知りません。
   ページ内検索にも、スクリーンリーダーにも、翻訳機能にも見えません。下の実験で確かめます。
-  この問題を正面から解こうとしているのが、DOM をレイアウトさせたまま canvas に描き込む HTML-in-Canvas の提案です（第 127 回）。
+  この問題を正面から解こうとしているのが、DOM をレイアウトさせたまま canvas に描き込む HTML-in-Canvas の提案です（第 132 回）。
 </Callout>
 
 ## それでも canvas に描く理由
 
 失うものがこれだけあっても、大きなアプリケーションはあえて canvas 側に移ってきました。
 
-- **Figma** は、HTML と SVG は余計な荷物が多く、DOM へのアクセスのせいで 2D canvas の API よりずっと遅いことが多いとして、描画をすべて WebGL で一から実装しました。エディタ本体は C++ で書き、emscripten で JavaScript（asm.js）にコンパイルしています（[Figma のブログ](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/)）。いまなら Wasm（第 195 回）の役割です
+- **Figma** は、HTML と SVG は余計な荷物が多く、DOM へのアクセスのせいで 2D canvas の API よりずっと遅いことが多いとして、描画をすべて WebGL で一から実装しました。エディタ本体は C++ で書き、emscripten で JavaScript（asm.js）にコンパイルしています（[Figma のブログ](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/)）。いまなら Wasm（第 204 回）の役割です
 - **Google ドキュメント**は 2021 年に、HTML による描画から canvas による描画へ実装を移すと告知しました。理由は、性能と、プラットフォームの違いによる見え方のずれを減らすことでした（[Google Workspace Updates](https://workspaceupdates.googleblog.com/2021/05/Google-Docs-Canvas-Based-Rendering-Update.html)）
 - **Skia** は Chrome、Android、Flutter などの描画エンジンになっている 2D グラフィックスのライブラリです（[Skia](https://skia.org/)）。この Skia を Wasm にコンパイルした CanvasKit も公開されていて、WebGL のコンテキストを Skia の描画先として HTML の canvas に直接描けます（[Skia: CanvasKit](https://skia.org/docs/user/modules/canvaskit/)）。ブラウザの中に、もう 1 つ描画エンジンを持ち込む形です
 
@@ -137,13 +137,13 @@ HTML Standard 自身が、canvas の使いどころを強く制限していま�
 | --- | --- | --- | --- | --- |
 | 宣言 | HTML と CSS、Web Animations、View Transitions | ブラウザ | ブラウザ（合成は GPU） | 第 90・91 回 |
 | 宣言 | SVG | ブラウザ（DOM） | ブラウザ | この回 |
-| 命令（2D） | Canvas 2D、OffscreenCanvas | 自分 | ブラウザの 2D 描画系 | 第 124 回 |
-| 命令（GPU） | WebGL 1 / 2 | 自分 | GPU（シェーダは自分で書く） | 第 125 回 |
-| 命令（GPU） | WebGPU | 自分 | GPU（描画と汎用の計算） | 第 126 回 |
-| 橋渡し | HTML-in-Canvas | ブラウザ（DOM）と自分の両方 | ブラウザが撮った DOM の写しを、自分が配置する | 第 127 回 |
-| 素材 | WebCodecs、`<video>` のフレーム | 自分 | 復号器が作ったフレームを、どこかに描く | 第 128 回 |
+| 命令（2D） | Canvas 2D、OffscreenCanvas | 自分 | ブラウザの 2D 描画系 | 第 129 回 |
+| 命令（GPU） | WebGL 1 / 2 | 自分 | GPU（シェーダは自分で書く） | 第 130 回 |
+| 命令（GPU） | WebGPU | 自分 | GPU（描画と汎用の計算） | 第 131 回 |
+| 橋渡し | HTML-in-Canvas | ブラウザ（DOM）と自分の両方 | ブラウザが撮った DOM の写しを、自分が配置する | 第 132 回 |
+| 素材 | WebCodecs、`<video>` のフレーム | 自分 | 復号器が作ったフレームを、どこかに描く | 第 133 回 |
 | ライブラリ | Three.js、PixiJS、deck.gl など | ライブラリ（保持モードに戻す） | WebGL / WebGPU | 各回で触れる |
-| 持ち込み | Wasm に移植した描画エンジン（CanvasKit など） | 自分のエンジン | WebGL / WebGPU | 第 195 回 |
+| 持ち込み | Wasm に移植した描画エンジン（CanvasKit など） | 自分のエンジン | WebGL / WebGPU | 第 204 回 |
 
 ライブラリの行に注目してください。[Three.js](https://threejs.org/) や [PixiJS](https://pixijs.com/) は、即時モードの WebGL の上に、**シーングラフという保持モードをもう一度作り直す**ものです。シーンにメッシュやスプライトを足し、位置を変えると、ライブラリが毎フレーム全部を描き直します。保持モードを捨てたのは、ブラウザ汎用の場面のモデルが重かったからで、場面そのものが要らなかったわけではありません。**自分の用途に合った軽い場面を、自分の側に持ち直す**のです。
 
@@ -181,7 +181,7 @@ render = () => {
 }
 ```
 
-WebGL の側の円は、頂点シェーダで点の大きさを決め、フラグメントシェーダで中心からの距離が半径を超える画素を捨てて作っています（第 125 回で詳しく見ます）。
+WebGL の側の円は、頂点シェーダで点の大きさを決め、フラグメントシェーダで中心からの距離が半径を超える画素を捨てて作っています（第 130 回で詳しく見ます）。
 
 `requestAnimationFrame` の中で `update()` と `render()` にかかった時間（JS の時間）と、コールバックの呼ばれる間隔（フレームの間隔）を 120 フレーム測り、最初の 10 フレームを捨てた中央値を出しました。60Hz なら間隔は 16.7ms が上限で、それより長ければフレームを落としています。
 
@@ -229,9 +229,9 @@ Canvas 2D の 30 万個では、style と layout は 0.1ms でした。ブラウ
 
 <Callout type="tip" title="この数字の読み方">
   これはヘッドレスの Chrome の、点の描画という最も単純な場面での目安です。
-  `requestAnimationFrame` は vsync に揃うので（第 116 回）、間隔は 16.7ms の倍数に張り付きます。
+  `requestAnimationFrame` は vsync に揃うので（第 121 回）、間隔は 16.7ms の倍数に張り付きます。
   WebGL の JS の時間は「命令を積んだ時間」であって、GPU が描き終えた時間ではありません。GPU の側が詰まれば、フレームの間隔に表れます。
-  場面が変われば崩れる場所も変わります。自分の場面で、自分の端末で測ってください（第 224 回）。
+  場面が変われば崩れる場所も変わります。自分の場面で、自分の端末で測ってください（第 233 回）。
 </Callout>
 
 ## 確かめる: canvas に描いた文字はどこにもない
@@ -277,7 +277,7 @@ canvas の中に、ちゃんとした文字や入力欄を置きたい → HTML-
 動画のフレームを加工したい → WebCodecs と、上のどれか
 ```
 
-実際には 1 つに決める必要はありません。地図のアプリなら、地図本体は WebGL、地名のラベルとボタンは DOM、というように**層ごとに使い分けて重ねる**のが普通です。canvas も 1 つの要素なので、DOM の上にも下にも置けます。合成の段（第 116 回）が、それらを 1 枚の画面にまとめます。
+実際には 1 つに決める必要はありません。地図のアプリなら、地図本体は WebGL、地名のラベルとボタンは DOM、というように**層ごとに使い分けて重ねる**のが普通です。canvas も 1 つの要素なので、DOM の上にも下にも置けます。合成の段（第 121 回）が、それらを 1 枚の画面にまとめます。
 
 <Callout type="note" title="なぜ選択肢がこれほど多いのか">
   WebGL は OpenGL ES を、WebGPU は Vulkan・Metal・Direct3D 12 の世代の GPU を、それぞれウェブに持ち込んだものです。

@@ -14,17 +14,17 @@ topics:
   - Client Hints / Accept-CH
   - credentials モード
 requires:
-  - ll-133-tracking-prevention
-  - ll-129-origin-site
-  - ll-169-session-cookie
-  - ll-112-navigation
+  - ll-138-tracking-prevention
+  - ll-134-origin-site
+  - ll-175-session-cookie
+  - ll-117-navigation
 ---
 
 import Callout from '../../components/Callout.astro'
 
 ## サーバは、要求の「出どころ」を知っているのか
 
-第 130 回で見たとおり、ブラウザは別のサイトのページからでも、画像の読み込み、フォームの POST、`fetch` を**送ること自体は**許します。制限されるのは主に応答を読むことです。
+第 135 回で見たとおり、ブラウザは別のサイトのページからでも、画像の読み込み、フォームの POST、`fetch` を**送ること自体は**許します。制限されるのは主に応答を読むことです。
 
 すると、サーバの側には次の疑問が残ります。
 
@@ -66,7 +66,7 @@ fetch(T + '/dest?via=fetch-forged', {
 <Callout type="warn" title="よくある誤解: 「Sec- のヘッダは偽れないので、これで認証できる」">
   偽れないのは**ブラウザの中のページから**です。curl や自作のクライアントなら、`Sec-Fetch-Site: same-origin` でも `Origin: https://bank.example` でも自由に書けます。
   つまりこれらのヘッダは「要求が本物の利用者から来たか」ではなく、**「利用者のブラウザが、別のサイトのページに操られて送ったのではないか」**を判定する材料です。
-  CSRF（第 169 回）のような、被害者のブラウザと Cookie を借りる攻撃には効きます。攻撃者が自分の端末から直接送る要求は、そもそも被害者の Cookie を持っていないので、別の手段（認証、レート制限）で守ります。
+  CSRF（第 175 回）のような、被害者のブラウザと Cookie を借りる攻撃には効きます。攻撃者が自分の端末から直接送る要求は、そもそも被害者の Cookie を持っていないので、別の手段（認証、レート制限）で守ります。
 </Callout>
 
 ## Referer: どのページから来たか
@@ -97,7 +97,7 @@ fetch(T + '/dest?via=fetch-forged', {
 | Chrome | 85（2020 年 8 月の安定版）で既定を `strict-origin-when-cross-origin` に | [Chrome for Developers](https://developer.chrome.com/blog/referrer-policy-new-chrome-default) |
 | Firefox | 87（2021 年 3 月）で既定を `strict-origin-when-cross-origin` に | [Mozilla Security Blog](https://blog.mozilla.org/security/2021/03/22/firefox-87-trims-http-referrers-by-default-to-protect-user-privacy/) |
 
-Safari の変更はポリシーの既定値の変更ではなく、ページが `unsafe-url` を指定してもクロスサイトではオリジンに切り詰める、というより強い制限です（第 133 回の ITP の流れの 1 つ）。また仕様は、URL 全体が 4096 バイトを超える場合はオリジンだけにすると定めています（[Referrer Policy 8.3](https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer)）。
+Safari の変更はポリシーの既定値の変更ではなく、ページが `unsafe-url` を指定してもクロスサイトではオリジンに切り詰める、というより強い制限です（第 138 回の ITP の流れの 1 つ）。また仕様は、URL 全体が 4096 バイトを超える場合はオリジンだけにすると定めています（[Referrer Policy 8.3](https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer)）。
 
 <Callout type="warn" title="よくある誤解: 「Referer を見れば、どこから来たか分かる」">
   Referer は**送られないことがよくあります**。ページの Referrer-Policy が `no-referrer` なら空、HTTPS から HTTP へは既定で空、プライバシーのための拡張機能やプロキシが消すこともあります。
@@ -107,7 +107,7 @@ Safari の変更はポリシーの既定値の変更ではなく、ページが 
 
 ## Origin: いつ付き、いつ付かないか
 
-`Origin` はパスを含まない Referer のようなもので、スキーム・ホスト・ポートの組（第 129 回のオリジン）だけを伝えます。Fetch Standard は、互換性の都合で**すべての要求には付けない**と明記し、付ける条件を手順として定めています（[Fetch Standard 3.2](https://fetch.spec.whatwg.org/#append-a-request-origin-header)）。
+`Origin` はパスを含まない Referer のようなもので、スキーム・ホスト・ポートの組（第 134 回のオリジン）だけを伝えます。Fetch Standard は、互換性の都合で**すべての要求には付けない**と明記し、付ける条件を手順として定めています（[Fetch Standard 3.2](https://fetch.spec.whatwg.org/#append-a-request-origin-header)）。
 
 1. 応答の扱い（response tainting）が `cors` の要求、つまり**別オリジンへの CORS の要求**には、メソッドに関係なく付ける。WebSocket と WebTransport の接続にも付ける
 2. それ以外でも、メソッドが **GET と HEAD 以外**（POST など）なら付ける
@@ -138,7 +138,7 @@ Referer と Origin は、「付いていたらその値」という情報しか�
 
 仕様上の細かい点が 3 つあります。
 
-- `same-site` の「サイト」は第 129 回の schemeful site です。`https://a.example.com` と `https://b.example.com` は `same-site`、`http://` と `https://` は `cross-site` になる
+- `same-site` の「サイト」は第 134 回の schemeful site です。`https://a.example.com` と `https://b.example.com` は `same-site`、`http://` と `https://` は `cross-site` になる
 - **リダイレクトの途中も数えます**。仕様は要求の URL の一覧をすべてたどり、1 つでもクロスサイトがあれば `cross-site` とします。別サイトを一度経由した要求が、最後に自分のサイトに戻ってきても `same-origin` にはなりません
 - 送るのは宛先が「潜在的に信頼できる」URL（HTTPS、または `127.0.0.1` や `localhost`）の場合だけです。平文の HTTP の公開サーバには付きません
 
@@ -168,16 +168,16 @@ def allow_request(req):
 
 | 攻撃 | 典型的な要求 | 止まるか |
 | --- | --- | --- |
-| CSRF（第 169 回） | 別サイトからのフォームの POST | 止まる（`cross-site` の POST の遷移） |
+| CSRF（第 175 回） | 別サイトからのフォームの POST | 止まる（`cross-site` の POST の遷移） |
 | スクリプトとしての読み込みで中身を漏らす（XSSI） | `<script src=...>` で JSON を読む | 止まる（`cross-site` / `no-cors` / `script`） |
-| XS-Leaks（第 130 回） | 画像や iframe の読み込みの成否・時間を測る | 多くは止まる。遷移とポップアップは別の対策が要る |
+| XS-Leaks（第 135 回） | 画像や iframe の読み込みの成否・時間を測る | 多くは止まる。遷移とポップアップは別の対策が要る |
 | 別サイトからのリンクで普通に来た利用者 | トップレベルの GET の遷移 | **通す**（壊さないため） |
 
-同期トークン（第 169 回）は経路ごとにフォームへ埋め込む必要がありますが、このポリシーは**ミドルウェアとして全経路に一度にかけられ**、しかも「読ませたくない GET」まで守れるのが違いです。
+同期トークン（第 175 回）は経路ごとにフォームへ埋め込む必要がありますが、このポリシーは**ミドルウェアとして全経路に一度にかけられ**、しかも「読ませたくない GET」まで守れるのが違いです。
 
 <Callout type="warn" title="よくある誤解: 「Fetch Metadata があれば CSRF トークンは要らない」">
   上の関数の 1 行目と 2 行目を見てください。**ヘッダを送らないブラウザは許し、`same-site` も許しています**。
-  古いブラウザや一部の組み込みのブラウザでは素通りしますし、同じ登録可能ドメインの別のサブドメイン（利用者が投稿できる `user.example.com` や、放置されたサブドメイン）からの要求は `same-site` として届きます。これは第 169 回の SameSite と同じ弱点です。
+  古いブラウザや一部の組み込みのブラウザでは素通りしますし、同じ登録可能ドメインの別のサブドメイン（利用者が投稿できる `user.example.com` や、放置されたサブドメイン）からの要求は `same-site` として届きます。これは第 175 回の SameSite と同じ弱点です。
   厳しくしたい経路では `same-site` を許さず `same-origin` だけにする、状態を変える要求にはトークンも併用する、という多層防御の一段として使います。
 </Callout>
 
@@ -206,7 +206,7 @@ Mozilla/5.0 (<unifiedPlatform>) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/<m
 
 - **既定で送るもの**（情報量の少ないもの）: `Sec-CH-UA`（銘柄と主要な版）、`Sec-CH-UA-Mobile`、`Sec-CH-UA-Platform`（[Chrome for Developers](https://developer.chrome.com/docs/privacy-security/user-agent-client-hints)）
 - **頼まれたら送るもの**: `Sec-CH-UA-Full-Version-List`、`Sec-CH-UA-Platform-Version`、`Sec-CH-UA-Model` など。サーバが応答に `Accept-CH: Sec-CH-UA-Platform-Version` のように書くと、以後の要求に付く
-- RFC 8942 は、`Accept-CH` による要求は**HTTPS 以外で届いたら無視しなければならない**と定め、ヒントで応答を変えるなら `Vary` にそのヒントを書くよう求めています。第 112 回のキャッシュの話と同じく、書き忘れると別の端末向けの応答がキャッシュから返ります
+- RFC 8942 は、`Accept-CH` による要求は**HTTPS 以外で届いたら無視しなければならない**と定め、ヒントで応答を変えるなら `Vary` にそのヒントを書くよう求めています。第 117 回のキャッシュの話と同じく、書き忘れると別の端末向けの応答がキャッシュから返ります
 
 <Callout type="warn" title="よくある誤解: 「User-Agent の代わりに Sec-CH-UA を見ればよい」">
   執筆時点（2026 年 9 月）で、`Sec-CH-UA` と `Accept-CH` を実装しているのは Chrome と Edge などの Chromium 系だけで、**Firefox と Safari は未対応**です（[browser-compat-data](https://github.com/mdn/browser-compat-data)）。
@@ -215,13 +215,13 @@ Mozilla/5.0 (<unifiedPlatform>) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/<m
 
 ## Cookie は、どの条件で付くのか
 
-`Cookie` もブラウザが書く文脈のヘッダの 1 つで、しかも最も重いものです。第 132 回と第 169 回で扱う条件を、要求の種類ごとに 1 つの表にまとめます。
+`Cookie` もブラウザが書く文脈のヘッダの 1 つで、しかも最も重いものです。第 137 回と第 175 回で扱う条件を、要求の種類ごとに 1 つの表にまとめます。
 
 | 判定 | 決めるもの | 単位 |
 | --- | --- | --- |
-| その Cookie がこの宛先に属するか | `Domain`、`Path`、`Secure`（第 169 回） | ホストとパス。ポートは区別しない |
-| 別のサイトから始まった要求に付けるか | `SameSite`（第 169 回） | サイト |
-| 別のサイトのページに埋め込まれた文脈で付けるか | 第三者 Cookie の制限と `Partitioned`（第 116・117 回） | トップレベルのサイト |
+| その Cookie がこの宛先に属するか | `Domain`、`Path`、`Secure`（第 175 回） | ホストとパス。ポートは区別しない |
+| 別のサイトから始まった要求に付けるか | `SameSite`（第 175 回） | サイト |
+| 別のサイトのページに埋め込まれた文脈で付けるか | 第三者 Cookie の制限と `Partitioned`（第 121・122 回） | トップレベルのサイト |
 | `fetch` がそもそも資格情報を載せるか | `credentials` モード | **オリジン** |
 
 最後の行は見落とされがちです。`fetch` の `credentials` は既定で `same-origin` で、仕様は「同一オリジンの URL への要求にだけ資格情報を含める」と定めています（[Fetch Standard 2.2.5](https://fetch.spec.whatwg.org/#concept-request-credentials-mode)）。**同じサイトでも別オリジンなら、`credentials: 'include'` を書かない限り Cookie は付きません**。一方、ページ遷移（`navigate`）は常に `include` として扱われます。SameSite はサイト単位、`credentials` はオリジン単位で、**同じ「Cookie が付くか」を別々の単位の判定が重ねて決めている**ことになります。
@@ -288,8 +288,8 @@ POST    /dest?via=form          Origin: http://localhost:18190
                                 Sec-Fetch-Site: cross-site  Mode: navigate  Dest: document  Cookie: c_none=1
 ```
 
-- ページが書いた `Sec-Fetch-Site: same-origin` は捨てられ、ブラウザ自身の `cross-site` が届いた。独自の `X-Test` は届き、そのためにプリフライト（`OPTIONS`、第 131 回）が先に飛んでいる
-- 画像とフォームの POST には `SameSite=None` の `c_none` だけ、利用者がクリックしたリンク（トップレベルの GET の遷移）には `Lax` の `c_lax` も付いた。第 169 回の SameSite の表のとおり
+- ページが書いた `Sec-Fetch-Site: same-origin` は捨てられ、ブラウザ自身の `cross-site` が届いた。独自の `X-Test` は届き、そのためにプリフライト（`OPTIONS`、第 136 回）が先に飛んでいる
+- 画像とフォームの POST には `SameSite=None` の `c_none` だけ、利用者がクリックしたリンク（トップレベルの GET の遷移）には `Lax` の `c_lax` も付いた。第 175 回の SameSite の表のとおり
 - `Sec-Fetch-User: ?1` はクリックしたリンクにだけ付いた。スクリプトで送信したフォームには付いていない
 - 資源の分離のポリシーをこのサーバにかければ、画像、`fetch`、フォームの POST は拒否、リンクの遷移だけが通ることになる
 
@@ -337,13 +337,13 @@ Sec-CH-UA-Full-Version-List: "Google Chrome";v="153.0.8010.54", "Not_A Brand";v=
 
 | 組み合わせ | 何ができるようになるか | 呼び戻す回 |
 | --- | --- | --- |
-| `Sec-Fetch-Site` + 状態を変える経路の拒否 | CSRF の多層防御の一段 | 第 169 回 |
-| `Sec-Fetch-Site` / `-Dest` + 資源の分離のポリシー | 別サイトのページからの埋め込みや XS-Leaks を、サーバ側で一括して拒否 | 第 130 回 |
-| `Origin` + CORS の応答ヘッダ | 別オリジンに応答を読ませてよいかの判断。`null` は許さない | 第 131 回 |
-| `Referrer-Policy` + 第三者への埋め込み | URL の中のトークンや検索語の漏えいを止める | 第 133 回 |
-| Cookie の `SameSite` + `credentials` モード + 第三者 Cookie の制限 | 3 つの単位（サイト、オリジン、トップレベルのサイト）で、Cookie が付くかが重ねて決まる | 第 116・149 回 |
-| Client Hints + `Vary` | 端末ごとに変える応答を、キャッシュで取り違えない | 第 112 回 |
-| `Sec-Fetch-Dest` + CORP / COEP | 読み込みの使い道に応じた、応答側からの拒否 | 第 136 回 |
+| `Sec-Fetch-Site` + 状態を変える経路の拒否 | CSRF の多層防御の一段 | 第 175 回 |
+| `Sec-Fetch-Site` / `-Dest` + 資源の分離のポリシー | 別サイトのページからの埋め込みや XS-Leaks を、サーバ側で一括して拒否 | 第 135 回 |
+| `Origin` + CORS の応答ヘッダ | 別オリジンに応答を読ませてよいかの判断。`null` は許さない | 第 136 回 |
+| `Referrer-Policy` + 第三者への埋め込み | URL の中のトークンや検索語の漏えいを止める | 第 138 回 |
+| Cookie の `SameSite` + `credentials` モード + 第三者 Cookie の制限 | 3 つの単位（サイト、オリジン、トップレベルのサイト）で、Cookie が付くかが重ねて決まる | 第 121・154 回 |
+| Client Hints + `Vary` | 端末ごとに変える応答を、キャッシュで取り違えない | 第 117 回 |
+| `Sec-Fetch-Dest` + CORP / COEP | 読み込みの使い道に応じた、応答側からの拒否 | 第 141 回 |
 
 ## まとめ
 

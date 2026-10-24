@@ -1,0 +1,508 @@
+---
+title: 外向きの接続だけで内側に届ける
+description: 社内や自宅の機械には、外から接続できません。それでも、外のサービスがその機械に仕事を頼めるのはなぜか。CI のランナー、クラウドのエージェント、開発用の公開 URL に共通する「内側から先に張った接続を、逆向きに使う」形を、100 行の逆向きトンネルとロングポーリングを手元で書いて確かめます
+chapter: atop
+order: 7
+status: published
+topics:
+  - リバーストンネル（逆向きのトンネル）
+  - Cloudflare Tunnel（cloudflared）
+  - ngrok
+  - Session Manager（SSM Agent）
+  - セルフホストランナー
+  - ロングポーリング
+  - 1 本の接続の上の多重化
+  - DERP
+  - Chrome DevTools Protocol（CDP）
+  - ハートビート
+  - ハーフオープン
+  - 指数バックオフとジッタ
+requires:
+  - ll-168-tls-vpn
+  - ll-166-ssh-tunnels
+  - ll-91-nat-traversal
+  - ll-88-server-push
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 入口を開けずに、仕事を頼みたい
+
+前回の第 168 回で見た VPN は、外にいる端末が**社内の網に入っていく**ための仕組みでした。そのためには、社内の側に、外から届く入口（VPN の装置）を置いておく必要があります。
+
+ところが、逆の向きの要求もよくあります。
+
+- GitHub のワークフローを、社内の網にあるビルド用のマシンで動かしたい
+- クラウドの管理画面から、データセンターや自宅にあるサーバのシェルを開きたい
+- 手元のノート PC で動かしている開発中の Web アプリを、外の人に URL で見せたい
+- クラウドで動く AI に、手元で動かしているツールのサーバやブラウザを使わせたい
+
+どれも、**外のサービスが、内側の機械に仕事を頼む**形です。そして内側の機械は、NAT やファイアウォールの内側にあって、外から接続を受けられません。受けられるようにすること（ポートを開ける、入口の装置を置く）は、それ自体が攻撃の入口を増やすので、できればやりたくありません。
+
+これらの製品は、どれも同じ答えを選んでいます。**内側の機械のほうから外へ、先に接続を張っておき、その接続の上を逆向きに使う**のです。第 166 回の `ssh -R` が、この形のいちばん素朴な姿でした。この回では、それを製品の規模で使うと何が問題になるのかを、自分で 100 行ほどの逆向きトンネルを書きながら見ていきます。
+
+## 外向きだけが通る理由
+
+まず、なぜ「内から外」は通って「外から内」は通らないのかを確かめておきます。
+
+第 91 回で見たとおり、NAT のルータは内側から外へ出ていく接続を覚えておき（Linux では conntrack の表）、**その戻りのパケットだけ**を内側へ渡します。表に行が無いパケットは、内側のどの機械に渡せばよいか決められないので、届きません。
+
+ステートフルなファイアウォールも、同じ表を使います。典型的な規則は「内から外への新しい接続は通す。外からのパケットは、**内から始まった接続に属するもの（ESTABLISHED）だけ**通す」です。アドレスが変換されない IPv6 でも、家庭用のゲートウェイについて RFC 6092 は、外から一方的に届いた通信を既定では通さない「単純な安全機能」を勧めています（すべてを通す透過モードも選べなければならない、とした上でです）（[RFC 6092](https://www.rfc-editor.org/rfc/rfc6092.html)）。
+
+つまり、**通信の向きを決めているのは、最初の SYN をどちらが送ったか**です。一度張られた TCP の接続は、その後は両方向にデータを流せます。外のサービスが内側に仕事を頼むには、内側が先に SYN を送ってくれればよいわけです。
+
+## 実験の環境
+
+Docker の中に、次の構成を作りました。
+
+```
+   「外」のネットワーク 198.51.100.0/24                 「内」のネットワーク 10.169.0.0/24
+                                                      （--internal: Docker の外へは出られない）
+ ┌──────────────┐   ┌──────────────┐   ┌───────────────────┐   ┌──────────────────────────┐
+ │ client       │   │ relay（中継） │   │ nat               │   │ agent                    │
+ │ .200         │   │ .100         │   │ 外 198.51.100.10   │   │ 10.169.0.10              │
+ │ 外の利用者    │   │ :8080 :8081  │   │ 内 10.169.0.254    │   │ 内側のアプリ :9000 など   │
+ └──────────────┘   └──────────────┘   │ MASQUERADE        │   │ 既定経路 → nat           │
+                                       │ FORWARD 既定 DROP  │   └──────────────────────────┘
+                                       └───────────────────┘
+```
+
+`nat` は家庭や社内の出口のルータの役で、次の 4 行の規則だけを入れています。
+
+```
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -P FORWARD DROP
+iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
+iptables -A FORWARD -i eth0 -o eth1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+```
+
+| 項目 | 版 |
+| --- | --- |
+| Docker Engine | 29.4.0（Linux カーネル 7.0.14、arm64） |
+| コンテナの OS | Alpine Linux 3.24.3 |
+| Python / aiohttp | 3.12.15 / 3.10.10 |
+| iptables | 1.8.13（nf_tables） |
+| Chromium | 155.0.8059.84（CDP の実験だけで使用） |
+
+途中から、`nat` の両側のインタフェースに `tc netem` で 10ms ずつの遅れを入れ、内と外の往復時間を約 20ms にしています（`ping` の平均 20.57ms）。
+
+## 実験 1: 外から内へは届かない
+
+`agent` の中で、すべてのアドレス（`0.0.0.0:9000`）で待ち受ける小さな HTTP のアプリを動かします。内側から外の `relay` へは、問題なく接続できます。
+
+```
+(agent から relay へ)
+$ curl -s -o /dev/null -w '%{http_code} %{remote_ip}\n' http://198.51.100.100:8000/
+200 198.51.100.100
+```
+
+外の `client` には、内側の網への経路を `nat` 経由で教えてあります。それでも届きません。
+
+```
+(client から agent の内側のアドレスへ)
+$ curl -s -m 3 http://10.169.0.10:9000/; echo rc=$?
+rc=28                              ← 3 秒で時間切れ
+(client から nat の外側のアドレスへ)
+$ curl -s -m 3 http://198.51.100.10:9000/; echo rc=$?
+rc=7                               ← 接続を拒否された
+
+$ iptables -L FORWARD -v -n        （nat で）
+Chain FORWARD (policy DROP 3 packets, 180 bytes)
+    6   403 ACCEPT  all  --  eth1  eth0  0.0.0.0/0  0.0.0.0/0
+    6  1281 ACCEPT  all  --  eth0  eth1  0.0.0.0/0  0.0.0.0/0  ctstate RELATED,ESTABLISHED
+```
+
+内側のアドレスに宛てた SYN は、どの接続にも属さないので `FORWARD` の既定の `DROP` で黙って捨てられました（`policy DROP 3 packets` が、`curl` の SYN とその再送です）。`nat` の外側のアドレスに宛てたものは、`nat` 自身に届き、そこで待ち受けているプログラムが無いので RST が返りました。アプリが `0.0.0.0` で待ち受けていても、**外から届く道がそもそも無い**のです。一方、内から出ていった接続の戻り（6 パケット、1281 バイト）は通っています。
+
+## 3 つの型
+
+内側から先に張った接続で仕事を受け取る方法は、大きく 3 つの型に分けられます。
+
+| 型 | 内側の機械がすること | 代表例 | 外から来た要求の運ばれ方 |
+| --- | --- | --- | --- |
+| 1 本の接続の上で多重化する | 外の中継に長く接続を張り続け、中継から送られてくる要求を受けて答える | Cloudflare Tunnel、ngrok、Session Manager | 要求ごとに、その接続の上の別の流れ（ストリーム、チャネル）として届く |
+| 仕事を取りに行く | 外の API に「仕事はあるか」と聞き続ける | GitHub Actions のセルフホストランナー | 要求ではなく「仕事」として、聞きに来た応答に入って届く |
+| `ssh -R` | SSH の接続を張り、相手の sshd に待ち受けを頼む | 第 166 回 | sshd が受けた接続ごとに、SSH のチャネルが開かれる |
+
+`ssh -R` の仕組み（`tcpip-forward` の要求と `forwarded-tcpip` のチャネル、`GatewayPorts` の既定）は第 166 回で確かめたので、ここでは繰り返しません。残りの 2 つの型を、製品の文書で確かめていきます。
+
+### 型 1: 1 本の接続の上で要求を運ぶ
+
+**Cloudflare Tunnel** では、内側で `cloudflared` というプログラムを動かします。文書によれば、`cloudflared` は「外向きだけの接続」で Cloudflare の網につながり、そのため内側では外からの通信をすべて遮断してよいとされています（[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/)）。1 つの `cloudflared` は、**少なくとも 2 か所の異なるデータセンターへ、4 本の接続**を張り、宛先は 7844 番です（[Tunnel configuration](https://developers.cloudflare.com/tunnel/configuration/index.md)）。接続の方式は `--protocol` で選び、既定の `auto` はまず QUIC（UDP）を使い、UDP の接続が張れなければ HTTP/2 に切り替えます（[Run parameters](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/)）。どちらも、第 79 回と第 80 回で見た「1 本の接続の上に多数のストリームを並べる」プロトコルです。外から来た HTTP の要求 1 つが、その上の 1 本のストリームになって内側へ届きます。
+
+**ngrok** の文書も同じ形を説明しています。エージェントは「外向きの、持続する TLS の接続」で ngrok の網につながり、公開した URL に来た通信は、その TLS の接続を通ってエージェントへ送られます（[How does ngrok's Gateway work?](https://ngrok.com/docs/gateway/how-it-works.md)）。手元の機械では何も外からの接続を受け付けないので、ポートの転送もファイアウォールの規則の変更も要らない、とも書かれています（[ngrok: tunnels](https://ngrok.com/docs/share-localhost/tunnels.md)）。
+
+**AWS Systems Manager の Session Manager** は、管理画面からサーバのシェルを開く機能です。管理される側のサーバに必要なのは、`ssmmessages.<リージョン>.amazonaws.com` などへの **443 番の外向きの HTTPS** だけです（[Session Manager prerequisites](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-prerequisites.html)）。この `ssmmessages` の窓口は、SSM Agent が「Session Manager とのセッションのチャネルを作り、消す」ために使うとされています（[Reference: ec2messages, ssmmessages](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-setting-up-messageAPIs.html)）。SSM Agent のソースを見ると、このチャネルは `wss://` で始まる **WebSocket** で、制御用のチャネル（`control-channel`）を張りっぱなしにしておき、セッションが始まるとデータ用のチャネルを別に開きます（[amazon-ssm-agent: session/config/config.go](https://github.com/aws/amazon-ssm-agent/blob/e5da10f27a438dc1737865589f9ee1e92587145d/agent/session/config/config.go)）。
+
+3 つとも、内側の機械は**外の中継（エッジ）にとってのクライアント**です。外の利用者から見るとサーバに届いているように見えますが、その裏では、内側が先に張った接続を、中継がサーバの側として使っています。
+
+### 型 2: 仕事を取りに行く
+
+**GitHub Actions のセルフホストランナー**は、要求を流し込まれるのではなく、**仕事を取りに行きます**。ホストに求められるのは、443 番での外向きの HTTPS 接続だけです（[Self-hosted runners reference](https://docs.github.com/en/actions/reference/runners/self-hosted-runners)）。取りに行く方法は、第 88 回で見た**ロングポーリング**です。GitHub Enterprise Server 3.13 の文書は、ランナーが GitHub への接続を 50 秒開いたままにし、応答が無ければ時間切れにして、新しいロングポーリングを始めると説明しています。そして、必要なのはランナーから GitHub への外向きの接続だけだ、と書いています（[GHES 3.13: Communicating with self-hosted runners](https://docs.github.com/en/enterprise-server@3.13/actions/concepts/runners/communicating-with-self-hosted-runners)）。現在の github.com 向けの文書からはこの説明が外れていますが、ランナーのソースでも、メッセージを待つ処理（`GetRunnerMessageAsync` など）を繰り返す作りは変わっていません（[actions/runner: MessageListener.cs](https://github.com/actions/runner/blob/f4a774978d9562d6539be5055c17c0eb970d08df/src/Runner.Listener/MessageListener.cs)）。
+
+仕事を取りに行く型では、GitHub の側は「誰に渡すか」を選ぶだけで、ランナーとの間に長い多重化の接続を持ちません。割り当てた仕事を 60 秒以内にランナーが受け取らなければ、仕事はキューに戻されて別のランナーに回り、24 時間を超えてキューに残った仕事は失敗します（[Self-hosted runners reference](https://docs.github.com/en/actions/reference/runners/self-hosted-runners)）。**受け取り手が消えても、仕事の側に期限があるので、いつまでも宙に浮かない**わけです。この「受け取ったことを確かめ、期限が来たら戻す」という形は、キューの可視性タイムアウトとよく似ています（第 114 回で見ました）。
+
+### 内側どうしをつなぐ: Tailscale の DERP
+
+内側の機械が 2 台とも NAT の内側にあるときは、両方が外の中継に外向きの接続を張り、中継がその間を取り持ちます。第 91 回で見た Tailscale の **DERP** がこれです。Tailscale の文書は、どの接続もまず DERP を経由する中継の接続として始まり、その後で直接の接続への切り替えを試みると説明しています（[Tailscale: Connection types](https://tailscale.com/kb/1257/connection-types)）。また、任意のホストへ HTTPS の接続を開ける機械なら、DERP を使ってトンネルを作れるとしています（同上）。DERP は暗号化済みの通信をそのまま転送するだけで、中身を復号できません（[Tailscale: DERP servers](https://tailscale.com/kb/1232/derp-servers)）。NAT を越えて直接つなぐ部分は、第 91 回を見てください。
+
+## 実験 2: 100 行の逆向きトンネル
+
+型 1 を、Python の aiohttp で書きました。外の `relay` は 2 つの口を持ちます。内側の `agent` が WebSocket を張りに来る `/_tunnel` と、外の利用者が HTTP の要求を送ってくるその他のすべてのパスです。利用者の要求を受けると、`relay` は番号を振って JSON にし、`agent` の WebSocket に流し、同じ番号の応答が返ってくるまで待ちます。
+
+```python
+# relay.py（外の中継）
+import asyncio, base64, itertools, json, os, time
+from aiohttp import web, WSMsgType
+
+AGENT_TOKEN = os.environ["AGENT_TOKEN"]
+EDGE_KEY = os.environ.get("EDGE_KEY")
+agents = []                      # 張られている WebSocket（複数台ならここに並ぶ）
+pending = {}                     # 要求番号 -> 応答を待つ Future
+ids = itertools.count(1)
+rr = itertools.count()
+
+def log(*a): print(f"{time.time():.3f} relay", *a, flush=True)
+
+async def tunnel(req):           # 内側のエージェントが張りに来る口
+    if req.headers.get("Authorization") != f"Bearer {AGENT_TOKEN}":
+        log("agent rejected", req.remote); return web.Response(status=401)
+    ws = web.WebSocketResponse(heartbeat=float(os.environ.get("HB", "10")) or None)
+    await ws.prepare(req)
+    agents.append(ws); log("agent up", req.remote, "agents=", len(agents))
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                m = json.loads(msg.data)
+                fut = pending.pop(m["id"], None)
+                if fut and not fut.done(): fut.set_result(m)
+    finally:
+        agents.remove(ws); log("agent down", req.remote, "agents=", len(agents))
+    return ws
+
+async def public(req):           # 外から来る要求の口
+    if EDGE_KEY and req.headers.get("X-Edge-Key") != EDGE_KEY:
+        return web.Response(status=401, text="edge: unauthenticated\n")
+    if not agents:
+        return web.Response(status=502, text="edge: no agent connected\n")
+    ws = agents[next(rr) % len(agents)]
+    rid = next(ids)
+    fut = asyncio.get_running_loop().create_future(); pending[rid] = fut
+    hdrs = {k: v for k, v in req.headers.items() if k.lower() not in ("x-edge-key",)}
+    await ws.send_str(json.dumps({"id": rid, "method": req.method, "path": req.path_qs,
+        "headers": hdrs, "body": base64.b64encode(await req.read()).decode()}))
+    try:
+        m = await asyncio.wait_for(fut, 10)
+    except asyncio.TimeoutError:
+        pending.pop(rid, None); return web.Response(status=504, text="edge: agent timeout\n")
+    return web.Response(status=m["status"], headers=m["headers"], body=base64.b64decode(m["body"]))
+
+app = web.Application()
+app.router.add_get("/_tunnel", tunnel)
+app.router.add_route("*", "/{p:.*}", public)
+web.run_app(app, port=8080, print=None, access_log=None)
+```
+
+内側の `agent` は、`relay` へ WebSocket を張り、届いた要求を手元のアプリ（`UPSTREAM`）へ HTTP で送り直して、応答を同じ WebSocket で返します。切れたら、待ち時間を延ばしながら張り直します。
+
+```python
+# agent.py（内側のエージェント）
+import asyncio, base64, json, os, random, time
+import aiohttp
+
+RELAY = os.environ["RELAY"]                     # ws://198.51.100.100:8080/_tunnel
+UPSTREAM = os.environ["UPSTREAM"]               # http://127.0.0.1:9000
+HOST_REWRITE = os.environ.get("HOST_REWRITE")   # ngrok の --host-header に当たるもの
+HOP = {"host", "connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding"}
+
+def log(*a): print(f"{time.time():.3f} agent", *a, flush=True)
+
+async def handle(http, ws, m):
+    h = {k: v for k, v in m["headers"].items() if k.lower() not in HOP}
+    h["Host"] = HOST_REWRITE or m["headers"].get("Host", "")
+    async with http.request(m["method"], UPSTREAM + m["path"], headers=h,
+                            data=base64.b64decode(m["body"])) as r:
+        body = await r.read()
+        await ws.send_str(json.dumps({"id": m["id"], "status": r.status,
+            "headers": {k: v for k, v in r.headers.items() if k.lower() not in HOP},
+            "body": base64.b64encode(body).decode()}))
+
+async def main():
+    attempt = 0
+    async with aiohttp.ClientSession(auto_decompress=False,
+            timeout=aiohttp.ClientTimeout(sock_connect=float(os.environ.get("CONNECT_TIMEOUT", "3")))) as http:
+        while True:
+            try:
+                async with http.ws_connect(RELAY, heartbeat=float(os.environ.get("HB", "10")) or None,
+                        headers={"Authorization": f"Bearer {os.environ['AGENT_TOKEN']}"}) as ws:
+                    log("connected"); since = time.monotonic()
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            asyncio.create_task(handle(http, ws, json.loads(msg.data)))
+                    log("closed", ws.close_code, ws.exception())
+                    if time.monotonic() - since > 10: attempt = 0   # 安定して続いたときだけ待ち時間を戻す
+            except Exception as e:
+                log("connect failed:", type(e).__name__, e)
+            delay = random.uniform(0, min(30, 0.5 * 2 ** attempt))   # full jitter
+            attempt += 1
+            log(f"retry in {delay:.2f}s (attempt {attempt})")
+            await asyncio.sleep(delay)
+
+asyncio.run(main())
+```
+
+1 つの要求に 1 つの番号を振り、応答を番号で突き合わせるので、**1 本の WebSocket の上で多数の要求を同時に運べます**。HTTP/2 のストリーム ID（第 79 回）を、アプリケーションの層で真似したものです。
+
+動かすと、`relay` には `nat` の外側のアドレスからの接続が 1 本だけでき、外の `client` の要求が内側のアプリに届きました。
+
+```
+relay : 1792838983.983 relay agent up 198.51.100.10 agents= 1
+
+$ curl -s -H 'X-Edge-Key: edge-lab' 'http://198.51.100.100:8080/hello?a=1'     （client で）
+inner app: GET /hello?a=1 host=198.51.100.100:8080 peer=127.0.0.1
+
+$ ss -tn                                                                     （agent で）
+ESTAB  10.169.0.10:36918   198.51.100.100:8080      ← 内から外へ張った 1 本
+ESTAB  127.0.0.1:54774     127.0.0.1:9000           ← agent が手元のアプリへ
+```
+
+内側のアプリから見た相手は `127.0.0.1` です。第 69 回の中継や、第 168 回の stunnel と同じく、**本当の送り主のアドレスは、中継の向こうからは見えなくなります**。
+
+### 往復時間
+
+`client` から同じ要求を続けて送り、1 回ごとの時間を測りました（aiohttp の 1 つのセッションで接続を使い回して 100〜300 回）。
+
+| 測ったもの | 中央値 | 90 パーセンタイル |
+| --- | --- | --- |
+| 遅れなし: `agent` の中から手元のアプリへ直接 | 0.16ms | 0.25ms |
+| 遅れなし: `client` → `relay`（エッジで 401 を返すだけ） | 0.16ms | 0.30ms |
+| 遅れなし: `client` → `relay` → トンネル → アプリ | 0.75ms | 1.09ms |
+| 往復 20ms: `client` → `relay` → トンネル → アプリ | 24.44ms | 32.00ms |
+
+往復 20ms の網では、トンネルを通した要求は**ほぼ 1 往復分**で返りました。比べるために、内側から `relay` へ毎回新しい接続を張って 401 を受け取ると、`time_connect` が約 21ms、全体が 42〜48ms でした。毎回の TCP のハンドシェイクで 1 往復余計にかかるからです（TLS を使えば、さらに 1 往復増えます）。**接続を先に張っておくことは、到達できるようにするだけでなく、要求ごとのハンドシェイクを省くこと**でもあります。逆に言えば、遅れなしの網で 0.6ms ほど増えた分が、JSON と base64 に包み直して 2 回中継する費用です。
+
+### 複数台のとき
+
+`agent` を 2 つ動かし、それぞれ別のアプリ（9000 番と 9001 番）につなぎました。`relay` は順番に振り分けます。途中で 9001 番の側の `agent` のプロセスを止めました。
+
+```
+inner app :9000: GET /r1 ...
+inner app :9001: GET /r2 ...
+inner app :9000: GET /r3 ...
+inner app :9001: GET /r4 ...
+                                     ← ここで 9001 番の agent を kill
+inner app :9000: GET /r5 ...  [200]
+inner app :9000: GET /r6 ...  [200]
+inner app :9000: GET /r7 ...  [200]
+
+relay: 1792839631.811 relay agent up 198.51.100.10 agents= 1
+       1792839631.850 relay agent up 198.51.100.10 agents= 2
+       1792839650.605 relay agent down 198.51.100.10 agents= 1
+```
+
+プロセスが止まると OS が TCP を閉じる（FIN を送る）ので、`relay` はすぐに気づき、残った 1 台に振り分けました。製品では、この振り分けの決め方がそれぞれ違います。
+
+- **Cloudflare Tunnel**: 同じトンネルに `cloudflared` を複数（レプリカ）動かせます。各レプリカが 4 本ずつ接続を張り、1 つのトンネルで最大 25 レプリカ（100 本）です。通信は**地理的に最も近いレプリカ**へ送られ、それ以上の負荷分散や健全性の確認が要るなら別の製品（Load Balancing）を使うよう案内されています（[Tunnel configuration](https://developers.cloudflare.com/tunnel/configuration/index.md)）
+- **ngrok**: 同じ URL のエンドポイントを複数のエージェントで開き、プーリングを有効にすると、着いた拠点に近いものの中から**ランダムに**振り分けます。失敗した接続や要求を、プールの別のエンドポイントで再試行はしません（[ngrok: Endpoint pooling](https://ngrok.com/docs/universal-gateway/endpoint-pooling.md)）
+- **セルフホストランナー**: 仕事を取りに来たランナーのどれかに渡し、受け取られなければ 60 秒で戻します（前述）
+
+上の実験の `relay` には、まだ穴があります。`agent` が切れたとき、その `agent` に送って応答を待っている要求（`pending`）を失敗させていません。後の実験で見るように、その要求の利用者は 10 秒の期限が切れるまで待たされます。中継は、**どの要求をどの接続に流したか**を覚えておき、接続が消えたらその要求をすぐに失敗させる（あるいは別の接続へ送り直してよいものだけ送り直す）必要があります。送り直してよいかどうかは、第 113 回で見た冪等性の問題です。
+
+## 実験 3: ロングポーリングで仕事を取りに行く
+
+型 2 も書きました。外の `relay` の 8081 番に、仕事を積む `POST /jobs` と、仕事を待つ `GET /jobs/next?wait=秒` を作ります。後者は、仕事が来るまで最長 `wait` 秒応答を返しません。内側の `agent` では、ワーカーを 20 個動かし、それぞれが仕事を受け取ったらすぐ次の `GET` を出します。仕事を積んだ時刻を仕事に書いておき、ワーカーが受け取った時刻との差を「遅れ」とします（どのコンテナも同じ仮想マシンの時計を使っています）。
+
+仕事は、0.2〜2 秒の間隔でばらばらに 30 件積みました。往復 20ms（片道 10ms）の網です。
+
+| 待ち方 | 仕事の遅れ（最小 / 中央値 / 最大） | 何もない 1 分間の要求数 | `relay` の 8081 番の ESTABLISHED |
+| --- | --- | --- | --- |
+| ロングポーリング（`wait=30`） | 10.8ms / 11.5ms / 26.0ms | 40 | 20 |
+| 5 秒ごとに聞く（`wait=0`） | 336ms / 3,353ms / 4,970ms | 245 | 20 |
+
+ロングポーリングでは、仕事を積んでから受け取られるまでが、**ほぼ片道の遅れ（10ms）だけ**でした。待っている要求がすでに `relay` に届いているので、仕事が来た瞬間に応答として送り出せるからです。何もない間の要求は、20 個のワーカーが 30 秒ごとに張り直す分（20 × 2 = 40）だけです。
+
+5 秒ごとに聞く方式では、遅れが 0〜5 秒の間に散らばり、中央値は 3.4 秒でした。それでいて、何もない間の要求は 6 倍です。
+
+接続の数はどちらも 20 本でした。aiohttp は HTTP の接続を使い回すので、5 秒ごとに聞く方式でも接続そのものは張りっぱなしになります。**ロングポーリングが減らすのは接続の数ではなく、要求の回数と、仕事が来てから届くまでの遅れ**です。代わりに、待っている間ずっと、`relay` の側では 20 個の要求が処理中のまま残ります（`/stats` の `waiting` が 20）。要求ごとにスレッドを 1 つ使うサーバでは、これがそのまま 20 個のスレッドになります。待つ要求を安く持てる非同期のサーバでないと、この型は大きくできません。
+
+`nat` の conntrack の表にも、8081 番への行が 20 行ありました。30 秒ごとに要求が流れるので、これらの行は途中の機器から見て「生きている」接続です。この点は、後の生存確認の節につながります。
+
+## 認証の向き
+
+逆向きのトンネルでは、確かめる向きが 2 つあります。
+
+```
+  外の利用者 ──① 外からの要求──▶ エッジ（中継） ◀──② 内側が名乗る── 内側のエージェント
+            エッジで認証してから中へ流す        外向きの接続を張るときに、外のサービスに自分を証明する
+```
+
+### 内側が、外に自分を証明する
+
+内側のエージェントは、外のサービスにとってのクライアントなので、接続を張るときに**自分が誰か**を示します。上の実験では、`Authorization: Bearer` の固定の文字列でした。間違った値では `relay` が 401 を返し、WebSocket は張れません。
+
+製品は、ここに長期の秘密を置かないための工夫をしています。
+
+- **セルフホストランナー**: 登録に使うトークンは 1 時間で期限が切れます（[REST API: Create a registration token](https://docs.github.com/en/rest/actions/self-hosted-runners#create-a-registration-token-for-a-repository)）。ランナーは登録のときに自分で RSA の鍵の組を作って公開鍵を登録し（[ConfigurationManager.cs](https://github.com/actions/runner/blob/f4a774978d9562d6539be5055c17c0eb970d08df/src/Runner.Listener/Configuration/ConfigurationManager.cs)）、以後は秘密鍵で署名した JWT を使う OAuth のクライアント認証で、短命なトークンを受け取ります（[OAuthCredential.cs](https://github.com/actions/runner/blob/f4a774978d9562d6539be5055c17c0eb970d08df/src/Runner.Listener/Configuration/OAuthCredential.cs)）。**登録のときの短命な秘密を、手元で生まれた鍵に引き換える**形です
+- **Session Manager**: EC2 の上の SSM Agent は、インスタンスに付けた IAM ロールの一時的な認証情報で名乗ります。`ssmmessages:OpenControlChannel` の権限をロールから外すと、エージェントは Systems Manager とのつながりを失うとされています（ただし切れるまで最大 1 時間かかることがある）（[Reference: ec2messages, ssmmessages](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-setting-up-messageAPIs.html)）。実行環境が身元を保証する、第 187 回のワークロード ID の考え方です
+- **Cloudflare Tunnel**: リモートで管理するトンネルは、トンネルのトークン 1 つで動きます。文書は「トークンを持つ人は誰でもトンネルを動かせる」と明記し、定期的な更新と、秘密の管理の仕組みに置くことを勧めています。漏れたときは、トークンを更新したうえで既存の接続をすべて消すよう案内しています（[Tunnel permissions](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/remote-tunnel-permissions/)）
+
+最後の点は重要です。前の節で見たとおり、エッジは同じトンネルにつながった複数のエージェントへ要求を振り分けます。トークンを盗んだ人が自分の機械でエージェントを動かせば、**本来は内側へ行くはずの利用者の要求が、その人の機械にも届きます**。内側の名乗りは「中に入る権利」ではなく「**利用者の要求を受け取る権利**」なので、それが盗まれると、なりすましたサーバが利用者の入力を受け取ることになります。
+
+### 外から来た要求は、エッジで確かめてから流す
+
+もう一方の向きです。上の `relay` は、`X-Edge-Key` が合わない要求を、トンネルに流す前に 401 で返します（往復 0.16ms で、内側には何も届きません）。製品では、ここに SSO や多要素認証を挟めるのが利点です。**内側のアプリに届く前に、エッジで利用者を確かめられる**ので、内側のアプリが古くて認証の弱いものでも、外の誰にでも見える状態にはなりません。
+
+では、受け口を開けないことは、なぜ守りになるのでしょうか。外から届く口が無ければ、インターネット全体からの走査や、認証の前の処理を狙った攻撃（第 168 回の SSL VPN の機器の例）が、内側の機械に直接は届きません。攻撃を受け止めるのはエッジで、そこは事業者が守っています。
+
+<Callout type="warn" title="トンネルは、ファイアウォールの外に入口を作る">
+  ここまでの話を守る側から見ると、逆向きのトンネルは**受信を禁じる規則を素通りする入口**です。第 166 回の `ssh -R` の Callout と同じことが、
+  `cloudflared` や `ngrok` を 1 つ動かすだけで起きます。ファイアウォールが見ているのは「内側から外の 443 番（や 7844 番）への普通の接続」だけです。
+  そして、トンネルの先に何をつなぐかを決めるのは、内側の機械でエージェントを動かした人です。開発用の公開 URL を作ったつもりで、
+  **127.0.0.1 にしか開いていない管理画面やデバッグ用の口**をそのまま外に出してしまうことがあります。
+  127.0.0.1 で待ち受けるサービスは「同じ機械の中の人しか来ない」ことを前提に、認証を省いていることが多いからです。
+</Callout>
+
+### 例: 127.0.0.1 の CDP を中継すると
+
+その危険を、Chrome DevTools Protocol（CDP）で確かめました。CDP は、DevTools や Playwright がブラウザを操作するための口です。`--remote-debugging-port=9222` を付けて起動したブラウザは、対象の一覧の取得や操作のための HTTP と WebSocket の口を持つローカルの HTTP サーバを開きます（[Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/)）。AI にブラウザを操作させる道具にも、この口を使うものがあります。
+
+`agent` の中で、127.0.0.1 だけで待ち受ける「社内の管理画面」（ログインの Cookie を返す）を開いたヘッドレスの Chromium を動かしました。待ち受けは 127.0.0.1 です。
+
+```
+$ ss -ltnp
+LISTEN 127.0.0.1:9100   users:(("python",...))      ← 管理画面
+LISTEN 127.0.0.1:9222   users:(("chromium",...))    ← CDP
+```
+
+`agent.py` の `UPSTREAM` を `http://127.0.0.1:9222` にして、外の `client` から読みました。
+
+```
+$ curl -s -H 'X-Edge-Key: edge-lab' -H 'Host: dev-1234.tunnel.example' http://198.51.100.100:8080/json/version
+Host header is specified and is not an IP address or localhost.        [500]
+```
+
+CDP の HTTP の口は、DNS リバインディングの攻撃を防ぐために `Host` ヘッダを確かめ、IP アドレスか `localhost` 以外の名前なら 500 を返します（[Chrome DevTools Protocol: Security and origin restrictions](https://chromedevtools.github.io/devtools-protocol/)）。トンネル用のホスト名で届いた要求は、ここで止まりました。
+
+しかし、この確認は「外から届かないこと」を前提にした安全装置にすぎません。中継が `Host` を `localhost` に書き換える設定（ngrok の `--host-header` のようなもの。`agent.py` では `HOST_REWRITE`）にすると、通ります。また、IP アドレスで呼ばれる中継なら、書き換えなしでも通りました。
+
+```
+$ curl -s -H 'X-Edge-Key: edge-lab' http://198.51.100.100:8080/json/list     （HOST_REWRITE=localhost:9222）
+[ {
+   "title": "Internal Admin",
+   "type": "page",
+   "url": "http://127.0.0.1:9100/admin/dashboard",
+   "webSocketDebuggerUrl": "ws://localhost:9222/devtools/page/ACD2063DE5503FA274F0B33F7B350F30"
+}, ...
+```
+
+開いているタブのタイトルと URL が、外から読めました。この手作りのトンネルは HTTP の要求と応答しか運びませんが、Cloudflare Tunnel や ngrok は WebSocket も運びます。その先で何ができるかを、`agent` の中から CDP の WebSocket に 1 つ命令を送って確かめました。
+
+```
+$ python /cdp.py        （Storage.getCookies を 1 回送るだけのスクリプト）
+127.0.0.1 session lab-session-7f3a httpOnly= True
+```
+
+`HttpOnly` の Cookie は、ページの JavaScript からは読めないように守られている値です。CDP はブラウザそのものを操作する口なので、それも含めて**ブラウザが持っているすべてのセッション**を返します。ほかにも、任意のページで JavaScript を実行する、画面を撮る、通信を見る、といったことができます。Chrome 136 からは、既定のプロファイルでは `--remote-debugging-port` が無視されるようになりました。Chrome の説明では、インフォスティーラー（情報を盗むマルウェア）がこの口を使って Cookie を抜き出す例が増えたことが理由です（[Chrome for Developers: Changes to remote debugging switches](https://developer.chrome.com/blog/remote-debugging-port)）。デバッグ用のプロファイルで動かしているブラウザをトンネルの先につなぐと、**そのプロファイルでログインしたすべてのサービスの鍵を、エッジの認証 1 枚の向こうに置く**ことになります。
+
+## 生存確認と再接続
+
+逆向きのトンネルは、**張りっぱなしの 1 本の接続**に頼っています。それが切れていることに気づけなければ、外からは何も届かなくなります。
+
+### 途中の機器は、黙って忘れる
+
+第 88 回で見たとおり、ロードバランサやプロキシは、しばらく何も流れない接続を切ります。NAT も同じで、conntrack の行には寿命があります。これを再現するために、ハートビートを両側で止めた状態で（`HB=0`）トンネルを張り、`nat` の conntrack から 8080 番の行を手で消しました。**途中の NAT が、無通信の間に行を忘れた**状況です。その後、外の `client` から要求を送りました。
+
+```
+$ conntrack -D -p tcp --dport 8080                （nat で）
+conntrack v1.4.9 (conntrack-tools): 1 flow entries have been deleted.
+
+$ curl ... http://198.51.100.100:8080/after-nat-forgot      （client で）
+edge: agent timeout   [504] 10.015705s
+$ curl ... http://198.51.100.100:8080/again
+edge: no agent connected   [502] 0.000885s
+
+(nat の eth0 で tcpdump)
+198.51.100.100.8080 > 198.51.100.10.60592: Flags [P.], ... length 161     ← relay が要求を流す
+198.51.100.10.60592 > 198.51.100.100.8080: Flags [R], ...                  ← nat 自身が RST を返す
+```
+
+`relay` が流した要求は、`nat` に届いた時点でどの内側の接続に属するのか分からず、`nat` 自身に宛てたものとして扱われて RST が返りました。`relay` は接続を失い、その要求は（前述の穴のせいで）10 秒待ってから 504 になりました。
+
+問題は内側です。30 秒以上たっても、`agent` は何も知りません。
+
+```
+$ cat /agent-nohb.log; ss -tn '( dport = :8080 )'         （agent で）
+1792839560.329 agent connected
+ESTAB  10.169.0.10:60592  198.51.100.100:8080
+```
+
+`agent` は、もう存在しない接続の上で要求を待ち続けています。片側だけが「つながっている」と思っているこの状態を**ハーフオープン**と呼びます。外からは届かず、内側は張り直さないので、誰かが気づくまで止まったままです。
+
+### ハートビートで気づく
+
+両側でハートビートを 10 秒（aiohttp の `heartbeat=10`。10 秒ごとに WebSocket の ping を送り、pong が返らなければ閉じる）にして、今度は `nat` で `relay` との間のパケットを両方向とも捨てました。線が切れた状況です。
+
+```
+cut      1792839404.614
+agent    1792839417.011 agent closed 1006               ← 12.4 秒で気づく
+agent    1792839417.011 agent retry in 0.34s (attempt 1)
+agent    1792839420.364 agent connect failed: ConnectionTimeoutError ...
+agent    1792839420.364 agent retry in 0.46s (attempt 2)
+agent    1792839423.837 agent connect failed: ConnectionTimeoutError ...
+agent    1792839423.837 agent retry in 1.67s (attempt 3)
+   ...（attempt 7 まで）
+agent    1792839443.252 agent retry in 5.97s (attempt 7)
+restored 1792839449.811
+agent    1792839450.345 agent connected                 ← 戻ってから 0.53 秒
+```
+
+切れてから 12.4 秒で気づき、張り直しを始めました。ping は**何も流れない間にも流れるデータ**なので、途中の機器の無通信のタイマも延ばします。第 88 回と同じ理屈で、ハートビートには「気づく」と「忘れさせない」の 2 つの役目があります。製品の値は、次のとおりです。
+
+- **SSM Agent**: WebSocket の ping を 54 秒ごとに送り、pong を 60 秒待ちます。ソースのコメントは、ping の間隔は pong を待つ時間より短くなければ検出できない、と書いています（[config.go](https://github.com/aws/amazon-ssm-agent/blob/e5da10f27a438dc1737865589f9ee1e92587145d/agent/session/config/config.go)）
+- **セルフホストランナー**: 50 秒のロングポーリングを繰り返すこと自体が、生存確認になっています。50 秒は、第 88 回で見た ALB の既定のアイドルタイムアウト（60 秒）より短い値です
+
+実は、最初の実行では、張り直しに時間がかかりました。`agent` が接続を試みる TCP のハンドシェイクに**期限を付けていなかった**ため、線が切れている間に始めた接続の試みが、SYN の再送を続けたまま止まっていたのです。線が戻ってから接続できるまで約 7.4 秒かかりました。上の結果は、接続の試みに 3 秒の期限（`sock_connect=3`）を付けた後のものです。**生存確認の期限と、接続の試みの期限は、別々に要ります**。
+
+### 再接続: 待ち時間を延ばし、ばらつかせる
+
+切れたエージェントがすぐに張り直そうとするのは自然です。しかし、エッジの側が再起動したときには、**すべてのエージェントが同時に切れて、同時に戻ってきます**。第 88 回のデプロイの節で計算したとおり、固定の待ち時間では全員が同じ瞬間に押し寄せます。そこで、失敗するたびに待ち時間を倍にし（指数バックオフ）、さらにその範囲の中で乱数を振ります（ジッタ）。上の `agent.py` は、0 から「0.5 秒 × 2 の試行回数乗（上限 30 秒）」の間の一様乱数を待つ、full jitter と呼ばれる方式です。ログの待ち時間が 0.34、0.46、1.67、0.46、3.84 秒と上下しているのはこのためです。
+
+製品の値は次のとおりです。
+
+| 製品 | 再接続の待ち方 |
+| --- | --- |
+| cloudflared | 接続とプロトコルのエラーで最大 5 回（`--retries`）、既定で 1、2、4、8、16 秒の指数バックオフ（[Run parameters](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/)） |
+| SSM Agent の制御チャネル | 最初 5 秒、倍率 2、ジッタの比率 0.5、上限 40 分、**回数の上限なし**（[config.go](https://github.com/aws/amazon-ssm-agent/blob/e5da10f27a438dc1737865589f9ee1e92587145d/agent/session/config/config.go)） |
+| セルフホストランナー | メッセージの取得に失敗したら、5 回目までは 15〜30 秒、それ以降は 30〜60 秒の乱数。ソースのコメントは、サービス側の障害で全ランナーがロングポーリングから一斉に外れたときに、同時に戻ってくるのを避けるためと説明している（[MessageListener.cs](https://github.com/actions/runner/blob/f4a774978d9562d6539be5055c17c0eb970d08df/src/Runner.Listener/MessageListener.cs)） |
+
+<Callout type="note" title="つながった瞬間に待ち時間を戻すと、バックオフが効かない">
+  実験の途中で、ハートビートの設定を誤って、つながった直後に毎回切れる状態を作ってしまいました。そのときの `agent.py` は、
+  つながった時点で試行回数を 0 に戻していたため、待ち時間がいつも 1 回目の範囲（0〜0.5 秒）に留まり、16 秒の間に数十回、つながっては切れるを繰り返しました。
+  「接続できた」ことは「正常に戻った」ことを意味しません。認証は通るのに直後に切られる、エッジが受け付けてすぐ落ちる、という失敗では、
+  このループがエッジへの負荷になります。今の `agent.py` は、接続が 10 秒以上続いたときだけ試行回数を戻しています。
+</Callout>
+
+## 並べる
+
+| | `ssh -R`（第 166 回） | 1 本の接続の上で多重化（cloudflared、ngrok、SSM） | ロングポーリングで取りに行く（セルフホストランナー） |
+| --- | --- | --- | --- |
+| 内側から張るもの | SSH の接続 1 本 | QUIC / HTTP/2 / TLS / WebSocket の長い接続（cloudflared は 4 本） | 50 秒ごとに張り直す HTTPS の要求 |
+| 外から届くもの | 任意の TCP 接続 | HTTP の要求、TCP、シェルのセッションなど | 仕事（ジョブの定義） |
+| 要求の遅れ | ほぼ 1 往復 | ほぼ 1 往復 | 待っているワーカーがいれば片道ほど。全員が忙しければ空くまで |
+| 内側が名乗る方法 | SSH の鍵 | トンネルのトークン、クラウドの IAM ロールなど | 登録時の短命なトークン → 手元で作った鍵 |
+| 外の利用者の確かめ方 | 外のサーバの設定次第（`GatewayPorts` の既定では外から届かない） | エッジで認証してから流せる | 利用者はいない。仕事を積めるのは GitHub の中の権限を持つ人 |
+| 切れたときに気づく方法 | `ServerAliveInterval` などを自分で設定 | エージェントのハートビート | ロングポーリングの繰り返しそのもの |
+| 複数台のとき | 1 つの待ち受けに 1 本 | エッジが近いもの・ランダムなどで振り分け | 取りに来たものに渡し、60 秒で戻す |
+
+## まとめ
+
+- NAT とステートフルなファイアウォールは、内から始まった接続の戻りだけを通す。向きを決めているのは最初の SYN で、一度張られた接続は両方向に使える。手元でも、`0.0.0.0` で待ち受けるアプリに外からは届かなかった
+- 逆向きのトンネルは、内側が外の中継へ先に接続を張り、その上を中継がサーバの側として使う形。型は、1 本の接続の上で要求を多重化する（Cloudflare Tunnel、ngrok、Session Manager）、仕事を取りに行く（セルフホストランナーのロングポーリング）、`ssh -R` の 3 つ
+- 手元の 100 行ほどの WebSocket のトンネルでは、往復 20ms の網で要求が中央値 24ms で返った。毎回新しく接続すると約 42〜48ms。先に張った接続は、要求ごとのハンドシェイクも省く
+- ロングポーリングでは、仕事を積んでから受け取られるまでが約 11ms（片道 10ms の網）。5 秒ごとに聞くと中央値 3.4 秒で、何もない間の要求は 6 倍。代わりに、待っている要求をサーバが持ち続ける
+- 認証は 2 つの向きにある。内側は外に名乗り（短命なトークンから手元の鍵へ、IAM ロール、トンネルのトークン）、外からの要求はエッジで確かめてから中へ流す。トンネルのトークンが盗まれると、利用者の要求を偽のエージェントが受け取る
+- トンネルはファイアウォールの外に入口を作る。127.0.0.1 の CDP を中継すると、タブの一覧が外から読め、WebSocket まで通せば HttpOnly の Cookie を含むブラウザのすべてのセッションが取れる。CDP の `Host` の確認は、中継が `Host` を書き換えれば通ってしまう
+- 途中の NAT が行を忘れると、中継の側は RST で切れるが、内側はハーフオープンのまま気づかない。ハートビートは「気づく」と「忘れさせない」の両方の役目を持つ。手元では 10 秒の設定で 12.4 秒で気づいた
+- 再接続は、指数バックオフとジッタで散らす。接続の試みにも期限を付け、試行回数は接続が安定して続いてから戻す
+
+ここまでの仕組みは、どれも IP アドレスを持った機械が、外へ接続を張れることを前提にしていました。次の第 170 回では、IP アドレスをもらう前の Wi-Fi の認証や、時刻合わせ、ログの転送のように、利用者の目に触れない場所で働く TLS を見ていきます。
