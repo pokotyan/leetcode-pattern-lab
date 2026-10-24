@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | アルゴリズム | `/algorithms/` | LeetCode を「型」で落とす。ステップ実行つき |
 | システム設計 | `/system-design/` | 大きな仕組みを中身まで降りて読む（`/reading/`） |
-| 低レイヤ | `/lowlevel/` | CPU からシステムコール、ストレージ、回線と電波（Wi-Fi・Bluetooth・4G/5G・光回線・AirDrop）、スイッチとルーター（VLAN・BGP・IPv6 と IPoE・クラウドのネットワーク）、ネットワーク（ソケットの中継まで）、DNS、サービス間通信（HTTP/2・HTTP/3・gRPC・ロードバランサ）、リアルタイム通信（WebSocket・MQTT・QUIC・NAT 越え・WebRTC・ゲームの同期・CRDT・差分同期）、DB、ブラウザ（DevTools の読み方まで）、ブラウザで描く（Canvas・WebGL・WebGPU・HTML-in-Canvas・WebCodecs）、ブラウザの境界（Cookie・CORS・ヘッダ・iframe・CDN とキャッシュ）、暗号（量子コンピュータとビットコインまで）・TLS（トラストストアの配られ方まで）・圧縮・SSH・その上に載るプロトコル（SFTP・FTPS・SSH のトンネル・DB の TLS・TLS の VPN・EAP-TLS・NTS）・認証認可・SSO、メール、FFI と Wasm、コンテナ、クラウドネイティブ、観測（CPU 使用率・ロードアベレージ・メモリ・プロファイルの読み方）、守りの継続的な検証（SAST・SCA・CSPM・サプライチェーン・テナント分離・証跡）まで 30 章（224 回） |
+| 低レイヤ | `/lowlevel/` | CPU からシステムコール、ストレージ、回線と電波（Wi-Fi・Bluetooth・4G/5G・光回線・AirDrop）、スイッチとルーター（VLAN・BGP・IPv6 と IPoE・クラウドのネットワーク）、ネットワーク（ソケットの中継まで）、DNS、サービス間通信（HTTP/2・HTTP/3・gRPC・ロードバランサ）、リアルタイム通信（WebSocket・MQTT・QUIC・NAT 越え・WebRTC・ゲームの同期・CRDT・差分同期）、DB（ロック・実行計画・結合・レプリケーション・バックアップ・シャーディングまで）、ブラウザ（DevTools の読み方まで）、ブラウザで描く（Canvas・WebGL・WebGPU・HTML-in-Canvas・WebCodecs）、ブラウザの境界（Cookie・CORS・ヘッダ・iframe・CDN とキャッシュ）、暗号（量子コンピュータとビットコインまで）・TLS（トラストストアの配られ方まで）・圧縮・SSH・その上に載るプロトコル（SFTP・FTPS・SSH のトンネル・DB の TLS・TLS の VPN・EAP-TLS・NTS）・認証認可・SSO、メール、FFI と Wasm、コンテナ、クラウドネイティブ、観測（CPU 使用率・ロードアベレージ・メモリ・プロファイルの読み方）、守りの継続的な検証（SAST・SCA・CSPM・サプライチェーン・テナント分離・証跡）まで 30 章（236 回） |
 | AI | `/ai/` | ニューラルネットワークから Transformer、強化学習、推論時スケーリング、拡散モデル、GPU、フィジカル AI までを元の論文の順にたどる歴史トラック（13 回）と、ベクトル・行列・微分・勾配・確率・統計をスライダーで動かす数学トラック（8 回） |
 | 作る | `/build/` | NAND から CPU、言語、NES エミュレータまで 3 トラック |
 

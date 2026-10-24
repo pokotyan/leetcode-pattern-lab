@@ -1,0 +1,484 @@
+---
+title: 結合の 3 つのやり方
+description: 2 つの表を突き合わせる方法は、本質的に 3 つしかありません。入れ子のループ、ハッシュ表、並べてから歩く。どれを選ぶかで、計算量もメモリもなぜここまで変わるのでしょうか
+chapter: db
+order: 7
+status: published
+topics:
+  - Nested Loop Join
+  - Index Nested Loop
+  - Hash Join
+  - build と probe
+  - Sort-Merge Join
+  - 結合順序
+  - 動的計画法
+  - GEQO
+  - join_collapse_limit
+  - 外部キーの索引
+requires:
+  - ll-97-db-index
+  - ll-101-db-planner
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 突き合わせる方法は 3 つしかない
+
+前回の第 101 回では、SQL が演算子の木に組み立てられ、統計からコストを見積もって計画が選ばれ、`EXPLAIN ANALYZE` でその結果を確かめられることを見ました。その木の中で、最も重く、最も計画によって差が出やすいのが **結合**（JOIN）です。
+
+注文の表 `orders` と利用者の表 `users` を、`orders.user_id = users.id` で突き合わせるとします。左の表の行ごとに、右の表から相手を探す。やることはこれだけですが、「相手を探す」やり方は、突き詰めると次の 3 つしかありません。
+
+| やり方 | 相手の探し方 | 日常の例え |
+| --- | --- | --- |
+| **Nested Loop Join** | 右の表を毎回、頭から（または索引で）探す | 名簿を 1 人ずつ読み上げ、もう 1 冊の名簿を毎回めくって探す |
+| **Hash Join** | 片方からハッシュ表を作り、もう片方で引く | 片方の名簿から索引カードを作り、もう片方をカードで引く |
+| **Sort-Merge Join** | 両方を同じ順に並べ、先頭から一緒に歩く | 2 冊とも五十音順に並べ、並べて上から照合する |
+
+PostgreSQL の文書も、計画の候補としてこの 3 つを挙げています（[PostgreSQL 文書: Planner/Optimizer](https://www.postgresql.org/docs/17/planner-optimizer.html)）。この回では、3 つそれぞれの仕組みと、計算量・メモリ・前提条件の違いを見たうえで、表が 3 つ以上になったときの「どの順に結合するか」という問題に進みます。
+
+以下、外側（先に読む側）の行数を N、内側の行数を M と書きます。
+
+## Nested Loop Join：素朴な入れ子のループ
+
+いちばん素直なやり方は、二重ループです。
+
+```
+for o in orders:              # N 回
+    for u in users:           # M 回
+        if o.user_id == u.id:
+            出力 (o, u)
+```
+
+比較の回数は **N × M** です。注文 1 万件と利用者 1,000 人なら 1,000 万回、注文 1,000 万件と利用者 100 万人なら 10 兆回になります。
+
+この素朴な形が使い物になるのは、両方が小さいときだけです。しかし、このやり方には他の 2 つにない長所が 2 つあります。
+
+- **結合条件を選ばない。** `=` でも `<` でも、関数を使った条件でも、行の組を 1 つずつ比べるので何でも扱える
+- **追加のメモリがほとんど要らない。** ハッシュ表も並べ替えも要らない
+
+そのため、他の方法が使えない場面での最後の手段として、どのデータベースにも必ず残っています。
+
+### Index Nested Loop：内側を索引でたどる
+
+内側の表の結合列に索引があると、話が一変します。内側を頭から読む代わりに、**外側の 1 行ごとに索引の B+tree を 1 回たどる** ことになります。
+
+```
+for o in orders:                      # N 回
+    u = users_pkey から o.user_id を探す   # B+tree を根から葉へ
+    出力 (o, u)
+```
+
+1 回の検索で読むページは、第 97 回で見た B+tree の段数と、行本体を読む 1 ページです。段数を h とすると、全体の手間はおよそ **N × (h + 1) ページ** です。M が増えても段数は対数でしか伸びないので、M に対してほとんど一定と言えます。
+
+PostgreSQL の文書も、Nested Loop は時間がかかりうるが、内側を索引で読めるなら良い戦略になりうる、と書いています（[PostgreSQL 文書: Planner/Optimizer](https://www.postgresql.org/docs/17/planner-optimizer.html)）。
+
+この形がいちばん強いのは、**外側が少ないとき** です。たとえば「この 100 件の注文の利用者名を出す」なら、索引を 100 回たどるだけで済み、利用者の表がどれだけ大きくても関係ありません。逆に、外側が何百万行もあると、索引を何百万回もたどることになります。1 回あたりは数ページでも、回数が多いと積み重なります。
+
+## Hash Join：作ってから引く
+
+Hash Join は 2 段階で動きます。
+
+```
+ 1. build（作る）                       2. probe（引く）
+
+  users を全部読む                        orders を 1 行ずつ読む
+       │                                      │
+       ▼                                      ▼
+  ┌─────────────────────────┐          hash(o.user_id) で
+  │ バケット 0: id=7, id=42  │ ◀────────  バケットを 1 つ選び、
+  │ バケット 1: id=3         │            その中だけを比べる
+  │ バケット 2: id=19, ...   │
+  └─────────────────────────┘
+     メモリ上のハッシュ表
+```
+
+1. **build**：片方の表（PostgreSQL の計画では `Hash` ノードの下に来る側）を最後まで読み、結合キーのハッシュ値でバケットに振り分けたハッシュ表をメモリ上に作る
+2. **probe**：もう片方の表を 1 行ずつ読み、結合キーのハッシュ値でバケットを選び、その中の行とだけ比べる
+
+PostgreSQL の文書の説明もこの通りです（[PostgreSQL 文書: Planner/Optimizer](https://www.postgresql.org/docs/17/planner-optimizer.html)）。それぞれの表を 1 回ずつ読むだけなので、手間は **N + M** に比例します。索引は要りません。
+
+### 小さいほうで作る
+
+どちらの表でハッシュ表を作っても、結果は同じです。それでも、データベースは **小さいほうで作ろうとします**。
+
+- ハッシュ表はメモリに置く。**必要なメモリは build 側の大きさで決まり**、probe 側は 1 行ずつ流すだけなので、どれだけ大きくてもメモリを使わない
+- build が終わるまで probe を始められない。build 側が小さいほど、最初の行が早く出る
+
+PostgreSQL では、ハッシュ表に使えるメモリの上限は `work_mem` に `hash_mem_multiplier` を掛けた値です（既定は 4MB × 2.0）（[PostgreSQL 文書: Resource Consumption](https://www.postgresql.org/docs/17/runtime-config-resource.html)）。build 側がこれに収まらないと、表をいくつかの **batch** に分け、一部を一時ファイルに書き出して順に処理します。`EXPLAIN ANALYZE` の `Hash` ノードに出る `Batches` がその数です。1 より大きければ、メモリに収まらなかったということです。この仕組みは、次の第 103 回で詳しく見ます。
+
+### 等値でしか使えない
+
+Hash Join には、はっきりした制約があります。**結合条件が等値（`=`）でなければ使えない** ことです。
+
+ハッシュ関数は、等しい値を同じバケットに送ることしか保証しません。`o.amount < u.score` のような条件では、「小さい相手」がどのバケットに入っているかを、ハッシュ値から知ることはできません。PostgreSQL では、ハッシュ結合に使える演算子は、実際には何らかの型の等値を表すものでなければならない、と定めています（[PostgreSQL 文書: Operator Optimization Information](https://www.postgresql.org/docs/17/xoper-optimization.html)）。
+
+## Sort-Merge Join：並べてから一緒に歩く
+
+3 つ目は、両方の表を結合キーの順に並べてから、先頭から同時に読み進める方法です。
+
+```
+  users（id 順）        orders（user_id 順）
+  ┌──────┐               ┌──────────┐
+  │ 1    │ ◀──── 一致 ──▶ │ 1, 1     │
+  │ 2    │ ◀──── 一致 ──▶ │ 2        │
+  │ 3    │   小さいほうを  │ 4, 4, 4  │  3 < 4 なので users を 1 つ進める
+  │ 4    │   1 つ進める    │ 5        │
+  └──────┘               └──────────┘
+```
+
+2 本の指を両方の先頭に置き、キーが等しければ出力し、等しくなければ **小さいほうの指を進める**。どちらの表も 1 回ずつしか読みません。歩く部分の手間は N + M です。
+
+問題は、並べ替えの費用です。並べ替えは N log N と M log M かかり、メモリに収まらなければ一時ファイルを使う外部ソートになります。
+
+しかし、**すでに並んでいれば並べ替えは要りません**。結合キーに B+tree の索引があれば、葉を順に読むだけで、キーの順に行が出てきます。第 97 回で見た「葉どうしが横につながっている」性質が、ここで効きます。PostgreSQL の文書も、並べ替えは明示的な Sort でも、結合キーの索引を順に読むことでも実現できる、と書いています（[PostgreSQL 文書: Planner/Optimizer](https://www.postgresql.org/docs/17/planner-optimizer.html)）。
+
+### 範囲や不等号の条件
+
+並べてから歩く方法は、原理的には等値以外にも広げられます。両方が並んでいれば、「`a < b` を満たす相手は、ある位置から先すべて」のように、範囲で相手を決められるからです。DuckDB は、不等号が 1 つの結合に、build 側を条件の列で並べる Piecewise Merge Join を使い、不等号が 2 つの結合には、2 つの列で並べる IEJoin を使います（[DuckDB: Range Joins in DuckDB](https://duckdb.org/2022/05/27/iejoin.html)）。
+
+ただし、どのデータベースでもそうなっているわけではありません。**PostgreSQL の Merge Join は等値の条件にしか使えません**。マージ結合に使える演算子も、実際には等値を表すものでなければならない、と定めています（[PostgreSQL 文書: Operator Optimization Information](https://www.postgresql.org/docs/17/xoper-optimization.html)）。PostgreSQL で不等号だけの結合を書くと、残る選択肢は Nested Loop だけになります。これは後の実験で確かめます。
+
+## 3 つを並べる
+
+| | Nested Loop | Index Nested Loop | Hash Join | Sort-Merge Join |
+| --- | --- | --- | --- | --- |
+| 手間の目安 | N × M | N × 索引の段数 | N + M | 並べ替え + N + M |
+| 追加のメモリ | ほぼ不要 | ほぼ不要 | build 側のハッシュ表 | 並べ替えの作業領域（並んでいれば不要） |
+| 前提 | なし | 内側の結合列に索引 | 等値条件 | 並べられる条件（PostgreSQL では等値）。並んでいれば安い |
+| 最初の行が出るまで | すぐ | すぐ | build が終わってから | 並べ替えが終わってから |
+| 得意な場面 | 両方とも小さい。他の方法が使えない | 外側が少ない | 両方とも大きく、索引がない | 両方とも結合キーの順に並んでいる |
+
+「最初の行が出るまで」の行は、`LIMIT` 付きのクエリで効きます。Nested Loop は最初の 1 行をすぐ返せるので、10 行だけ欲しいなら、全部を読む Hash Join より速いことがあります。
+
+どれが速いかは、行数、索引の有無、並び、メモリで決まります。第 101 回で見たとおり、プランナは統計から行数を見積もり、3 つのコストを比べて選びます。
+
+## MySQL の歴史：長く入れ子のループしかなかった
+
+ここで、MySQL の事情を見ておきます。MySQL のマニュアルは、MySQL は結合を入れ子のループのアルゴリズム、またはその変形で実行する、と書いています（[MySQL 8.4 リファレンス: Nested-Loop Join Algorithms](https://dev.mysql.com/doc/refman/8.4/en/nested-loop-joins.html)）。
+
+長い間、MySQL の結合は Nested Loop の系統だけでした。内側に索引があれば Index Nested Loop、なければ **Block Nested Loop**（BNL）です。BNL は、外側の行を結合バッファ（`join_buffer_size`）にまとめて溜め、内側を 1 回読むごとに、溜めた行すべてと比べる方法です。内側を読む回数は減りますが、比較の回数は N × M のままです（[MySQL 8.0 リファレンス: Block Nested-Loop Join Algorithm](https://dev.mysql.com/doc/refman/8.0/en/nested-loop-joins.html)）。
+
+これが変わったのは 8.0 系の途中です。
+
+- **8.0.18**（2019 年）：内部結合の等値結合を Hash Join で実行できるようになった。結合に等値条件が 1 つ以上あり、結合条件に使える索引がない場合は、既定で Hash Join を使う。メモリは `join_buffer_size` で制御し、超えるとディスク上のファイルを使う（[MySQL 8.0.18 リリースノート](https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-18.html)）
+- **8.0.20**（2020 年）：BNL を使っていたところでは、すべて Hash Join を使うようになった。不等号の内部結合、準結合、反結合、外部結合にも広がり、`EXPLAIN` にも `block nested loop` の代わりに `hash join` と出るようになった（[MySQL 8.0.20 リリースノート](https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-20.html)）
+
+いまの MySQL 8.4 のマニュアルにある結合アルゴリズムは、入れ子のループの系統と Hash Join です（[MySQL 8.4 リファレンス: Hash Join Optimization](https://dev.mysql.com/doc/refman/8.4/en/hash-joins.html)）。一方、PostgreSQL は Nested Loop、Hash Join、Merge Join の 3 つを持ち、コストで選びます。
+
+<Callout type="note" title="Hash Join の有効・無効を切り替える名前">
+  MySQL 8.4 で Hash Join を使わせない方法として、マニュアルが挙げているのは `NO_BNL` ヒントと、`optimizer_switch` の `block_nested_loop=off` です（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/hash-joins.html)）。
+  名前に BNL が残っているのは、BNL を置き換えた経緯のためです。
+  8.0.18 のリリースノートにあった `hash_join` スイッチと `NO_HASH_JOIN` ヒントは、手元の 8.4 で試すと計画が変わりませんでした（後述）。
+</Callout>
+
+## 結合の順序：表が増えると組合せが爆発する
+
+ここまでは 2 つの表の話でした。表が 3 つ以上になると、もう 1 つの問題が加わります。**どの順に結合するか** です。
+
+結合は、結果としては順番を入れ替えても同じになります（内部結合の場合）。しかし手間は大きく変わります。たとえば A、B、C の 3 つを結合するとき、先に A と B を結合した中間結果が 10 行なら、次の C との結合は軽く済みます。先に A と C を結合して中間結果が 1,000 万行になれば、その後はすべて重くなります。
+
+候補の数は、表の数に対して急激に増えます。左から 1 つずつ足していく形に限っても、n 個の表の並べ方は n! 通りあり、10 個なら 362 万通りを超えます。PostgreSQL の文書も、表が増えると結合順序の候補は指数的に増えると書いています（[PostgreSQL 文書: Controlling the Planner with Explicit JOIN Clauses](https://www.postgresql.org/docs/17/explicit-joins.html)）。
+
+### PostgreSQL：動的計画法
+
+PostgreSQL のプランナは、結合の木を **動的計画法** で組み立てます。まず 2 つの表の組すべてについて最も安い結合の仕方を求め、次にそれを使って 3 つの組、4 つの組と積み上げ、最後にすべての表を含む 1 つを得ます（[PostgreSQL ソース: src/backend/optimizer/README](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/optimizer/README)）。
+
+```
+ 1 段目: {A,B} {A,C} {B,C} ...      それぞれ最安の方式（NL / Hash / Merge）を記録
+ 2 段目: {A,B,C} = {A,B}+C か {A,C}+B か {B,C}+A のうち最安
+ 3 段目: {A,B,C,D} = ...
+```
+
+部分集合ごとに最安のものだけを残すので、n! 通りをすべて試すよりずっと少なく済みます。それでも、部分集合の数は 2 の n 乗で増えるので、表が十数個になると計画を立てるだけで時間がかかります。なお、結合条件のない組（直積になる組）は、他に手がない場合にしか検討しません（[PostgreSQL 文書: Planner/Optimizer](https://www.postgresql.org/docs/17/planner-optimizer.html)）。
+
+### 遺伝的アルゴリズムへの切り替え
+
+そこで PostgreSQL は、表の数が多いときに、すべてを調べることを諦めます。
+
+- **`geqo_threshold`**（既定 12）：`FROM` の項目がこの数以上になると、**遺伝的アルゴリズム**（GEQO）で結合順序を探す（[PostgreSQL 文書: Query Planning](https://www.postgresql.org/docs/17/runtime-config-query.html)）。GEQO は結合順序を「表の番号の並び」として表し、巡回セールスマン問題のように扱って、推定コストの低い並びを残しながら改良していく（[PostgreSQL 文書: Genetic Query Optimization](https://www.postgresql.org/docs/17/geqo-pg-intro.html)）。最適とは限らないが、妥当な計画を妥当な時間で得るための仕組みである
+- **`join_collapse_limit`**（既定は `from_collapse_limit` と同じ 8）：明示的に書いた `JOIN` を、この数までの項目なら 1 つの並べ替え対象のリストにまとめる。超えた部分は、書かれた `JOIN` の形のまま分けて計画する。1 にすると、書いた順序を一切並べ替えない（[PostgreSQL 文書: Query Planning](https://www.postgresql.org/docs/17/runtime-config-query.html)）
+
+既定の設定では、`JOIN` を 8 個を超えて並べると、9 個目以降は書いた順序に縛られます。計画の時間は抑えられますが、**書き方によって計画が変わる** ということでもあります。後の実験で、表の数を増やしたときの計画時間を測ります。
+
+<Callout type="note" title="分散エンジンでは、もう 1 つの軸が加わる">
+  ここまでの話は、1 台のマシンの中で表を突き合わせる話でした。
+  データが何台ものマシンに分かれていると、「同じキーの行をどうやって同じマシンに集めるか」という問題が先に来ます。
+  小さい表を全員に配る broadcast 結合と、両方の表をキーで振り分け直す shuffle 結合です。
+  これは <a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a> の「結合方式と選び方」で、Spark や Trino の設定と合わせて扱っています。
+</Callout>
+
+## 実務の落とし穴：外部キーの列に索引がない
+
+結合方式の話は、`SELECT` だけのものではありません。よく踏む落とし穴が、**外部キーの参照する側の列に索引がない** 場合です。
+
+`child.parent_id` が `parent.id` を参照しているとします。`parent` の行を削除すると、データベースは「この親を参照している子が残っていないか」を確かめる必要があります（`ON DELETE CASCADE` なら、子を探して消す必要があります）。これは、削除した親の 1 行ごとに `child` から `parent_id` が一致する行を探す処理で、形としては **親を外側にした Nested Loop** です。`child.parent_id` に索引がなければ、親を 1 行消すたびに `child` を全部読むことになります。
+
+PostgreSQL の文書は、親の削除や参照される列の更新では、参照する側の表を古い値で探す必要があるので、参照する側の列にも索引を作るのがよいことが多いと書いたうえで、**外部キー制約を宣言しても、参照する側の列に索引は自動では作られない** と明記しています（[PostgreSQL 文書: Constraints](https://www.postgresql.org/docs/17/ddl-constraints.html)）。
+
+MySQL（InnoDB）は逆で、外部キーの検査で表を全部読まずに済むよう、参照する側に外部キーの列を先頭に持つ索引を要求し、なければ自動で作ります（[MySQL 8.4 リファレンス: FOREIGN KEY Constraints](https://dev.mysql.com/doc/refman/8.4/en/create-table-foreign-keys.html)）。**同じ DDL でも、PostgreSQL では索引が無いまま運用が始まりうる** ということです。
+
+<Callout type="warn" title="複合主キーの 2 列目は、索引の先頭ではない">
+  `PRIMARY KEY (product_no, order_id)` のような複合主キーがあっても、`order_id` で探すときには使えません。
+  第 97 回で見たとおり、複合インデックスは先頭の列から並んでいるからです。
+  PostgreSQL の文書の例も、この形の表で `order_id` に別の索引を作っています。
+</Callout>
+
+## 手元で確かめる
+
+すべて Docker の中で行いました。
+
+| 役割 | イメージ | 版 |
+| --- | --- | --- |
+| PostgreSQL | `postgres:17` | 17.11（aarch64） |
+| MySQL | `mysql:8.4` | 8.4.13 |
+
+PostgreSQL の設定は既定のまま（`work_mem` 4MB、`hash_mem_multiplier` 2、`shared_buffers` 128MB）です。ただし、方式どうしを比べやすくするため、各クエリの前に次の 3 つを切りました。
+
+```sql
+SET max_parallel_workers_per_gather = 0;  -- 並列ワーカーを使わない
+SET enable_memoize = off;                 -- Nested Loop の内側の結果を覚える仕組みを使わない
+SET jit = off;                            -- JIT コンパイルを使わない
+```
+
+既定のままだと、PostgreSQL 17 は大きい結合を 3 つのプロセスで分担し、Nested Loop の内側には直前の検索結果を覚えておく `Memoize` ノードを挟みます。これらは方式の性質とは別の話なので外しました。
+
+### 3 つの方式を、行数を変えて比べる
+
+利用者と注文を 3 段階の大きさで作りました。注文の `user_id` は、利用者の数の範囲にハッシュで散らしています。
+
+```sql
+-- s: users 1,000 行 / orders 10,000 行
+-- m: users 100,000 行 / orders 1,000,000 行
+-- l: users 1,000,000 行 / orders 10,000,000 行（orders_l は 422MB、users_l は 50MB）
+CREATE TABLE users_l (id int PRIMARY KEY, name text, score int);
+CREATE TABLE orders_l (id int PRIMARY KEY, user_id int, amount int);
+INSERT INTO users_l SELECT i, 'user'||i, i % 100 FROM generate_series(1,1000000) i;
+INSERT INTO orders_l SELECT i, 1 + (hashint4(i) & 2147483647) % 1000000, i % 500
+  FROM generate_series(1,10000000) i;
+VACUUM ANALYZE;
+```
+
+同じクエリを、`enable_hashjoin` / `enable_mergejoin` / `enable_nestloop` のうち 2 つを `off` にして、残りの 1 方式で実行しました。各方式とも 1 回空打ちしてから、2 回目の `EXPLAIN (ANALYZE, BUFFERS)` を記録しています。
+
+```sql
+SET enable_mergejoin = off; SET enable_nestloop = off;   -- Hash Join だけを残す
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT sum(o.amount + u.score) FROM orders_l o JOIN users_l u ON u.id = o.user_id;
+```
+
+| 大きさ | 方式 | 実行時間 | 共有バッファ（8KB ページの読み） | 一時ファイル（ページ） |
+| --- | --- | --- | --- | --- |
+| s | Hash Join | 2.2 ms | 61 | なし |
+| s | Merge Join | 3.6 ms | 65 | なし |
+| s | Nested Loop | 7.8 ms | 30,055 | なし |
+| m | Hash Join | 287 ms | 6,042 | なし |
+| m | Merge Join | 509 ms | 6,317 | 読み 2,213 / 書き 2,225 |
+| m | Nested Loop | 1,385 ms | 3,005,406 | なし |
+| l | Hash Join | 4,844 ms | 60,424 | 読み 32,898 / 書き 32,898 |
+| l | Merge Join | 6,146 ms | 63,159 | 読み 44,038 / 書き 44,159 |
+| l | Nested Loop | 27,052 ms | 40,054,055 | なし |
+
+既定の設定（3 方式とも有効で、並列実行なども切らない状態）では、s と m でプランナは Hash Join を選びました（l は既定の設定では測っていません）。
+
+**Nested Loop のバッファの数は、B+tree の段数で説明できます。** 実行した計画の内側はこうなっていました。
+
+```
+ ->  Index Scan using users_s_pkey on users_s u (actual time=0.000..0.000 rows=1 loops=10000)
+       Index Cond: (id = o.user_id)
+       Buffers: shared hit=30000
+```
+
+外側の 10,000 行それぞれについて、3 ページずつ読んでいます。`pageinspect` 拡張の `bt_metap` で索引の高さを調べると、`users_s_pkey` と `users_m_pkey` は `level` が 1（根と葉の 2 段）、`users_l_pkey` は 2（3 段）でした。2 段の索引をたどって行本体を 1 ページ読めば 3 ページ、3 段なら 4 ページです。l では外側が 1,000 万行なので、内側だけで 4,000 万ページ（`shared hit=40000000`）を読んでいます。どれもバッファプールに載っていたので読み自体は速いのですが、回数が桁違いです。
+
+**Hash Join のバッファは、両方の表を 1 回ずつ読んだ数とほぼ同じです**。m の Hash ノードには次の行がありました。
+
+```
+ ->  Hash (actual time=18.0..18.0 rows=100000 loops=1)
+       Buckets: 131072  Batches: 1  Memory Usage: 4931kB
+```
+
+10 万行の利用者で、ハッシュ表は約 4.8MB でした。上限の 8MB（4MB × 2）に収まったので `Batches: 1` です。l では 100 万行になり、上限に収まらなくなりました。
+
+```
+ ->  Hash (actual time=237.2..237.2 rows=1000000 loops=1)
+       Buckets: 262144  Batches: 8  Memory Usage: 6935kB
+       Buffers: shared hit=32 read=6337, temp written=2987
+```
+
+表を 8 つの batch に分け、メモリに置けない分を一時ファイルに書き出しています。上の表の l の Hash Join にある一時ファイルの読み書きがそれです。いずれの方式でも、ハッシュ表を作ったのは小さいほうの `users` で、大きい `orders` は probe 側に流れていました。
+
+**Merge Join は、片方だけを並べ替えていました。** m の計画です。
+
+```
+ ->  Merge Join (actual time=213.4..467.1 rows=1000000 loops=1)
+       Merge Cond: (u.id = o.user_id)
+       ->  Index Scan using users_m_pkey on users_m u (... rows=100000 loops=1)
+       ->  Materialize
+             ->  Sort
+                   Sort Key: o.user_id
+                   Sort Method: external merge  Disk: 17704kB
+```
+
+`users` は主キーの索引を順に読めば `id` の順に並んでいるので、並べ替えを省いています。`orders` は `user_id` に索引がないので、100 万行を並べ替えており、それが `work_mem` に収まらず一時ファイルを使う外部ソートになりました。
+
+### 外側が少なければ、Index Nested Loop が勝つ
+
+同じ l の表で、注文を 100 件に絞りました。
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT sum(o.amount + u.score) FROM orders_l o JOIN users_l u ON u.id = o.user_id
+WHERE o.id <= 100;
+```
+
+| 方式 | 実行時間 | 共有バッファ |
+| --- | --- | --- |
+| Nested Loop（既定でこれが選ばれた） | 4.2 ms | 404 |
+| Hash Join（Nested Loop と Merge Join を切った） | 148 ms | 6,373 |
+
+既定の計画は、絞った 100 件を外側にして、`users_l_pkey` を 100 回たどっていました（内側 `Buffers: shared hit=400`、1 回 4 ページ）。Hash Join にすると、100 件の注文でハッシュ表を作ったうえで、100 万行の `users_l` を全部読んで probe することになり、30 倍以上遅くなりました。1,000 万行を全部結合したときの順位と、ちょうど逆です。
+
+### 索引のない素朴な Nested Loop
+
+s の `users_s` に、`id` と同じ値で索引のない列 `uid2` を足し、そちらで結合しました。
+
+```
+ Nested Loop (actual time=0.182..754.637 rows=10000 loops=1)
+   Join Filter: (o.user_id = u.uid2)
+   Rows Removed by Join Filter: 9990000
+   ->  Seq Scan on orders_s o (... rows=10000 loops=1)
+   ->  Materialize (actual time=0.000..0.032 rows=1000 loops=10000)
+ Execution Time: 755.424 ms
+```
+
+1 万 × 1,000 = 1,000 万組を比べ、9,990,000 組を捨てています。`Materialize` は内側の 1,000 行をメモリに置いて読み直しているだけで、比較の回数は減りません。既定の設定に戻すと、プランナは Hash Join を選び、2.4 ms で終わりました。同じ結果を得るのに、300 倍の差です。
+
+### 不等号の結合では、Nested Loop しか残らない
+
+`enable_nestloop = off` にしたうえで、不等号だけの結合を実行しました。
+
+```sql
+SET enable_nestloop = off;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM orders_s o JOIN users_s u ON o.amount < u.score;
+```
+
+```
+ Aggregate  (cost=10000316858.67..10000316858.68 rows=1 width=8) (actual time=913.555..913.556 rows=1 loops=1)
+   ->  Nested Loop  (cost=10000000000.00..10000300192.00 rows=6666667 width=0) (actual time=0.023..862.582 rows=990000 loops=1)
+         Join Filter: (o.amount < u.score)
+         Rows Removed by Join Filter: 9010000
+```
+
+切ったはずの Nested Loop が選ばれ、コストに 100 億が足されています。PostgreSQL の文書のとおり、`enable_nestloop` は Nested Loop を完全には禁止できず、他の方法があるときに使われにくくするだけです（[PostgreSQL 文書: Query Planning](https://www.postgresql.org/docs/17/runtime-config-query.html)）。Hash Join も Merge Join も等値でしか使えないので、他の方法がなかったのです。等値と不等号を組み合わせた `o.user_id = u.id AND o.amount < u.score` なら、等値の部分で Hash Join を使い、不等号は `Join Filter` で後から絞る計画になりました。
+
+### ハッシュ表をメモリに収めると
+
+l の Hash Join を、`work_mem` を 64MB にして 3 回ずつ実行しました。
+
+| `work_mem` | Batches | Memory Usage | 一時ファイル | 実行時間（3 回） |
+| --- | --- | --- | --- | --- |
+| 4MB | 8 | 6,935kB | 読み・書き各 32,898 ページ | 6,526 / 4,960 / 4,310 ms |
+| 64MB | 1 | 47,255kB | なし | 6,808 / 6,341 / 6,209 ms |
+
+100 万行のハッシュ表は約 46MB でした。上限を上げると `Batches: 1` になり、一時ファイルは消えました。しかし、この環境では速くなっていません。一時ファイルが OS のページキャッシュに収まる大きさだったこと、大きなハッシュ表は CPU のキャッシュに収まらないことなどが考えられますが、ここでは確かめていません。**一時ファイルが出たら必ず遅い、とは限らない** ということだけ押さえて、次の第 103 回で詳しく見ます。
+
+### 結合する表を増やすと、計画の時間が爆発する
+
+1,000 行の小さな表を 16 個作り、すべてを同じキーで結合するクエリを、表の数を変えて計画させました（`EXPLAIN` だけで、実行はしていません）。
+
+```sql
+-- n = 4 のとき
+SELECT count(*) FROM j1 JOIN j2 ON j2.id = j1.id JOIN j3 ON j3.id = j1.id JOIN j4 ON j4.id = j1.id;
+```
+
+すべての表が同じ値で結ばれるので、どの 2 つの組にも結合条件があり、動的計画法が調べる組合せが最も多くなる形です。`join_collapse_limit` と `from_collapse_limit` を 20 に上げて並べ替えの制限を外したうえで、`geqo` を切った場合と入れた場合、そして既定の設定（制限 8）を比べました。数値は Planning Time です（2 回測った場合はその範囲）。
+
+| 表の数 | `geqo = off`（全探索） | `geqo = on` | 既定の設定 |
+| --- | --- | --- | --- |
+| 8 | 10〜11 ms | 10 ms | 10.9 ms |
+| 10 | 75〜84 ms | 75〜78 ms | 11.1 ms |
+| 11 | 244〜312 ms | 221〜259 ms | 12.3 ms |
+| 12 | 643〜952 ms | 45〜55 ms | 12.7 ms |
+| 13 | 2,618〜2,971 ms | 54〜75 ms | 15.2 ms |
+| 14 | 10,064〜10,266 ms | 68〜77 ms | 32.4 ms |
+
+全探索では、表が 1 つ増えるたびに計画時間がおよそ 3〜4 倍になり、14 個では **計画を立てるだけで 10 秒** かかりました。`geqo = on` は 11 個までは全探索と同じで、`geqo_threshold` の 12 に達したところで遺伝的アルゴリズムに切り替わり、一気に下がっています。既定の設定では、`join_collapse_limit` が 8 なので、9 個目以降の `JOIN` は書いた形のまま分けて計画され、そもそも大きな探索になりません。
+
+### 外部キーの索引がないと、親の削除が遅い
+
+親 10 万行、子 100 万行の表を作り、`ON DELETE CASCADE` の外部キーでつなぎました。親を 100 行消す時間を、子の `parent_id` に索引がない場合とある場合で比べます（`BEGIN` と `ROLLBACK` で挟んで実際には消していません）。
+
+```sql
+CREATE TABLE parent (id int PRIMARY KEY);
+CREATE TABLE child (id int PRIMARY KEY, parent_id int REFERENCES parent ON DELETE CASCADE);
+EXPLAIN (ANALYZE) DELETE FROM parent WHERE id <= 100;
+```
+
+```
+-- 索引なし
+ Trigger for constraint child_parent_id_fkey: time=3127.442 calls=100
+ Execution Time: 3127.760 ms
+
+-- CREATE INDEX ON child (parent_id); の後
+ Trigger for constraint child_parent_id_fkey: time=5.291 calls=100
+ Execution Time: 5.457 ms
+```
+
+親の行を探す部分は 0.2 ms 足らずで、時間のほとんどは外部キーの検査（`Trigger for constraint`）でした。索引がないと、親 1 行あたり約 31 ms、つまり毎回 100 万行の `child` を読んでいます。索引を作ると、約 600 分の 1 になりました。
+
+### MySQL 8.4：Hash Join と、索引があるときの NLJ
+
+MySQL では、利用者 10 万行と注文 100 万行で試しました。注文には、索引のある `users.id` を指す `user_id` と、索引のない `users.code` を指す `user_code` の 2 列を持たせています。
+
+索引のない列で結合すると、`EXPLAIN FORMAT=TREE` に `Inner hash join` が出ます。
+
+```
+EXPLAIN: -> Aggregate: sum((o.amount + u.score))  (cost=11e+9 rows=1)
+    -> Inner hash join (o.user_code = u.`code`)  (cost=10e+9 rows=10e+9)
+        -> Table scan on o  (cost=0.126 rows=997899)
+        -> Hash
+            -> Table scan on u  (cost=10082 rows=100256)
+```
+
+小さい `users` が `Hash` の下（build 側）に来ています。`EXPLAIN ANALYZE` の実行時間は 462 ms でした。
+
+主キーで結合すると、Nested Loop に変わります。
+
+```
+EXPLAIN: -> Aggregate: sum((o.amount + u.score))  (cost=549445 rows=1)
+    -> Nested loop inner join  (cost=449656 rows=997899)
+        -> Filter: (o.user_id is not null)  (cost=100391 rows=997899)
+            -> Table scan on o  (cost=100391 rows=997899)
+        -> Single-row index lookup on u using PRIMARY (id=o.user_id)  (cost=0.25 rows=1)
+```
+
+`Single-row index lookup` を 100 万回（`loops=1e+6`）行う Index Nested Loop です。8.0.18 のリリースノートにある「結合条件に使える索引がないとき Hash Join を使う」という規則のとおりです。
+
+ただし、この場合は Hash Join のほうが速いことがあります。
+
+| 計画 | 実行時間（`EXPLAIN ANALYZE`） |
+| --- | --- |
+| 主キーで Index Nested Loop（既定で選ばれた） | 1,365 / 998 / 1,028 ms |
+| `IGNORE INDEX (PRIMARY)` で Hash Join にした | 382 / 371 ms |
+| 注文を 1,000 件に絞って、主キーで Index Nested Loop | 1.25 ms |
+| 索引のない列で、`NO_BNL` ヒントで Hash Join を禁じた（注文 1,000 件） | 14,644 ms |
+| 同じ条件で、Hash Join（既定） | 18 ms |
+
+全件の結合では、索引を 100 万回たどるより、10 万行のハッシュ表を作って 1 回ずつ読むほうが約 3 倍速くなりました。一方、注文を 1,000 件に絞れば、Index Nested Loop は 1 ms ほどで終わります。PostgreSQL で見たのと同じ関係です。
+
+`NO_BNL` ヒントで Hash Join を禁じると、索引のない列では素朴な Nested Loop になり、内側の 10 万行を全部読む操作を 1,000 回（`loops=1000`）繰り返して 14 秒以上かかりました。8.0.18 より前の MySQL で索引を張り忘れたときに起きていたのは、BNL による多少の軽減はあるにせよ、この種類の処理です。なお、`NO_HASH_JOIN` ヒントを付けた場合は、計画が Hash Join のまま変わりませんでした。
+
+不等号だけの結合（`o.amount < u.score`）では、8.0.20 以降の規則どおり、`Inner hash join (no condition)` の上に `Filter: (o.amount < u.score)` が載る計画になりました。条件のないハッシュ表を、直積を作る入れ物として使っているので、比較の回数は N × M のままです。
+
+## まとめ
+
+- 2 つの表を突き合わせる方法は、Nested Loop、Hash Join、Sort-Merge Join の 3 つに集約される
+- Nested Loop は N × M だが、条件を選ばず、メモリも要らない。内側に索引があれば、外側の 1 行ごとに B+tree の段数ぶんのページを読むだけになり、外側が少ないときに最も強い
+- Hash Join は小さい側でハッシュ表を作り（build）、大きい側を流して引く（probe）。手間は N + M で索引も要らないが、等値条件にしか使えず、build 側がメモリに収まらないと batch に分けて一時ファイルを使う
+- Sort-Merge Join は両側を並べて一緒に歩く。索引の順に読めば並べ替えを省ける。範囲の結合に広げる実装もあるが、PostgreSQL の Merge Join は等値だけ
+- MySQL は長く入れ子のループ（索引がなければ BNL）だけだった。8.0.18 で等値結合に Hash Join が入り、8.0.20 で BNL を置き換えた。PostgreSQL は 3 つをコストで選ぶ
+- 表が増えると結合順序の組合せが爆発する。PostgreSQL は動的計画法で探し、`geqo_threshold`（既定 12）以上では遺伝的アルゴリズムに切り替える。`join_collapse_limit`（既定 8）を超える `JOIN` は書いた形に縛られる
+- PostgreSQL は外部キーの参照する側に索引を自動で作らない。親の削除や更新が、子の表を毎回全部読む Nested Loop になりうる
+
+次の回では、この回の実験で何度も現れた `Batches: 8` や `external merge Disk` の正体、つまり **ハッシュ表や並べ替えがメモリに収まらないとき、データベースが何をしているのか** を見ます。

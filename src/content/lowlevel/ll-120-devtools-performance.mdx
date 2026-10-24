@@ -1,0 +1,362 @@
+---
+title: DevTools の Performance パネルを読む
+description: 第 119 回の LCP と INP は、どの段が遅いかを探す手がかりでした。その「どの段か」を実際に見せるのが Chrome DevTools の Performance パネルです。トラックの並び、Main トラックのフレームチャート、長いタスクの印、3 つの表、Insights による LCP と INP の分解、強制同期レイアウトの見つけ方を、わざと遅くしたページのトレースで確かめます
+chapter: browser
+order: 9
+status: published
+topics:
+  - Chrome DevTools
+  - Performance パネル
+  - ライブ指標
+  - CPU スロットリング
+  - Main トラック
+  - フレームチャート
+  - 長いタスク
+  - Call tree / Bottom-up / Event log
+  - Insights
+  - LCP の内訳
+  - INP の内訳
+  - 強制同期レイアウト
+  - レイアウトスラッシング
+requires:
+  - ll-115-rendering-pipeline
+  - ll-117-event-loop
+  - ll-119-web-vitals
+---
+
+import Callout from '../../components/Callout.astro'
+import DevtoolsFlameChart from '../../components/sim/problems/DevtoolsFlameChart'
+
+## 指標の次に見るもの
+
+第 119 回で、LCP は 4 つの区間に、INP は 3 つの区間に分解できると書きました。指標が悪いと分かったら、次は**どの区間が長いのか**、そして**その区間でメインスレッドが何をしていたのか**を確かめる番です。
+
+それを見せてくれるのが、Chrome DevTools の **Performance パネル**です。ページを動かしている間にブラウザの中で起きたことを記録し、時間軸に並べて表示します。この回では、わざと遅くしたページを用意し、そのトレース（記録）を実際に読みながら、パネルの見方を順に押さえます。
+
+## パネルが記録しているもの
+
+最初に、パネルが何を材料にしているのかを確認しておきます。第 228 回で、CPU プロファイラが持っているのは「一定間隔で覗いたスタックの束」だと書きました。Performance パネルの記録は、それより少し豊かです。
+
+- **トレースイベント**: ブラウザのコードに埋め込まれた計測点が、「ここからここまでスタイルを再計算した」「ここからここまでレイアウトした」と、開始と終了の時刻を記録したもの。第 228 回の言葉でいえば**計装**です
+- **JavaScript の標本**: V8 の CPU プロファイラが、一定間隔で JavaScript のスタックを覗いたもの。こちらは**サンプリング**です
+
+パネルは、この 2 つを 1 本の時間軸に重ねて描きます。`Layout` や `Paint` のようなブラウザの処理は正確な開始と終了を持ち、その間に挟まる自分の関数（`relayout` など）の幅は標本から推定したもの、という混成になっています。
+
+## 実験に使うページ
+
+実験用に、遅くなる原因を 3 つ仕込んだページを用意しました。
+
+```js
+function busy(ms) {
+  const end = performance.now() + ms
+  while (performance.now() < end) {}
+}
+
+function boot() {
+  busy(250)                                  // 起動時に 250ms 塞ぐ
+  const img = document.createElement('img')  // LCP になる画像を、スクリプトから差し込む
+  img.id = 'hero'
+  img.src = '/hero.png'
+  document.getElementById('slot').append(img)
+}
+
+function relayout() {
+  const rows = list.children                 // 400 行の div
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].style.width = `${50 + (i % 50)}%` // 書く
+    rows[i].dataset.h = rows[i].offsetHeight   // すぐ読む
+  }
+}
+
+btn.addEventListener('click', () => {
+  relayout()
+  busy(60)
+})
+
+window.addEventListener('message', (e) => {
+  if (e.data === 'block') busy(150)          // 別の仕事でメインスレッドを 150ms 塞ぐ
+})
+```
+
+サーバは HTML を 300ms、画像（1600×900 の PNG、約 670KB）を 600ms 遅らせて返します。記録は、Playwright から Chrome 155.0.8059.85（ヘッドレス）を起動し、DevTools と同じ種類のトレースを取りました。ページを読み込み、`block` で 150ms 塞いでいる最中にボタンをクリックし、1.5 秒待って止めています。取ったトレースは、DevTools の Performance パネルが内部で使っているトレース解析のコードを npm に切り出した `@paulirish/trace_engine`（0.0.67）で読み、パネルの Insights と同じ計算で区間を出しました。
+
+環境は Apple M1 Pro / macOS 26.2 です。ただし、計測中のホストは他の作業でロードアベレージが 30〜40 あり、同じ条件で繰り返しても値は揺れました。以下では、揺れの小さかった回の値を使い、揺れが大きかった区間はその旨を書きます。
+
+## 記録を取る
+
+### ライブ指標の画面
+
+パネルを開くと、記録の前に**ライブ指標**の画面が出ます。文書は「When you first open the Performance panel you will be presented with the Live Metrics screen which gives you an instant performance summary of the current page using the three Core Web Vitals.」と説明しています（[Chrome DevTools: Performance features reference](https://developer.chrome.com/docs/devtools/performance/reference)）。ページを操作すると LCP、INP、CLS がその場で更新されるので、まずここで「どの操作が遅いか」の当たりをつけ、再現できたら記録を取る、という順番が勧められています。
+
+### スロットリング
+
+開発者のマシンは利用者の端末より速いのが普通です。そこで記録の前に、CPU とネットワークを意図的に遅くする**スロットリング**を設定できます。CPU については、文書が次のように注意しています。
+
+> Throttling is relative to your computer's capabilities. For example, the 2x slowdown option makes your CPU operate 2 times slower than its usual ability. DevTools can't truly simulate the CPUs of mobile devices, because the architecture of mobile devices is very different from that of desktops and laptops.
+
+「4 倍遅く」は、**手元のマシンの 4 分の 1** という意味で、特定の携帯端末の再現ではありません。速いマシンで 4 倍にしても、遅い端末より速いことはよくあります。
+
+後で、この同じページを CPU 4 倍の設定でも記録して比べます。
+
+### 読み込みを記録するか、操作を記録するか
+
+記録には、ページの再読み込みから自動で始めるものと、記録ボタンを押してから自分で操作するものがあります。LCP を見たいなら前者、INP を見たいなら後者です。INP は操作がないと値が出ないので、第 119 回で見たとおり、実験室の計測では**自分で操作した分しか測れません**。
+
+## トラックの並び
+
+記録が終わると、時間軸を共有する何本かの**トラック**が縦に並びます。主なものを、文書の説明とともに表にします。
+
+| トラック | 文書の説明 | 何を見るか |
+| --- | --- | --- |
+| Network | 「a waterfall of network requests that occurred during the performance recording」 | どの資源がいつ取りに行かれ、いつ届いたか。第 121 回で詳しく見る |
+| Frames | 「tells you exactly how long a particular frame took」 | 画面が何ミリ秒ごとに描き変わったか |
+| Interactions | 「View user interactions on the Interactions track to track down potential responsiveness issues.」 | クリックやキー入力の 1 回ずつと、その INP の内訳 |
+| Timings | 「view your custom performance markers」 | `performance.mark()` や `performance.measure()` で自分で付けた印 |
+| Main | 「view activity that occurred on the page's main thread」 | メインスレッドで動いたタスクの中身。いちばん長く見ることになる |
+| GPU、Thread pool（Raster） | 「View GPU activity in the GPU section.」「View raster activity in the Thread Pool section.」 | 第 116 回の、メインスレッドの外で行われる描画の仕事 |
+
+（引用はすべて [Performance features reference](https://developer.chrome.com/docs/devtools/performance/reference)）
+
+Interactions トラックは、INP の目安を超えた操作に印を付けます。文書によれば「The Interactions track marks the interactions over 200 milliseconds with a red triangle in the top right corner.」です。操作のバーには、入力の遅れと表示の遅れを示すひげ（細い線）が付き、太い部分が処理の時間です。
+
+## Main トラックを読む
+
+### 横は時刻、上が原因
+
+Main トラックは、第 228 回の言葉でいう**フレームチャート**です。文書の説明はこうです。
+
+> The Performance panel represents main thread activity in a flame chart. The x-axis represents the recording over time. The y-axis represents the call stack. The events on top cause the events below.
+
+第 228 回のフレームグラフ（Brendan Gregg の形式）と、上下が逆になっている点に注意してください。フレームグラフは根を下に置いて上へ積みますが、DevTools は**根を上に置いて下へ垂らします**。いちばん上の灰色の帯が **Task** で、イベントループが 1 回に取り出した仕事（第 117 回）です。その下に、そのタスクの中で何が起きたかが積まれます。
+
+色にも決まりがあります。文書は、スクリプトごとの色は見分けるための乱数だと断ったうえで、「The darker yellow represents scripting activity, and the purple event represents rendering activity. These darker yellow and purple events are consistent across all recordings.」と書いています。黄色が JavaScript、紫がスタイルとレイアウトです。描画（Painting）の処理も、それとは別の決まった色で塗られます。
+
+### 第 16 章のパイプラインとの対応
+
+Main トラックに出てくる名前は、この章で見てきた段とほぼ 1 対 1 に対応します。トレースの中のイベント名と、パネルでの表示名、分類を並べます。分類は、トレース解析のコード（`models/trace/Styles.js`）の対応表から取りました。
+
+| パネルでの表示 | トレースのイベント名 | 分類 | この章のどこか |
+| --- | --- | --- | --- |
+| Task | `RunTask` | その他（灰） | 第 117 回のタスク 1 個 |
+| Evaluate script | `EvaluateScript` | Scripting | 第 114 回、`<script>` を読み込んで実行する |
+| Event: click など | `EventDispatch` | Scripting | 第 117 回、入力をハンドラへ配る |
+| Function call | `FunctionCall` | Scripting | タイマーやイベントのハンドラを呼ぶ |
+| Recalculate style | `UpdateLayoutTree` | Rendering | 第 115 回の style |
+| Layout | `Layout` | Rendering | 第 115 回の layout |
+| Paint | `Paint` | Painting | 第 115 回の paint（描画命令の記録） |
+| Commit | `Commit` | Painting | 第 116 回、結果を合成のスレッドへ渡す |
+
+Recalculate style が、トレースの中では `UpdateLayoutTree` という別の名前で記録されている点に注意してください。生のトレースファイルを読むときは、この名前の違いを知っておくと迷いません。
+
+### 実測：タスクを 1 つずつ開く
+
+実験のトレースから、メインスレッドで 50ms を超えたタスクを取り出し、中で時間を使っていたイベントを並べました。時刻はナビゲーション開始からです。
+
+```text
+task @318ms dur 251.2: EvaluateScript x1 251.1 | v8.run x1 251.1 | RunMicrotasks x1 0.2 | ...
+task @569ms dur 68.5: ProxyMain::BeginMainFrame x1 68.4 | Layout x1 65.9 | ... | UpdateLayoutTree x1 1.2 | Paint x1 0.5 | ...
+task @1716ms dur 150.0: HandlePostMessage x1 150.0 | v8.callFunction x1 149.9 | FunctionCall x1 149.9 | ...
+task @1866ms dur 102.5: ... | EventDispatch(click) x1 100.8 | FunctionCall x1 100.7 | Layout x400 30.9 | ...
+```
+
+4 つのタスクが、仕込んだ原因にそのまま対応しています。
+
+- 318ms からの 251ms は `<script>` の評価（Evaluate script）で、`boot()` の `busy(250)` です
+- 569ms からの 68ms は最初のフレームで、400 行を初めて並べる Layout が 66ms を占めます
+- 1716ms からの 150ms は `message` のハンドラ（Function call）です
+- 1866ms からの 102ms がクリックで、その中に Layout が **400 回**出てきます
+
+最後のタスクの「Layout x400」が、この回の後半で扱う強制同期レイアウトです。
+
+## 長いタスクの印
+
+第 119 回で、50ms を超えるタスクを**長いタスク**と呼びました。web.dev の文書は「Any task that takes longer than 50 milliseconds is a long task. For tasks that exceed 50 milliseconds, the task's total time minus 50 milliseconds is known as the task's blocking period.」と定義しています（[web.dev: Optimize long tasks](https://web.dev/articles/optimize-long-tasks)）。
+
+Main トラックは、これを見た目で示します。
+
+> Long tasks are also highlighted with a red triangle, and with the part over 50 milliseconds shaded in red:
+
+最初の 50ms は塗らず、**それを超えた部分だけを赤くする**のは、超えた部分が上の定義の「ブロックしている時間」だからです。150ms のタスクなら、赤いのは後ろの 100ms です。
+
+下のシミュレーターは、実験のクリックの前後を Main トラックの形で 1 手ずつ積んだものです。数値は実測の値を丸めたものです。プリセットで、後で見る 2 つの直し方（書いてから読む、塞ぐ処理を刻む）に切り替えられます。
+
+<DevtoolsFlameChart client:visible />
+
+「元のページ」で、クリックが 20.5ms に届いても、ハンドラが動き出すのは 150ms のタスクが終わってからです。その間の 129.5ms が**入力の遅れ**になります。クリックのタスク自身も 100ms を超えるので、ここにも赤い三角が付きます。
+
+## 3 つの表
+
+フレームチャートの下には、選んだ範囲を表で集計するタブが 3 つあります。文書の説明は次のとおりです。
+
+- Call tree：「Use the Call tree tab to view which root activities cause the most work.」
+- Bottom-up：「Use the Bottom-up tab to view which activities directly took up the most time in aggregate.」
+- Event log：「Use the Event log tab to view activities in the order in which they occurred during the recording.」
+
+これは第 228 回の 4 つの表示と同じものを、別の名前で呼んでいるだけです。
+
+| DevTools のタブ | 第 228 回の表示 | 向いている問い |
+| --- | --- | --- |
+| Main トラック | フレームチャート | 何がどの順で起きたか |
+| Call tree | コールツリー（トップダウン） | どの起点（イベント、タイマー、読み込み）が仕事を生んだか |
+| Bottom-up | ボトムアップ | どの関数・処理そのものが時間を食ったか |
+| Event log | 時刻順の一覧 | 選んだ範囲で起きたことを順に確かめる |
+
+Call tree と Bottom-up には、第 228 回と同じ 2 つの列があります。文書は「Self Time represents the time directly spent in that activity. Total Time represents the time spent in that activity or any of its children.」と説明しています。Call tree のいちばん上に並ぶのは、文書が **root activities** と呼ぶ「ブラウザに仕事をさせた起点」です。文書の例では、クリックすると Event が起点になり、その Event がハンドラを動かします。
+
+実験のクリックのタスクの中身を、トレースイベントの種類ごとに足し上げると、Layout が 400 回で 30.9ms、Recalculate style が 400 回で 4.7ms、残りの約 65ms が JavaScript（ほぼ `busy(60)`）でした。Bottom-up は、このように処理の種類や関数ごとに self 時間を足し上げる表です。フレームチャートでは 400 本の細い帯に散らばって目立たない Layout も、ここでは 1 行にまとまって上位に出ます。第 228 回で見たとおり、**あちこちから呼ばれる小さな処理を探すときはボトムアップ**です。
+
+<Callout type="tip" title="自分のコードではないものも写る">
+  実験のトレースの JavaScript の標本には、`InjectedScript` や `querySelectorAll` など、Playwright がページに差し込んだ関数も少しだけ写っていました。自動化の道具も、拡張機能も、同じメインスレッドで動きます。
+  手元のブラウザで記録するときは、拡張機能を切ったプロファイルか、シークレットウィンドウで取ると、自分のページ以外の仕事が混ざりにくくなります。
+</Callout>
+
+## Insights で LCP を分解する
+
+記録の左側の **Insights** タブは、トレースを自動で読んで、改善の当たりを出してくれます。文書は、LCP と INP の内訳もここで出すと書いています（「These insights can suggest ways to improve performance and provide guided analysis on the following performance issues such as LCP and INP subparts, LCP request discovery issues, third parties, as well as legacy and duplicated JavaScript resources.」）。
+
+LCP breakdown は、第 119 回の 4 区間を出します。web.dev はこの 4 区間について「Every single page can have its LCP value broken down into these four subparts. There is no overlap or gap between them. Collectively, they add up to the full LCP time.」と書いています（[web.dev: Optimize Largest Contentful Paint](https://web.dev/articles/optimize-lcp)）。
+
+実験のトレースを、Insights と同じ計算で読んだ結果です。
+
+```text
+LCP 1186.1 ms
+   ttfb 307.0
+   loadDelay 262.1
+   loadDuration 604.4
+   renderDelay 12.6
+```
+
+307.0 + 262.1 + 604.4 + 12.6 = 1186.1 で、確かに隙間なく足し合わさっています。仕込んだ原因と照らし合わせます。
+
+| 区間 | 値 | 原因 |
+| --- | --- | --- |
+| TTFB | 307.0ms | サーバが HTML を 300ms 遅らせた |
+| 読み込み開始の遅れ | 262.1ms | 画像を `boot()` の 250ms の後にスクリプトから差し込んだので、それまで誰も取りに行かない |
+| 読み込み時間 | 604.4ms | サーバが画像を 600ms 遅らせた |
+| 描画の遅れ | 12.6ms | 画像が届いた時点でメインスレッドは空いていた |
+
+**画像を圧縮しても、縮むのは 604.4ms の区間だけです。** 262.1ms は、`<img>` を HTML に直接書けば、HTML を読んだ時点で先読みが見つけて取りに行くので、ほぼ消えます（第 114 回）。どちらを先に直すべきかは、この内訳を見るまで分かりません。
+
+なお、同じ条件で 3 回記録したところ、読み込み開始の遅れは 262〜463ms と揺れました。463ms の回は、`<script>` の評価より前の最初のレイアウトに 184ms かかっていて、そのぶん画像の差し込みが遅れていました。ホストに負荷がかかっていたためと考えられますが、確かめてはいません。**1 回の記録の数字を鵜呑みにせず、何度か取って揺れる区間と揺れない区間を分ける**のが安全です。
+
+## Insights で INP を分解する
+
+INP breakdown は、最も長かった操作を 3 区間に分けます。web.dev の定義を引きます（[web.dev: Optimize Interaction to Next Paint](https://web.dev/articles/optimize-inp)）。
+
+> The input delay, which starts when the user initiates an interaction with the page, and ends when the event callbacks for the interaction begin to run.
+>
+> The processing duration, which consists of the time it takes for event callbacks to run to completion.
+>
+> The presentation delay, which is the time it takes for the browser to present the next frame which contains the visual result of the interaction.
+
+実験の結果はこうです。
+
+```text
+INP pointerdown 268.4 ms  input 129.5 processing 101.3 presentation 37.6
+```
+
+| 区間 | 値 | 原因 |
+| --- | --- | --- |
+| 入力の遅れ | 129.5ms | クリックの時点で、150ms のタスクがまだ 129.5ms 残っていた |
+| 処理 | 101.3ms | `relayout()` の強制レイアウトと `busy(60)` |
+| 表示の遅れ | 37.6ms | ハンドラが戻ってから次のフレームが出るまで |
+
+代表として選ばれているのが `click` ではなく `pointerdown` である点に注意してください。1 回のクリックは、pointerdown、pointerup、click などいくつかのイベントの組で、web.dev は「The event with the longest duration within the interaction is what contributes to the interaction's total latency.」と書いています（[web.dev: Interaction to Next Paint](https://web.dev/articles/inp)）。実験では、塞がっている間に届いた pointerdown から click までがまとめて同じタスクで配られたので、最も早く届いた pointerdown の待ちが最も長くなりました。
+
+表示の遅れの 37.6ms については、記録の中身まで見ても内訳が付きませんでした。ハンドラが戻った後のフレームの処理（`ProxyMain::BeginMainFrame`）は 35.1ms 続きますが、Paint と Commit は合わせて約 1.7ms で、残りの約 34ms にはどのイベントも記録されていません。トレースは、計測点のない時間を名前のない空白として残します。**内訳が付かない区間があったら、そこで何が起きているかは別の手段で確かめる必要がある**、と覚えておいてください。
+
+## 強制同期レイアウトを見つける
+
+### なぜ 400 回もレイアウトするのか
+
+第 115 回で、スタイルを変えるとレイアウトがやり直しになると書きました。ブラウザは普段、変更をためておき、次のフレームの直前にまとめてやり直します。ところが、JavaScript がその途中で**レイアウトの結果を読む**と、ためていた変更をその場で反映しなければ正しい値を返せません。web.dev はこれを次のように説明しています（[web.dev: Avoid large, complex layouts and layout thrashing](https://web.dev/articles/avoid-large-complex-layouts-and-layout-thrashing)）。
+
+> First the JavaScript runs, then style calculations, then layout. It is, however, possible to force a browser to perform layout earlier with JavaScript. This is called forced synchronous layout (or sometimes forced reflow).
+
+実験の `relayout()` は、1 行ごとに「幅を書く → 高さを読む」を繰り返します。読むたびに、直前に書いた変更を反映するためのスタイル再計算とレイアウトが走るので、400 行なら 400 回です。これを短い間に何度も繰り返すことを、**レイアウトスラッシング**と呼びます。
+
+### パネルでの見え方
+
+Main トラックでは、ハンドラの関数の下に紫の Recalculate style と Layout が細かく並びます。Layout を選ぶと、Summary タブに強制リフローの警告と、それを起こしたコードの行へのリンクが出ます（[Chrome DevTools: Analyze runtime performance](https://developer.chrome.com/docs/devtools/performance)）。Insights の **Forced reflow** は、これを集計して「どの関数が、合計何ミリ秒の強制レイアウトを起こしたか」を出します。
+
+```text
+ForcedReflow relayout 35.6 ms events 800
+```
+
+`relayout` が、Recalculate style と Layout を 400 回ずつ、計 800 個のイベントを起こし、合計 35.6ms を使っていました（Layout が 30.9ms、Recalculate style が 4.7ms）。
+
+### 直し方 1：書いてから読む
+
+直し方は、読み書きを分けることです。
+
+```js
+for (let i = 0; i < rows.length; i++) rows[i].style.width = `${50 + (i % 50)}%`
+for (let i = 0; i < rows.length; i++) rows[i].dataset.h = rows[i].offsetHeight
+```
+
+すべて書き終えてから読めば、最初の読みで 1 回だけレイアウトすれば済み、残りの 399 回の読みは同じ結果を返すだけです。記録し直すと、次のようになりました。
+
+```text
+INP pointerdown 230.8 ms  input 127.3 processing 64.8 presentation 38.7
+```
+
+Forced reflow の Insight には何も出なくなり、クリックの中の Layout は 1 回（0.6ms）、Recalculate style も 1 回（1.5ms）でした。処理の区間は 101.3ms から 64.8ms に縮み、残りはほぼ `busy(60)` です。ただし、INP は 268.4ms から 230.8ms にしか縮んでいません。**いちばん長い区間は入力の遅れ（127.3ms）のまま**だからです。
+
+### 直し方 2：塞いでいる処理を刻む
+
+入力の遅れの原因は、クリックとは関係のない 150ms のタスクでした。これを 10ms ずつに刻み、合間にメインスレッドを手放します。
+
+```js
+for (let done = 0; done < 150; done += 10) {
+  busy(10)
+  await scheduler.yield()
+}
+```
+
+`scheduler.yield()` は、いったんイベントループに制御を返し、続きを後回しにする関数です。合間にクリックが届いていれば、ブラウザは先にそちらを処理できます（第 119 回の Callout の「長いタスクを切る」です）。
+
+```text
+INP pointerdown 147.6 ms  input 9.4 processing 101.1 presentation 37.2
+```
+
+入力の遅れは 129.5ms から 9.4ms になりました。長いタスクの一覧からも 150ms のタスクが消えています。こちらは強制レイアウトを直していないので、処理の区間は元のままです。
+
+3 つを並べます。
+
+| ページ | 入力の遅れ | 処理 | 表示の遅れ | INP |
+| --- | --- | --- | --- | --- |
+| 元のページ | 129.5ms | 101.3ms | 37.6ms | 268.4ms |
+| 書いてから読む | 127.3ms | 64.8ms | 38.7ms | 230.8ms |
+| 塞ぐ処理を刻む | 9.4ms | 101.1ms | 37.2ms | 147.6ms |
+
+INP を縮めるには、3 区間のうち**長いものから**手を付けます。強制レイアウトは見つけやすく直しやすいので先に目が行きますが、この実験では、関係のない仕事が入力を待たせていたことのほうが大きく効きました。
+
+## CPU を 4 倍遅くすると何が変わるか
+
+同じページを、CPU 4 倍のスロットリングで記録しました。
+
+| | 1 倍 | 4 倍 |
+| --- | --- | --- |
+| `<script>` の評価（`busy(250)`） | 251.2ms | 256.5ms |
+| 最初のフレーム（400 行の Layout） | 68.5ms | 263.4ms |
+| `message` のハンドラ（`busy(150)`） | 150.0ms | 150.5ms |
+| クリックのタスク | 102.5ms | 236.9ms |
+| 強制レイアウトの合計 | 35.6ms | 150.6ms |
+| INP | 268.4ms | 420.1ms |
+
+レイアウトは 4 倍前後に伸びたのに、`busy()` の 3 つはほとんど変わっていません。`busy()` は `performance.now()` が指定の時刻になるまで回り続ける関数なので、CPU が遅くなっても**壁時計で決まった時間だけ回って終わる**からです。第 225 回の言葉でいえば、経過時間で終わる仕事は、CPU 時間で決まる仕事と違ってスロットリングで伸びません。
+
+実際のページの JavaScript は、決まった量の計算をする仕事なので、スロットリングで伸びます。実験のページで INP が 1.6 倍にしかならなかったのは、待ち時間を `busy()` で作った模型だからです。**スロットリングの結果を読むときは、その遅さが計算の量で決まっているのか、時刻で決まっているのか**を区別してください。ネットワークの待ちやタイマーの待ちは、CPU を絞っても伸びません。
+
+## まとめ
+
+- Performance パネルは、ブラウザの計測点が記録したトレースイベント（計装）と、JavaScript の標本（サンプリング）を 1 本の時間軸に重ねて表示する
+- 記録の前にライブ指標で遅い操作の当たりをつけ、CPU とネットワークのスロットリングを設定する。CPU の倍率は手元のマシンに対する相対値で、特定の端末の再現ではない
+- Main トラックはフレームチャート。横が時刻で、上の帯が下の帯を起こした原因。灰色の Task の下に、Scripting（黄）、Rendering（紫）、Painting が積まれ、第 16 章のパイプラインの段にほぼ 1 対 1 で対応する
+- 50ms を超えたタスクには赤い三角が付き、超えた部分だけが赤く塗られる
+- Call tree、Bottom-up、Event log は、第 228 回のコールツリー、ボトムアップ、時刻順の一覧と同じもの
+- Insights の LCP breakdown と INP breakdown は、第 119 回の区間をそのまま出す。区間が分かれば、何を直すべきかが決まる
+- 書いてすぐ読むと、読むたびにスタイル再計算とレイアウトが走る。Forced reflow の Insight と Main トラックの細かい紫の帯で見つかる
+- INP は長い区間から直す。関係のない長いタスクが入力の遅れを作っていることも多い
+
+次の回では、同じ DevTools の Network パネルを開き、LCP の「読み込み開始の遅れ」と「読み込み時間」の中身を、1 本ずつのリクエストの時間の内訳として読みます。

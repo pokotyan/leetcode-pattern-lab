@@ -1,0 +1,483 @@
+---
+title: 列ごとにまとめて計算する：ベクトル化と組み込み型
+description: 何億行を集計するとき、CPU は何に時間を使っているのか。1 行ずつの関数呼び出しをやめて値の塊を渡すベクトル化実行と、サーバを立てずにアプリのプロセスの中で動く DuckDB の作りを、手元で測りながら見ます
+chapter: db
+order: 9
+status: published
+topics:
+  - ベクトル化実行
+  - MonetDB/X100
+  - 選択ベクトル
+  - クエリのコンパイル
+  - DataChunk / Vector
+  - プッシュ型パイプライン
+  - morsel 駆動の並列化
+  - 軽量圧縮
+  - 組み込み型データベース
+  - DuckDB
+  - Apache Arrow
+requires:
+  - ll-101-db-planner
+  - ll-103-db-spill
+  - ll-12-ooo-simd
+  - ll-15-cache
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 何億行を集計するとき、CPU は何をしているのか
+
+第 101 回で見たとおり、実行計画は演算子の木で、各演算子は子に `next()` を呼んで 1 行ずつ受け取ります。Volcano モデルと呼ばれるこの形は、どんな演算子でも同じ口で組み合わせられる、よくできた設計です。
+
+ところが、1 億行の表を集計する問い合わせでは、この `next()` が**行の数 × 演算子の数**だけ呼ばれます。読み物の<a href={`${import.meta.env.BASE_URL}reading/row-column-store/`}>行指向と列指向</a>では、列ごとに保存すれば読む量が減ることを PostgreSQL と DuckDB で確かめました。しかし、読む量を減らしてデータがメモリに載ったあとも、まだ速さには大きな差が残ります。残りは **CPU の使い方**の差です。
+
+2005 年に CWI（オランダの国立研究所）の Boncz らは、MySQL 4.1 で TPC-H の Query 1（明細を全行読んで合計と平均を出す集計）を実行し、関数ごとの時間を測りました。結果は次のとおりです（[MonetDB/X100: Hyper-Pipelining Query Execution](https://www.cidrdb.org/cidr2005/papers/P19.pdf)、表 2）。
+
+| 何に使われたか | 全体に占める割合 |
+| --- | --- |
+| 足し算・掛け算・合計・平均という「本来の計算」 | 10% |
+| 集約のためのハッシュ表の作成と検索 | 28% |
+| 行の表現から列の値を取り出し、コピーする処理など | 62% |
+
+足し算 1 回に 38 命令を使い、1 サイクルあたり 0.8 命令しか進まないため、**足し算 1 回が約 49 サイクル**になっていました。同じ CPU は、ループで回せば 3 サイクルに 1 回の掛け算ができます。論文はこの原因を「tuple-at-a-time execution, which causes both high interpretation overhead, and hides opportunities for CPU parallelism from the compiler」とまとめています。
+
+この回では、この差をどう埋めるのかを見ます。答えの 1 つが**ベクトル化実行**で、それを中心に据えたのが DuckDB です。後半では、DuckDB が**サーバを立てずに、アプリのプロセスの中で動く**ことの意味も見ます。
+
+## 1 行ずつ処理すると、何が無駄になるのか
+
+`SELECT sum(qty * price) FROM sales WHERE qty >= 5` を 1 行ずつ処理すると、1 行ごとに次のことが起きます。
+
+```
+ for 各行:
+   Aggregate.next()
+     └→ Filter.next()                 ← 仮想関数呼び出し
+          └→ Scan.next()              ← 仮想関数呼び出し。行を 1 つ組み立てる
+          式 qty >= 5 を評価           ← 式の木を辿る。型ごとに分岐
+          if 偽: 次の行へ              ← 結果が行ごとにばらばらな分岐
+     式 qty * price を評価             ← また式の木を辿る
+     合計に足す
+```
+
+ここには、CPU の章で見た 3 つの問題がそろっています。
+
+**関数呼び出しと間接分岐。** `next()` も式の評価も、演算子や型によって中身が違うので、仮想関数や関数ポインタを通した呼び出しになります。1 回の呼び出しで行う本来の仕事は足し算 1 つなのに、呼び出しの前後でレジスタの退避やスタックの操作が要ります。コンパイラは呼び出しの向こう側が分からないので、ループ全体を最適化できません。
+
+**分岐予測の失敗。** `qty >= 5` の結果がほぼ半々でランダムなら、第 11 回の分岐予測はおよそ半分の確率で外れ、そのたびにパイプラインを捨てて最初からやり直します。HyPer を作った Neumann も、従来の反復子方式が遅い理由として「lack of locality and frequent instruction mispredictions」を挙げています（[Efficiently Compiling Efficient Query Plans for Modern Hardware](https://www.vldb.org/pvldb/vol4/p539-neumann.pdf)）。
+
+**命令レベルの並列性が使えない。** 第 12 回で見たように、CPU は互いに依存しない命令を同時に進められ、SIMD なら 1 命令で複数の値を足せます。しかし 1 回の呼び出しで 1 つの足し算しかしないなら、並べて進める独立した命令がそもそもありません。X100 の論文が MySQL で 49 サイクルかかった理由として挙げたのも、この「ループにならない」ことでした。
+
+<Callout type="note" title="ディスクが遅かった時代には問題にならなかった">
+  1 行ずつの関数呼び出しが数十サイクルかかっても、ディスクから 1 ページ読むのに何ミリ秒もかかるなら、CPU の無駄は誤差です。
+  メモリが大きくなり、分析するデータの多くがメモリに載るようになって初めて、CPU の使い方が全体の速さを決めるようになりました。
+  Neumann の論文も、冒頭で「As main memory grows, query performance is more and more determined by the raw CPU costs of query processing itself.」と書いています。
+</Callout>
+
+## ベクトル化実行：一塊ずつ渡す
+
+X100 の答えは単純です。演算子の間で受け渡す単位を、1 行から **1,000 個ほどの値の塊（ベクトル）** に変えます。
+
+```
+ 1 行ずつ（Volcano）                 ベクトルずつ（X100 / DuckDB）
+
+ next() → 1 行                       next() → 列ごとの配列 × 1,000 行分
+ next() → 1 行                         qty:   [3, 7, 5, 1, 9, ...]
+ next() → 1 行                         price: [820, 150, 4410, ...]
+   ...（1 億回）                        ...（10 万回）
+```
+
+演算子の木の形も、`next()` で子に要求する仕組みも Volcano のままです。違うのは、1 回の呼び出しで処理する量だけです。これで次のことが変わります。
+
+- 関数呼び出しや式の木を辿る費用は、1,000 個の値で 1 回ぶんになり、ほぼ消える
+- 演算の中身は、型の決まった配列に対する単純な `for` ループになる。コンパイラはこれを展開し、SIMD 命令に置き換えられる（第 12 回）
+- 塊が CPU のキャッシュに収まる大きさなら、ある演算子が書いた結果を次の演算子がキャッシュから読める（第 15 回）
+
+塊の大きさには上限と下限があります。X100 の論文は、塊の大きさを変えて Query 1 を測り、1 個（つまり 1 行ずつ）では MySQL と同じく遅く、大きくするにつれて急に速くなり、128 から 8K のあいだはどれもよく、それを超えると中間結果がキャッシュから溢れて遅くなる、と報告しています（同論文、図 10）。
+
+### 捨てずに印を付ける：選択ベクトル
+
+`WHERE qty >= 5` で半分の行が落ちたとき、残った値を新しい配列に詰め直すのはコピーの無駄です。そこで、**どの位置の値が生き残ったか** を表す番号の配列だけを作り、元の配列はそのまま次の演算子に渡します。これが**選択ベクトル**です。X100 の基本演算は、次のように選択ベクトルを受け取れる形で書かれています（論文中のコードを簡略化）。
+
+```c
+void map_plus_double_col_double_col(int n, double *res,
+                                    double *col1, double *col2, int *sel) {
+    if (sel) {
+        for (int j = 0; j < n; j++) {
+            int i = sel[j];          /* 生き残った位置だけを処理する */
+            res[i] = col1[i] + col2[i];
+        }
+    } else {
+        for (int i = 0; i < n; i++)  /* 全部残っていれば、素直なループ */
+            res[i] = col1[i] + col2[i];
+    }
+}
+```
+
+1 行ずつの処理では「この行は条件を満たすか」という分岐が行ごとに入りましたが、ここでは条件の判定と後の計算が別々のループに分かれます。後の計算は、選択ベクトルを順に辿るだけの、分岐のないループです。
+
+### 列ごとに全部、との違い
+
+X100 の前身の MonetDB は、逆の極端を取っていました。1 つの演算を**列全体に一度にかけ**、結果の列を丸ごと作ってから次の演算へ進む方式です。関数呼び出しの無駄はありませんが、1 億行の中間結果を毎回メモリに書いて読み直すことになり、メモリの帯域で詰まります。論文はこれを「its policy of full column materialization causes it to generate large data streams during query execution」と書いています（同論文、1 節）。
+
+| 方式 | 1 回の受け渡し | 弱点 |
+| --- | --- | --- |
+| 1 行ずつ（Volcano） | 1 行 | 呼び出しと分岐の費用が行ごとにかかる |
+| 列ごとに全部（MonetDB/MIL） | 列全体 | 中間結果が巨大になり、メモリ帯域で詰まる |
+| ベクトルずつ（X100） | キャッシュに収まる塊 | 両者の中間。塊の大きさの調整が要る |
+
+後で見るとおり、pandas の普通の書き方は 2 段目に近い動き方をします。
+
+### もう 1 つの道：問い合わせをコンパイルする
+
+同じ問題に、別の方向から答えたのが HyPer です。Neumann（2011）は、問い合わせごとに専用の機械語を LLVM で生成し、演算子の境目をなくして、1 行の値をレジスタに載せたまま、パイプラインの最後まで一気に処理します（[Efficiently Compiling Efficient Query Plans for Modern Hardware](https://www.vldb.org/pvldb/vol4/p539-neumann.pdf)）。第 32 回の JIT と同じ発想です。
+
+DuckDB はコンパイル方式を選びませんでした。2019 年の論文は、その理由を移植性に置いています。JIT のエンジンは LLVM のような大きなコンパイラのライブラリに依存し、それがさらに別のライブラリを連れてくるからです（[DuckDB: an Embeddable Analytical Database](https://mytherin.github.io/papers/2019-duckdbdemo.pdf)）。後で見る「アプリに組み込むライブラリ」という性格と、ここでつながっています。
+
+## DuckDB の中
+
+### Vector と DataChunk
+
+DuckDB の演算子のあいだを流れるのは **DataChunk** で、これは列ごとの **Vector** の束です。1 つの Vector に入る値の数は、既定で 2,048 個です（[DuckDB: Execution Format](https://duckdb.org/docs/2.0/internals/vector.html)）。2019 年の論文では 1,024 個でした。
+
+Vector は、中身の持ち方によっていくつかの種類があります。
+
+| 種類 | 物理的な持ち方 | 使われる場面の例 |
+| --- | --- | --- |
+| flat | 値の連続した配列。圧縮していない標準の形 | 普通のスキャン結果、計算結果 |
+| constant | 値 1 つだけ | `price * 1.1` の `1.1`、全行が同じ値の列 |
+| dictionary | 子の Vector と、そこへの番号の配列（選択ベクトル） | フィルタの結果、辞書圧縮された列をそのまま読んだとき |
+| sequence | 開始値と増分の 2 つだけ | `range()` が生成する連番 |
+
+定数を 2,048 個に展開せず 1 つのまま持てば、`price * 1.1` は「配列 × 定数」という専用のループで計算できます。辞書圧縮された文字列の列なら、2,048 個の文字列をほどかずに、辞書の番号のまま比較や集約に回せます。どの種類でも扱えるように、演算の側はすべての Vector を「値の配列と番号の配列」という共通の見方（unified format）に変換して読むこともできます。
+
+### プッシュ型のパイプライン
+
+2019 年の DuckDB は、根の演算子から子へ `next()` で塊を引っ張る「Vector Volcano」でした（上記 2019 年の論文）。その後、**プッシュ型**に切り替えています。DuckDB の文書は「DuckDB uses a push-based vectorized model, where DataChunks are pushed through the operator tree.」と書いています（[DuckDB: Overview](https://duckdb.org/docs/2.0/internals/overview.html)）。切り替えの経緯は、開発者の Raasveldt による講演「Push-Based Execution in DuckDB」で説明されています（[CWI](https://dsdsd.da.cwi.nl/past_talks/duckdb-push-based-execution)）。
+
+プッシュ型では、計画を**パイプライン**に分けます。パイプラインの区切りは、入力を最後まで見ないと 1 行も出せない演算子、つまり第 103 回で見たブロッキングな演算子です。DuckDB の文書はこれを blocking operator と呼び、グループ化、結合、並べ替え、ウィンドウ関数を挙げています（[DuckDB: Tuning Workloads](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads.html)）。
+
+```
+ SELECT s.region, sum(o.amount)
+ FROM orders o JOIN stores s USING (store_id)
+ GROUP BY s.region
+
+ パイプライン 1:  Scan(stores) ──→ ハッシュ表を作る（結合の構築側）
+                                           │ 完成を待つ
+ パイプライン 2:  Scan(orders) ─→ Filter ─→ ハッシュ表を引く ─→ 集約の表に足す
+                                                                  │ 完成を待つ
+ パイプライン 3:                                       集約の表を読む ─→ 結果
+```
+
+1 本のパイプラインの中では、スキャンが作った DataChunk を、フィルタ、結合の検索、集約へと順に押し込み、塊がキャッシュにあるうちに最後まで処理します。第 102 回のハッシュ結合の構築側は、この区切りにあたります。第 103 回で見た spill も、この区切りにある演算子（ハッシュ表、並べ替え）で起きます。
+
+### morsel 駆動の並列化
+
+パイプラインに分けておくと、並列化も素直になります。1 本のパイプラインを、入力を小さく区切った単位ごとに、空いているスレッドが取りに行って実行すればよいからです。
+
+これを提案したのが Leis らの **morsel 駆動**（morsel-driven）の並列化です（[Morsel-Driven Parallelism](https://db.in.tum.de/~leis/papers/morsels.pdf)、SIGMOD 2014）。論文は「Morsel-driven query processing takes small fragments of input data ("morsels") and schedules these to worker threads that run entire operator pipelines until the next pipeline breaker.」と説明し、morsel の大きさは 10 万行ほどがよいとしています。計画を作る時点でスレッドの数を決めて仕事を等分する方式と違い、速く終わったスレッドが次の morsel を取りに行くので、データの偏りや、コアごとの速さの違いを吸収できます。
+
+DuckDB の共同創業者の Mühleisen も、DuckDB の特徴として「vectorized query processing, morsel-driven parallelism」を挙げています（[AI Council の講演紹介](https://www.aicouncil.com/talks/liberate-analytical-data-management-with-duckdb)）。DuckDB の文書によれば、スキャンの並列化は**行グループ**単位で始まり、行グループの既定の大きさは 122,880 行です（[DuckDB: Tuning Workloads](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads.html)）。122,880 は 2,048 のちょうど 60 倍で、Leis らの 10 万行とも近い大きさです。
+
+```
+ 表 sales（1 億行 = 814 行グループ）
+
+ 行グループ:  [0][1][2][3][4][5][6][7][8] ... [813]
+                │  │  │  │
+ スレッド 1 ◀──┘  │  │  └──▶ スレッド 4      空いたスレッドが
+ スレッド 2 ◀─────┘  └─────▶ スレッド 3      次の番号を取りに行く
+
+ 各スレッドは、取った行グループを 2,048 行ずつの DataChunk にして
+ パイプラインの最後（スレッドごとの集約の表）まで流す
+```
+
+集約は、スレッドごとに別々のハッシュ表を作り、最後にまとめます。DuckDB の集約の表は、スレッドごとにグループのハッシュ値で分割した表を作り、分割ごとに別のスレッドがマージします（[DuckDB: Parallel Grouped Aggregation](https://duckdb.org/2022/03/07/aggregate-hashtable.html)）。
+
+### 列ごとの軽量圧縮
+
+ディスク上の行グループの中では、列ごとに区切った塊（セグメント）ごとに圧縮方式を選びます。書き込みのときにまずセグメントを分析し、そのセグメントに最もよい方式を選んでから圧縮します（[DuckDB: Lightweight Compression](https://duckdb.org/2022/10/28/lightweight-compression.html)）。
+
+| 方式 | 一言で |
+| --- | --- |
+| Constant | セグメントの値がすべて同じなら、その値 1 つだけを持つ |
+| RLE | 「値と、それが続く個数」の組を並べる |
+| BitPacking | 値の範囲に必要なビット数だけで詰める |
+| Frame of Reference | 最小値からの差にしてから、ビットで詰める |
+| Dictionary | 出てくる値を辞書に出し、列には番号を並べる |
+| FSST | 文字列の**中**で繰り返し出てくる断片を短い符号に置き換える |
+| DICT_FSST | 辞書と FSST の組み合わせ（[ソース](https://github.com/duckdb/duckdb/blob/main/src/storage/compression/dict_fsst.cpp)） |
+| ALP / Chimp / Patas | 浮動小数点数のための方式 |
+
+これらは「軽量」と呼ばれるとおり、gzip や zstd のような汎用の圧縮より縮み方は控えめですが、解凍が速く、一部はベクトルの種類（constant、dictionary）のまま演算に渡せます。どの列にどれが選ばれたかは、後の実験で見ます。
+
+## サーバを立てずに動く：組み込み型
+
+PostgreSQL や MySQL を使うには、サーバのプロセスを起動し、アプリからソケットでつなぎます。手元で試すだけでも、コンテナを 1 つ立てるのが普通です。DuckDB は `pip install duckdb` のあと、`import duckdb` だけで SQL が書けます。何が違うのでしょうか。
+
+DuckDB は、**アプリのプロセスに読み込まれるライブラリ**です。公式の説明は「By default, DuckDB does not run as a separate process but is completely embedded within a host process.」「For DuckDB, there is no DBMS server software to install, update and maintain.」です（[Why DuckDB](https://duckdb.org/why_duckdb)）。
+
+```
+ クライアント・サーバ型（PostgreSQL など）
+
+ ┌─ アプリのプロセス ─┐   ソケット    ┌─ サーバのプロセス ─────┐
+ │ ドライバ           │ ◀──────────▶ │ 実行エンジン            │──▶ データファイル
+ │ 行を受け取って      │  行を直列化   │ 結果を行ごとに直列化     │
+ │ オブジェクトに戻す   │  して送る     │                       │
+ └──────────────────┘              └──────────────────────┘
+
+ 組み込み型（DuckDB、SQLite）
+
+ ┌─ アプリのプロセス ───────────────────────────┐
+ │ アプリのコード ──関数呼び出し──▶ 実行エンジン   │──▶ データファイル
+ │       ▲                          │          │
+ │       └──── 同じメモリ上の配列 ────┘          │
+ └──────────────────────────────────────────┘
+```
+
+組み込み型で最も広く使われているのは SQLite です。DuckDB の論文自身が、SQLite の人気が「プロセスの中で動く、手間のいらないデータ管理」の需要を示している、というところから話を始めています（上記 2019 年の論文）。形は同じですが、目的は逆です。
+
+| | SQLite | DuckDB |
+| --- | --- | --- |
+| 動き方 | アプリのプロセスの中、1 つのファイル | アプリのプロセスの中、1 つのファイル |
+| 保存の形 | 行指向（B-tree のページ） | 列指向（行グループの中で列ごとに圧縮） |
+| 実行 | 1 行ずつ | ベクトルずつ、複数スレッド |
+| 得意なこと | 1 件の読み書き（アプリの設定、端末内のデータ） | 大量の行の集計 |
+| 複数プロセスからの書き込み | できる。ただし書き手は同時に 1 つ（[SQLite: WAL](https://www.sqlite.org/wal.html)） | できない（下記） |
+
+### 直列化がいらない
+
+クライアント・サーバ型では、結果を返すときに、サーバが行を通信用のバイト列に直し、ソケットに書き、ドライバがそれを読んで言語のオブジェクトに戻します。何百万行を返すときには、この直列化と復元の手間も無視できません（結果がどんなバイト列で送られるかは、次回の第 105 回で見ます）。
+
+組み込み型では、結果は同じプロセスのメモリにあります。DuckDB の結果は列ごとの配列なので、NumPy の配列や Arrow の表に**ほぼそのまま渡せます**。DuckDB のブログは、Arrow との連携を「zero-copy streaming of data between DuckDB and Arrow and vice versa」と説明しています（[DuckDB quacks Arrow](https://duckdb.org/2021/12/03/duck-arrow.html)）。逆向きも同じで、Python の変数に入った pandas の DataFrame や Arrow の表を、SQL の中で表の名前として直接読めます（[SQL on Pandas](https://duckdb.org/docs/2.0/guides/python/sql_on_pandas.html)、[SQL on Apache Arrow](https://duckdb.org/docs/2.0/guides/python/sql_on_arrow.html)）。
+
+### 代わりに失うもの：書けるプロセスは 1 つ
+
+サーバがいないということは、複数のプロセスのあいだを調停する者もいない、ということです。DuckDB の文書は、1 つのデータベースファイルの開き方を次の 2 つに限っています（[DuckDB: Concurrency](https://duckdb.org/docs/2.0/connect/concurrency.html)）。
+
+- 「Read-write mode: one process can both read and write to the database.」
+- 「Read-only mode: multiple processes can read from the database, but no processes can write」
+
+1 つのプロセスの中なら、複数のスレッドから同時に書けます。DuckDB は MVCC（第 99 回）と楽観的な同時実行制御を組み合わせ、2 つのスレッドが同じ行を同時に更新・削除しようとしたときだけ、後の方を衝突のエラーにします（同文書）。
+
+Web アプリのように、複数のワーカープロセスが同じデータベースに書く使い方には、そのままでは向きません。
+
+<Callout type="note" title="DuckDB 2.0 には、サーバになる道もある">
+  DuckDB 2.0 の文書は、複数のプロセスからの書き込みを Quack というリモートプロトコルで扱えるとしています。
+  拡張機能を読み込み、1 つの DuckDB をサーバとして待ち受けさせ、ほかの DuckDB が HTTP でつなぐ形です
+  （[Quack: The DuckDB Client-Server Protocol](https://duckdb.org/2026/05/12/quack-remote-protocol.html)）。
+  これは組み込み型をやめたのではなく、必要なときに足すものです。既定では、DuckDB はいまもプロセスの中で動きます。
+</Callout>
+
+## 手元で確かめる
+
+### 環境
+
+| 項目 | 値 |
+| --- | --- |
+| マシン | Apple M1 Pro（8 コア：性能コア 6、効率コア 2）、メモリ 32 GB、macOS |
+| Python | 3.14.0（venv） |
+| ライブラリ | duckdb 2.0.0、pandas 3.1.0、numpy 2.5.4、pyarrow 26.0.0 |
+
+数値は、同じ処理を数回繰り返したうちの最短の時間です。
+
+### 1. 同じ集計を 3 通りで
+
+1,000 万行の売上（店舗 ID 0〜99、数量 1〜10、単価 100〜9,999、いずれも 32 ビット整数）を NumPy で作り、「数量 5 以上の行について、店舗ごとに数量 × 単価を合計する」集計を 3 通りで書きました。
+
+```python
+# Python の for ループ（列を Python のリストにしてから）
+for si, qi, pi in zip(s, q, p):
+    if qi >= 5:
+        acc[si] = acc.get(si, 0) + qi * pi
+
+# pandas
+d = df[df.qty >= 5]
+(d.qty * d.price).groupby(d.store_id).sum()
+
+# DuckDB（Python の変数 df を、そのまま表の名前として読む）
+con.sql("SELECT store_id, sum(qty * price) FROM df WHERE qty >= 5 GROUP BY store_id").fetchall()
+```
+
+```text
+rows=10,000,000 cpu_count=8 duckdb=2.0.0 pandas=3.1.0 numpy=2.5.4
+Python の for ループ                   wall    702.1 ms  cpu    685.6 ms
+pandas                             wall     60.3 ms  cpu     59.4 ms
+DuckDB 1 スレッド（DataFrame を直接）       wall     62.3 ms  cpu     57.5 ms
+DuckDB 8 スレッド（DataFrame を直接）       wall     23.3 ms  cpu     72.3 ms
+DuckDB 1 スレッド（自前の表）                wall     44.2 ms  cpu     39.8 ms
+DuckDB 8 スレッド（自前の表）                wall     10.0 ms  cpu     46.2 ms
+```
+
+読み取れることは 3 つです。
+
+- 1 行ずつの Python のループは、ほかより 1 桁遅い。1 行ごとにインタプリタが命令を解釈し、整数のオブジェクトを作り、辞書を引くからで、冒頭の MySQL と同じ構図です
+- pandas と、**1 スレッドの DuckDB はほぼ同じ速さ**です。pandas の各演算も、中身は NumPy の型の決まった配列に対するループだからです。この単純な集計では、DuckDB の速さの大部分はベクトル化そのものではなく、次の並列化から来ています
+- `cpu` の列（プロセスが使った CPU 時間の合計）を見ると、pandas は壁時計の時間と同じで 1 コアしか使っていません。DuckDB の 8 スレッドは、壁時計の数倍の CPU 時間を使っています
+
+<Callout type="warn" title="この数字の読み方">
+  単純な集計 1 本の、メモリに載った 1,000 万行での比較です。
+  データの形、問い合わせの複雑さ、メモリに収まるかどうかで差は大きく変わります。
+  「DuckDB は pandas の何倍速い」という一つの数字にはなりません。
+</Callout>
+
+### 2. スレッドの数を変える
+
+DuckDB のファイルに 1 億行の表を作り、同じ集計を `SET threads = N` で変えながら測りました。既定のスレッド数は、コアの数と同じ 8 でした。
+
+```text
+default threads: 8
+agg threads=1:   403.0 ms
+agg threads=2:   225.9 ms
+agg threads=4:   131.4 ms
+agg threads=6:   112.3 ms
+agg threads=8:   110.0 ms
+```
+
+1 スレッドから 8 スレッドで約 3.7 倍です。4 スレッドまではほぼ素直に伸び、その先は鈍ります。このマシンの 8 コアのうち 2 つは遅い効率コアであることと、1 億行を読む速さがメモリの帯域に近づいていることが考えられます。DuckDB の文書も、スレッドが多すぎるとかえって遅くなることがあり、その場合は `SET threads` で絞る価値がある、と書いています（[DuckDB: Tuning Workloads](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads.html)）。
+
+### 3. 演算子ごとの時間を見る
+
+同じ集計を 1 スレッドで `EXPLAIN ANALYZE` にかけました（2 回目の実行）。
+
+```text
+╭─ Summary ──────────╮
+│ Total Time: 0.443s │
+╰────────────────────╯
+╭─ Perfect Hash Group By ───────────╮
+│ Groups: #0                        │
+│ Aggregates: sum_no_overflow(#1)   │
+│ 100 rows                  160.0ms │
+╰─────────────────┒┎────────────────╯
+╭─ Projection ────┚┖────────────────╮
+│ Projections: store_id,            │
+│              qty * price          │
+│ 60,000,775 rows            40.0ms │
+╰─────────────────┒┎────────────────╯
+╭─ Projection ────┚┖────────────────╮
+│ Projections: #0,                  │
+│              CAST(#1 AS TINYINT), │
+│              #2                   │
+│ 60,000,775 rows            40.0ms │
+╰─────────────────┒┎────────────────╯
+╭─ Table Scan ────┚┖────────────────╮
+│ Table: sales.main.sales           │
+│ Type: Sequential Scan             │
+│ Projections: qty, store_id, price │
+│ Filters: qty >= 5                 │
+│ Row Groups Scanned: 814 / 814     │
+│ 60,000,775 rows           180.0ms │
+╰───────────────────────────────────╯
+```
+
+- `Table Scan` の `Filters: qty >= 5`：条件はスキャンの中で評価され、6,000 万行だけが上に渡っています。フィルタが独立した演算子として現れていません
+- `Projections: qty, store_id, price`：表の 4 列のうち、使う 3 列だけを読んでいます
+- `Row Groups Scanned: 814 / 814`：1 億 ÷ 122,880 ≒ 814。並列化の単位になる行グループの数です
+- `Perfect Hash Group By`：店舗 ID の値の範囲が 0〜99 と狭いので、衝突のない表で集約しています。時間の多くはここで使われています
+- 1 億行の集計の全体が 0.44 秒、つまり 1 行あたり約 4 ナノ秒です。M1 Pro の 1 クロックは 0.3 ナノ秒ほどなので、1 行あたり 10 数クロックで、冒頭の「足し算 1 回で 49 サイクル」とは桁が違います
+
+8 スレッドで同じことをすると、`Table Scan` の時間が `Total Time` より大きく表示されました。演算子ごとの時間は、各スレッドの時間を足した値として出ているようです。並列で実行したときの演算子の時間は、壁時計の時間として読まないよう注意します。
+
+### 4. 結果を Python に渡す
+
+1,000 万行 × 3 列の結果を、受け取り方を変えて Python に渡しました。
+
+```text
+fetchall()           wall   1490.2 ms  cpu   1451.7 ms  -> builtins.list
+fetchnumpy()         wall     54.3 ms  cpu     49.9 ms  -> builtins.dict
+df()                 wall     55.7 ms  cpu     51.0 ms  -> pandas.DataFrame
+arrow().read_all()   wall     34.9 ms  cpu     32.8 ms  -> pyarrow.lib.Table
+```
+
+`fetchall()` は、3,000 万個の値を 1 つずつ Python の整数オブジェクトにし、1,000 万個のタプルに詰めます。それに 1.5 秒かかり、NumPy の配列や Arrow の表で受け取ると 30〜50 ms で済みました。DuckDB の内部の形が列ごとの配列で、受け取る側も列ごとの配列なら、同じプロセスの中で渡すのはほぼ配列のコピーだけです。**組み込み型の利点は、受け取る側も列の形で受け取って初めて活きる**、ということでもあります。
+
+### 5. 同じファイルを 2 つのプロセスから開く
+
+1 つ目のプロセスで `duckdb.connect("sales.duckdb")`（読み書き）を開いたまま待たせ、2 つ目のプロセスから開きました。
+
+```text
+# 2 つ目を読み書きで開く
+IOException: IO Error: Could not set lock on file ".../sales.duckdb": Conflicting lock is held in
+.../python3.14 (PID 3687) by user tomohiro.soga. See also https://duckdb.org/docs/current/connect/concurrency
+
+# 2 つ目を read_only=True で開く
+IOException: IO Error: Could not set lock on file ".../sales.duckdb": Conflicting lock is held in
+.../python3.14 (PID 3687) by user tomohiro.soga. See also https://duckdb.org/docs/current/connect/concurrency
+```
+
+読み書きで開いているプロセスがあると、2 つ目は**読み取り専用でも開けません**。1 つ目も `read_only=True` で開いた場合は、2 つ目の読み取り専用は開けて、読み書きの方だけが「However, you would be able to open this database in read-only mode」という案内付きで断られました。
+
+一方、1 つのプロセスの中で 4 つのスレッドがそれぞれ別のカーソルから 1,000 行ずつ `INSERT` すると、エラーなく 4,000 行が入りました。
+
+```text
+[(0, 1000), (1, 1000), (2, 1000), (3, 1000)]
+```
+
+ファイルのロックはプロセスの単位、MVCC はプロセスの中、という分担です。
+
+### 6. 列ごとの圧縮を見る
+
+性質の違う列を 8 つ持つ 1,000 万行の表を作り、`CHECKPOINT` でディスクに書いてから、`pragma_storage_info` で列ごとに選ばれた方式を数えました。
+
+```sql
+SELECT i AS event_id,                                         -- 連番
+       'JP' AS country, 1 AS version,                          -- 全行同じ
+       (i // 100000)::INTEGER AS day,                          -- 10 万行ずつ同じ値が続く
+       (hash(i) % 10)::INTEGER AS qty,                         -- 0〜9 のばらばらな整数
+       ['web','ios','android'][...] AS channel,                -- 3 種類の文字列
+       'https://example.com/items/' || ... || '?ref=top' AS url, -- 共通の断片を持つ文字列
+       round((hash(i*11) % 100000) / 100.0, 2)::DOUBLE AS amount -- 小数 2 桁の浮動小数点数
+FROM range(10_000_000) t(i)
+```
+
+```text
+event_id   BitPacking        82
+country    DICT_FSST         82
+version    Constant          82
+day        RLE               81
+day        Constant           1
+qty        BitPacking        82
+channel    DICT_FSST         82
+url        DICT_FSST        326
+amount     ALP              163
+[('112.0 MiB',)]
+```
+
+- `version`（全行 1）は Constant、`day`（同じ値が 10 万行続く）は RLE。`day` の 1 セグメントだけが Constant なのは、そのセグメントの中では値が 1 種類しかなかったからです。方式はセグメントごとに選ばれます
+- 範囲の狭い整数 `qty` と連番 `event_id` は BitPacking
+- 文字列の列は、この版（2.0.0）ではすべて DICT_FSST になりました。読み物の<a href={`${import.meta.env.BASE_URL}reading/row-column-store/`}>行指向と列指向</a>で 1.4.3 を使ったときは Dictionary と FSST が別々に選ばれていたので、版によって選ばれ方が変わります
+- 小数 2 桁の `amount` には、浮動小数点数向けの ALP が選ばれています
+- 行グループは 82 個（1,000 万 ÷ 122,880 ≒ 82）で、どの列も 1 行グループに 1 セグメント以上を持ちます。`url` だけセグメントが 4 倍あるのは、圧縮しても大きいからです
+
+## pandas より速いと言われる理由
+
+DuckDB が pandas より速いと言われる理由を、ここまでの要素で整理します。実験 1 で見たとおり、単純な集計では 1 スレッド同士の差は小さく、すべての場面で速いわけではありません。
+
+| 要素 | pandas（普通の書き方） | DuckDB |
+| --- | --- | --- |
+| 1 回の演算の単位 | 列全体（NumPy の配列） | 2,048 値のベクトル |
+| 中間結果 | 各段で列全体を作る。実験 1 では `df[df.qty >= 5]` だけで約 600 万行・120 MB のコピー | キャッシュに収まる塊のまま、パイプラインの最後まで流す |
+| 並列化 | 多くの演算が 1 コア（実験 1 の `cpu` 列） | morsel 駆動で全コア（実験 2） |
+| 実行の順序 | 書いた順に 1 行ずつその場で実行する | 問い合わせ全体を見てから計画を作る。フィルタをスキャンへ、使う列だけを読む（実験 3） |
+| メモリに収まらないとき | 基本的に、全体がメモリに載る前提 | 中間結果をディスクへ逃がす（第 103 回、[DuckDB: Tuning Workloads](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads.html)） |
+| 保存の形 | — | 列ごとの圧縮。読む量そのものが減る（実験 6） |
+
+pandas の書き方は、X100 の論文で見た「列ごとに全部」の方式に近いものです。1 回の演算は速いループですが、そのたびに列全体の中間結果を作ります。DuckDB は「ベクトルずつ」に加えて、問い合わせ全体を見る最適化と、複数コアでの実行を持っています。
+
+<Callout type="tip" title="DuckDB の Python API も遅延評価">
+  `con.sql(...)` が返すのは、まだ実行していない問い合わせ（関係）です。
+  `fetchall()` や `df()` を呼んだときに初めて、全体を最適化して実行します。
+  DuckDB 2.0 では、関係に `fetchone()` を呼ぶと「a relation keeps no result between calls, so every call runs it again」というエラーで止まりました。
+  呼ぶたびに実行し直す、という性質がはっきり表に出ています。
+</Callout>
+
+## まとめ
+
+- 1 行ずつ `next()` を呼ぶ Volcano モデルでは、何億行の集計で関数呼び出し、分岐予測の失敗、ループにならないことによる無駄が支配的になる。2005 年の測定では、MySQL の時間のうち本来の計算は 10% だった
+- ベクトル化実行は、演算子のあいだで 1,000 個前後の値の塊を渡す。呼び出しの費用が塊で割られ、中身は型の決まった配列のループになり、SIMD とキャッシュが効く（MonetDB/X100）
+- フィルタの結果は詰め直さず、生き残った位置の番号（選択ベクトル）で表す
+- 問い合わせを機械語にコンパイルする方式（HyPer）もある。DuckDB は移植性のためにベクトル化された解釈実行を選んだ
+- DuckDB は 2,048 値の Vector を束ねた DataChunk を、プッシュ型のパイプラインで流す。Vector には flat、constant、dictionary、sequence の持ち方がある
+- パイプラインは、入力を全部見るまで出力できない演算子で区切られ、行グループ（122,880 行）単位の morsel 駆動で全コアに配られる
+- ディスク上では、セグメントごとに Constant、RLE、BitPacking、Dictionary、FSST、ALP などの軽量圧縮を選ぶ
+- DuckDB はサーバを持たず、アプリのプロセスに入るライブラリとして動く。結果を列の配列のまま Python に渡せる代わりに、1 つのファイルに書けるのは 1 つのプロセスだけ
+- pandas との差は、ベクトル化、並列化、問い合わせ全体の最適化、メモリに収まらないときの対処の組み合わせから来る。単純な集計を 1 スレッド同士で比べると、差は小さい
+
+DuckDB には接続という段階がありませんでした。次の第 105 回では、クライアントとサーバのあいだで、接続の確立、認証、問い合わせと結果の受け渡しが、どのようなバイト列でやり取りされているのかを見ます。

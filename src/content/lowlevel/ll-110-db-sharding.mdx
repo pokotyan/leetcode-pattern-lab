@@ -1,0 +1,488 @@
+---
+title: 手で分ける：シャーディング
+description: 書き込みが 1 台に収まらなくなったとき、表を複数のデータベースに分けて持つと、何を自分で引き受けることになるのか。振り分け方、ID の採番、シャードをまたぐ処理、分け直しを、Python の計算と Citus のクラスタで確かめます
+chapter: db
+order: 15
+status: published
+topics:
+  - 垂直分割 / 水平分割
+  - シャードキー
+  - ハッシュ剰余 / 範囲 / ディレクトリ
+  - 仮想シャード
+  - Snowflake / UUIDv7
+  - scatter-gather
+  - XA / 2PC
+  - Vitess（vtgate / VSchema / vindex）
+  - Citus（分散テーブル / 参照テーブル）
+  - リシャーディング
+  - ホットスポット
+requires:
+  - ll-97-db-index
+  - ll-106-db-replication
+  - ll-107-db-schema-change
+  - ll-109-db-disaggregated
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 書き込みを受ける 1 台が足りなくなったら
+
+前回の第 109 回では、計算とストレージを分けました。ストレージは何台にも広がり、読み取り用の計算ノードも足せます。それでも、**書き込みを受けるのは依然 1 台**でした。第 106 回のレプリケーションも同じで、レプリカを何台足しても、すべての `INSERT` と `UPDATE` は 1 台のプライマリを通ります。
+
+その 1 台の CPU、WAL を書く速さ、バッファプールに載るデータの量のどれかが限界に達したとき、残る手は **データそのものを複数のデータベースに分けて、書き込みを受ける台数を増やす** ことです。これを **シャーディング** と呼びます。
+
+この回で扱うのは、データベースの**外側**で分ける方法です。データベース自身は、自分が全体の一部しか持っていないことを知りません。PostgreSQL や MySQL が 4 台あり、それぞれが普通に動いているだけです。「どの行がどの台にあるか」を知っていて、正しい台に問い合わせるのは、データベースの外にいる誰か（アプリ、ライブラリ、プロキシ）の仕事になります。
+
+1 台のときにデータベースが黙ってやってくれていたことのうち、次のものを、その誰かが引き受けることになります。
+
+| 1 台のときは | 分けると |
+| --- | --- |
+| 行はその 1 台にある | どのシャードにあるかを計算する |
+| `AUTO_INCREMENT` で ID が振られる | シャードをまたいで重ならない ID を自分で作る |
+| JOIN、集計、`ORDER BY ... LIMIT` が書ける | 各シャードに投げて、結果を手元で合わせる |
+| トランザクションで複数行をまとめて更新できる | シャードをまたぐと、2PC か、諦めて補償 |
+| データが増えても何もしなくてよい | 台数を変えるたびにデータを移す |
+
+この表の行を、上から順に見ていきます。
+
+## 縦に分けるか、横に分けるか
+
+分け方には 2 つの方向があります。
+
+```
+ 垂直分割（機能ごと）                     水平分割（シャーディング）
+
+ ┌──────────┐ ┌──────────┐            ┌────────────┐ ┌────────────┐
+ │ DB-1     │ │ DB-2     │            │ DB-1       │ │ DB-2       │
+ │ users    │ │ orders   │            │ orders     │ │ orders     │
+ │ sessions │ │ payments │            │ user 0〜49 │ │ user 50〜99│
+ └──────────┘ └──────────┘            └────────────┘ └────────────┘
+ 表ごとに置き場所が違う                   同じ表の行を分ける
+```
+
+**垂直分割** は、表を機能ごとに別のデータベースに移すことです。ユーザ管理の表と注文の表を、別々のサーバに置きます。仕組みとしては簡単で、ルーティングも「この表はこっち」と決めるだけです。代わりに、ユーザと注文の JOIN は SQL で書けなくなります。そして、注文の表 1 つが 1 台に収まらなくなれば、それ以上は分けられません。
+
+**水平分割** は、同じ表の行を、あるキーで分けて複数のデータベースに置くことです。シャーディングと言えば普通こちらを指します。表 1 つがどれだけ大きくなっても、台数を増やせば受け止められます。この回の残りは、水平分割の話です。
+
+実務では、まず垂直分割をして、それでも収まらない表だけを水平分割する、という順で進むことが多いでしょう。後で見る Vitess も、表を別の keyspace（論理的なデータベース）に移す **MoveTables** を「垂直分割に使う」と説明しています（[Vitess 文書](https://vitess.io/docs/reference/vreplication/movetables/)）。
+
+## どの列で分けるか：シャードキー
+
+水平分割では、行ごとに「どのシャードに置くか」を決める列が要ります。これを **シャードキー**（分散キー、分割キー）と呼びます。
+
+シャードキーの選び方で、後のほとんどすべてが決まります。理由は単純で、**シャードキーで絞れるクエリだけが 1 台で完結する**からです。
+
+- `orders` を `user_id` で分ければ、「このユーザの注文一覧」は 1 台に問い合わせれば済む
+- 同じ `orders` で「この商品の注文一覧」を引くと、どのシャードにあるか分からないので、全シャードに問い合わせる
+- `users` と `orders` を両方 `user_id` で分ければ、同じユーザの行は同じシャードに載り、その JOIN は各シャードの中で完結する
+
+よく使うクエリの多くが同じ列で絞れること、その列の値が十分に多くの種類に散らばっていること、そして**一緒に読み書きする行が同じ値を持つこと**。この 3 つを満たす列を探します。多くのサービスでは、それはユーザ ID、テナント ID、店舗 ID のような「所有者」を表す列です。
+
+## 振り分け方
+
+シャードキーの値から、置き場所を決める方法はいくつかあります。台数の変え方まで含めて比べます。
+
+### 範囲
+
+キーの値の範囲で区切ります。ユーザ ID 1〜100 万は 1 号機、100 万 1〜200 万は 2 号機、という形です。
+
+範囲検索が 1 台で済み、分け直しも「範囲を 2 つに割る」だけで考えやすい方式です。弱点は偏りで、ID が時刻順に増えるなら、**新しい行はすべて最後の範囲に入り**、書き込みは 1 台に集中します。この問題は後の「ホットスポット」で戻ってきます。
+
+### ハッシュ剰余
+
+キーをハッシュして、台数で割った余りを使います。
+
+```python
+shard = zlib.crc32(str(user_id).encode()) % N
+```
+
+均等に散らばり、対応表も要りません。ただし、**N を変えた瞬間に、ほとんどのキーの行き先が変わります**。4 台から 5 台にすると、行き先が変わらないのは `h % 4 == h % 5` を満たすキーだけです。`h` を 20 で割った余りで考えると、20 通りのうち、この式を満たすのは余りが 0、1、2、3 の 4 通りだけです。**残りの 16/20 = 80% のキーが移動**します。一般に N から N+1 にすると、およそ N/(N+1) が移動します。キャッシュならミスが増えるだけですが、データベースでは、そのすべての行を物理的に別の台へコピーすることになります。
+
+### Consistent Hashing
+
+キーとノードを同じ円の上に置き、キーから時計回りに進んで最初に出会ったノードに置く方式です。ノードを 1 台足しても、行き先が変わるのは新しいノードの直前の区間のキーだけで、移動は約 1/(N+1) で済みます。仕組みと、1 台を円上の多数の点に分ける **仮想ノード** は、システムデザインの読み物の<a href={`${import.meta.env.BASE_URL}reading/consistent-hashing/`}>Consistent Hashing と Sharding</a>で扱いました。ここでは、データベースで実際に多く使われている次の方式との比較に使います。
+
+### ディレクトリ（対応表）
+
+キーごと、またはキーの範囲ごとに「どこにあるか」を表に書いておき、引くたびにその表を見る方式です。どのキーでも自由に移せるので、特定の大口テナントだけを専用のシャードに移すといった扱いができます。代わりに、その対応表が全リクエストの通り道になり、表自体の可用性と一貫性を確保しなければなりません。
+
+### 仮想シャード
+
+実務で最も多いのは、ハッシュと対応表の組み合わせです。
+
+1. 台数よりずっと多い数の **論理シャード**（たとえば 1024 個）を決め、`hash(key) % 1024` で論理シャードを決める。この数は**二度と変えない**
+2. 論理シャードを物理ノードに割り当てる対応表を持つ。1024 行しかないので、全ルーターがメモリに持てる
+3. 台数を増やすときは、**論理シャードを丸ごと**新しいノードへ移し、対応表を書き換える
+
+```
+ key ──hash % 1024──→ 論理シャード 0..1023 ──対応表──→ 物理ノード
+                       （固定）                     （ここだけ変わる）
+```
+
+キーと論理シャードの関係は固定なので、剰余の弱点が出ません。移す単位が論理シャードなので、移すべきデータの範囲が最初から分かっています。Instagram は PostgreSQL の上に数千の論理シャードを作り、少数の物理サーバに割り当てていたと書いています（[Instagram Engineering](https://instagram-engineering.com/1cf5a71e5a5c)）。後で見る Citus の分散テーブルも、ハッシュ値の範囲で区切った 32 個（既定）のシャードをノードに割り当てる、この形です。
+
+## 手元で確かめる：どれだけ動くか
+
+100 万個のキー（`user:0`〜`user:999999`）を、4 台から 5 台に増やしたときに、行き先が変わるキーの割合と、5 台の間の偏りを測りました。キーのハッシュは CRC32、円上のノードの位置は MD5 の先頭 4 バイトです。仮想シャードは 1024 個を 4 台に均等に割り当てておき、増設時に各台から少しずつ取って 204 個を 5 台目に移しました（Python 3.14）。
+
+```python
+# 抜粋（全体は 50 行ほど）
+import zlib, bisect, hashlib, statistics
+
+KEYS = [f"user:{i}" for i in range(1_000_000)]
+H = [zlib.crc32(k.encode()) for k in KEYS]
+
+# 剰余
+before, after = [h % 4 for h in H], [h % 5 for h in H]
+
+# Consistent Hashing（ノード 1 台を v 個の点として円に置く）
+def ring(n, v):
+    pts = sorted((h32(f"node{j}#{i}"), j) for j in range(n) for i in range(v))
+    return [p for p, _ in pts], [j for _, j in pts]
+
+# 仮想シャード（論理シャード番号は h % 1024 で固定、対応表だけ書き換える）
+before = [assign4[h % 1024] for h in H]
+after  = [assign5[h % 1024] for h in H]
+```
+
+```
+mod N (4->5)                 moved= 80.03%  max/mean=1.005  sd/mean= 0.29%
+ring vnodes=1 (4->5)         moved= 20.72%  max/mean=1.961  sd/mean=57.80%
+ring vnodes=10 (4->5)        moved= 17.71%  max/mean=1.546  sd/mean=29.11%
+ring vnodes=100 (4->5)       moved= 20.03%  max/mean=1.123  sd/mean= 8.43%
+ring vnodes=1000 (4->5)      moved= 20.65%  max/mean=1.038  sd/mean= 3.52%
+virtual shards S=1024 (4->5) moved= 19.92%  max/mean=1.001  sd/mean= 0.20%
+```
+
+- **剰余** は計算どおり 80% が動きます。偏りはほぼありません
+- **Consistent Hashing** は、どの設定でも約 20%（= 1/5）しか動きません。ただし仮想ノードが 1 個だと、最も重い台が平均の 1.96 倍を持ちます。100 個で 1.12 倍、1000 個で 1.04 倍まで縮みます
+- **仮想シャード** は、移動が約 20% で、偏りも剰余並みに小さい。動かす単位を人が選べるので、均等に配れます
+
+Consistent Hashing の偏りは、ノードの点の位置をハッシュに任せているところから来ます。仮想シャードは「どの論理シャードをどこに置くか」を対応表で決めるので、偏りを人が直せます。その代わりに、対応表を全員で共有する仕組みが要ります。
+
+## ID の採番
+
+1 台のデータベースでは、`AUTO_INCREMENT` や `SERIAL` が一意な番号を振ってくれました。4 台がそれぞれ `AUTO_INCREMENT` を持つと、どの台も 1 から数え始め、同じ ID が 4 つできます。シャードキー以外の ID（注文番号など）でも、別の表から参照される以上、全体で一意でなければ困ります。
+
+| 方式 | 仕組み | 弱点 |
+| --- | --- | --- |
+| 増分とオフセット | 各台が 1, 5, 9… / 2, 6, 10… のように飛び飛びに振る | 台数を後から増やしにくい |
+| 採番専用の表 | 1 台の採番サーバから番号をもらう | 採番サーバが全挿入の通り道になる |
+| Snowflake 型 | 時刻 + ノード番号 + 連番を 64 ビットに詰める | ノード番号の管理と、時計への依存 |
+| UUIDv4 | 122 ビットの乱数 | 16 バイトで、B+tree を散らかす |
+| UUIDv7 | 先頭 48 ビットがミリ秒の時刻、残りが乱数 | 16 バイト |
+
+**増分とオフセット。** MySQL の `auto_increment_increment` と `auto_increment_offset` は、`auto_increment_offset + N × auto_increment_increment` という列を作ります。本来は、2 台が互いに書き込みを複製し合う構成で ID が衝突しないように用意されたものです（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/replication-options-source.html#sysvar_auto_increment_increment)）。サーバ全体の設定で、表ごとには変えられません。
+
+**採番専用の表。** Flickr は、MySQL に 1 行だけの表を置き、`REPLACE INTO Tickets64 (stub) VALUES ('a'); SELECT LAST_INSERT_ID();` で番号を取る **チケットサーバ** を使っていました。1 台では単一障害点になるので、`auto-increment-increment = 2` にした 2 台に奇数と偶数を受け持たせています（[Flickr](https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/)）。Vitess の **sequence** も、専用の表から番号を 1000 個ずつなどまとめて取る仕組みで、VSchema の文書は「AUTO_INCREMENT はシャードされた表ではうまく働かない」と書いています（[Vitess 文書](https://vitess.io/docs/reference/features/vschema/)）。
+
+**Snowflake 型。** Twitter の Snowflake は、64 ビットを「独自の起点からのミリ秒 41 ビット」「マシン番号 10 ビット」「連番 12 ビット」に分けます（[twitter-archive/snowflake](https://github.com/twitter-archive/snowflake/tree/snowflake-2010)）。各マシンが誰にも問い合わせずに番号を作れて、しかも**ほぼ時刻順に並びます**。Instagram は同じ考え方で、マシン番号の代わりに 13 ビットの**論理シャード番号**を入れました（[Instagram Engineering](https://instagram-engineering.com/1cf5a71e5a5c)）。ID を見るだけで、その行がどの論理シャードにあるか分かります。
+
+**UUID。** 乱数だけの UUIDv4 は、誰とも調整せずに作れる最も簡単な方法です。UUIDv7 は RFC 9562 で標準化された形式で、先頭にミリ秒の時刻を置きます（[RFC 9562](https://www.rfc-editor.org/rfc/rfc9562)）。
+
+### B+tree から見た ID と、シャードから見た ID
+
+第 97 回で見たとおり、ランダムな主キーは B+tree のあちこちでページ分割を起こし、索引を大きくします。シャーディングしても、各シャードの中は普通の B+tree なので、この性質はそのまま残ります。PostgreSQL 18.6 で、100 万行を 1 回の `INSERT ... SELECT` で入れて、主キーの索引を比べ直しました。
+
+```sql
+CREATE TABLE u4 (id uuid PRIMARY KEY);    -- gen_random_uuid()
+CREATE TABLE u7 (id uuid PRIMARY KEY);    -- uuidv7()
+CREATE TABLE sf (id bigint PRIMARY KEY);  -- Snowflake 風: ミリ秒 << 22 | ノード 3 << 12 | 連番
+```
+
+```
+     k     | size  | avg_leaf_density
+-----------+-------+------------------
+ v4        | 38 MB |            71.59
+ v7        | 30 MB |            89.98
+ snowflake | 21 MB |            90.01
+```
+
+第 97 回と同じく、UUIDv4 は葉が 7 割しか埋まらず、UUIDv7 は 9 割埋まります。Snowflake 型は同じく右端に追記されるうえ、8 バイトなのでさらに小さくなります。時刻順の ID は、**各シャードの中では** B+tree に優しいままです。
+
+ところが、この ID を**シャードキーにすると**話が変わります。
+
+- **範囲で分ける** と、時刻順の ID は常に最新の範囲に入るので、**すべての挿入が最後の 1 シャードに集中**します。第 97 回で B+tree の右端への追記として好ましかった性質が、ここでは裏目に出ます
+- **ハッシュで分ける** と、挿入は全シャードに散らばります。各シャードの中では、届く ID が時刻順のままなので、B+tree の右端への追記という性質も保たれます。代わりに「最近 1 時間の行」のような範囲の問い合わせは、全シャードに投げることになります
+
+時刻順の ID は、主キーとしては優秀で、範囲で分けるシャードキーとしては危険です。両方を満たしたいなら、ユーザ ID のような別の列をシャードキーにし、時刻順の ID はその中の主キーとして使うのが普通の形です。
+
+## シャードをまたぐ処理
+
+### JOIN と集計：scatter-gather
+
+シャードキーで絞れないクエリは、全シャードに投げて（scatter）、結果を手元で集めます（gather）。
+
+```
+            SELECT count(*) FROM orders
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+   shard 1: count   shard 2: count   shard 3: count
+        └─────────────┼─────────────┘
+                      ▼
+           ルーター側で部分結果を足す
+```
+
+`count` や `sum` は、各シャードの部分結果を足せば済みます。`avg` は、各シャードの平均を平均してはいけません。`sum` と `count` を返してもらって割ります。`count(DISTINCT ...)` は、部分結果を足すと重複を数えてしまうので、値そのものを集めるか、近似で済ませます。
+
+**`ORDER BY ... LIMIT`** は、各シャードから上位 `LIMIT` 件ずつを取り寄せ、手元でもう一度並べて上位を取ります。`LIMIT 10 OFFSET 1000` なら、各シャードから 1010 件ずつを取る必要があります。深いページほど、シャード数に比例して高くつきます。
+
+**JOIN** は、両方の表が同じキーで分かれていて、結合条件がそのキーなら、各シャードの中で完結します。そうでない JOIN は、片方を全シャードに配るか、片方を結合キーで分け直して送るか、アプリで 2 回に分けて引くかになります。どれも、第 102 回で見た結合を、ネットワーク越しにやり直すことです。小さく、あまり変わらない表（国、商品カテゴリなど）は、**全シャードに同じものを置いておく**と、どのシャードの中でも JOIN できます。これを参照テーブルと呼びます。
+
+### シャードをまたぐトランザクション
+
+1 つのシャードの中なら、トランザクションは普通に使えます。問題は、ユーザ A（シャード 1）からユーザ B（シャード 2）への送金のように、2 つのシャードを同時に変えたいときです。
+
+選べる道は 2 つです。
+
+**2PC で守る。** 全シャードに「コミットできる状態にしておいて」と頼み（prepare）、全員が「できる」と答えたら全員にコミットさせます。MySQL は X/Open の XA 仕様に沿った **XA トランザクション** を InnoDB で提供しており（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/xa.html)）、PostgreSQL は `PREPARE TRANSACTION` を持っています。調整役が prepare の後に落ちると、参加者はロックを握ったまま待つしかない、という 2PC の弱点もそのまま付いてきます。
+
+**諦めて、補償で戻す。** 各シャードで別々にコミットし、途中で失敗したら、済んだ分を取り消す処理を後から流します（Saga）。整合性は一時的に崩れます。
+
+両者の性質は、システムデザインの読み物の<a href={`${import.meta.env.BASE_URL}reading/distributed-transaction/`}>分散トランザクション</a>で比べました。シャーディングの設計では、**そもそもシャードをまたぐトランザクションが要らないようにシャードキーを選ぶ**のが第一の手です。
+
+もう 1 つ、見落としやすいものがあります。**一意制約**です。`email` の一意制約は、各シャードの中でしか効きません。シャードキー以外の列を全体で一意にしたければ、その列をキーにした別の表（または別の仕組み）で確かめることになります。
+
+## ルーティングを誰がやるか
+
+ここまでの仕事を、誰が担うかで構成が分かれます。
+
+| どこで | 例 | 特徴 |
+| --- | --- | --- |
+| アプリ内のライブラリ | ORM のシャーディング機能、自作のルーター | 追加の通り道がない。言語ごとに実装が要る |
+| SQL を中継するプロキシ | ProxySQL、Vitess の vtgate | アプリからは 1 つのデータベースに見える |
+| データベースの拡張 | Citus のコーディネータ | PostgreSQL の実行計画に組み込まれる |
+
+**ProxySQL** は MySQL のプロキシで、クエリの文字列やスキーマ名をルールで照合して、送り先のサーバの組を選びます。文書は、シャードキーの値ごと、文の種類ごとにルールが要ること、そして **シャードをまたぐ JOIN はアプリで扱う必要がある** ことを明記しています（[ProxySQL 文書](https://proxysql.com/documentation/how-to-setup-proxysql-sharding/)）。ProxySQL が担うのは振り分けまでです。
+
+**Vitess** は、MySQL の前に **vtgate** というプロキシを置きます。vtgate は **VSchema**（どの表がどの keyspace にあり、どの列で分けられているか）を見てクエリをシャードに振り分けます（[Vitess 文書](https://vitess.io/docs/reference/features/vschema/)）。シャードキーから行き先を計算する関数を **vindex** と呼び、各表は **primary vindex** を必ず 1 つ持ちます。primary vindex は列の値を 1 つの **keyspace ID** に変換し、各シャードは keyspace ID の範囲を受け持ちます（[Vitess 文書](https://vitess.io/docs/reference/features/vindexes/)）。シャードの名前 `-80` や `80-` は、その範囲を 16 進数で書いたもので、`-80` は先頭が 0x80 未満、`80-` は 0x80 以上です（[Vitess 文書](https://vitess.io/docs/reference/features/sharding/)）。
+
+ハッシュで固定長の keyspace ID を作り、その**範囲**をシャードに割り当てる。これは、先ほどの仮想シャードを、論理シャードの個数ではなくハッシュ値の範囲で表したものです。シャードを 2 つに割るときは、範囲を半分に割るだけで、キーの並びは変わりません。シャードキー以外の列から引くために、列の値から keyspace ID への対応を MySQL の表に持つ **lookup vindex** もあります。シャードをまたぐ索引にあたるものです。
+
+**Citus** は PostgreSQL の拡張で、1 台の **コーディネータ** がクエリを受け、関係するワーカーに中継して結果をまとめます（[Citus 文書](https://docs.citusdata.com/en/stable/get_started/concepts.html)）。表を `create_distributed_table` で **分散テーブル** にすると、分散列のハッシュ値の範囲で区切ったシャードがワーカーに配られます。`create_reference_table` で作る **参照テーブル** は、1 つのシャードを全ワーカーに複製したものです（[Citus 文書](https://docs.citusdata.com/en/stable/develop/api_udf.html)）。
+
+## 手元で確かめる：Citus
+
+Citus の公式イメージ `citusdata/citus:13.0`（Citus 13.0.3、PostgreSQL 17.2）で、コーディネータ 1 台とワーカー 2 台を docker network 上に立てました。ホストへのポートは公開せず、すべて `docker exec` で操作しています。
+
+```sql
+SELECT citus_set_coordinator_host('ll-110-coord', 5432);
+SELECT citus_add_node('ll-110-w1', 5432);
+SELECT citus_add_node('ll-110-w2', 5432);
+
+CREATE TABLE orders (user_id bigint, order_id bigint, item_id int, amount int,
+                     created_at timestamptz DEFAULT now(), PRIMARY KEY (user_id, order_id));
+SELECT create_distributed_table('orders', 'user_id');
+CREATE TABLE items (item_id int PRIMARY KEY, name text);
+SELECT create_reference_table('items');
+
+-- 1 万ユーザ、100 万件の注文
+INSERT INTO orders (user_id, order_id, item_id, amount)
+  SELECT i % 10000, i, 1 + i % 100, i % 1000 FROM generate_series(1, 1000000) i;
+```
+
+主キーに `user_id` を含めているのは、Citus の分散テーブルでは一意制約に分散列を含める必要があるからです。先ほどの「一意制約は各シャードの中でしか効かない」が、ここでは制約として表に出ています。
+
+```
+ citus.shard_count
+-------------------
+ 32
+
+ nodename  | shards | pg_size_pretty
+-----------+--------+----------------
+ ll-110-w1 |     16 | 52 MB
+ ll-110-w2 |     16 | 53 MB
+
+ shardid | shardminvalue | shardmaxvalue
+---------+---------------+---------------
+  102008 | -2147483648   | -2013265921
+  102009 | -2013265920   | -1879048193
+  102010 | -1879048192   | -1744830465
+```
+
+32 個のシャードが 16 個ずつ 2 台に配られました。各シャードは、32 ビットのハッシュ値の空間を 32 等分した範囲を受け持っています。
+
+### 全シャードに配られるクエリ
+
+```
+EXPLAIN SELECT count(*) FROM orders;
+
+ Aggregate
+   ->  Custom Scan (Citus Adaptive)
+         Task Count: 32
+         Tasks Shown: One of 32
+         ->  Task
+               Node: host=ll-110-w1 port=5432 dbname=postgres
+               ->  Aggregate
+                     ->  Seq Scan on orders_102008 orders
+```
+
+`Task Count: 32` で、32 個のシャードそれぞれに `count(*)` を投げ、コーディネータの `Aggregate` で足し合わせています。scatter-gather です。各シャードは `orders_102008` のような名前の、ワーカー上の普通の PostgreSQL の表です。
+
+### シャードキーで絞ったクエリ
+
+```
+EXPLAIN SELECT * FROM orders WHERE user_id = 42;
+
+ Custom Scan (Citus Adaptive)
+   Task Count: 1
+   Tasks Shown: All
+   ->  Task
+         Node: host=ll-110-w2 port=5432 dbname=postgres
+         ->  Bitmap Heap Scan on orders_102035 orders
+               Recheck Cond: (user_id = 42)
+               ->  Bitmap Index Scan on orders_pkey_102035
+```
+
+`Task Count: 1` です。コーディネータは `user_id = 42` のハッシュ値から、シャード 102035（ワーカー 2）だけに問い合わせています。`get_shard_id_for_distribution_column('orders', 42)` も 102035 を返しました。
+
+### ORDER BY ... LIMIT
+
+```
+EXPLAIN SELECT user_id, order_id, amount FROM orders ORDER BY amount DESC, order_id LIMIT 5;
+
+ Limit
+   ->  Sort
+         Sort Key: remote_scan.amount DESC, remote_scan.order_id
+         ->  Custom Scan (Citus Adaptive)
+               Task Count: 32
+               ->  Task
+                     ->  Limit
+                           ->  Sort
+                                 Sort Key: amount DESC, order_id
+                                 ->  Seq Scan on orders_102008 orders
+```
+
+各シャードで並べて上位 5 件に絞り（内側の `Limit`）、コーディネータで 32 × 5 件をもう一度並べて 5 件を取っています（外側の `Limit`）。
+
+### 参照テーブルとの JOIN
+
+```
+EXPLAIN SELECT i.name, sum(o.amount) FROM orders o JOIN items i USING (item_id)
+        GROUP BY i.name ORDER BY 2 DESC LIMIT 3;
+
+ Limit
+   ->  Sort
+         ->  HashAggregate
+               Group Key: remote_scan.name
+               ->  Custom Scan (Citus Adaptive)
+                     Task Count: 32
+                     ->  Task
+                           ->  HashAggregate
+                                 Group Key: i.name
+                                 ->  Hash Join
+                                       Hash Cond: (o.item_id = i.item_id)
+                                       ->  Seq Scan on orders_102008 o
+                                       ->  Hash
+                                             ->  Seq Scan on items_102040 i
+```
+
+`items` は全ワーカーに同じものがあるので、JOIN は各シャードの中の `Hash Join` で済み、ワーカーは名前ごとの部分的な合計だけを返します。コーディネータの `HashAggregate` が、32 個の部分合計を合わせています。
+
+### 分散列以外での JOIN
+
+```
+SELECT count(*) FROM orders a JOIN orders b ON a.order_id = b.user_id;
+
+ERROR:  the query contains a join that requires repartitioning
+HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
+```
+
+分散列でない列どうしの JOIN は、片方を結合キーで分け直して送る必要があり、Citus は既定ではこれを断ります。データベースの外で分けるとき、どのクエリが高くつくかがここで表に出ます。
+
+### シャードをまたぐ更新
+
+ユーザ 42（ワーカー 2）とユーザ 2（ワーカー 1）の行を、1 つのトランザクションで更新しました。
+
+```sql
+BEGIN;
+UPDATE orders SET amount = amount - 100 WHERE user_id = 42 AND order_id = 10042;
+UPDATE orders SET amount = amount + 100 WHERE user_id = 2  AND order_id = 10002;
+COMMIT;
+SELECT groupid, gid FROM pg_dist_transaction;
+
+ groupid |       gid
+---------+------------------
+       2 | citus_0_216_10_0
+       1 | citus_0_216_10_1
+```
+
+コーディネータの `pg_dist_transaction` に、ワーカーごとに 1 行ずつ、prepare した分散トランザクションの記録が残りました。2 台をまたぐ書き込みでは、Citus が各ワーカーで `PREPARE TRANSACTION` をしてからコミットする 2PC を使っていることが分かります。コーディネータは prepare の記録を自分の表に残し、障害の後や定期的にそれを見て、ワーカーに残った中途半端なトランザクションを片付けます（[Citus ブログ](https://www.citusdata.com/blog/2017/11/22/how-citus-executes-distributed-transactions/)）。同じユーザ（同じワーカー）どうしの更新では、この表に記録は増えませんでした。
+
+## 分け直す：リシャーディング
+
+台数を増やす、偏ったシャードを割る、大口のテナントを専用のシャードに移す。どれも、**動いているデータを別の台に移す**作業です。止めてよいなら、止めてコピーして再開するだけです。止めずにやるには、この章ですでに見た 2 つの考え方を組み合わせます。
+
+1. **コピー**：ある時点の一貫したスナップショットから、移す行を新しい台にコピーする
+2. **差分を追う**：コピーしている間に入った変更を、binlog や論理レプリケーションで新しい台に流し続ける（第 106 回）
+3. **切り替え**：差分が十分小さくなったら、元の台への書き込みを一瞬止め、追いつくのを待ち、ルーティングを新しい台に向ける
+
+これは第 107 回で見た gh-ost が 1 台の中でやっていたこと（影の表にコピーし、binlog で追いかけ、最後に表をすり替える）を、**台をまたいで**やっているのと同じ形です。
+
+**Vitess** では、この仕組みを **VReplication** と呼びます。まずソースから一貫した形でコピーし、終わったら binlog から変更を流し続けます（[Vitess 文書](https://vitess.io/docs/reference/vreplication/vreplication/)）。表を別の keyspace に移すのが **MoveTables**、シャードを割ったりまとめたりするのが **Reshard** です。Reshard の手順は、作成してコピーを始める、遅延が十分小さくなるのを待つ、**VDiff** で中身を比べる、**SwitchTraffic** で読み取りと書き込みを切り替える、**Complete** で後片付けをする、の順です。書き込みを切り替えるときは、元のシャードを一時的に読み取り専用にして移行先が追いつくのを待ち、その間 vtgate がクエリを溜めておきます。逆向きのレプリケーションも既定で作られるので、`ReverseTraffic` で元に戻せます（[Vitess 文書](https://vitess.io/docs/reference/vreplication/reshard/)）。
+
+### 手元で確かめる：Citus でワーカーを足す
+
+先ほどのクラスタ（全ノードを `wal_level=logical` で起動）に 3 台目のワーカーを足し、シャードを再配置しました。その間、別の接続から 1 行ずつ `INSERT` を流し続けています。Citus 13.0 の同期版の関数 `rebalance_table_shards()` を使いました（v11.2 以降は非推奨で、バックグラウンドで動く `citus_rebalance_start()` が推奨されています。[Citus 文書](https://docs.citusdata.com/en/stable/develop/api_udf.html)）。
+
+```
+SELECT citus_add_node('ll-110-w3', 5432);
+SELECT count(*) AS planned_moves FROM get_rebalance_table_shards_plan();
+ planned_moves
+---------------
+            10
+
+SELECT rebalance_table_shards();
+NOTICE:  replicating reference table 'items' to ll-110-w3:5432 ...
+NOTICE:  Moving shard 102029 from ll-110-w2:5432 to ll-110-w3:5432 ...
+NOTICE:  Moving shard 102026 from ll-110-w1:5432 to ll-110-w3:5432 ...
+  （中略、計 10 個）
+Time: 32857.387 ms (00:32.857)
+
+ nodename  | shards | pg_size_pretty
+-----------+--------+----------------
+ ll-110-w1 |     11 | 33 MB
+ ll-110-w2 |     11 | 33 MB
+ ll-110-w3 |     10 | 33 MB
+```
+
+32 個のうち 10 個（31%）が動きました。2 台から 3 台にするときの理想は 1/3 です。移動の単位がシャードなので、ハッシュ値の範囲とキーの対応は一切変わっていません。参照テーブルの `items` は、新しいワーカーにも複製されています。並行して流した `INSERT` は 105 件すべて成功し、失敗は 0 件でした（x86_64 のイメージを arm64 の上で動かしているので、1 件ごとの `psql` の起動が遅く、件数は少なめです）。
+
+ワーカー 1 のログには、シャードごとに論理レプリケーションのスロットを作った記録が残っていました。
+
+```
+LOG:  logical decoding found consistent point at 0/56A9378
+STATEMENT:  CREATE_REPLICATION_SLOT citus_shard_move_slot_4_10_3 LOGICAL pgoutput EXPORT_SNAPSHOT;
+LOG:  starting logical decoding for slot "citus_shard_move_slot_4_10_3"
+```
+
+`EXPORT_SNAPSHOT` でスロットを作った時点のスナップショットを書き出し、それでコピーし、その後の変更をスロットから流す。上の「コピー → 差分を追う → 切り替え」が、PostgreSQL の論理レプリケーションの部品でそのまま組み立てられています。
+
+<Callout type="warn" title="何がシャードの移動を難しくするか">
+  移すこと自体は、レプリケーションの部品で組み立てられます。難しいのは、切り替えの瞬間に**全ルーターが同時に新しい行き先を知る**ことです。
+  あるアプリのサーバだけが古い対応表を持ったまま元のシャードに書き込めば、その書き込みは失われるか、二重に存在します。
+  Vitess が書き込みの切り替え中に元のシャードを読み取り専用にし、vtgate でクエリを溜めるのは、この瞬間を作るためです。
+  アプリ内のライブラリで振り分けている場合は、この調整をアプリ側で用意することになります。
+</Callout>
+
+## ホットスポット
+
+どの振り分け方でも、**キーの個数**が均等になるだけで、**アクセスの量**が均等になるとは限りません。
+
+- **特定のキーへの集中**：フォロワーの多いアカウント、大口のテナント。ハッシュでも範囲でも、そのキーを持つ 1 台が重くなる。キーを細かく割る、専用のシャードに移す（ディレクトリ方式の出番）、読み取りならキャッシュで吸収する、といった個別の手を打つ
+- **最新のデータへの集中**：時刻順のキーを範囲で分けると、書き込みは常に末尾の 1 シャードに来る。ハッシュで分けるか、キーの先頭に散らすための値を足す
+
+ホットスポットは、外側で手で分けたときだけの問題ではありません。第 111 回で見る NewSQL は、キーの範囲で自動的に分割し、自動的に移動させますが、**連番の主キーで末尾の範囲に書き込みが集まる問題は、そのまま残ります**。
+
+## まとめ
+
+- 書き込みを受ける台を増やすには、データを分けるしかない。データベースの外で分けると、行の在りか、ID、シャードをまたぐ処理、分け直しを、アプリやプロキシが引き受ける
+- 垂直分割は表ごとに置き場所を変える。水平分割（シャーディング）は同じ表の行をシャードキーで分ける。シャードキーで絞れるクエリだけが 1 台で完結する
+- 剰余方式は台数を 4 → 5 にすると 80% のキーが動く。Consistent Hashing と仮想シャードは約 20%（1/N）で済む。100 万キーの実験で、仮想ノード 1 個の Consistent Hashing は最大の台が平均の 1.96 倍、1024 個の仮想シャードは 1.001 倍だった
+- `AUTO_INCREMENT` は台ごとに重なる。増分とオフセット、採番専用の表、Snowflake 型、UUIDv4 / UUIDv7 のどれかで全体の一意性を作る。時刻順の ID は各シャードの B+tree には優しい（UUIDv4 の 38MB に対し UUIDv7 は 30MB）が、範囲で分けるシャードキーにすると最新の 1 シャードに書き込みが集まる
+- シャードをまたぐ集計、`ORDER BY ... LIMIT`、JOIN は scatter-gather になる。小さな表は参照テーブルとして全シャードに置く。シャードをまたぐ更新は 2PC（MySQL なら XA）か、補償で戻す Saga
+- 振り分けはアプリのライブラリ、ProxySQL や Vitess の vtgate、Citus のコーディネータが担う。Vitess は vindex で keyspace ID を作り、その範囲をシャードに割り当てる。Citus はハッシュ値の範囲で区切った 32 個のシャードを配り、`EXPLAIN` の `Task Count` で 1 シャードか全シャードかが分かる
+- 分け直しは、コピー、binlog や論理レプリケーションでの差分の追跡、切り替えの 3 段階。第 106 回のレプリケーションと第 107 回の gh-ost の考え方を台をまたいで使う。Vitess の MoveTables / Reshard、Citus のシャードの移動がその実装
+
+ここで引き受けたもの（どのシャードにあるかを知ること、シャードをまたぐ JOIN とトランザクション、止めずに分け直すこと）を、データベースの内側に取り込んだのが、次の第 111 回で見る NewSQL です。

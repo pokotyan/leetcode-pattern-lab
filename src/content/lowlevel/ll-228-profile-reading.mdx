@@ -1,0 +1,333 @@
+---
+title: プロファイルを読む（フレームグラフ・フレームチャート・コールツリー）
+description: プロファイラが集めているのは、一定間隔で覗いたスタックの束だけです。その束が、フレームグラフ、フレームチャート、コールツリー、ボトムアップという 4 つの表示にどう変換されるのか。self と total、ホットスポットの探し方、そして表示が嘘をつく場面を、Go の pprof と Linux の perf の実測で確かめます
+chapter: observe
+order: 8
+status: published
+topics:
+  - サンプリングプロファイラ
+  - 計装プロファイラ
+  - フレームグラフ
+  - フレームチャート
+  - コールツリー
+  - ボトムアップ表示
+  - self 時間と total 時間
+  - ホットスポット
+  - off-CPU 分析
+  - 差分プロファイル
+  - pprof
+requires:
+  - ll-224-measure
+  - ll-31-abi
+  - ll-201-debugger
+---
+
+import Callout from '../../components/Callout.astro'
+import ProfileViews from '../../components/sim/problems/ProfileViews'
+
+## プロファイラが持っているもの
+
+第 224 回では、`perf record` で取ったプロファイルをフレームグラフにすれば「横に広い平らな部分がボトルネック」だと書きました。この回では、その一言の中身を分解します。
+
+先に結論を書くと、CPU プロファイラが手にしているのは、**一定の間隔で対象を覗いたときのスタックの記録の束**だけです。スタックとは、その瞬間に実行中の関数と、そこへ至るまでの呼び出し元の列（`main → handle → render → template → escapeHTML` のようなもの）のことです。フレームグラフも、時系列のチャートも、関数の一覧表も、すべてこの同じ束を別の切り口で集計し直したものにすぎません。
+
+したがって、表示の読み方を覚えるより、**束からどう集計したのか**を知っておく方が応用が利きます。どの表示で何が見え、何が消えるのかが、集計の手順から決まるからです。
+
+## サンプリングと計装
+
+プロファイラが情報を集める方法は、大きく 2 つあります。
+
+**サンプリング**（統計的プロファイリング）は、一定間隔でタイマー割り込みやシグナルを起こし、その瞬間の実行位置とスタックを記録します。Go の `runtime/pprof` は SIGPROF というシグナルに頼っています（[runtime/pprof](https://pkg.go.dev/runtime/pprof)）。後で見る実測では、記録の 1 件あたりの重みが 10 ms（`Period: 10000000` ナノ秒）、つまり 1 秒に 100 回でした。Linux の `perf record -F 99` も同じ考え方で、1 秒に 99 回覗きます。
+
+**計装**（決定論的プロファイリング）は、関数に入るとき・出るときにフックを仕掛け、すべての呼び出しの時刻を記録します。Python の文書はこの 2 つを次のように対比しています（[Python: The Python Profilers](https://docs.python.org/3/library/profile.html)）。
+
+> _Deterministic profiling_ is meant to reflect the fact that all _function call_, _function return_, and _exception_ events are monitored, and precise timings are made for the intervals between these events (during which time the user's code is executing). In contrast, _statistical profiling_ (which is provided by the `profiling.sampling` module) periodically samples the effective instruction pointer, and deduces where time is being spent. The latter technique traditionally involves less overhead (as the code does not need to be instrumented), but provides only relative indications of where time is being spent.
+
+（決定論的プロファイリングは、関数の呼び出し・戻り・例外のすべてを監視し、その間隔を精密に計る。統計的プロファイリングは実行位置を定期的に採取して時間の使われ方を推定する。後者は計装が要らないぶん負荷が小さいが、どこで時間が使われているかの相対的な目安しか得られない。）
+
+両者の違いを、誤差の出方で整理しておきます。
+
+| | サンプリング | 計装 |
+| --- | --- | --- |
+| 何を数えるか | 覗いた瞬間にどこにいたか | すべての呼び出しの出入り |
+| 呼び出し回数 | 分からない | 正確に分かる |
+| 短い関数 | 間隔より短いものは運次第で写らない | 写るが、フックの費用が本体より大きくなる |
+| 誤差の正体 | 標本の少なさ（件数を増やせば減る） | 計測そのものが対象を遅くする |
+| 本番で使えるか | 間隔を粗くすれば常時でも使える | 負荷が大きく、多くは開発時だけ |
+
+サンプリングの誤差は統計の誤差です。全体の 30% を占める関数でも、標本が 20 件しかなければ 20% にも 40% にも見えます。**数パーセントの差を議論したいなら、数千件の標本が要ります。** 逆に、計装のプロファイラで「小さな関数を大量に呼ぶ処理が遅い」と出たときは、フックの費用を測っているだけかもしれません。
+
+## 同じ束から 4 つの表示を作る
+
+ここから、束をどう集計すると各表示になるのかを見ます。下のシミュレーターは、後で実測する Go のプログラムの比率（`parseJSON` 28%、`template` 自身 8%、`template` から呼ばれる `escapeHTML` 35%、`logLine` から呼ばれる `escapeHTML` 27%）を 20 件の標本に丸めたものです。1 件ずつ集計しながら、表示を切り替えて見比べてください。
+
+<ProfileViews client:visible />
+
+### フレームグラフ：名前順に並べて併合する
+
+フレームグラフは、Brendan Gregg が考案し、2011 年 12 月に公開した表示です。本人の説明は次のとおりです（[Brendan Gregg: Flame Graphs](https://www.brendangregg.com/flamegraphs.html)）。
+
+> The x-axis shows the stack profile population, sorted alphabetically (it is not the passage of time), and the y-axis shows stack depth, counting from zero at the bottom.
+
+> The wider a frame is is, the more often it was present in the stacks.
+
+作り方は、シミュレーターの `fold` そのものです。根から葉へ向かって 1 段ずつ箱をたどり、**同じ経路を通った標本は同じ箱に積む**。横幅はその箱を通った標本の数（total）です。兄弟の箱を名前順に並べるのは、時刻の順に並べると同じ経路が飛び飛びに現れて併合できないからで、Gregg も「Flame graphs reorder the x-axis samples alphabetically, which maximizes frame merging」と書いています。
+
+ここから 3 つの読み方が出てきます。
+
+- **横軸は時刻ではない。** 左にある関数が先に動いたわけではありません。シミュレーターで「サンプル列」を「段階ごとにまとめて」に切り替えても、フレームグラフはまったく変わりません。
+- **幅は total、上端は self。** ある箱の幅のうち、上に子の箱が載っていない部分が、その関数自身が CPU を使っていた割合です。「横に広い平らな部分」とは、self が大きい箱のことを言っています。
+- **色に意味はない。** 元のフレームグラフは隣り合う箱を見分けるために乱数で色を付けています（Gregg: 「Original flame graphs use random colors to help visually differentiate adjacent frames.」）。赤いから重いわけではありません。道具によっては、言語やモジュールで塗り分ける設定もあります。
+
+### フレームチャート：時刻の順に並べる
+
+フレームチャートは、同じ箱の積み方を時刻の順で行います。Gregg はこれを「flame charts put the passage of time on the x-axis instead of the alphabet」と説明しています。隣り合う標本が同じ経路なら箱をつなげ、違えばそこで切ります。
+
+「段階ごとにまとめて」に切り替えると、フレームチャートでは前半が `parseJSON`、後半が `render` と `logLine` に分かれて見えます。「リクエストごとに交互」では細切れになります。フレームグラフでは区別できなかった**いつ何が起きたか**が見えるのが、この表示の価値です。ブラウザの Performance パネルのメインスレッドの表示はこの形で、1 回のクリックの処理がどの順で進んだかを追うのに向いています（第 120 回で扱います）。
+
+その代わり、同じ処理が何百回も繰り返されると、細い箱が何百本も並ぶだけで、全体として何が重いのかは読み取れません。**集計の問いにはフレームグラフ、順序の問いにはフレームチャート**、と使い分けます。
+
+speedscope というプロファイル表示ツールは、同じ切り替えを明示的に持っています。時刻順の表示は「call stacks are ordered left-to-right in the same order as they occurred in the input file」、併合した表示は「identical stacks are grouped together, regardless of whether they were recorded sequentially」と説明され、後者は重いものを左に寄せるので「Left Heavy」と呼ばれています（[speedscope](https://github.com/jlfwong/speedscope)）。
+
+### コールツリー：同じ木を表で読む
+
+コールツリー（トップダウン表示）は、フレームグラフと**同じ木**を、字下げした表として出したものです。各行に total と self が付きます。フレームグラフの幅を目で測る代わりに数字で読めるので、「`render` の 40% のうち、`template` 自身は何 % か」のような問いに向いています。
+
+pprof の文書は、この 2 つの値を次のように定義しています（[pprof: README](https://github.com/google/pprof/blob/main/doc/README.md)）。flat（self と同じ意味）は「the value of the location itself.」、cum（total と同じ意味）は「the value of the location plus all its descendants.」です。
+
+### ボトムアップ：関数ごとに集め直す
+
+ボトムアップ表示（関数一覧、pprof の `-top`、speedscope の Sandwich）は、木をいったん捨てて、**関数名ごとに**標本を数え直します。シミュレーターの `by_function` です。self は「その関数が葉だった標本の数」、total は「その関数がスタックのどこかにいた標本の数」です。
+
+シミュレーターの最後のステップを見てください。フレームグラフで幅の広い箱は `render`（45%）と `logLine`（25%）で、`escapeHTML` の箱は 2 つに割れてそれぞれ細く見えます。ボトムアップに切り替えると、`escapeHTML` は 1 行にまとまり、self 60% で先頭に来ます。呼び出し元の内訳（`template` から 35%、`logLine` から 25%）も出ます。
+
+**フレームグラフは、同じ関数でも呼び出し元が違えば別の箱にする。** これは「どの経路で呼ばれたか」を残すための性質ですが、あちこちから呼ばれる小さな関数（文字列の変換、ハッシュ、ロック、メモリ確保）がホットスポットのときは、それを細切れにして隠してしまいます。
+
+<Callout type="tip" title="total を数えるとき、再帰は 1 回と数える">
+  `by_function` で `set(stack)` を取っているのは、再帰のためです。`f → f → f` というスタックで `f` の total を 3 回足すと、total が 100% を超えてしまいます。
+  pprof もボトムアップの total を「その関数を含む標本の数」として数えます。
+  一方、フレームグラフでは `f` の箱が 3 段に積み重なり、それぞれが別の箱として幅を持ちます。
+</Callout>
+
+## 実測：Go のプログラムをプロファイルする
+
+ここまでの話を、実際のプロファイラで確かめます。次のプログラムは、`handle` が `parseJSON`、`render`、`logLine` を順に呼び、`escapeHTML` が `template` と `logLine` の 2 か所から呼ばれる形です。中身は乗算と加算のループで CPU を使うだけです。
+
+```go
+// 呼び出し元に展開される小さな関数。pprof では (inline) として現れる
+func step(x uint64) uint64 { return x*6364136223846793005 + 1442695040888963407 }
+
+//go:noinline
+func parseJSON() { /* step を 200 万回 */ }
+
+//go:noinline
+func escapeHTML(n int) { /* 乗算と加算を n 回 */ }
+
+//go:noinline
+func template() {
+	/* 乗算と加算を 50 万回 */
+	escapeHTML(2_500_000)
+}
+
+//go:noinline
+func render() { template() }
+
+//go:noinline
+func logLine() { escapeHTML(2_000_000) }
+
+//go:noinline
+func handle() {
+	parseJSON()
+	render()
+	logLine()
+}
+```
+
+`main` は `pprof.StartCPUProfile` を呼んでから `handle` を 10 秒間繰り返します。環境は Apple M1 Pro / macOS 26.2、Go 1.24.6 です。
+
+### -top：ボトムアップの表
+
+```text
+$ go tool pprof -top prof cpu.pprof
+Duration: 10.33s, Total samples = 8150ms (78.92%)
+      flat  flat%   sum%        cum   cum%
+    4790ms 58.77% 58.77%     4970ms 60.98%  main.escapeHTML
+    1850ms 22.70% 81.47%     2500ms 30.67%  main.parseJSON
+     640ms  7.85% 89.33%     3410ms 41.84%  main.template
+     560ms  6.87% 96.20%      600ms  7.36%  main.step (inline)
+     270ms  3.31% 99.51%      270ms  3.31%  runtime.asyncPreempt
+         0     0% 99.51%     8110ms 99.51%  main.handle
+         0     0% 99.51%     2200ms 26.99%  main.logLine
+         0     0% 99.51%     8120ms 99.63%  main.main
+         0     0% 99.51%     3410ms 41.84%  main.render
+```
+
+flat の大きい順に並び、先頭は `escapeHTML` の 59% です。`render` と `handle` は flat が 0 で、cum だけを持っています。自分では何も計算せず、呼び出すだけの関数だからです。
+
+`main.step (inline)` は、`step` が `parseJSON` の中に展開（インライン化）されたことを示しています。展開された関数は機械語の上では独立した関数として存在しませんが、Go のコンパイラはどの命令がどの関数から来たかを記録しているので、pprof は別の行として出せます。`parseJSON` の cum 2500ms には、この `step` の 600ms が含まれています。
+
+1 行目の `Total samples = 8150ms (78.92%)` にも注意してください。プロファイルを取った 10.33 秒のうち、標本が表しているのは 8.15 秒ぶんだけです。SIGPROF のタイマーは**このプロセスが CPU を使った時間**で進むので、CPU を使えていなかった時間は標本になりません。この実測は、ほかの重い処理が同時に走っていてロードアベレージが 80 を超えている状態で取ったので、実行可能なのに CPU が回ってこない時間がかなりありました。同じプログラムを Linux のコンテナ（OrbStack の仮想マシン、カーネル 7.0.14）で動かしたときは 92.93% でした。**CPU プロファイルは CPU 時間の内訳であって、経過時間の内訳ではありません。**
+
+### -peek：呼び出し元の内訳
+
+ボトムアップで見つけた関数を、誰が呼んでいるのかを見ます。
+
+```text
+$ go tool pprof -peek 'main.escapeHTML$' prof cpu.pprof
+      flat  flat%   sum%        cum   cum%   calls calls% + context
+----------------------------------------------------------+-------------
+                                             2.77s 55.73% |   main.template
+                                             2.20s 44.27% |   main.logLine
+     4.79s 58.77% 58.77%      4.97s 60.98%                | main.escapeHTML
+                                             0.18s  3.62% |   runtime.asyncPreempt
+```
+
+区切り線の上が呼び出し元、下が呼び出し先です。`escapeHTML` の時間の 56% は `template` から、44% は `logLine` から来ています。ログの出力でも HTML のエスケープをしていて、それが全体の 4 分の 1 を占めている、というのがこの表から読める事実です。
+
+### フレームグラフ：Linux の perf で取る
+
+同じプログラムを Linux のコンテナ（`golang:1.24-bookworm` に `linux-perf` 6.1.190 を入れたもの）で `perf record -F 99 -g` にかけ、FlameGraph のスクリプトで SVG にしました。
+
+```bash
+perf record -F 99 -g -o perf.data ./proflinux -n 600 -o /dev/null
+perf script -i perf.data | stackcollapse-perf.pl > perf.folded
+flamegraph.pl perf.folded > perf.svg
+```
+
+`stackcollapse-perf.pl` が出す中間形式は、1 行が「根から葉までの関数名を `;` でつないだもの」と「その経路の重み」です。これがシミュレーターの「サンプル列」を経路ごとに数えたものにあたります。
+
+```text
+proflinux;runtime.goexit.abi0;runtime.main;main.main;main.handle;main.render;main.template;main.escapeHTML 2676767650
+proflinux;runtime.goexit.abi0;runtime.main;main.main;main.handle;main.parseJSON 2111111090
+proflinux;runtime.goexit.abi0;runtime.main;main.main;main.handle;main.logLine;main.escapeHTML 2010100990
+proflinux;runtime.goexit.abi0;runtime.main;main.main;main.handle;main.render;main.render;main.template 636363630
+```
+
+（重みは標本 1 件あたりの CPU 時間をナノ秒で足したもの。長い経路は一部省略）
+
+この形式には**時刻がありません**。経路ごとに足し合わせた時点で、いつ起きたかは捨てられています。だからこの中間形式からはフレームグラフは作れても、フレームチャートは作れません。
+
+SVG の箱を拾うと、次のようになりました。
+
+| 箱 | 幅 |
+| --- | --- |
+| `main.render`（`handle` の上） | 43.39% |
+| `main.parseJSON` | 28.50% |
+| `main.logLine` | 26.94% |
+| `main.escapeHTML`（`template` の上） | 34.84% |
+| `main.escapeHTML`（`logLine` の上） | 26.94% |
+| `main.render`（`render` の上） | 8.42% |
+
+最も幅の広い 1 つの箱は `render` で、`escapeHTML` は 35% と 27% の 2 つに割れています。足せば 62% で全体の最大ですが、絵を見ただけではそうは見えません。シミュレーターで見たことが、実際の道具でもそのまま起きています。`perf report --no-children` は関数ごとに集め直すので、`escapeHTML` を 60.10% として先頭に出し、その下に呼び出し元の内訳（`template` 経由 34.33%、`logLine` 経由 25.78%）を出しました。
+
+<Callout type="note" title="ホットスポットの探し方">
+  1. **ボトムアップ（`-top`、`perf report --no-children`）で self の大きい関数を探す。** あちこちから呼ばれる関数も 1 行にまとまる。
+  2. **その関数の呼び出し元をたどる（`-peek`、フレームグラフの検索）。** 直すべきは関数の中身か、呼ぶ回数か、呼ぶ経路か。
+  3. **フレームグラフで、total が大きいのに self が小さい塔を見る。** 自分は何もせず、重い子を抱えている関数で、設計の単位でどこが重いかが分かる。
+
+  self が大きい関数を直すのは「その処理を速くする」こと、total が大きい関数を直すのは「その処理を呼ばない」ことに対応します。後者の方が効くことがよくあります。
+</Callout>
+
+## 表示が嘘をつく場面
+
+プロファイルは、スタックが正しく記録できている限りにおいて正しいものです。同じ実測の中に、それが崩れた例が 2 つ写っていました。
+
+### 存在しない経路が混じる
+
+上の表の最後の行、`render` の上にさらに `render` が載った箱（8.42%）は、プログラムに存在しない経路です。`render` は自分を呼びません。この 8% の標本を `perf script` で確かめると、どれも `template` が自分のループを回している最中（`template+0x28` から `+0x60` の範囲）に取られたものでした。
+
+スタックをたどる処理は、各関数がスタックに残した「戻り先」の記録（第 31 回で見たフレームポインタの連鎖など）を読んで呼び出し元を復元します。サンプルを取った瞬間の命令の位置によっては、この復元が 1 段ずれたり、重複したり、途中で切れたりします。原因は環境ごとに違いますが、**フレームグラフに見覚えのない経路があったら、まずスタックの取り方を疑う**のが安全です。今回なら、`render;render;template` を `render;template` と読み替えれば、`template` の self は 8% で、pprof の 7.85% と一致します。
+
+### 展開された関数が別の場所に付く
+
+Go の CPU プロファイル（pprof 形式）を `go tool pprof -raw` で生の形式にし、FlameGraph に付属する `stackcollapse-go.pl` で中間形式に変換すると、次の行が出ました。
+
+```text
+runtime.main;main.main;main.handle;main.step 56
+```
+
+`step` が `handle` から直接呼ばれたことになり、間にいたはずの `parseJSON` が消えています。生の形式を見ると、`step` の命令の記録には「`main.step` main.go:14」と「`main.parseJSON` main.go:20」の 2 行が付いていました。1 つの機械語の位置に、展開された `step` と展開先の `parseJSON` の両方が対応しているのです。変換スクリプトは 1 行目だけを読むので、`parseJSON` を落としました。pprof 自身の表示（`-top` や Web 画面）は 2 行とも読むので正しく出ます。
+
+インライン化は、最適化されたプログラムではあらゆる場所で起きています。**変換を挟むたびに、展開の情報が落ちていないか**を確かめる必要があります。逆に、展開の情報を持たない道具では、展開された関数の時間は展開先の関数の self として数えられます。Linux の perf の表示で `parseJSON` が 27.07% と、pprof の flat（22.70%）より大きく出たのは、`step` のぶんが含まれているためです。
+
+### スタックが途中で切れる
+
+第 224 回で触れたとおり、フレームポインタを省略したプログラムでは、スタックをたどる連鎖が途中で切れます。切れた標本は根から始まらない短い塔になり、フレームグラフの端に「`[unknown]`」のような箱として並びます。本来は深い経路の一部だった時間が、根の近くに浮いて見えるわけです。
+
+フレームポインタを持たせるか、DWARF の情報を使ってたどるか（`perf record --call-graph dwarf`）で対処します。Ubuntu は 24.04 LTS から、ほぼすべてのパッケージをフレームポインタ付きで作り直す方針を取りました（[Ubuntu: Performance engineering with frame pointers by default](https://ubuntu.com/blog/ubuntu-performance-engineering-with-frame-pointers-by-default)）。経緯は第 201 回で扱いました。
+
+## on-CPU と off-CPU
+
+ここまでのプロファイルはすべて **on-CPU**、つまり CPU を使っていた時間の内訳です。CPU を使わずに待っている時間は写りません。
+
+`handle` の中に 10 ms の `time.Sleep`（データベースの応答待ちのつもり）を足して、同じ 300 回を回しました。
+
+| | 経過時間 | CPU プロファイルの標本 |
+| --- | --- | --- |
+| 待ちなし | 6.66 秒 | 2.60 秒 |
+| 1 回 10 ms の待ちあり | 11.24 秒 | 2.78 秒 |
+
+経過時間は 4.6 秒延びたのに、標本の量はほとんど変わらず、待ちの時間を表す関数も出てきません。利用者から見て「遅くなった」原因が CPU プロファイルには一切写らない、ということです。
+
+待ちの時間を見るのが **off-CPU 分析**です。Gregg は「Off-CPU analysis is a performance methodology where off-CPU time is measured and studied, along with context such as stack traces.」と定義し、「It differs from CPU profiling, which only examines threads if they are executing on-CPU.」と対比しています（[Brendan Gregg: Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html)）。スレッドが眠りに入るときと起きるときのスタックと時刻を記録し、眠っていた時間で重み付けして同じようにフレームグラフにします。第 221 回の eBPF でスケジューラの切り替えを捕まえる方法が代表的です。Go なら、待っているゴルーチンのスタックを集める `goroutine` や、ブロックした時間を数える `block`・`mutex` のプロファイルが、それに近い役割を持ちます。
+
+**応答が遅いのに CPU 使用率が低いなら、CPU プロファイルを取っても答えは出ません。**
+
+## 2 つのプロファイルを比べる
+
+変更の効果や、性能が落ちた原因を探すときは、2 つのプロファイルの差を取ります。pprof の `-diff_base` は、片方からもう片方を引いた差を表示します。pprof の文書は「When using the -diff_base option, some report entries may have negative values.」と注意しています。Gregg も、差分をフレームグラフの色で表す差分フレームグラフを作っています。
+
+差を取る前に、**2 つのプロファイルが同じ量の仕事を表しているか**を確かめる必要があります。`escapeHTML` の仕事を半分にした版を作り、まず元の版と同じく「10 秒間回す」で比べました。
+
+```text
+$ go tool pprof -top -diff_base cpu.pprof prof2 cpu2.pprof
+      flat  flat%   sum%        cum   cum%
+     1.04s 12.76% 12.76%      1.37s 16.81%  main.parseJSON
+    -0.72s  8.83%  3.93%     -0.81s  9.94%  main.escapeHTML
+     0.43s  5.28%  9.20%     -0.07s  0.86%  main.template
+```
+
+`escapeHTML` が 0.72 秒減った一方で、何も変えていない `parseJSON` が 1.04 秒増えています。10 秒という時間を固定したので、速くなったぶん `handle` が多く回り、そのぶん `parseJSON` も多く呼ばれたのです。この表を「`parseJSON` が遅くなった」と読むと間違えます。
+
+次に、どちらも `handle` を 3000 回だけ回すようにして比べ直しました。
+
+```text
+$ go tool pprof -top -diff_base a.pprof prof2 b.pprof
+      flat  flat%   sum%        cum   cum%
+    -7.55s 29.79% 29.79%     -7.87s 31.06%  main.escapeHTML
+    -0.30s  1.18% 30.98%     -0.30s  1.18%  runtime.asyncPreempt
+     0.24s  0.95% 30.03%      0.27s  1.07%  main.parseJSON
+```
+
+今度は `escapeHTML` だけが大きく減り、`parseJSON` の差は標本のゆらぎの範囲に収まりました。本番のプロファイルのように仕事の量を揃えられない場合は、`-normalize`（比べる側の標本の合計を、基準の側の合計に揃えてから引く）を使うか、リクエスト 1 件あたりの値に直してから比べます。
+
+## 言語ごとの道具
+
+表示の考え方はどの道具でも共通で、違うのは標本の取り方です。
+
+| 対象 | 代表的な道具 | 標本の取り方 |
+| --- | --- | --- |
+| C、C++、Rust、Linux 全体 | `perf` + FlameGraph | カーネルのタイマーやハードウェアの計数器で割り込み、カーネルがスタックをたどる |
+| Go | `runtime/pprof`、`go tool pprof` | SIGPROF でランタイムが自分のスタックを記録する |
+| Python | `py-spy`、`profiling.sampling` | 別のプロセスから対象のメモリを読み、インタプリタのスタックを復元する |
+| Java などの JVM | async-profiler | perf のイベントと JVM の内部の API を組み合わせ、JIT された関数の名前も出す |
+| ブラウザの JavaScript | Chrome の Performance パネル | エンジンが内蔵する計測。第 120 回で扱う |
+
+インタプリタや JIT の言語では、OS から見たスタックはインタプリタ自身の関数（`_PyEval_EvalFrameDefault` の繰り返しなど）にしかなりません。言語の関数名で見たいなら、その言語のスタックを理解する道具を選びます。pprof の形式や FlameGraph の中間形式に変換できる道具が多いので、表示は共通の道具に寄せられます。
+
+## この章を終えて
+
+第 29 章では、本番で動いているものを止めずに外から見る方法と、手元で測る道具と、その出力の読み方を見てきました。観測の目的は性能や障害だけではありません。守りの仕組みが**今も効いているか**を確かめるのも、同じ「動いているものを見る」仕事です。
+
+次の第 30 章「守りが効き続けているか」では、ここまでの章で個別に見てきた守り（権限の絞り方、暗号と鍵、TLS、認証と認可、ブラウザの境界）を、設計の段階でどう洗い出し、どの基準に沿って作り、動かしている間もずれていないことを機械でどう確かめ続け、最後にどう証跡として残すのかを見ます。
+
+## まとめ
+
+- CPU プロファイラが持っているのは、一定間隔で覗いたスタックの束だけ。表示はすべてその集計の仕方の違い
+- サンプリングは負荷が小さいが相対的な目安で、標本の数だけ精度が上がる。計装は回数まで正確だが、計測が対象を遅くする
+- フレームグラフは名前順に並べて同じ経路を併合したもの。横軸は時刻ではなく、幅が total、上端が self、色に意味はない
+- フレームチャートは時刻順に並べたもの。順序を問うときに使う。経路ごとに足し合わせた中間形式からは作れない
+- コールツリーはフレームグラフと同じ木を表にしたもの。ボトムアップは関数ごとに集め直したもので、あちこちから呼ばれるホットスポットはここで見つかる
+- 存在しない経路、展開された関数の付け替え、途中で切れたスタックは、スタックのたどり方の限界から来る。見覚えのない形はまず取り方を疑う
+- CPU プロファイルは CPU 時間の内訳。待ち時間は off-CPU 分析で見る
+- 差分を取るときは、2 つのプロファイルが同じ量の仕事を表しているかを先に確かめる

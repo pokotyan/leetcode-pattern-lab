@@ -1,0 +1,542 @@
+---
+title: 文字列の比べ方：文字セットと照合順序
+description: インデックスはキーを比べて並べる。では「はは」と「ぱぱ」は同じ文字列なのか。文字をバイトにする規則と、文字列どうしを比べる規則が別にあること、そしてその比べ方が一意制約やインデックスの並び、結合にまで効く理由
+chapter: db
+order: 3
+status: published
+topics:
+  - 文字セット
+  - 照合順序（collation）
+  - utf8mb3 / utf8mb4
+  - Unicode Collation Algorithm
+  - utf8mb4_0900_ai_ci
+  - PAD SPACE / NO PAD
+  - Illegal mix of collations
+  - ICU / libc / builtin
+  - 非決定的照合順序
+  - glibc 2.28
+  - インデックスキー長の上限
+requires:
+  - ll-05-text
+  - ll-97-db-index
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 「同じ」かどうかを誰が決めるのか
+
+前回、B+tree の葉にはキーが **小さい順に** 並んでいると書きました。検索も、一意制約の検査も、範囲の読み出しも、「このキーはあのキーより小さいか、等しいか、大きいか」という比較の上に成り立っています。
+
+整数なら比較に迷いはありません。では文字列はどうでしょうか。
+
+- `'abc'` と `'ABC'` は同じか
+- `'はは'` と `'ぱぱ'` は同じか
+- `'ABC'` と全角の `'ＡＢＣ'` は同じか
+- `'a'` と、末尾に空白の付いた `'a '` は同じか
+
+どれも、答えは **設定次第** です。そして、その設定が変わると、昨日まで入っていた 2 行が今日は「重複」になり、インデックスの並びが今の比較規則と食い違います。
+
+この回では、データベースが文字列を比べるときに使う 2 つの規則を分けて見ていきます。
+
+| 規則 | 決めること | 例 |
+| --- | --- | --- |
+| **文字セット**（符号化） | 文字をどのバイト列で表すか | `utf8mb4`、`UTF8` |
+| **照合順序**（collation） | 2 つの文字列のどちらが先か、等しいか | `utf8mb4_0900_ai_ci`、`ja-x-icu` |
+
+第 5 回で見たのは前者、文字と数の対応表の話でした。この回の主役は後者です。
+
+## 文字セット：MySQL の utf8 は 3 バイトまで
+
+第 5 回で見たとおり、UTF-8 は 1 文字を 1〜4 バイトで表します。4 バイトになるのは、U+10000 以降の **補助面** の文字で、絵文字の多くや一部の漢字（「𠮷」など）がここに入ります。
+
+MySQL には UTF-8 を名乗る文字セットが 2 つあります。
+
+| 名前 | 1 文字の最大バイト数 | 補助面の文字 |
+| --- | --- | --- |
+| `utf8mb3` | 3 | 入らない |
+| `utf8mb4` | 4 | 入る |
+
+古くから使われてきた `utf8` という名前は **`utf8mb3` の別名** です。MySQL 8.4 のリファレンスは、`utf8mb3` を「BMP の文字のみ（補助文字は扱えない）」とし、非推奨で、新しいアプリケーションは `utf8mb4` を使うべきだと書いています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/charset-unicode-utf8mb3.html)）。
+
+手元の MySQL 8.4.13（`mysql:8.4` イメージ）で、`utf8` を指定した表に絵文字を入れてみます。
+
+```sql
+CREATE TABLE e (s VARCHAR(10) CHARACTER SET utf8);
+-- Warning 3719: 'utf8' is currently an alias for the character set UTF8MB3,
+--   but will be an alias for UTF8MB4 in a future release. ...
+SHOW CREATE TABLE e;
+--   `s` varchar(10) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci DEFAULT NULL
+
+INSERT INTO e VALUES ('寿司🍣');
+-- ERROR 1366 (HY000): Incorrect string value: '\xF0\x9F\x8D\xA3' for column 's' at row 1
+```
+
+`F0 9F 8D A3` は 🍣（U+1F363）の UTF-8 表現で、先頭の `F0` は第 5 回で見た「4 バイト文字の始まり」の印です。3 バイトまでしか持てない列には入りません。
+
+厳格モード（`sql_mode` の `STRICT_TRANS_TABLES`、8.4 の既定で有効）を外すと、エラーにならずに **黙って化けます**。
+
+```sql
+SET sql_mode = '';
+INSERT INTO e VALUES ('寿司🍣');      -- Warning 1366
+SELECT s, HEX(s) FROM e;
+--  寿司? | E5AFBFE58FB83F           -- 最後の 3F は '?'
+```
+
+<Callout type="warn" title="8.0 で既定が変わっている">
+  MySQL 8.0.1 で、サーバの既定の文字セットは `latin1` から `utf8mb4` に、既定の照合順序は `latin1_swedish_ci` から `utf8mb4_0900_ai_ci` に変わりました
+  （[MySQL 8.0.1 リリースノート](https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-1.html)）。
+  5.7 以前から引き継いだデータベースでは、表や列ごとに `utf8mb3` や `utf8mb4_general_ci` が残っていることがよくあります。
+  **新しく作った表と古い表で、文字セットも照合順序も違う** という状態が、後で見る結合の問題につながります。
+</Callout>
+
+文字セットだけを `utf8mb4` に揃えても、比べ方は決まりません。ここからが照合順序の話です。
+
+## 照合順序：重みを並べて比べる
+
+### 文字に「重み」を付ける
+
+バイト列をそのまま比べる、という方法がいちばん単純です。これを **バイナリ照合** と呼びます。ただし、それだと `'B'`（0x42）が `'a'`（0x61）より前に来て、`'á'`（0xC3 0xA1）は `'b'` より後ろに行きます。辞書の並びとは違います。
+
+そこで、文字ごとに **比較用の重み** を決め、重みの列どうしを比べます。Unicode はこの重みの付け方を **Unicode Collation Algorithm**（UCA、UTS #10）として標準化しています。UCA の要点は、**重みを 1 つではなく何段かに分ける** ことです（[UTS #10](https://www.unicode.org/reports/tr10/)）。
+
+| 段 | 何を区別するか | UTS #10 の例 |
+| --- | --- | --- |
+| 1 段目（L1） | 基本の文字 | role &lt; roles &lt; rule |
+| 2 段目（L2） | アクセント | role &lt; rôle &lt; roles |
+| 3 段目（L3） | 大文字・小文字、字形の違い | role &lt; Role &lt; rôle |
+
+比べるときは、まず全体を 1 段目の重みだけで比べます。そこで差が付かなければ 2 段目、それでも同じなら 3 段目を見ます。辞書で「role」「Role」「rôle」が隣り合うのはこのためです。
+
+日本語のかなでは、濁点・半濁点は 2 段目、ひらがなとカタカナ、全角と半角の違いは 3 段目以降に置かれます。MySQL の `WEIGHT_STRING()` で、実際の重みを取り出してみます（`utf8mb4_0900_as_cs`、3 段すべてを使う照合順序）。
+
+```
+ 'はは'  3D74 3D74 | 0000 | 0020 0020           | 0000 | 000E 000E
+ 'ぱぱ'  3D74 3D74 | 0000 | 0020 0038 0020 0038 | 0000 | 000E 0002 000E 0002
+          ─────────         ───────────────────          ───────────────────
+           1 段目              2 段目（半濁点）              3 段目
+
+ 'a'     1C47 | 0000 | 0020      | 0000 | 0002
+ 'A'     1C47 | 0000 | 0020      | 0000 | 0008       ← 大文字は 3 段目だけが違う
+ 'á'     1C47 | 0000 | 0020 0024 | 0000 | 0002 0002  ← アクセントは 2 段目に足される
+```
+
+`0000` は段の区切りです（UTS #10 も区切りに 0 を使うと定めています）。「はは」と「ぱぱ」は 1 段目がまったく同じ `3D74 3D74` で、半濁点の分だけ 2 段目が違います。
+
+### 何段目まで見るかが、照合順序の名前に出る
+
+この重みの列を **何段目まで比べるか** で、等しいかどうかが変わります。MySQL の照合順序名の接尾辞は、それを表しています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/charset-collation-names.html)）。
+
+| 接尾辞 | 意味 | 何段目まで見るか（0900 系） |
+| --- | --- | --- |
+| `_ai_ci` | アクセントも大小文字も区別しない | 1 段目だけ |
+| `_as_ci` | アクセントは区別し、大小文字は区別しない | 2 段目まで |
+| `_as_cs` | どちらも区別する | 3 段目まで |
+| `_ks` | かな（ひらがな・カタカナ）も区別する | 4 段目まで |
+| `_bin` | 重みではなく、コードポイントやバイトで比べる | ― |
+
+`utf8mb4_0900_ai_ci` の `0900` は、UCA 9.0.0 の重みを使うという意味です。名前に版の無い `utf8mb4_unicode_ci` は UCA 4.0.0 です（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/charset-unicode-sets.html)）。`_ai_ci` で `WEIGHT_STRING()` を取ると、1 段目しか出てきません。
+
+```sql
+SELECT HEX(WEIGHT_STRING('はは' COLLATE utf8mb4_0900_ai_ci)),
+       HEX(WEIGHT_STRING('ぱぱ' COLLATE utf8mb4_0900_ai_ci));
+--  3D743D74 | 3D743D74
+```
+
+重みが同じなので、この照合順序では「はは」と「ぱぱ」は **等しい** 文字列です。
+
+### utf8mb4_general_ci は UCA ではない
+
+もう 1 つ、古くから使われている `utf8mb4_general_ci` があります。これは UCA に基づかない旧来の照合順序で、**1 文字に 1 つの重みを対応させるだけ** です。1 文字を 2 文字ぶんとして扱う展開（ドイツ語の `ß` = `ss` など）もできません（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/charset-unicode-sets.html)）。
+
+同じリファレンスは、general 系の照合順序と UCA 4.0.0 の照合順序では、**補助面の文字はすべて U+FFFD（置換文字）の重みになる** と書いています。つまり、絵文字はどれも互いに等しくなります。
+
+```sql
+SELECT HEX(WEIGHT_STRING('a'  COLLATE utf8mb4_general_ci)),   -- 0041
+       HEX(WEIGHT_STRING('🍣' COLLATE utf8mb4_general_ci)),   -- FFFD
+       HEX(WEIGHT_STRING('🍣' COLLATE utf8mb4_0900_ai_ci)),   -- 130C
+       HEX(WEIGHT_STRING('🍺' COLLATE utf8mb4_0900_ai_ci));   -- 1323
+```
+
+## 手元で比べる：何が等しいか
+
+MySQL 8.4.13 で、文字列の組を照合順序ごとに `=` で比べました。`1` が等しい、`0` が異なるです。
+
+| 比べる組 | `0900_ai_ci` | `general_ci` | `unicode_ci` | `0900_as_ci` | `0900_as_cs` | `bin` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `'はは'` と `'ぱぱ'` | **1** | 0 | **1** | 0 | 0 | 0 |
+| `'abc'` と `'ABC'` | 1 | 1 | ― | 1 | 0 | 0 |
+| `'cafe'` と `'café'` | 1 | 1 | ― | 0 | ― | ― |
+| `'ABC'` と `'ＡＢＣ'`（全角） | **1** | 0 | 1 | 1 | 0 | 0 |
+| `'ハハ'` と `'はは'` | **1** | 0 | ― | ― | ― | ― |
+| `'ｱ'`（半角）と `'ア'` | **1** | 0 | ― | ― | ― | ― |
+| `'🍣'` と `'🍺'` | 0 | **1** | **1** | ― | ― | 0 |
+
+（― は試していない組です。`bin` は `utf8mb4_bin`）
+
+8.0 以降の既定である `utf8mb4_0900_ai_ci` は、**濁点・半濁点、ひらがなとカタカナ、全角と半角をすべて同一視** します。一方、以前よく使われた `utf8mb4_general_ci` は、それらを区別する代わりに、**絵文字をすべて同一視** します。どちらも `_ci` ですが、等しいと判定する範囲がまったく違います。
+
+日本語の文を扱うなら、MySQL には日本語用の照合順序もあります。`utf8mb4_ja_0900_as_cs` はひらがなとカタカナを同一視し、`utf8mb4_ja_0900_as_cs_ks` は区別します（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/charset-unicode-sets.html)）。手元でも、`'ハハ' = 'はは'` は前者で `1`、後者で `0` でした。
+
+### 末尾の空白：PAD SPACE と NO PAD
+
+もう 1 つ、見落としやすい違いが **末尾の空白** です。
+
+```sql
+SELECT 'a' = 'a ' COLLATE utf8mb4_0900_ai_ci,   -- 0
+       'a' = 'a ' COLLATE utf8mb4_general_ci,   -- 1
+       'a' = 'a ' COLLATE utf8mb4_bin;          -- 1
+```
+
+`utf8mb4_general_ci` や `utf8mb4_bin` は、短いほうの末尾を空白で埋めてから比べます。これを **PAD SPACE** と呼びます。UCA 9.0.0 以降の照合順序は **NO PAD** で、末尾の空白もほかの文字と同じに扱います（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/charset-unicode-sets.html)）。どちらなのかは `information_schema.COLLATIONS` の `PAD_ATTRIBUTE` 列で確かめられます。
+
+| 照合順序 | PAD_ATTRIBUTE |
+| --- | --- |
+| `utf8mb4_0900_ai_ci` | NO PAD |
+| `utf8mb4_0900_bin` | NO PAD |
+| `utf8mb4_ja_0900_as_cs` | NO PAD |
+| `utf8mb4_general_ci` | PAD SPACE |
+| `utf8mb4_unicode_ci` | PAD SPACE |
+| `utf8mb4_bin` | PAD SPACE |
+
+名前に `bin` が付いていても、`utf8mb4_bin` と `utf8mb4_0900_bin` では末尾の空白の扱いが違います。
+
+## 照合順序は、インデックスの形そのもの
+
+ここまでは `SELECT` で比べただけでした。照合順序が本当に効くのは、それが **B+tree の並びを決めている** からです。インデックスに入るキーの順序、一意制約での「同じキー」、`GROUP BY` でまとめる単位、結合での一致。すべて同じ比較関数で決まります。
+
+### 一意制約が通るかどうか
+
+同じ 2 行を、照合順序だけを変えた 3 つの表に入れました。
+
+```sql
+CREATE TABLE u_gen (name VARCHAR(20) COLLATE utf8mb4_general_ci, UNIQUE KEY (name));
+CREATE TABLE u_ai  (name VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, UNIQUE KEY (name));
+CREATE TABLE u_bin (name VARCHAR(20) COLLATE utf8mb4_0900_bin,   UNIQUE KEY (name));
+```
+
+| 挿入する 2 行 | `u_gen` | `u_ai` | `u_bin` |
+| --- | --- | --- | --- |
+| `'はは'`、`'ぱぱ'` | 両方入る | **2 行目が ERROR 1062** | 両方入る |
+| `'🍣'`、`'🍺'` | **2 行目が ERROR 1062** | 両方入る | ― |
+| `'Tokyo'`、`'tokyo'` | ― | ― | 両方入る |
+
+```
+ERROR 1062 (23000): Duplicate entry 'ぱぱ' for key 'u_ai.name'
+ERROR 1062 (23000): Duplicate entry '?' for key 'u_gen.name'
+```
+
+既定の照合順序のままユーザー名を一意にすると、「はは」さんがいる限り「ぱぱ」さんは登録できません。
+
+### 照合順序を変えると duplicate entry が出る
+
+この性質は、照合順序を **後から変える** ときに表に出ます。`utf8mb4_general_ci` で運用してきた表を、既定の `utf8mb4_0900_ai_ci` に揃えようとした場合です。
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY,
+                    name VARCHAR(50) COLLATE utf8mb4_general_ci,
+                    UNIQUE KEY uk_name (name));
+INSERT INTO users VALUES (1,'はは'), (2,'ぱぱ'), (3,'ばば');
+
+ALTER TABLE users MODIFY name VARCHAR(50) COLLATE utf8mb4_0900_ai_ci;
+-- ERROR 1062 (23000): Duplicate entry 'ぱぱ' for key 'users.uk_name'
+```
+
+古い照合順序では別々だった 3 行が、新しい照合順序では同じキーになります。インデックスを新しい比較規則で作り直す途中で、一意制約に引っかかったのです。変更の前に、新しい照合順序で重複するものを数えておけば、事前に分かります。
+
+```sql
+SELECT name COLLATE utf8mb4_0900_ai_ci AS k, COUNT(*)
+FROM users GROUP BY k HAVING COUNT(*) > 1;
+--  はは | 3
+```
+
+### 並び順と GROUP BY
+
+同じ 14 個の文字列を、照合順序ごとに並べました。MySQL 8.4.13 の `GROUP_CONCAT(... ORDER BY s COLLATE ...)` の出力です。
+
+```
+ utf8mb4_bin        10 9 A B _x a b á はは ばば ぱぱ ハハ Ｂ ﾊﾊ
+ utf8mb4_general_ci 10 9 á A a B b _x はは ばば ぱぱ ハハ Ｂ ﾊﾊ
+ utf8mb4_0900_ai_ci _x 10 9 á A a Ｂ B b ﾊﾊ ハハ ばば ぱぱ はは
+ utf8mb4_0900_as_cs _x 10 9 a A á b B Ｂ はは ハハ ﾊﾊ ばば ぱぱ
+```
+
+- `bin` はコードポイント順です。大文字がすべて小文字より前、全角の `Ｂ`（U+FF22）はかなより後ろに行きます
+- `0900_as_cs` は辞書らしい並びです。`a` の仲間がまとまり、その中を 2 段目、3 段目の順で並べています
+- `0900_ai_ci` では、`á A a` や `ﾊﾊ ハハ ばば ぱぱ はは` は **すべて等しい** ので、その中の順番は決まっていません。ここに見えている順は、たまたまの順です
+- どれも `'10'` が `'9'` より前です。文字列は数として比べません
+
+`GROUP BY` も同じ比較でまとめます。`0900_ai_ci` で `GROUP BY` すると、`はは ぱぱ ばば ハハ ﾊﾊ` の 5 つが **1 つのグループ** になり、`general_ci` では 5 つのグループに分かれました。集計の件数そのものが、照合順序で変わります。
+
+<Callout type="tip" title="比べ方を変えたいなら、列ごとに決める">
+  照合順序は、サーバ、データベース、表、列、式の順に細かく指定できます。
+  メールアドレスやコードのような「完全一致で比べたい」列は `utf8mb4_0900_bin` に、
+  人の名前のような「表記ゆれを吸収したい」列は `_ai_ci` に、と **列の意味で選ぶ** のが基本です。
+  ただし、`WHERE` で `COLLATE` を付けて比べ方を変えると、次に見るとおりインデックスが使えなくなります。
+</Callout>
+
+### 結合の両側で照合順序が違うと
+
+結合の代表的なやり方の 1 つは、片方の表の値をもう片方のインデックスで引くことです（結合のやり方は第 102 回でまとめて見ます）。引く側のインデックスは、**その列の照合順序で並んでいる** ので、違う比較規則の値ではたどれません。
+
+MySQL は式ごとに、どちらの照合順序を使うかを **強制度**（coercibility）で決めます。明示的な `COLLATE` は 0、列は 2 です。同じ強制度で照合順序が違い、どちらも Unicode なら **エラー** になります（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/charset-collation-coercibility.html)）。
+
+1,000 行ずつの表を 3 つ作りました。`a.code` は `utf8mb4_0900_ai_ci` の主キー、`b.code` は `utf8mb4_general_ci`、`c.code` は `utf8mb3_general_ci` で、それぞれにインデックスがあります。
+
+```sql
+SELECT COUNT(*) FROM a JOIN b ON a.code = b.code;
+-- ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_0900_ai_ci,IMPLICIT)
+--   and (utf8mb4_general_ci,IMPLICIT) for operation '='
+```
+
+どちらも `utf8mb4` ですが、照合順序が違うので比べられません。どちらの規則で比べるべきかを、データベースは決められないのです。
+
+`utf8mb3` と `utf8mb4` の組ではエラーになりません。`utf8mb3` の側が `utf8mb4` に変換されて比べられます。その結果、インデックスが使えるかどうかが **結合の向きで変わります**。
+
+```
+-- a から c を引く（c.code のインデックスで引きたい）
+-> Inner hash join (c.`code` = a.`code`)
+    -> Covering index scan on c using code      ← c を全部読む
+    -> Hash
+        -> Covering index scan on a using PRIMARY
+
+-- c から a を引く
+-> Nested loop inner join
+    -> Covering index scan on c using code
+    -> Single-row covering index lookup on a using PRIMARY (code=c.`code`)
+```
+
+`a` から `c` を引こうとしても、`c` のインデックスは `utf8mb3_general_ci` で並んでいるので、`utf8mb4` の値ではたどれません。MySQL は `c` を全部読んでハッシュ結合に切り替えました。逆向きなら、`c` の値を `utf8mb4` に変換したうえで `a` の主キーを 1 行ずつ引けます。照合順序を揃えた表（`c4`、`utf8mb4_0900_ai_ci`）なら、`a` から引いても `Covering index lookup on c4 using code` になります。
+
+（`STRAIGHT_JOIN` で結合の向きを固定し、`EXPLAIN FORMAT=TREE` の出力からコストの表示などを省いて抜粋しています）
+
+同じことは `WHERE` に `COLLATE` を付けたときにも起きます。
+
+```
+EXPLAIN FORMAT=TREE SELECT * FROM b WHERE code = 'c5';
+-> Covering index lookup on b using code (code='c5')
+
+EXPLAIN FORMAT=TREE SELECT * FROM b WHERE code = 'c5' COLLATE utf8mb4_0900_ai_ci;
+-> Filter: (b.`code` = <cache>(('c5' collate utf8mb4_0900_ai_ci)))
+    -> Covering index scan on b using code
+```
+
+1 行を引くはずの検索が、インデックス全体を読むスキャンに変わりました。
+
+## PostgreSQL：照合順序を OS や ICU に任せる
+
+PostgreSQL では、文字セット（エンコーディング）は基本的にデータベースごとに 1 つで、今は `UTF8` がほとんどです。照合順序のほうは、**どのライブラリに比較を任せるか**（プロバイダ）から選びます（[PostgreSQL 17 文書](https://www.postgresql.org/docs/17/locale.html)）。
+
+| プロバイダ | 比較を行うもの | 特徴 |
+| --- | --- | --- |
+| `libc` | OS の C ライブラリ（glibc など）の `strcoll` | 従来の既定。OS を更新すると並びが変わりうる |
+| `icu` | ICU ライブラリ | OS に依存しない。言語ごとの規則や段の指定ができる |
+| `builtin` | PostgreSQL 自身（17 から） | `C` と `C.UTF-8` だけ。コードポイント順で安定 |
+
+データベースの既定の照合順序は、`CREATE DATABASE` のときに決まります。PostgreSQL の文書は、`LC_COLLATE` と `LC_CTYPE` は **データベースを作った後では変えられない** とし、その理由を「インデックスの並び順に影響するので、固定しておかないとテキスト列のインデックスが壊れる」と説明しています（[PostgreSQL 17 文書](https://www.postgresql.org/docs/17/locale.html)）。列や式ごとに別の照合順序を指定することはできます。
+
+`postgres:17` イメージ（17.11、Debian 13、glibc 2.41）の既定のデータベースは、`libc` の `en_US.utf8` でした。
+
+```
+ datname  | datlocprovider | datcollate | datcollversion
+----------+----------------+------------+----------------
+ postgres | c              | en_US.utf8 | 2.41
+```
+
+`datlocprovider` の `c` は libc、`datcollversion` の `2.41` は、作ったときの glibc の版です。後で見るとおり、この版の記録が大切になります。
+
+### 同じ文字列を、プロバイダごとに並べる
+
+MySQL と同じ 14 個の文字列を、PostgreSQL 17.11 で並べました。
+
+```
+ "C"          10 9 A B _x a b á はは ばば ぱぱ ハハ Ｂ ﾊﾊ
+ pg_c_utf8    10 9 A B _x a b á はは ばば ぱぱ ハハ Ｂ ﾊﾊ
+ en_US.utf8   10 9 a A á b B Ｂ _x はは ハハ ﾊﾊ ばば ぱぱ
+ und-x-icu    _x 10 9 a A á b B Ｂ はは ハハ ﾊﾊ ばば ぱぱ
+```
+
+- `"C"` と組み込みの `pg_c_utf8` はコードポイント順で、MySQL の `utf8mb4_bin` と同じ並びです
+- glibc の `en_US.utf8` は、`_x` を `b` の後ろに置きました。`_` を無視して `x` として並べたように振る舞っています
+- ICU の `und-x-icu`（言語を特定しない既定の規則）は、`_x` を先頭に置きました
+
+`libc` と `icu` で、同じ「英語圏向けの辞書順」のつもりでも結果は一致しません。比較の実装が別物だからです。
+
+### 決定的と非決定的
+
+PostgreSQL の照合順序は、既定では **決定的**（deterministic）です。文書によれば、決定的な照合順序は **バイト列が同じときだけ等しい** とみなします（[PostgreSQL 17 文書](https://www.postgresql.org/docs/17/collation.html)）。ICU の `und-x-icu` で並べても、等しいかどうかの判定はバイト列で行われます。
+
+```sql
+SELECT 'はは' = 'ぱぱ' COLLATE "und-x-icu",   -- f
+       'abc' = 'ABC'  COLLATE "und-x-icu";   -- f
+```
+
+並べる順は言語の規則、等しいかどうかはバイト。これが PostgreSQL の既定です。MySQL の `_ci` のように「大小文字を無視して等しい」をやりたければ、**非決定的**（nondeterministic）な照合順序を作ります。ICU のロケール名に、何段目まで比べるかを `ks-level` で書きます。
+
+```sql
+CREATE COLLATION ci    (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+CREATE COLLATION ai_ci (provider = icu, locale = 'und-u-ks-level1', deterministic = false);
+
+SELECT 'abc' = 'ABC' COLLATE ci,       -- t   大小文字は 3 段目なので無視
+       'はは' = 'ぱぱ' COLLATE ci,      -- f   半濁点は 2 段目なので区別
+       'はは' = 'ぱぱ' COLLATE ai_ci,   -- t   1 段目だけなら等しい
+       'ABC' = 'ＡＢＣ' COLLATE ci;     -- t   全角と半角も 3 段目なので無視
+```
+
+MySQL の `_as_ci` と `_ai_ci` に当たるものを、自分で組み立てられるわけです。これを列に付ければ、大小文字を無視した一意制約になります。
+
+```sql
+CREATE TABLE accounts (email text COLLATE ci UNIQUE);
+INSERT INTO accounts VALUES ('Alice@Example.com');
+INSERT INTO accounts VALUES ('alice@example.com');
+-- ERROR:  duplicate key value violates unique constraint "accounts_email_key"
+-- DETAIL:  Key (email)=(alice@example.com) already exists.
+
+SELECT * FROM accounts WHERE email = 'ALICE@EXAMPLE.COM';
+--  Alice@Example.com
+
+SELECT * FROM accounts WHERE email LIKE 'alice%';
+-- ERROR:  nondeterministic collations are not supported for LIKE
+```
+
+最後の `LIKE` は 17 ではエラーです。文書は、非決定的な照合順序には性能上の代償があり、B-tree の重複排除（deduplication）が使えず、パターン照合のような一部の操作もできないと書いています（[PostgreSQL 17 文書](https://www.postgresql.org/docs/17/collation.html)）。`LIKE` は PostgreSQL 18 で使えるようになりました（[PostgreSQL 18 リリースノート](https://www.postgresql.org/docs/release/18.0/)）。
+
+## OS を更新したら、インデックスが壊れた
+
+`libc` プロバイダは、比較を OS の glibc に任せています。ということは、**glibc の版が変わって並べ方が変われば、ディスク上のインデックスの並びと、今の比較関数が食い違います**。
+
+実際に大きな変化があったのが glibc 2.28（2018 年 8 月）で、ロケールデータが大きく更新されました。PostgreSQL の wiki は、Debian 10、RHEL 8、Ubuntu 18.10 以降がこの新しいデータを使っていること、並び順の変化で誤った検索結果が出たり、一意制約が守られずに重複が入ったりしうること、そして更新後にテキスト列のインデックスをすべて作り直すべきことをまとめています（[PostgreSQL wiki](https://wiki.postgresql.org/wiki/Locale_data_changes)）。
+
+### 手元で壊してみる
+
+これを手元で再現しました。同じ PostgreSQL 11 のデータディレクトリを、glibc の版が違う 2 つのイメージで順に開きます。
+
+| イメージ | PostgreSQL | glibc |
+| --- | --- | --- |
+| `postgres:11-stretch` | 11.16 | 2.24（2.28 より前） |
+| `postgres:11-bullseye` | 11.22 | 2.31（2.28 より後） |
+
+まず、同じ文字列を `en_US.utf8` で並べた結果が、2 つの glibc で違うことを確かめます（新しいほうは `postgres:17` の glibc 2.41）。
+
+```
+ glibc 2.24  11 1-1 12 1-2 ab a b a-c
+ glibc 2.41  1-1 11 1-2 12 a b ab a-c
+```
+
+wiki が例に挙げている `1-1` と `11` の順が、実際に入れ替わっています。
+
+次に、glibc 2.24 の側で、`'1-1'` のような文字列と `'11'` のような文字列を 1 万件ずつ、計 2 万件入れ、インデックスを作りました。そのデータディレクトリを glibc 2.31 の側で開きます。
+
+```sql
+SET enable_seqscan = off;
+SELECT count(*) FROM t WHERE s = '1-1';
+--  0                                   ← 行はあるのに見つからない
+SELECT count(*) FROM t WHERE s IN ('1-1','11','2-1','21','10-1','101');
+--  1                                   ← 本当は 6
+
+SET enable_indexscan = off; SET enable_bitmapscan = off; SET enable_seqscan = on;
+SELECT count(*) FROM t WHERE s IN ('1-1','11','2-1','21','10-1','101');
+--  6                                   ← テーブルを全部読めば 6
+```
+
+インデックスは古い比較規則で並んでいます。新しい比較規則で B+tree をたどると、途中の分岐で **反対側の枝に降りてしまい**、ある行が見つかりません。エラーにはならず、ただ結果が少なくなります。
+
+`amcheck` 拡張で調べると、並びの矛盾として検出されます。作り直せば直ります。
+
+```sql
+CREATE EXTENSION amcheck;
+SELECT bt_index_check('t_s');
+-- ERROR:  item order invariant violated for index "t_s"
+-- DETAIL:  Lower index tid=(1,2) (points to heap tid=(88,13)) higher index tid=(1,3) ...
+
+REINDEX INDEX t_s;
+SELECT bt_index_check('t_s');   -- エラーなし
+-- インデックスを使った検索でも 6 件
+```
+
+<Callout type="warn" title="照合順序の版を記録して、食い違いを警告する">
+  PostgreSQL は、照合順序を作ったときのライブラリの版をカタログに記録しています（上の `datcollversion` の `2.41` や、ICU の照合順序の `collversion`）。
+  起動したライブラリの版がそれと違えば、警告を出し、影響を受けるオブジェクトを作り直してから
+  `ALTER COLLATION ... REFRESH VERSION`（データベースの既定の照合順序なら `ALTER DATABASE ... REFRESH COLLATION VERSION`）を実行するよう促します
+  （[PostgreSQL 17 文書](https://www.postgresql.org/docs/17/sql-altercollation.html)）。
+  ただし文書のとおり、このコマンドは記録を更新するだけで、**作り直しが済んだかどうかは確かめません**。
+  OS のメジャーアップグレードや、レプリカを別の OS の版で立てるときは、`REINDEX` を手順に入れておく必要があります。
+</Callout>
+
+### PostgreSQL 17 の組み込みプロバイダ
+
+この問題を根本から避けるために、PostgreSQL 17 で **組み込み（builtin）プロバイダ** が加わりました（[PostgreSQL 17 リリースノート](https://www.postgresql.org/docs/release/17.0/)）。使えるロケールは `C` と `C.UTF-8` だけです。`C.UTF-8` は **コードポイントの値だけで並べ**、大文字・小文字の変換や正規表現の文字クラスは Unicode の定義に従います。並びは同じメジャー版の中で安定しています（[PostgreSQL 17 文書](https://www.postgresql.org/docs/17/collation.html)）。
+
+従来の `C` との違いは、並び順ではなく文字の性質の扱いです。
+
+```sql
+SELECT lower('ÁBC' COLLATE "C"),        -- Ábc   ASCII 以外は小文字にならない
+       lower('ÁBC' COLLATE pg_c_utf8),  -- ábc
+       'é' ~ '^\w$' COLLATE "C",         -- f
+       'é' ~ '^\w$' COLLATE pg_c_utf8;   -- t
+```
+
+データベース全体を組み込みプロバイダで作ることもできます。
+
+```sql
+CREATE DATABASE b LOCALE_PROVIDER builtin BUILTIN_LOCALE 'C.UTF-8' TEMPLATE template0;
+--  datname | datlocprovider | datlocale | datcollversion
+--  b       | b              | C.UTF-8   | 1
+```
+
+並びは辞書順ではなくなりますが、OS を更新してもインデックスが壊れません。人に見せる並びが必要な箇所だけ、`ORDER BY name COLLATE "ja-x-icu"` のように式で照合順序を指定する、という使い分けができます。
+
+## インデックスに入るキーの長さ
+
+最後に、文字セットがインデックスに効くもう 1 つの面を見ます。**キーの最大長** です。
+
+B+tree は 1 つのページにいくつものキーを並べ、分岐の数を稼いでいました。1 つのキーが長すぎると、それが成り立ちません。InnoDB はインデックスのキーの長さに上限を設けていて、その値は **行フォーマット** で決まります（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-limits.html)）。
+
+| 行フォーマット | キー長の上限 |
+| --- | --- |
+| `REDUNDANT`、`COMPACT` | 767 バイト |
+| `DYNAMIC`、`COMPRESSED` | 3072 バイト |
+
+上限は **バイト** で決まり、列の長さは **文字数** で書きます。そのため、文字セットの 1 文字の最大バイト数を掛けて計算されます。`utf8mb4` は 1 文字 4 バイトなので、
+
+```
+ VARCHAR(255) × 4 バイト = 1020 バイト   → 767 を超える
+ VARCHAR(191) × 4 バイト =  764 バイト   → 767 に収まる
+ VARCHAR(768) × 4 バイト = 3072 バイト   → 3072 にちょうど収まる
+```
+
+MySQL 8.4.13 で確かめました。
+
+```sql
+CREATE TABLE k1 (s VARCHAR(255) CHARACTER SET utf8mb4, KEY (s)) ROW_FORMAT=COMPACT;
+-- ERROR 1071 (42000): Specified key was too long; max key length is 767 bytes
+CREATE TABLE k2 (s VARCHAR(191) CHARACTER SET utf8mb4, KEY (s)) ROW_FORMAT=COMPACT;   -- OK
+CREATE TABLE k3 (s VARCHAR(255) CHARACTER SET utf8mb4, KEY (s)) ROW_FORMAT=DYNAMIC;   -- OK
+CREATE TABLE k4 (s VARCHAR(769) CHARACTER SET utf8mb4, KEY (s)) ROW_FORMAT=DYNAMIC;
+-- ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes
+CREATE TABLE k5 (s VARCHAR(768) CHARACTER SET utf8mb4, KEY (s)) ROW_FORMAT=DYNAMIC;   -- OK
+CREATE TABLE k7 (s VARCHAR(2000) CHARACTER SET utf8mb4, KEY (s(768))) ROW_FORMAT=DYNAMIC;  -- OK
+```
+
+`utf8mb3` から `utf8mb4` に移すと、同じ `VARCHAR(255)` が 765 バイトから 1020 バイトになります。古い行フォーマットのままの表で文字セットだけを変えようとすると、ここで止まります。フレームワークの雛形やマイグレーションに `VARCHAR(191)` という半端な数がよく現れるのは、この 767 バイトの上限に合わせた名残です。
+
+最後の `k7` のように、列の先頭の一部だけをキーにする **プレフィックスインデックス** も作れます。ただし、キーに入っていない部分は比べられないので、一意制約や、インデックスだけで答える使い方には向きません。
+
+<Callout type="note" title="今の既定は DYNAMIC">
+  手元の MySQL 8.4.13 では `innodb_default_row_format` が `dynamic` でした。新しく作る表は、指定しなければ 3072 バイトの上限になります。
+  767 バイトの上限に当たるのは、明示的に `COMPACT` や `REDUNDANT` を指定した表や、古い版から引き継いだ表です。
+  `information_schema.TABLES` の `ROW_FORMAT` 列で確かめられます。
+</Callout>
+
+## まとめ
+
+- 文字列を扱う規則は 2 つある。文字をバイトにする **文字セット** と、文字列どうしを比べる **照合順序**
+- MySQL の `utf8` は `utf8mb3` の別名で、3 バイトまで。絵文字などの補助面の文字は入らない。`utf8mb4` を使う
+- UCA は重みを段に分ける。基本の文字、アクセント（濁点）、大小文字や字形。何段目まで比べるかが `_ai_ci` / `_as_ci` / `_as_cs` の違い
+- MySQL 8.0 以降の既定 `utf8mb4_0900_ai_ci` は「はは」と「ぱぱ」、全角と半角、ひらがなとカタカナを等しいとみなす。旧来の `utf8mb4_general_ci` はそれらを区別するが、絵文字をすべて等しいとみなす。末尾の空白も、PAD SPACE と NO PAD で扱いが違う
+- 照合順序はインデックスの並びそのもの。一意制約、`ORDER BY`、`GROUP BY`、結合の一致がすべてこれで決まる。照合順序の変更で duplicate entry が出るのは、新しい規則で別々の行が同じキーになるため
+- 結合の両側で照合順序が違うと、エラーになるか、片側のインデックスが使えなくなる
+- PostgreSQL は比較を libc、ICU、組み込みのどれかに任せる。既定は決定的で、大小文字を無視したければ非決定的な照合順序を作る
+- libc の比較は OS の glibc 次第。glibc 2.28 で並びが変わり、更新前に作ったインデックスは黙って行を見失う。`amcheck` で見つけ、`REINDEX` で直す。17 の組み込みプロバイダはこの問題を避けられる
+- InnoDB のキー長の上限はバイトで決まる（COMPACT なら 767、DYNAMIC なら 3072）。`utf8mb4` の `VARCHAR(255)` は 1020 バイトになる
+
+ここまでで、ページの上に並んだキーを、どの順で、どう比べて並べるのかがそろいました。次は、このページを書き換えるときに、**クラッシュからも、同時に走る他のトランザクションからも、どう守るのか** を見ます。

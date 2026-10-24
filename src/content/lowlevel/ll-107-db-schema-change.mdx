@@ -1,0 +1,593 @@
+---
+title: 動いている表を変える
+description: 本番で動いている表に列や索引を足すとき、ALTER TABLE 1 行の裏でデータベースは表を作り直すのか、その間に誰を待たせるのか。メタデータロックの行列、MySQL のオンライン DDL、PostgreSQL のトランザクションに入る DDL、影の表を使う外部ツールを、手元で確かめます
+chapter: db
+order: 12
+status: published
+topics:
+  - メタデータロック（MDL）
+  - ロック待ちの行列
+  - lock_timeout / lock_wait_timeout
+  - オンライン DDL
+  - ALGORITHM=INSTANT / INPLACE / COPY
+  - 暗黙のコミット
+  - transactional DDL
+  - CREATE INDEX CONCURRENTLY
+  - NOT VALID / VALIDATE CONSTRAINT
+  - pt-online-schema-change / gh-ost
+  - pgroll
+  - expand / contract
+requires:
+  - ll-100-db-lock
+  - ll-99-db-wal-mvcc
+  - ll-97-db-index
+  - ll-106-db-replication
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 1 行の ALTER TABLE で、サービスが止まる
+
+本番で動いている `orders` 表に、列を 1 つ足したいとします。
+
+```sql
+ALTER TABLE orders ADD COLUMN note varchar(200);
+```
+
+手元の開発用データベースでは一瞬で終わります。ところが本番で流すと、数秒から数分、アプリのあらゆるクエリが返ってこなくなることがあります。`orders` を読むだけの `SELECT` まで止まり、接続プールが埋まり、アプリのヘルスチェックが落ちます。この `ALTER TABLE` 自体は、実はほとんど何の仕事もしていなかったとしてもです。
+
+スキーマ変更で困ることは、2 つに分けて考えられます。
+
+1. **表を作り直すか。** 列の型を変えるといった変更では、全行を新しい形式で書き直す必要があります。1 億行なら、その時間だけ重い I/O が続きます
+2. **誰を待たせるか。** 作り直しの有無にかかわらず、DDL は「表の定義」を書き換えます。定義を読みながら動いている他のクエリと、どこかで順番を決めなければなりません
+
+冒頭の事故は、2 つ目の問題です。この回では、まず DDL が取るロックとその行列を見て、次に MySQL と PostgreSQL がそれぞれ 1 つ目の問題（作り直し）をどう避けているかを見ます。最後に、データベースの外側で作り直しを肩代わりする道具と、アプリの変更とスキーマの変更を分けて進める設計の話をします。
+
+## DDL もロックを取る
+
+第 100 回では、行とすき間に掛かるロック、そして PostgreSQL のテーブル単位のロックを見ました。そこで扱わなかったのが、**表の定義そのもの**を守るロックです。
+
+あるトランザクションが `orders` を読んでいる途中で、別のセッションが列を消したらどうなるでしょうか。同じトランザクションの中で、1 回目の `SELECT *` と 2 回目の `SELECT *` で列の数が変わってしまいます。そこでデータベースは、**表を使っているトランザクションが終わるまで、その表の定義を変えさせない**ようにしています。
+
+### MySQL: メタデータロック
+
+MySQL では、これを **メタデータロック**（MDL）と呼びます。リファレンスは、トランザクションの直列化可能性を保つために、他のセッションで未完了のトランザクションが使っている表に対して DDL を実行させてはならない、と書いています。そのため、トランザクションの中で使った表にメタデータロックを取り、**その解放をトランザクションの終わりまで遅らせます**（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html)）。自動コミットの文なら、文の終わりで外れます。
+
+ここで大事なのは、**行ロックを 1 つも取らない普通の `SELECT` も、メタデータロックは取る**ことです。第 99 回の MVCC で「読む人と書く人が互いを待たない」と書いたのは行の話で、表の定義については、読む人も共有のロックを持っています。
+
+| 操作 | 取るメタデータロック（`metadata_locks` の表記） |
+| --- | --- |
+| `SELECT` | `SHARED_READ` |
+| `INSERT` / `UPDATE` / `DELETE` | `SHARED_WRITE` |
+| オンライン DDL の大半の時間 | `SHARED_UPGRADABLE` |
+| DDL が定義を差し替える瞬間 | `EXCLUSIVE` |
+
+`EXCLUSIVE` は他のすべてと両立しません。
+
+### 待っている DDL の後ろに、全員が並ぶ
+
+問題は、DDL が `EXCLUSIVE` を**待っている間**に起きます。リファレンスは、同じロックに複数の待ち手がいるときは優先度の高い要求から満たし、**書き込みロックの要求は読み取りロックの要求より優先される**と書いています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/metadata-locking.html)）。オンライン DDL の章にも、オンライン DDL が要求した保留中の排他メタデータロックは、**その表に対する後続のトランザクションを止める**とはっきり書かれています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-performance.html)）。
+
+```
+ 時刻 →
+ A: BEGIN; SELECT ... FROM orders;  ──────────（コミットしないまま）────────→
+                                     SHARED_READ を持ち続ける
+ B: ALTER TABLE orders ...              ■■■■■■■■■■ EXCLUSIVE を待つ ■■■■■■■
+ C: SELECT ... FROM orders                 ■■■■■■■ B の後ろで待つ ■■■■■■■■
+ D: UPDATE orders ...                         ■■■■ B の後ろで待つ ■■■■■■■■
+```
+
+C の `SELECT` は、A の `SHARED_READ` とは両立します。B がいなければ、すぐに通っていました。しかし B の `EXCLUSIVE` 要求が先に並んでいるので、その後ろに付きます。結果として、**A が終わるまで、この表に触る全員が止まります**。A は、アプリのどこかで `BEGIN` したまま放置された接続かもしれませんし、何十分も走る集計かもしれません。ALTER そのものは一瞬で終わる種類でも、待っている間は全員を巻き込みます。
+
+### PostgreSQL も同じ形になる
+
+PostgreSQL では、第 100 回で見たテーブル単位のロックがこの役を担います。`SELECT` は `ACCESS SHARE` を取り、多くの `ALTER TABLE` は `ACCESS EXCLUSIVE` を取ります。`ACCESS EXCLUSIVE` は `SELECT` とも衝突する唯一のモードです（[PostgreSQL 文書](https://www.postgresql.org/docs/current/explicit-locking.html)）。`ALTER TABLE` のリファレンスも、特に注記が無い限り `ACCESS EXCLUSIVE` を取ると書いています（[PostgreSQL 文書](https://www.postgresql.org/docs/current/sql-altertable.html)）。
+
+行列ができる理由は、ロックマネージャの作りにあります。ソースの `lock.c` には「要求したロックが**待っている人たちの要求と**衝突するなら、待ち行列に入らなければならない。そうでなければ、すでに保持されているロックとの衝突を調べる」というコメントがあります（[lock.c](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/storage/lmgr/lock.c)）。同じディレクトリの README は、待ち行列の順番を守るのは、衝突する要求を**到着順に**満たすためだと説明しています（[lmgr/README](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/storage/lmgr/README)）。後から来た `ACCESS SHARE` は、すでに保持されている `ACCESS SHARE` とは衝突しなくても、待っている `ACCESS EXCLUSIVE` と衝突するので、その後ろに並びます。
+
+到着順に並ばせるのは、意地悪ではありません。もし後から来た読み取りを次々と追い越させれば、読み取りが途切れない表では、DDL はいつまでも順番が回ってこなくなります（飢餓）。どちらの製品も「書き手を先に」という同じ判断をしていて、その副作用が行列です。
+
+### 定石: 待つ時間に上限を付けて、何度も試す
+
+行列を避ける方法は、**DDL がロックを待つ時間を短く区切る**ことです。待ちが長引いたら DDL のほうが諦めて行列を解き、少し間を置いて再試行します。
+
+| | 設定 | 既定値 |
+| --- | --- | --- |
+| MySQL | `lock_wait_timeout`（メタデータロックを待つ秒数） | 31536000 秒（1 年） |
+| PostgreSQL | `lock_timeout` | 0（無制限） |
+
+PostgreSQL の文書は、`lock_timeout` はテーブル、インデックス、行などのロックを待つ文を中止するもので、制限は**ロックを取ろうとする試行ごとに**適用される、と書いています。`postgresql.conf` で全体に設定するのは勧められておらず、マイグレーションのセッションで `SET lock_timeout = '...'` とするのが普通です（[PostgreSQL 文書](https://www.postgresql.org/docs/current/runtime-config-client.html)）。
+
+上限を何秒にするかは、「後ろに並んだクエリを最大で何秒待たせてよいか」で決まります。DDL が待っている間は全員が止まるので、ここに書いた秒数が、そのままアプリから見た最悪の遅延になります。
+
+<Callout type="warn" title="先に、長いトランザクションを探す">
+  `lock_timeout` は行列を短くするだけで、DDL を通すわけではありません。
+  何時間も開きっぱなしのトランザクションがあれば、何度試しても失敗します。
+  流す前に、MySQL なら `information_schema.innodb_trx`、PostgreSQL なら `pg_stat_activity` の `xact_start` で、
+  古いトランザクションが残っていないかを見ておきます。
+  第 99 回で見た「長いトランザクションは全員の敵」は、スキーマ変更でも同じです。
+</Callout>
+
+## MySQL のオンライン DDL
+
+ロックの話の次は、1 つ目の問題、表の作り直しです。
+
+かつての MySQL の `ALTER TABLE` は、どんな変更でも**新しい定義の空の表を作り、全行をコピーし、名前を差し替える**という方法でした。その間、元の表への書き込みは止まります。InnoDB はここに、表の中で直接作業する方法と、定義だけを書き換える方法を足してきました。今の `ALTER TABLE` は、どの方法で実行するかを `ALGORITHM` で、並行する操作をどこまで許すかを `LOCK` で指定できます。
+
+| `ALGORITHM` | 何をするか |
+| --- | --- |
+| `INSTANT` | データディクショナリの定義だけを書き換える。行には触らない |
+| `INPLACE` | InnoDB の中で作業する。表を作り直すこともあるが、作業中も書き込みを受け付けられる |
+| `COPY` | 新しい表を作って全行をコピーする。作業中は書き込みを止める |
+
+| `LOCK` | 作業中に許すもの |
+| --- | --- |
+| `NONE` | 読み取りも DML も許す |
+| `SHARED` | 読み取りは許し、DML は止める |
+| `EXCLUSIVE` | 読み取りも DML も止める |
+| `DEFAULT`（省略時） | その操作で可能な限り多くを許す |
+
+指定した方法が使えない操作では、黙って重い方法に切り替わるのではなく、**文がエラーで失敗します**（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-performance.html)）。本番で流す `ALTER` に `ALGORITHM=INSTANT` や `LOCK=NONE` を明記しておくのは、「想定より重い方法で走る」ことを防ぐ安全装置になります。
+
+### 操作ごとにできること
+
+どの操作がどの方法で実行できるかは、リファレンスに大きな表があります（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html)）。代表的なものだけを抜き出します。
+
+| 操作 | INSTANT | INPLACE | 表を作り直すか | 並行する DML |
+| --- | --- | --- | --- | --- |
+| 列を足す | できる（条件あり） | できる | INSTANT なら作り直さない | 許す |
+| 列を消す | できる（条件あり） | できる | INSTANT 以外では作り直す | 許す |
+| 列の名前を変える | できる | できる | 作り直さない | 許す |
+| 列の既定値を変える | できる | できる | 作り直さない | 許す |
+| セカンダリインデックスを足す | できない | できる | 作り直さない | 許す |
+| `VARCHAR` を広げる | できない | できる（長さを表すバイト数が変わらない範囲） | 作り直さない | 許す |
+| 列の型を変える | できない | できない | 作り直す（COPY のみ） | 許さない |
+
+### INSTANT: 行に触らずに列を足す
+
+`ALGORITHM=INSTANT` で列を足すと、既存の行はそのままです。行には「どの版の定義で書かれたか」が残り、読むときに、その行が書かれた後に足された列は既定値で補われます。リファレンスは、版ごとに定義の情報が要るため、**行の版は 64 まで**（MySQL 9.1.0 から 255）と書いています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html)）。上限に達した表は、一度作り直すまで INSTANT で列を足せません。
+
+版による違いが大きい機能です（[MySQL 8.0 リファレンス](https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html)）。
+
+- **8.0.12**: 列の追加で `INSTANT` が既定になった。ただし足せるのは表の**最後の列**だけ
+- **8.0.29**: **任意の位置**に足せるようになった。列の削除も `INSTANT` が既定になった
+
+### INPLACE: 作業中も書き込みを受け付ける
+
+`INPLACE` でインデックスを作るとき、元の表は読み書きできたままです。作業中に来た変更は、**一時ログ**（行ログ）に記録されます。インデックスを作り終えたら、溜まったログを当てて追い付きます。
+
+このログの上限が `innodb_online_alter_log_max_size` です。作業が長く、その間の書き込みが多くてログがこの値を超えると、DDL は `DB_ONLINE_LOG_TOO_BIG` で失敗します。リファレンスは、上限を大きくすれば作業中に受け付けられる DML は増えるが、**最後にログを当てる間、表がロックされる時間も延びる**と書いています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-space-requirements.html)）。第 99 回の WAL と同じく、「先に変更の記録だけを取っておき、後で当てる」発想です。
+
+### オンラインでも、排他ロックは要る
+
+`LOCK=NONE` のオンライン DDL も、メタデータロックとは無縁ではありません。リファレンスは、オンライン DDL を 3 つの段階に分けています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-performance.html)）。
+
+```
+ 段階           メタデータロック                 長さ
+ ─────────────────────────────────────────────────────────
+ 1. 初期化      SHARED_UPGRADABLE（共有）          短い
+ 2. 実行        必要なら準備の間だけ EXCLUSIVE      ← 本体の作業はここ。DML は通る
+ 3. 定義の確定  EXCLUSIVE に格上げ                 短い
+```
+
+本体の作業の間は共有ロックなので、DML は通ります。しかし**最初と最後に排他ロックが要る**ので、そこで長いトランザクションに当たれば、前の節の行列がそのまま起きます。INSTANT も同じで、定義を書き換える瞬間には排他ロックが要ります。後の実験では、行に触らないはずの INSTANT な `ADD COLUMN` で、行列ができるのを確かめます。
+
+## DDL とトランザクション
+
+マイグレーションのファイルには、たいてい複数の DDL が並んでいます。そのうちの 1 つが失敗したら、どうなるでしょうか。ここで MySQL と PostgreSQL は大きく分かれます。
+
+### MySQL: DDL の前で暗黙にコミットされる
+
+MySQL のリファレンスは、DDL などの文は、**実行する前に COMMIT したかのように、そのセッションで進行中のトランザクションを終わらせる**と書いています。多くの文は実行の後にもう一度暗黙のコミットを起こし、その文だけを 1 つのトランザクションとして扱います（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html)）。`BEGIN` の後に `ALTER TABLE` を書いても、そこでトランザクションは切れます。
+
+MySQL 8.0 からは **アトミック DDL** があります。DDL 1 文に伴う、データディクショナリの更新、ストレージエンジンの操作、バイナリログへの書き込みを 1 つの原子的な操作にまとめ、途中でサーバが止まっても、全部反映されるか全部戻るかのどちらかになります。ただし、同じページに **「アトミック DDL はトランザクショナル DDL ではない」** と明記されています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/atomic-ddl.html)）。原子的なのは **1 文の中**だけで、複数の DDL をまとめて取り消すことはできません。
+
+その結果、3 本の `ALTER` からなるマイグレーションの 2 本目で失敗すると、**1 本目だけが適用された状態**が残ります。マイグレーションのツールは、これを検知して人に知らせる仕組みを持っています。たとえば golang-migrate は、マイグレーションを流す前にデータベースに dirty という印を付け、失敗したらその印を残したまま止まります。以後のマイグレーションは拒否され、人が「部分的に適用されたのか、まったく適用されなかったのか」を調べ、実際の状態に合う版を `force` で指定するまで進めません（[golang-migrate: Getting started](https://github.com/golang-migrate/migrate/blob/master/GETTING_STARTED.md)）。ツールが自動で戻せないのは、データベースのほうに戻す手段が無いからです。
+
+MySQL でマイグレーションを書くときは、**1 ファイルに 1 つの DDL** にしておくと、失敗したときの状態が「その 1 本が当たったか、当たっていないか」の 2 通りに絞られます。
+
+### PostgreSQL: DDL もトランザクションに入る
+
+PostgreSQL では、ほとんどの DDL を普通のトランザクションの中で実行できます。`BEGIN` から始めて `ALTER TABLE` を何本流しても、`ROLLBACK` すれば、列もインデックスも消え、途中で入れた行も消えます。表の定義はシステムカタログという普通の表に入っていて、その更新も第 99 回の MVCC の版として扱われるからです。
+
+マイグレーションのツールの多くは、PostgreSQL では 1 本のマイグレーションを 1 つのトランザクションで包みます。失敗すれば何も起きなかったことになり、MySQL のような中途半端な状態は残りません。
+
+ただし、トランザクションに包むことには代償があります。**取ったロックはトランザクションの終わりまで持ち続けます。** 1 本目の `ALTER TABLE` で取った `ACCESS EXCLUSIVE` は、3 本目が終わってコミットするまで外れません。軽い変更でも、重い変更と同じトランザクションに入れれば、表は重い変更が終わるまで止まります。
+
+### CREATE INDEX CONCURRENTLY は、その外にある
+
+PostgreSQL の通常の `CREATE INDEX` は、表への書き込みを止めて（`SHARE` ロック）、1 回の走査でインデックスを作ります。読み取りは通りますが、`INSERT`、`UPDATE`、`DELETE` は作り終えるまで待ちます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/sql-createindex.html)）。
+
+書き込みを止めずに作るのが `CREATE INDEX CONCURRENTLY` です。取るロックは `SHARE UPDATE EXCLUSIVE` で、書き込みとは衝突しません（第 100 回の表）。その代わり、表を **2 回**走査し、さらにそのインデックスを使ったり変更したりしうる**既存のトランザクションがすべて終わるのを待ちます**。手間が多く、通常の作成よりかなり時間がかかります（[PostgreSQL 文書](https://www.postgresql.org/docs/current/sql-createindex.html)）。
+
+途中で「既存のトランザクションの終わりを待つ」ために、内部で何度もトランザクションを区切って進みます。そのため、**トランザクションの中では実行できません。** そして途中で失敗すると、そこまでの作業は取り消されず、**INVALID なインデックス**が残ります。文書の言葉では、一意インデックスで値の重複が見つかったなどで失敗すると、コマンドは失敗するが「invalid」なインデックスを残す、そのインデックスは検索には使われないが、更新の負担は掛かりうる、とされています。勧められている後始末は、インデックスを消してから作り直すか、`REINDEX INDEX CONCURRENTLY` です（同上）。
+
+<Callout type="note" title="ほかにも、トランザクションに入らない DDL がある">
+  PostgreSQL でも、すべての DDL がトランザクションに入るわけではありません。
+  `CREATE INDEX CONCURRENTLY`、`DROP INDEX CONCURRENTLY`、`REINDEX ... CONCURRENTLY`、`CREATE DATABASE`、`VACUUM` などはトランザクションの中では実行できません。
+  マイグレーションのツールでは、これらを含むファイルだけトランザクションで包まないように指定する仕組み（ツールごとに名前が違う）を使います。
+</Callout>
+
+## PostgreSQL: 書き換えが起きる ALTER、起きない ALTER
+
+PostgreSQL の `ALTER TABLE` には、MySQL の `ALGORITHM` のような指定はありません。どの操作で表の書き換えが起きるかは、操作の種類で決まっています。書き換えでは、新しいファイルに全行を書き直し、インデックスも作り直します。その間ずっと `ACCESS EXCLUSIVE` を持つので、読み取りも止まります。
+
+### 定数の既定値なら、書き換えない
+
+PostgreSQL 11 から、既定値つきの列の追加が、表を書き換えずにできるようになりました。リリースノートには「既定値が定数のとき有効」とあります（[PostgreSQL 11 リリースノート](https://www.postgresql.org/docs/release/11.0/)）。
+
+仕組みは MySQL の INSTANT に似ています。既定値は文の実行時に一度だけ評価され、**表のメタデータに保存されます**。既存の行を読むときは、そこから値が返されます。値が行に実際に書かれるのは、次に表が書き換えられたときです（[PostgreSQL 文書](https://www.postgresql.org/docs/current/sql-altertable.html)）。
+
+一方、`clock_timestamp()` や `random()` のような **volatile な関数**を既定値にすると、行ごとに違う値を入れなければならないので、表とインデックス全体が書き換えられます（同上）。`now()` は volatile ではないので（トランザクションの中で同じ値を返す stable）、定数と同じ扱いになり、**既存の全行が同じ時刻**になります。
+
+### 型の変更は、たいてい書き換える
+
+既存の列の型を変えると、通常は表とインデックス全体が書き換えられます。例外は、古い型から新しい型へ**バイナリ互換**（中身のバイト列を変えずにそのまま解釈し直せる）で、`USING` で中身を変えない場合です。このときは表の書き換えが要りません（[PostgreSQL 文書](https://www.postgresql.org/docs/current/sql-altertable.html)）。`int` から `bigint` は幅が変わるので書き換え、`varchar(50)` を `varchar(100)` に広げるのは書き換えなし、という違いを後の実験で確かめます。
+
+### 制約は 2 段階で足す
+
+`CHECK` や外部キーを足すと、既存の全行が条件を満たすかを確かめるため、表を走査します。その間は `ACCESS EXCLUSIVE` を持つので、全員が止まります。
+
+`NOT VALID` を付けると、この走査を後回しにできます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/sql-altertable.html)）。
+
+```sql
+-- 1. 制約を足す。既存の行は確かめない。新しく書かれる行にはすぐ効く
+ALTER TABLE orders ADD CONSTRAINT amount_nonneg CHECK (amount >= 0) NOT VALID;
+-- 2. 後で既存の行を確かめる
+ALTER TABLE orders VALIDATE CONSTRAINT amount_nonneg;
+```
+
+1 の時点で、新しく挿入、更新される行にはすでに制約が効いています。だから 2 の検証では、**既存の行だけ**を確かめればよく、並行する更新を締め出す必要がありません。文書は、検証は `SHARE UPDATE EXCLUSIVE` しか取らないと書いています（同上）。1 も `ACCESS EXCLUSIVE` を取りますが、走査をしないので一瞬で終わります。
+
+`SET NOT NULL` も表を走査しますが、「NULL が無い」ことを証明する有効な `CHECK` 制約がすでにあれば、走査を省きます（同上）。そこで、`CHECK (col IS NOT NULL) NOT VALID` を足して検証し、それから `SET NOT NULL` を実行する、という手順が使えます。
+
+| 操作 | 書き換え | 全行の走査 | ロック |
+| --- | --- | --- | --- |
+| `ADD COLUMN`（既定値なし、または定数） | しない | しない | `ACCESS EXCLUSIVE`（一瞬） |
+| `ADD COLUMN ... DEFAULT random()` | する | — | `ACCESS EXCLUSIVE`（書き換えの間ずっと） |
+| `ALTER COLUMN TYPE`（バイナリ互換でない） | する | — | `ACCESS EXCLUSIVE`（書き換えの間ずっと） |
+| `ADD CONSTRAINT ... CHECK` | しない | する | `ACCESS EXCLUSIVE`（走査の間ずっと） |
+| `ADD CONSTRAINT ... NOT VALID` | しない | しない | `ACCESS EXCLUSIVE`（一瞬） |
+| `VALIDATE CONSTRAINT` | しない | する | `SHARE UPDATE EXCLUSIVE` |
+| `CREATE INDEX CONCURRENTLY` | しない | 2 回 | `SHARE UPDATE EXCLUSIVE` |
+
+「一瞬」の操作でも、`ACCESS EXCLUSIVE` を取る以上、前の節の行列の問題は残ります。`lock_timeout` はどの行でも必要です。
+
+## データベースの外で作り直す
+
+型の変更のように、どうしても全行の書き直しが要る変更があります。MySQL の `COPY` も PostgreSQL の書き換えも、その間は書き込みを止めます。そこで、**作り直しをデータベースの外のツールが少しずつ行い、最後に表を差し替える**という方法が広く使われています。
+
+### pt-online-schema-change: 影の表とトリガー
+
+Percona Toolkit の pt-online-schema-change は、次の手順で動きます（[Percona Toolkit 文書](https://docs.percona.com/percona-toolkit/pt-online-schema-change.html)）。
+
+1. 元の表と同じ形の空の表（影の表）を作り、そこに `ALTER` を当てる
+2. 元の表に**トリガー**を作り、元の表への `INSERT`、`UPDATE`、`DELETE` を影の表にも反映させる
+3. 元の表の行を、小さな塊（チャンク）ごとに影の表へコピーする
+4. コピーが終わったら、原子的な `RENAME TABLE` で 2 つの表の名前を同時に入れ替える
+
+元の表は、コピーの間も読み書きできます。外部キーで参照されている表では、名前を入れ替えると子の表の外部キーが古い表を指したままになるので、それを付け替える方法を別に選ぶ必要があります。
+
+### gh-ost: 影の表と binlog
+
+GitHub の gh-ost は、同じく影の表を作ってコピーしますが、**トリガーを使いません**。元の表への変更は、**バイナリログ**（binlog）のストリームから読み取り、非同期に影の表へ当てます（[gh-ost README](https://github.com/github/gh-ost/blob/master/README.md)）。
+
+```
+              アプリの書き込み
+                    │
+                    ▼
+ ┌──────────────┐  binlog（ROW 形式）   ┌──────────┐
+ │ 元の表       │ ─────────────────────→ │ gh-ost   │
+ │ orders       │                        │          │
+ │              │ ←── 行をチャンクで読む ─│          │
+ └──────────────┘                        └────┬─────┘
+                                              │ コピーと、binlog の変更を当てる
+                                              ▼
+                                       ┌──────────────┐
+                                       │ 影の表        │
+                                       │ _orders_gho  │
+                                       └──────────────┘
+```
+
+トリガーをやめた理由として、gh-ost の文書は次のような点を挙げています（[gh-ost: Why triggerless](https://github.com/github/gh-ost/blob/master/doc/why-triggerless.md)）。
+
+- トリガーは、元の書き込みと**同じトランザクションの中**で動く。忙しい表では、すべての書き込みに目に見える負担が乗る
+- トリガーが影の表のロックを取り合い、本番で表がほとんど止まった例がある
+- 負荷が高いときにコピーを一時停止しても、トリガーは止められない。止めれば変更が失われるからだ
+
+binlog を読む方式は、ここを切り離します。影の表への書き込みは gh-ost の接続から行われるので、gh-ost が自分の判断で止めたり速度を落としたりできます。
+
+この仕組みが成り立つのは、**binlog に行の変更そのものが書かれているから**です。第 106 回で見た ROW 形式の binlog には、どの行がどの値からどの値に変わったかが入っています。文の形式（STATEMENT）の binlog では、`UPDATE ... WHERE ...` という文しか分からず、影の表に同じ変更を当てられません。gh-ost の文書は、`binlog_format=ROW` が必要（そうでなければ切り替える）で、行イメージは `FULL` に対応している、と書いています。外部キーとトリガーのある表には対応していません（[gh-ost: Requirements and limitations](https://github.com/github/gh-ost/blob/master/doc/requirements-and-limitations.md)）。
+
+最後の差し替え（cut-over）では、1 つの接続が表のロックを持ち、別の接続が原子的な `RENAME` を試みる形で、2 つの表を一度に入れ替えます。待っていた接続は**短い時間だけ**止まり、タイムアウトなどで失敗したときは、元の表がそのまま残った状態に戻って再試行できます（[gh-ost: Cut-over](https://github.com/github/gh-ost/blob/master/doc/cut-over.md)）。外部ツールを使っても、最後の瞬間にはやはりメタデータロックが要り、そこでは「待つ時間を区切って、だめなら戻る」という前の節と同じ定石が使われています。
+
+### pgroll: 新旧のスキーマを同時に見せる
+
+PostgreSQL 向けの pgroll は、発想が少し違います。表を作り直して差し替えるのではなく、**新旧 2 つの版のスキーマを同時に**提供します（[pgroll README](https://github.com/xataio/pgroll/blob/main/README.md)）。
+
+- 実際の表の上に、版ごとのスキーマを作り、その中に**ビュー**を置く。ビューが「この版では、この列をこの名前で見せる」という対応を持つ
+- 開始（start）では、列や表を足すといった、既存のアプリを壊さない変更だけを物理的な表に施す
+- 列の型や制約を変えるような壊す変更では、新しい列を足して古い列から値を埋め（バックフィル）、**トリガーで新旧どちらへの書き込みも相手に伝える**
+- アプリは `search_path` を新しい版のスキーマに向けることで、新しい形を見る。古いアプリは古い版のスキーマを見続ける
+- 完了（complete）で古い版を消し、新しい列を最終的な名前にする。途中ならいつでも取り消せる
+
+次の節の expand / contract を、データベースの側で自動化した道具だと言えます。
+
+## アプリとスキーマの変更を分ける: expand / contract
+
+ここまでの道具は、どれも「1 回の変更を、止めずに実行する」ためのものでした。しかし、本当の難しさはもう 1 段上にあります。**アプリのコードとスキーマは、同時には切り替わらない**ことです。
+
+アプリは複数の台数で動いていて、デプロイは 1 台ずつ進みます。その途中では、古いコードと新しいコードが同じデータベースを同時に使います。列の名前を `email` から `mail_address` に一度で変えると、名前を変えた瞬間に、古いコードの `SELECT email` がすべて失敗します。逆に、先にコードを変えれば、新しいコードの `SELECT mail_address` が失敗します。
+
+そこで、変更を**広げる段階**（expand）と**縮める段階**（contract）に分け、その間に、新旧どちらのコードでも動く状態を挟みます。この進め方は parallel change とも呼ばれます。
+
+```
+ 段階                         スキーマ              アプリ
+ ────────────────────────────────────────────────────────────────
+ 1. expand                    mail_address を足す    （変えない）
+ 2. 両方に書く                                      email と mail_address の両方に書く
+ 3. 埋める                    既存行を少しずつコピー
+ 4. 新しいほうを読む                                 mail_address を読む
+ 5. 古いほうに書くのをやめる                         mail_address だけに書く
+ 6. contract                  email を消す
+```
+
+どの段階で止めても、その時点で動いているどのコードも壊れません。各段階のスキーマ変更は、それぞれ「定数の既定値で列を足す」「列を消す」のような、この回で見た**軽い操作**だけでできています。重い 1 回の変更を、軽い変更とデプロイの列に分解したわけです。手順は長くなりますが、**どの段階でも前の段階に戻せる**ことが、この方式の本当の価値です。
+
+<Callout type="tip" title="3 の「埋める」も、小分けにする">
+  既存の行を `UPDATE orders SET mail_address = email` の 1 文で埋めると、
+  全行の行ロックを 1 つのトランザクションで持ち、MVCC の古い版も一度に生まれます（第 99 回）。
+  レプリカの遅延も一気に増えます（第 106 回）。
+  主キーの範囲で 1,000 行ずつ区切ってコミットする、というように小分けにするのが普通です。
+  pt-online-schema-change や gh-ost がチャンクでコピーするのも、同じ理由です。
+</Callout>
+
+## 手元で確かめる
+
+Docker の中で `mysql:8.4`（8.4.13）と `postgres:17`（17.11）を立てて試しました。複数のセッションは、`docker exec` で起こした別々のクライアントを時間差で起動して作っています。表示している時間には、`docker exec` でクライアントを起こす時間（手元で 0.1 秒弱）が含まれるものがあります。
+
+### MySQL: メタデータロックの行列
+
+3 行の表 `t` で、次の 3 つを 1 秒ずつずらして始めました。
+
+```sql
+-- A: 読んだまま 12 秒コミットしない
+BEGIN; SELECT * FROM t WHERE id = 1; SELECT SLEEP(12); COMMIT;
+-- B: 列を足す（8.4 の既定では INSTANT）
+ALTER TABLE t ADD COLUMN c INT;
+-- C: 自動コミットの、ただの SELECT
+SELECT * FROM t WHERE id = 2;
+```
+
+その最中の `processlist` と `performance_schema.metadata_locks` です。
+
+```
++----+---------+------+---------------------------------+--------------------------------+
+| id | command | time | state                           | info                           |
++----+---------+------+---------------------------------+--------------------------------+
+| 10 | Query   |    5 | User sleep                      | SELECT SLEEP(12)               |
+| 11 | Query   |    4 | Waiting for table metadata lock | ALTER TABLE t ADD COLUMN c INT |
+| 12 | Query   |    3 | Waiting for table metadata lock | SELECT * FROM t WHERE id=2     |
++----+---------+------+---------------------------------+--------------------------------+
++-------------+-------------------+---------------+-------------+------+
+| object_name | lock_type         | lock_duration | lock_status | pid  |
++-------------+-------------------+---------------+-------------+------+
+| t           | SHARED_READ       | TRANSACTION   | GRANTED     |   10 |
+| t           | SHARED_UPGRADABLE | TRANSACTION   | GRANTED     |   11 |
+| #sql-1_b    | EXCLUSIVE         | STATEMENT     | GRANTED     |   11 |
+| t           | EXCLUSIVE         | TRANSACTION   | PENDING     |   11 |
+| t           | SHARED_READ       | TRANSACTION   | PENDING     |   12 |
++-------------+-------------------+---------------+-------------+------+
+```
+
+A（10）は `SLEEP` の最中で、`SHARED_READ` を持ったままです。B（11）は `SHARED_UPGRADABLE` を手に入れ、`EXCLUSIVE` への格上げを待っています（`PENDING`）。C（12）の `SHARED_READ` は、A の `SHARED_READ` とは両立するはずなのに `PENDING` で、状態は B と同じ `Waiting for table metadata lock` です。B の後ろに並んでいます。
+
+結局、C の 1 行の `SELECT` は **10.1 秒**かかり、A のコミットの直後に B と C が続けて終わりました。C の結果には、B が足した列 `c` がすでに含まれていました。
+
+次に、B のセッションで `lock_wait_timeout` を 2 秒にして、同じことをしました。既定値は `31536000`（1 年）でした。
+
+```
+ERROR 1205 (HY000) at line 1: Lock wait timeout exceeded; try restarting transaction
+real	0m2.093s
+```
+
+2 秒で B が諦め、行列は解けます。
+
+### MySQL: INSTANT / INPLACE / COPY の時間
+
+100 万行の表 `big`（`id INT` 主キー、`a INT`、`s VARCHAR(100)` に 80 文字。`data_length` で約 113MB）で、同じ種類の操作を方法を変えて流しました。時間は `mysql` クライアントが表示したものです。
+
+| 操作 | INSTANT | INPLACE | COPY |
+| --- | --- | --- | --- |
+| `ADD COLUMN ... INT` | **0.02 秒** | 3.33 秒 | 3.67 秒 |
+| `ADD INDEX (a)` | エラー 1845 | 3.02 秒 | 5.66 秒 |
+| `MODIFY a BIGINT` | — | エラー 1846 | 4.37 秒 |
+
+INSTANT はほぼ一瞬です。INPLACE の `ADD COLUMN` は、表示は `0 rows affected` ですが 3.3 秒かかり、COPY とほとんど変わりませんでした。INSTANT 以外で列を足すと、表の中で作り直しが起きているためです。ほかに INSTANT で、`DROP COLUMN` が 0.02 秒、`RENAME COLUMN` が 0.05 秒、`SET DEFAULT` が 0.04 秒、`AFTER id` で途中の位置に列を足すのが 0.04 秒でした。
+
+使えない方法を指定したときは、黙って切り替わらずに失敗します。
+
+```
+ALTER TABLE big ADD INDEX ia (a), ALGORITHM=INSTANT;
+ERROR 1845 (0A000): ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=COPY/INPLACE.
+
+ALTER TABLE big MODIFY a BIGINT, ALGORITHM=INPLACE;
+ERROR 1846 (0A000): ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.
+
+ALTER TABLE big MODIFY a BIGINT, ALGORITHM=COPY, LOCK=NONE;
+ERROR 1846 (0A000): LOCK=NONE is not supported. Reason: COPY algorithm requires a lock. Try LOCK=SHARED.
+```
+
+時間が同じくらいでも、INPLACE と COPY では他人への影響が違います。インデックスを作り始めて 0.8 秒後に、別のセッションから 1 行を `UPDATE` しました。
+
+| `ADD INDEX` の方法 | `UPDATE` 1 行にかかった時間 |
+| --- | --- |
+| `ALGORITHM=INPLACE, LOCK=NONE` | 0.14 秒（クライアントを起こすだけで 0.09 秒） |
+| `ALGORITHM=COPY` | **5.16 秒**（コピーが終わるまで待たされた） |
+
+### MySQL: DDL の暗黙のコミット
+
+```sql
+CREATE TABLE ic (id INT PRIMARY KEY);
+BEGIN;
+INSERT INTO ic VALUES (1);
+ALTER TABLE ic ADD COLUMN x INT;
+INSERT INTO ic VALUES (2, 0);
+ROLLBACK;
+SELECT * FROM ic;
+```
+
+```
++----+------+
+| id | x    |
++----+------+
+|  1 | NULL |
+|  2 |    0 |
++----+------+
+```
+
+`ROLLBACK` したのに、**2 行とも残りました**。1 行目は `ALTER` の直前の暗黙のコミットで確定しています。2 行目は、`ALTER` でトランザクションが終わった後の文なので、自動コミットで確定しています。`ROLLBACK` の時点では、取り消すトランザクションが何も残っていませんでした。
+
+マイグレーションの途中で失敗した場合も確かめました。
+
+```sql
+ALTER TABLE users ADD COLUMN email VARCHAR(255);
+ALTER TABLE users ADD UNIQUE INDEX uq_mail (mail);   -- 列名の書き間違い
+```
+
+2 本目は `ERROR 1072 (42000): Key column 'mail' doesn't exist in table` で失敗し、`SHOW COLUMNS` には 1 本目で足した `email` が残っていました。golang-migrate の dirty は、この状態を知らせるための印です。
+
+### PostgreSQL: DDL を取り消す
+
+同じことを PostgreSQL で行いました。
+
+```sql
+INSERT INTO users VALUES (1, 'a');
+BEGIN;
+INSERT INTO users VALUES (2, 'b');
+ALTER TABLE users ADD COLUMN email text;
+CREATE UNIQUE INDEX users_email ON users (email);
+ROLLBACK;
+```
+
+`ROLLBACK` の前の `\d users` には `email` 列と `users_email` インデックスがあり、後には両方とも消えていました。`SELECT * FROM users` は `(1, 'a')` の 1 行だけで、トランザクションの中で入れた 2 行目も消えています。
+
+### PostgreSQL: ALTER の後ろに SELECT が並ぶ
+
+MySQL と同じ 3 つのセッションを作りました。A は `BEGIN; SELECT count(*) FROM users;` の後に 10 秒眠り、B は `ALTER TABLE users ADD COLUMN x int`、C は `SELECT count(*) FROM users` です。
+
+```
+ pid | blocked_by | wait_event_type | wait_event |               query
+-----+------------+-----------------+------------+------------------------------------
+  89 | {}         | Timeout         | PgSleep    | SELECT pg_sleep(10)
+  95 | {89}       | Lock            | relation   | ALTER TABLE users ADD COLUMN x int
+ 101 | {95}       | Lock            | relation   | SELECT count(*) FROM users
+
+ pid |        mode         | granted
+-----+---------------------+---------
+  89 | AccessShareLock     | t
+  95 | AccessExclusiveLock | f
+ 101 | AccessShareLock     | f
+```
+
+`blocked_by` は `pg_blocking_pids(pid)` の結果です。B（95）は A（89）に止められ、C（101）は **A ではなく B（95）に**止められています。C が求めているのは A と同じ `AccessShareLock` で、A とは衝突しません。待っている B の `AccessExclusiveLock` と衝突するので、その後ろに並んでいるわけです。`pg_blocking_pids` の文書が、待ち行列の前にいて衝突する要求を持つプロセスも「止めている側」に数えると書いているとおりです（[PostgreSQL 文書](https://www.postgresql.org/docs/current/functions-info.html)）。C の `SELECT` は 7.2 秒かかりました。
+
+### PostgreSQL: lock_timeout で諦めて、やり直す
+
+A が 6 秒間 `users` を読んだまま眠っている間に、B が `SET lock_timeout = '1s'` で `ALTER` を試し、失敗したら 0.5 秒待って再試行するようにしました。C は 1.2 秒おきに `SELECT` を 3 回流します。左は、A を始めてからの秒数です。
+
+```
+ 2.21 B: try 1: ERROR:  canceling statement due to lock timeout
+ 2.20 C1: SELECT took .644161000
+ 3.90 B: try 2: ERROR:  canceling statement due to lock timeout
+ 3.87 C2: SELECT took 1.082949000
+ 4.32 C3: SELECT took .274375000
+ 5.61 B: try 3: ERROR:  canceling statement due to lock timeout
+ 6.14 A: COMMIT
+ 6.73 B: try 4: ALTER TABLE
+```
+
+B が並んでいる間に来た C は、やはり B の後ろで待ちます。しかし B が 1 秒で諦めるので、C の待ちも**最大でおよそ 1 秒**で終わります。A がコミットした後の 4 回目で、`ALTER` は通りました。`lock_timeout` がない前の実験では、C は 7 秒待っていました。
+
+### PostgreSQL: CREATE INDEX CONCURRENTLY が INVALID を残す
+
+10 万行の表 `acct` に、`email` が重複する行を 1 つだけ混ぜてから、一意インデックスを `CONCURRENTLY` で作りました。
+
+```
+BEGIN;
+CREATE INDEX CONCURRENTLY acct_email ON acct (email);
+ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+
+CREATE UNIQUE INDEX CONCURRENTLY acct_email ON acct (email);
+ERROR:  could not create unique index "acct_email"
+DETAIL:  Key (email)=(u1@example.com) is duplicated.
+```
+
+失敗した後の `\d acct` です。
+
+```
+Indexes:
+    "acct_pkey" PRIMARY KEY, btree (id)
+    "acct_email" UNIQUE, btree (email) INVALID
+```
+
+```
+ indexrelid | indisvalid | indisready | pg_size_pretty
+------------+------------+------------+----------------
+ acct_pkey  | t          | t          | 2208 kB
+ acct_email | f          | f          | 0 bytes
+```
+
+エラーになったのに、`acct_email` という名前のインデックスはカタログに残り、`INVALID` と表示されています。検索には使われず、`email` での検索は `Seq Scan` のままでした。今回は最初の走査の段階で失敗したので `indisready` も `f` で、書き込みのたびの更新もされていません（実際、この状態で重複する値の `INSERT` が通りました）。より後の段階で失敗すると `indisready` が `t` になり、文書のいう「検索には使われないが更新の負担は掛かる」状態になります。
+
+そのまま同じ文を流し直すと、`ERROR: relation "acct_email" already exists` で失敗しました。`DROP INDEX CONCURRENTLY acct_email` で消し、重複を直してから作り直すと、`indisvalid = t` で完成しました。
+
+### PostgreSQL: 書き換えの有無で、時間が 3 桁変わる
+
+100 万行の表 `big`（ヒープ 81MB）で、列の追加と型の変更を比べました。表が書き換えられたかどうかは、`pg_relation_filenode('big')`（表の実体のファイル番号）が変わったかで判断しています。
+
+| 操作 | 時間 | ファイル番号 |
+| --- | --- | --- |
+| `ADD COLUMN c1 int DEFAULT 0` | 3.8 ms | 16405 のまま |
+| `ADD COLUMN c2 timestamptz DEFAULT now()` | 10.5 ms | 16405 のまま |
+| `ADD COLUMN c3 float8 DEFAULT random()` | **2,440 ms** | 16413 に変わった |
+| `ALTER COLUMN s TYPE varchar(100)`（50 から） | 6.5 ms | 16413 のまま |
+| `ALTER COLUMN a TYPE bigint`（`int` から） | **3,795 ms** | 16417 に変わった |
+
+定数と `now()` の既定値は数ミリ秒で終わり、ファイルも変わりません。`random()` は行ごとに違う値が要るので、表全体が新しいファイルに書き直されました。`now()` で足した `c2` を `count(DISTINCT c2)` で数えると 1 で、100 万行がすべて同じ時刻でした。
+
+書き換えなしで足した列の既定値は、カタログの `pg_attribute` に入っています。3 行の表に定数と `now()` の既定値で列を足した直後です。
+
+```
+ attname | atthasmissing |           attmissingval
+---------+---------------+-----------------------------------
+ id      | f             |
+ c1      | t             | {0}
+ c2      | t             | {"2026-10-24 10:03:13.360659+00"}
+```
+
+`atthasmissing` が「既存の行にはこの列の値が無いので、ここから補え」という印で、`attmissingval` が補う値です。`big` のほうでは、`random()` の列を足したときの書き換えで値が行に書き込まれ、`c1` と `c2` の `atthasmissing` も `f` に戻っていました。
+
+最後に、制約を 2 段階で足したときのロックを、トランザクションの中で `pg_locks` から見ました。
+
+```
+ALTER TABLE big ADD CONSTRAINT a_nonneg CHECK (a >= 0) NOT VALID;  → AccessExclusiveLock
+ALTER TABLE big VALIDATE CONSTRAINT a_nonneg;                        → ShareUpdateExclusiveLock
+```
+
+`NOT VALID` で足す瞬間は最も強いロックですが走査はなく、時間のかかる検証は、書き込みと衝突しない `SHARE UPDATE EXCLUSIVE` で行われています。比較のため `NOT VALID` を付けずに `CHECK (a < 100000)` を足すと、100 万行の走査に 69 ms かかり、その間は `ACCESS EXCLUSIVE` を持ち続けます。
+
+## まとめ
+
+- スキーマ変更の困りごとは 2 つある。表を作り直すかどうかと、その間に誰を待たせるか
+- DDL は表の定義を守るロックを取る。MySQL ではメタデータロック、PostgreSQL ではテーブルロックの `ACCESS EXCLUSIVE`。普通の `SELECT` も共有のロックを持ち、トランザクションの終わりまで外さない
+- 排他ロックを**待っている** DDL の後ろには、後から来た `SELECT` まで並ぶ。書き手の飢餓を防ぐための順番が、長いトランザクション 1 つで全員を止める行列になる
+- 定石は、`lock_wait_timeout` や `lock_timeout` を短くして DDL に諦めさせ、何度も試すこと。秒数は、後ろに並ぶクエリを待たせてよい最大の時間で決める
+- MySQL のオンライン DDL は `ALGORITHM`（INSTANT / INPLACE / COPY）と `LOCK` で方法を明示でき、使えなければエラーになる。INSTANT の列追加は 8.0.12 から、任意の位置は 8.0.29 から。INPLACE は作業中の変更を行ログに溜め、最後に当てる。どの方法でも、最初と最後に排他のメタデータロックが要る
+- MySQL の DDL は前後で暗黙にコミットする。アトミック DDL は 1 文が原子的なだけで、複数の DDL は取り消せない。途中で失敗したマイグレーションは中途半端に残る
+- PostgreSQL の DDL の多くはトランザクションに入り、取り消せる。ただし `CREATE INDEX CONCURRENTLY` はトランザクションの中では使えず、失敗すると INVALID なインデックスが残る
+- PostgreSQL 11 から、定数の既定値つきの列追加は書き換えなし。volatile な既定値と、バイナリ互換でない型変更は書き換えになる。制約は `NOT VALID` で足して `VALIDATE CONSTRAINT` で検証すると、重い走査を弱いロックで行える
+- pt-online-schema-change は影の表とトリガー、gh-ost は影の表と ROW 形式の binlog で、作り直しをデータベースの外で少しずつ行う。最後の差し替えにはやはり短いロックが要る
+- アプリとスキーマは同時には切り替わらない。expand / contract で、重い 1 回の変更を、軽い変更とデプロイの列に分け、どの段階でも戻せるようにする
+
+この回の実験では、操作を誤っても、`ROLLBACK` やインデックスの作り直しで戻せました。しかし、`DROP TABLE` をコミットしてしまった、間違った `UPDATE` が全行に当たってしまった、という誤りは、どのロックもどのトランザクションも救ってくれません。次の第 108 回では、そうした誤りやディスクの故障から、データベースを過去のある時点の状態に戻すための、バックアップと時点復旧を見ます。

@@ -1,0 +1,560 @@
+---
+title: 接続とプロトコル
+description: サーバ型のデータベースでは、SQL はソケットを通って届きます。1 本の接続の裏でサーバは何を用意し、バイト列はどんな形で行き来しているのか。接続ごとのプロセスとスレッド、プーラー、ソケットファイル、ワイヤプロトコル、LISTEN / NOTIFY を、PostgreSQL と MySQL で確かめます
+chapter: db
+order: 10
+status: published
+topics:
+  - バックエンドプロセス
+  - one-thread-per-connection
+  - max_connections
+  - コネクションプール
+  - PgBouncer
+  - UNIX ドメインソケット
+  - ワイヤプロトコル
+  - SCRAM-SHA-256
+  - Simple Query / Extended Query
+  - caching_sha2_password
+  - max_allowed_packet
+  - LISTEN / NOTIFY
+requires:
+  - ll-99-db-wal-mvcc
+  - ll-101-db-planner
+  - ll-33-process
+  - ll-34-thread
+  - ll-66-socket-tcp
+---
+
+import Callout from '../../components/Callout.astro'
+
+## SQL はソケットを通って届く
+
+前回の第 104 回で、DuckDB や SQLite のような組み込み型はアプリのプロセスの中に入るので、**接続というものが無い**ことを見ました。関数を呼べば、同じアドレス空間の中で計算が始まります。
+
+PostgreSQL や MySQL のようなサーバ型のデータベースでは、そうはいきません。アプリとデータベースは別のプロセスで、多くの場合は別の機械です。アプリが書いた SQL は、第 66 回で見たソケットに**バイト列として**書き込まれ、相手のカーネルを通ってサーバのプロセスに届きます。結果も同じ道を戻ってきます。
+
+この「間」には、普段は意識しないものがいくつも挟まっています。
+
+- 接続を 1 本張ると、サーバの中では何が 1 つ増えるのか。それはどれくらい重いのか
+- なぜ、どの現場でもコネクションプールやプーラーを置くのか。置くと何が壊れるのか
+- 「localhost だと繋がらないのに、127.0.0.1 なら繋がる」のはなぜか
+- 送られているバイト列は、どんな形をしているのか
+- データベースのほうからアプリに話しかける手段（LISTEN / NOTIFY）は、どこまで頼れるのか
+
+この回では、これらを PostgreSQL と MySQL で順に確かめます。TLS で接続を包む話は第 162 回で扱うので、ここでは包まれる**中身**のほうを見ます。
+
+## 実験の環境
+
+すべて Docker の中で完結させました。サーバとクライアントのコンテナを同じブリッジネットワークに置き、ホストへのポート公開はしていません。
+
+| 役割 | ソフトウェア | 版 |
+| --- | --- | --- |
+| PostgreSQL のサーバ、psql、pgbench | `postgres:17` イメージ | 17.11 |
+| MySQL のサーバとクライアント | `mysql:8.4` イメージ | 8.4.13 |
+| 手書きのクライアント | `python:3.13-alpine`、mysql-connector-python | Python 3.13.17 |
+| パケットの取得と解析 | `nicolaka/netshoot`（tcpdump、TShark） | TShark 4.6.6 |
+| Docker | Docker Engine（aarch64） | 29.4.0 |
+
+設定はどちらもイメージの既定のままです。PostgreSQL は `max_connections = 100`、MySQL は `max_connections = 151`、`thread_cache_size = 9` でした。
+
+## 接続 1 本の向こう側にあるもの
+
+### PostgreSQL: 接続ごとにプロセス
+
+PostgreSQL は「process per user」のモデルを取っています。**postmaster** という監督役のプロセスがポートで待ち受け、接続の要求が来るたびに、その接続専用の**バックエンドプロセス**を新しく作ります（[PostgreSQL 文書: How Connections Are Established](https://www.postgresql.org/docs/current/connect-estab.html)）。Unix では、この作成は `fork` です（[launch_backend.c](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/postmaster/launch_backend.c) の `postmaster_child_launch` が `fork_process()` を呼び、それは `fork()` の薄い包み）。
+
+```
+               ┌──────────── postmaster（PID 1）───────────┐
+ 接続要求 ───▶ │  accept → fork                              │
+               └──┬──────────────┬──────────────┬──────────┘
+                  ▼              ▼              ▼
+            バックエンド     バックエンド     バックエンド      ← 接続 1 本につき 1 つ
+                  │              │              │
+                  └──── 共有メモリ（shared_buffers、ロック表、WAL バッファ）────┘
+```
+
+第 33 回で見たとおり、プロセスはそれぞれ自分のアドレス空間を持ちます。バッファプール（第 96 回）やロック表のように全員で使うものは共有メモリに置き、ソートやハッシュの作業領域（第 103 回の `work_mem`）、計画のキャッシュ、カタログのキャッシュは各バックエンドが自分で持ちます。
+
+### MySQL: 接続ごとにスレッド
+
+MySQL は 1 つのプロセス `mysqld` の中で、**接続ごとに専用のスレッド**を割り当てます。接続を受けるマネージャスレッドが、まず**スレッドキャッシュ**に使えるスレッドが残っていないかを見て、無ければ新しく作ります。接続が終わると、キャッシュに空きがあればスレッドはそこへ戻ります（[MySQL 8.4: Connection Interfaces](https://dev.mysql.com/doc/refman/8.4/en/connection-interfaces.html)）。
+
+第 34 回で見たように、スレッドはアドレス空間を共有するので、作るのも切り替えるのもプロセスより軽い。ただし文書自身が「接続中のクライアントと同じ数だけスレッドがあり、大量の接続を捌くときには不利な点がある」と書いているとおり、**1 接続 = 1 実行単位**という形は PostgreSQL と変わりません（同上）。
+
+| | PostgreSQL | MySQL |
+| --- | --- | --- |
+| 接続 1 本に対応するもの | バックエンドプロセス | `mysqld` の中のスレッド |
+| 作り方 | postmaster が `fork` | マネージャスレッドが作る。キャッシュがあれば再利用 |
+| 接続数の上限 | `max_connections`（既定 100） | `max_connections`（既定 151） |
+| 上限を変えるには | 再起動が必要。共有メモリの大きさがこの値で決まる | 実行中に変えられる |
+
+PostgreSQL の `max_connections` は、再起動しないと変えられません。この値に比例して確保される資源（共有メモリを含む）があるからです（[PostgreSQL 文書: Connection Settings](https://www.postgresql.org/docs/current/runtime-config-connection.html)）。
+
+### 手元で数える: 50 本張ってみる
+
+クライアントのコンテナから、`SELECT pg_sleep(30)` を実行する psql を 50 本同時に走らせ、サーバのコンテナで `ps` を見ました。
+
+```
+$ ps -e -o pid,ppid,rss,cmd
+    PID    PPID   RSS CMD
+      1       0 25236 postgres
+     59       1 25008 postgres: checkpointer
+     60       1  9192 postgres: background writer
+     62       1 11628 postgres: walwriter
+     63       1  9888 postgres: autovacuum launcher
+     64       1  9332 postgres: logical replication launcher
+   4553       1 15624 postgres: app postgres 192.168.158.4(36714) SELECT
+   4554       1 15624 postgres: app postgres 192.168.158.4(36722) SELECT
+   4555       1 15624 postgres: app postgres 192.168.158.4(36734) SELECT
+   ...（同じ形の行が 50 本）
+```
+
+- 接続していないときは、PID 1 の postmaster と、第 99 回のチェックポイントや WAL の書き出しを担う裏方の 5 つだけでした
+- 50 本張ると、**親が PID 1 のプロセスが 50 個増えました**。プロセス名には利用者、データベース、相手のアドレスとポート、いま実行中の文の種類が入ります
+- 各プロセスの RSS は約 15.6MB ですが、これは共有メモリやライブラリを数え重ねた値です。50 個の平均を `/proc/<pid>/smaps_rollup` で取ると、**Pss が 1,474kB、そのプロセスだけが書き換えた Private_Dirty が 1,244kB** でした
+
+何もしていない（`pg_sleep` で寝ているだけの）バックエンドでも、1 本につき 1MB 強を自分だけのものとして持っています。複雑な問い合わせを実行すれば、カタログのキャッシュや作業領域でこれが増えます。
+
+MySQL でも同じように 50 本張り、`mysqld` のスレッドを `/proc/<pid>/task` の数で数えました。
+
+```
+接続なし:   スレッド 35   VmRSS 475,484 kB
+50 本接続:  スレッド 85   VmRSS 487,128 kB   Threads_connected 51（確認用の 1 本を含む）
+全部切断:   スレッド 43   Threads_cached 8   Threads_created 51
+```
+
+`performance_schema.threads` でも、`thread/sql/one_connection` という名前のスレッドが接続の数だけ並びました。全体の RSS の増え方は 50 本で約 11.4MB、1 本あたり 230kB ほどで、プロセスを分ける PostgreSQL よりずっと小さく済んでいます。切断した後もスレッドが 8 本残っているのがスレッドキャッシュで、次の接続はこのスレッドを使い回します。
+
+### 1 本張るのにかかる時間
+
+接続にはメモリのほかに、**張るたびの時間**がかかります。pgbench で、主キーで 1 行を読む問い合わせ（`-S`）を、接続を張りっぱなしにした場合と、1 回ごとに張り直す場合（`-C`）で 10 秒ずつ流しました（クライアント 1 本、別コンテナから TCP）。
+
+| 条件 | 平均の所要時間 | 1 秒あたり |
+| --- | --- | --- |
+| 接続を張りっぱなし | 0.048 ms | 20,947 |
+| 毎回張り直す（SCRAM-SHA-256 認証） | 6.884 ms（うち接続 6.203 ms） | 145 |
+| 毎回張り直す（認証を `trust` にした場合） | 4.134 ms（うち接続 3.303 ms） | 242 |
+
+問い合わせそのものは 0.05 ms なのに、接続には 3〜6 ms かかります。**100 倍以上**です。中身は、TCP の 3 ウェイハンドシェイク、`fork`、新しいバックエンドの初期化、認証です。認証を外しても 3 ms 残るので、プロセスを作って立ち上げる部分が大きいことが分かります。後で見る SCRAM は、パスワードから鍵を作るのに既定で 4,096 回のハッシュ計算をするので、その分がさらに上乗せされています。
+
+## 接続を使い回す: プール
+
+1 本が重く、張るのも遅いなら、答えは 1 つです。**一度張った接続を、閉じずに使い回す**。これがコネクションプールです。
+
+### アプリの中のプール
+
+多くの言語のドライバやフレームワークは、プールを内蔵しています。Go の `database/sql` を例に取ると、`sql.DB` 自体がプールで、次の設定があります（[Go: database/sql](https://pkg.go.dev/database/sql)）。
+
+| 設定 | 意味 | 既定 |
+| --- | --- | --- |
+| `SetMaxOpenConns` | 同時に開いてよい接続の数 | 0（**無制限**） |
+| `SetMaxIdleConns` | 使っていない接続を何本まで手元に残すか | 2 |
+| `SetConnMaxLifetime` | 1 本の接続を使い回してよい時間 | 0（無期限） |
+| `SetConnMaxIdleTime` | 使われずに置いておいてよい時間 | 0（無期限） |
+
+既定のままだと、2 つの困ったことが起きます。
+
+- **上限が無い。** 負荷が跳ねて 300 個のゴルーチンが同時に問い合わせると、300 本の接続を張りに行き、データベースの `max_connections` にぶつかります
+- **手元に残すのは 2 本だけ。** 跳ねが収まると、2 本を残してすべて閉じます。次に跳ねたら、また張り直します。上の表の「毎回張り直す」に近い状態が、跳ねるたびに起きます
+
+そのため、`SetMaxOpenConns` と `SetMaxIdleConns` を同じくらいの値に明示するのが普通です。
+
+### 台数とプールの掛け算
+
+アプリの中のプールは、**そのプロセスの中でしか**接続を使い回せません。データベースから見た接続の数は、掛け算で積み上がります。
+
+```
+  アプリのプロセス数 × 1 プロセスあたりの最大接続数 = データベースが受ける接続数
+
+  例:  Pod 20 個 × MaxOpenConns 25            = 500 本
+       オートスケールで Pod が 40 個に増えると   = 1,000 本
+       バッチ、管理画面、移行ツールの分も別に足される
+```
+
+PostgreSQL の既定 100 本は、Pod が 4 つあれば埋まります。かといって `max_connections` を何千にも上げると、上で見た 1 本あたりのメモリが積み上がるうえ、同時に動けるのは結局 CPU のコア数ぶんだけなので、残りは第 36 回のスケジューラの上で順番を待つだけになります。ロック（第 100 回）や共有の構造の奪い合いも増えます。
+
+**データベースに張る本数は少なく抑え、アプリ側の多くの接続をその少ない本数に束ねたい。** これを複数のアプリにまたがって行うのが、データベースの手前に置くプーラーです。
+
+### PgBouncer の 3 つのモード
+
+PostgreSQL のプーラーとして広く使われる PgBouncer は、PostgreSQL のプロトコルを話すプロキシです。アプリからは PostgreSQL に見え、後ろには自分で張った少数の接続を持っています。アプリ側の接続（クライアント接続）にサーバ側の接続を**いつ割り当て、いつ返すか**で、3 つのモードがあります（[PgBouncer: Features](https://www.pgbouncer.org/features.html)）。
+
+| モード | サーバ接続を持たせている期間 | 束ねる効果 |
+| --- | --- | --- |
+| session（既定） | クライアントが接続している間ずっと | 小さい。張り直しが減るだけ |
+| transaction | トランザクションの間だけ | 大きい |
+| statement | 1 文の間だけ。複数文のトランザクションは禁止 | 最も大きい |
+
+```
+ transaction モード
+
+ クライアント A: BEGIN ... COMMIT          BEGIN ... COMMIT
+                 └── サーバ接続 1 ──┘      └── サーバ接続 2 ──┘   ← 毎回違ってよい
+ クライアント B:         BEGIN ... COMMIT
+                         └── サーバ接続 1 ──┘
+```
+
+transaction モードなら、アイドル中のクライアント接続はサーバ接続を一切占有しません。1,000 本のクライアント接続を、`default_pool_size`（既定 20）本のサーバ接続でさばけます（[PgBouncer: Configuration](https://www.pgbouncer.org/config.html)）。
+
+### transaction モードで壊れるもの
+
+その代わり、**同じクライアントの次のトランザクションが、同じバックエンドで動く保証が無くなります**。バックエンドに残る状態、つまり「セッション」に結び付いた機能は、すべて当てにできなくなります。PgBouncer の文書は、transaction モードで使えないものとして次を挙げています（[PgBouncer: Features](https://www.pgbouncer.org/features.html)）。
+
+| 機能 | 何が起きるか |
+| --- | --- |
+| `SET` / `RESET` | 設定した値が、別のクライアントのトランザクションに残ったり、自分の次のトランザクションで消えたりする |
+| `LISTEN` | 登録したバックエンドが、もう自分のものではない。通知が届かない |
+| `WITH HOLD` カーソル、一時テーブルの保持 | トランザクションをまたいで残すものが、次は別のバックエンドにある |
+| SQL の `PREPARE` / `DEALLOCATE` | 準備した文が、次のトランザクションのバックエンドには無い |
+| セッション単位の勧告ロック | 取ったバックエンドと解放するバックエンドが違ってしまう |
+
+文書自身が、transaction モードは「**設計上**、クライアントがサーバに期待することを破る」と書いています。`SET` の代わりに `SET LOCAL`（トランザクションの中だけ効く）を使う、のように、トランザクションの外に状態を持ち越さない書き方にそろえる必要があります。
+
+プリペアドステートメントは長く例外でした。多くのドライバは、次の節で見るプロトコルの Parse メッセージで、名前付きの文を裏で準備します。PgBouncer は 1.21.0（2023 年 10 月）で、この**プロトコルレベル**の名前付きプリペアドに対応しました（[PgBouncer: Changelog](https://www.pgbouncer.org/changelog.html)）。クライアントが付けた名前を `PGBOUNCER_<番号>` という内部の名前に置き換え、どのサーバ接続にどの文を準備済みかを覚えておき、無ければその場で準備し直します。有効にするには `max_prepared_statements` を 0 以外にする必要があり、現在の文書での既定は 200 です（[PgBouncer: Configuration](https://www.pgbouncer.org/config.html)）。SQL で書く `PREPARE` は対象外で、今でも使えません。
+
+<Callout type="tip" title="プーラーは何段にも重なる">
+  実際の構成では、アプリの中のプール、PgBouncer、クラウドが提供するプロキシ（RDS Proxy など）が重なることがあります。
+  どの段がどのモードで束ねているかで、`SET` や `LISTEN` が効くかどうかが変わります。
+  「設定したはずの `search_path` や `statement_timeout` が、ときどき効いていない」という症状は、どこかの段の transaction モードが原因になっていることがよくあります。
+  TLS の区間が段ごとに分かれる話は、第 162 回で扱います。
+</Callout>
+
+## 同じ機械の中ならソケットファイル
+
+ここまでは TCP の話でした。データベースとクライアントが**同じ機械**にいるときは、もう 1 つの道があります。**UNIX ドメインソケット**です。ファイルシステム上のパスを名前にするソケットで、第 42 回で見たとおり、開けば普通の fd として読み書きできます。IP も TCP も通らないので、パケットの組み立て、チェックサム、輻輳制御といった第 66〜67 回の仕事を丸ごと省けます。
+
+PostgreSQL のサーバは、`unix_socket_directories` のディレクトリに `.s.PGSQL.<ポート番号>` という名前のソケットを作ります（[PostgreSQL 文書: Connection Settings](https://www.postgresql.org/docs/current/runtime-config-connection.html)）。文書上の既定は `/tmp` ですが、ビルド時に変えられ、Debian 系のパッケージや公式の Docker イメージでは `/var/run/postgresql` です。
+
+```
+$ ls -la /var/run/postgresql/
+srwxrwxrwx 1 postgres postgres  0 Oct 24 09:57 .s.PGSQL.5432
+-rw------- 1 postgres postgres 63 Oct 24 09:57 .s.PGSQL.5432.lock
+```
+
+先頭の `s` がソケットの印です。libpq（psql など）は、ホストを指定しなければこのソケットを使います。サーバの中でソケット経由と TCP 経由で 1 本ずつつなぎ、自分の接続を `pg_stat_activity` で見ると違いが分かります。
+
+```
+$ psql -U postgres -Atc "select client_addr, client_port from pg_stat_activity where pid = pg_backend_pid()"
+|-1                          ← ソケット: アドレスは空、ポートは -1
+$ psql -h 127.0.0.1 -U postgres -Atc "（同じ）"
+127.0.0.1|45968              ← TCP
+```
+
+### MySQL の localhost は特別扱い
+
+MySQL のクライアントには、知らないと必ずつまずく決まりがあります。Unix では、**ホスト名 `localhost` を TCP の宛先として扱わず、ソケットファイルにつなぐ**のです。`--port` を指定しても無視されます。TCP にしたいときは `127.0.0.1` を書くか、`--protocol=TCP` を付けます（[MySQL 8.4: Connecting to the MySQL Server](https://dev.mysql.com/doc/refman/8.4/en/connecting.html)）。
+
+サーバのコンテナの中で、両方を `\s`（status）で見ました。
+
+```
+$ mysql -h localhost -uroot -p -e '\s'
+Current user:		root@localhost
+SSL:			Not in use
+Connection:		Localhost via UNIX socket
+UNIX socket:		/var/run/mysqld/mysqld.sock
+
+$ mysql -h 127.0.0.1 -uroot -p -e '\s'
+Current user:		root@127.0.0.1
+SSL:			Cipher in use is TLS_AES_128_GCM_SHA256
+Connection:		127.0.0.1 via TCP/IP
+TCP port:		3306
+```
+
+違いは道だけではありません。
+
+- **TLS の有無。** TCP では既定で TLS になり、ソケットでは使われません。MySQL は、ソケットの接続を TLS と並ぶ安全な経路として扱います（TLS の決まり方は第 162 回）
+- **どのアカウントとして認証されたか。** `current_user()` を見ると、`localhost` では `root@localhost`、`127.0.0.1` では `root@%` でした。MySQL のアカウントは「利用者名 @ 接続元」の組で、`mysql.user` には `root@localhost` と `root@%` が**別の行**として入っています。どちらで入ったかで、パスワードも権限も変わりえます
+
+### コンテナで「localhost だと繋がらない」
+
+この 2 つの決まりが、コンテナで典型的な事故を起こします。アプリのコンテナから、別のコンテナのデータベースに `localhost` でつなごうとした結果です。
+
+```
+$ mysql -h localhost -uroot -p -e 'select 1'
+ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/var/run/mysqld/mysqld.sock' (2)
+$ mysql -h 127.0.0.1 -uroot -p -e 'select 1'
+ERROR 2003 (HY000): Can't connect to MySQL server on '127.0.0.1:3306' (111)
+$ psql -U app -d postgres -c 'select 1'
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: No such file or directory
+```
+
+- `localhost` の MySQL と、ホストを書かない psql は、**自分のコンテナのファイルシステム**にあるソケットファイルを探しに行き、無いので `No such file or directory`（エラーの末尾の `(2)` は `ENOENT`）で失敗します。ソケットファイルはサーバのコンテナの中にあります
+- `127.0.0.1` は、**自分のコンテナのネットワーク名前空間**のループバックです。そこでは誰も 3306 で待っていないので、`Connection refused`（`(111)` は `ECONNREFUSED`）になります
+
+コンテナごとにファイルシステムとネットワークの名前空間が分かれているので、「同じ機械の中」という前提がどちらの道でも成り立たないのです。正しくは、サーバのコンテナの名前（Compose ならサービス名）で TCP でつなぎます。今回の環境では `-h ll-105-my` で `Connection: ll-105-my via TCP/IP` になりました。どうしてもソケットを使いたければ、ソケットのあるディレクトリをボリュームで両方のコンテナに見せる方法もあります。
+
+## バイト列の形: PostgreSQL
+
+では、ソケットの中を流れているバイト列を見ていきます。
+
+### 種別 1 バイトと長さ 4 バイト
+
+PostgreSQL のプロトコル（版 3.0）のメッセージは、すべて同じ形をしています（[PostgreSQL 文書: Messaging Overview](https://www.postgresql.org/docs/current/protocol-overview.html)）。
+
+```
+ ┌──────┬────────────────┬──────────────────────────┐
+ │ 種別 │ 長さ（4 バイト）│ 中身                       │
+ │ 1 B  │ 自分自身を含む  │ 長さ − 4 バイト            │
+ └──────┴────────────────┴──────────────────────────┘
+   'Q'    00 00 00 1c      select 41 + 1 as answer\0
+```
+
+長さは種別の 1 バイトを含まず、長さの欄の 4 バイト自身は含みます。受け取る側は、5 バイト読めば残りを何バイト読めばよいかが分かります。TCP はバイトの流れであって区切りを持たないので（第 66 回）、**区切りはプロトコルの側で長さとして書く**必要があるわけです。
+
+例外は接続して最初に送る**起動メッセージ**（StartupMessage）で、種別のバイトがありません。長さの次にプロトコルの版番号が来ます。TLS に切り替えるときに送る SSLRequest（第 162 回）が、版番号の位置に `80877103` という決して版番号と重ならない値を置くのは、この形を共有しているからです。
+
+### 起動と認証を手で話す
+
+Python の `socket` だけで起動メッセージを組み立てて送り、返ってくるメッセージを 1 つずつ表示しました。認証は SCRAM-SHA-256 なので、その計算（PBKDF2 と HMAC）も手で書いています。左の `C>` がクライアント、`S>` がサーバ、続く 1 文字が種別です。
+
+```
+C> StartupMessage 36 bytes: 00 00 00 24 00 03 00 00 ...
+S> R len=23 auth_code=10 b'SCRAM-SHA-256||'
+C> p SASLInitialResponse b'n,,n=,r=w06v04Ei7nRoyeiFdBeou0Gg'
+S> R len=92 auth_code=11 r=w06v04Ei7nRoyeiFdBeou0GgZE8uuO0rB1FVbYJnxbTFjBRr,s=JWfXchzbieUVDwZKv13Kaw==,i=4096
+C> p SASLResponse b'c=biws,r=w06v04Ei7nRoyeiFdBeou0GgZE8uuO0rB1FVbYJnxbTFjBRr,p=' ...
+S> R len=54 auth_code=12 b'v=iTguX/rD2PyC3yGa9N8VKb5INxcaUFtXdDM8Jmu21Dg='
+S> R len=8 auth_code=0 b''
+S> S len=23 in_hot_standby=off
+S> S len=25 integer_datetimes=on
+S> S len=21 TimeZone=Etc/UTC
+   ...（S が全部で 14 個）
+S> S len=51 server_version=17.11 (Debian 17.11-1.pgdg13+2)
+S> S len=25 server_encoding=UTF8
+S> K len=12 pid=579 ...
+S> Z len=5 status=I
+```
+
+順に読むと、接続の始まりが全部見えます。
+
+1. **起動メッセージ**。長さ `0x24`（36）、版 `00 03 00 00`（3.0）、続いて `user`、`database` などの名前と値の組を並べる
+2. **`R`（Authentication）**。中の番号で意味が変わる。10 は「SASL で認証せよ。使える方式は SCRAM-SHA-256」
+3. SCRAM の 2 往復（[PostgreSQL 文書: SASL Authentication](https://www.postgresql.org/docs/current/sasl-authentication.html)）
+   - クライアントが乱数 `r=...` を送る
+   - サーバが、その乱数に自分の乱数を継ぎ足したもの、塩 `s=...`、繰り返し回数 `i=4096` を返す
+   - クライアントは、パスワードと塩から 4,096 回のハッシュで鍵を作り、ここまでのやり取り全体に対する証明 `p=...` を送る
+   - サーバも同じ計算で確かめ、自分も正しい鍵を知っている証拠 `v=...` を返す（番号 12）
+4. **`R` 番号 0（AuthenticationOk）**。ここで認証が終わり、バックエンドの準備が始まる
+5. **`S`（ParameterStatus）**。文字コード、タイムゾーン、サーバの版などの現在値。`SET` で変わったときも、この形で知らされる
+6. **`K`（BackendKeyData）**。このバックエンドの PID（579）と秘密の値。実行中の問い合わせを取り消すときは、**別の接続を新しく張って**この 2 つを送る（[PostgreSQL 文書: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)）。PID が出てくるのは、上で見たとおり接続 1 本が 1 プロセスだから
+7. **`Z`（ReadyForQuery）**。状態 `I` はトランザクションの外で待機中。トランザクションの中なら `T`、失敗したトランザクションの中なら `E` になる
+
+パスワードそのものはどこにも流れていません。流れるのは、乱数とパスワード由来の鍵から作った証明だけで、毎回の乱数が違うので、盗み見た証明を別の接続で使い回すこともできません。
+
+続けて `Q`（Query）で `SELECT 1 AS x, 'hi' AS y` を送ると、次の 4 つが返りました。
+
+```
+S> T len=46   列の名前と型（x は int4 = OID 23、y は text = OID 25）
+S> D len=17   1 行ぶんのデータ。列ごとに「長さ 4 バイト + 文字列」で "1" と "hi"
+S> C len=13   SELECT 1
+S> Z len=5    I
+```
+
+`D`（DataRow）の中の数値 `1` は、**文字列の "1"** として送られています。
+
+### Simple Query と Extended Query
+
+いま使った `Q` は **Simple Query** です。SQL の文字列を 1 つ送り、サーバはそれを解析してすぐ実行します。値を埋め込むなら SQL の文字列の中に書くしかありません。
+
+もう 1 つの **Extended Query** は、処理を段階に分けます（[PostgreSQL 文書: Messaging Overview](https://www.postgresql.org/docs/current/protocol-overview.html)）。
+
+| メッセージ | 種別 | 役割 |
+| --- | --- | --- |
+| Parse | `P` | SQL を解析して**準備済みの文**を作る。値は `$1` などの穴のまま |
+| Bind | `B` | 準備済みの文に値を入れて**ポータル**（実行できる状態）を作る |
+| Describe | `D` | 結果の列の形を尋ねる |
+| Execute | `E` | ポータルを実行する |
+| Sync | `S` | 一連の区切り。ここで暗黙のトランザクションを閉じ、`Z` を返させる |
+
+psql 16 以降の `\bind` を使うと、psql に Extended Query を話させることができます。同じ計算を 2 通りで送り、サーバ側のネットワークで TShark に解析させました。
+
+```
+-- psql -c "select 41 + 1 as answer"
+C>  Simple query
+S>  Row description, Data row, Command completion, Ready for query
+
+-- psql で  select $1::int + 1 as answer \bind 41 \g
+C>  Parse, Bind, Describe, Execute, Sync
+S>  Parse completion, Bind completion, Row description, Data row, Command completion, Ready for query
+```
+
+Extended のほうでクライアントが送ったのは、5 つのメッセージを 1 つにつなげた 81 バイトでした。種別の文字と長さで区切ると次のとおりです。
+
+```
+50 00000025 00 "select $1::int + 1 as answer " 00 0000          P  文の名前は空（無名）、穴の型指定 0 個
+42 00000014 00 00 0001 0000 0001 00000002 "41" 0001 0000        B  ポータル名も空、値 1 個 = 長さ 2 の "41"
+44 00000006 50 00                                              D  ポータル（'P'）の形を尋ねる
+45 00000009 00 00000000                                        E  無名ポータルを、行数の上限なしで実行
+53 00000004                                                    S
+```
+
+SQL の文字列の中に `41` はありません。**値は Bind の中で、SQL とは別の欄として**送られています。サーバのログ（`log_statement = all`）にも、Simple のほうは `statement: select 41 + 1 as answer`、Extended のほうは `execute <unnamed>: select $1::int + 1 as answer` と `Parameters: $1 = '41'` が別々に記録されました。値が SQL の構文として解釈される余地が、プロトコルの段階で無くなっているわけです。
+
+Parse で名前を付ければ、準備済みの文はそのセッションの間残り、次からは Bind と Execute だけで済みます。ただし文書のとおり、準備済みの文やポータルは**そのセッションの中にしか存在せず、他のセッションとは共有されません**（同上）。前の節で、transaction モードのプーラーがプリペアドを壊していた理由がこれです。準備した文はバックエンドプロセスのメモリの中にあるので、次のトランザクションが別のバックエンドに回されれば、そこには無いのです。
+
+pgbench の `-M` で、同じ 1 行の読み取りを 3 通りに送り比べました（クライアント 1 本、10 秒）。
+
+| `-M` | 送るもの | 平均の所要時間 | 1 秒あたり |
+| --- | --- | --- | --- |
+| `simple` | `Q` だけ | 0.040 ms | 25,313 |
+| `extended` | 毎回 無名の Parse / Bind / Execute / Sync | 0.064 ms | 15,697 |
+| `prepared` | 最初に名前付きで Parse、以後は Bind / Execute / Sync | 0.030 ms | 33,362 |
+
+Extended を毎回無名で使うと、メッセージが増えるぶん Simple より遅くなります。名前を付けて使い回すと、解析と計画（第 101 回で見たように、汎用計画に切り替わったあとは計画も）を省けるので最も速くなります。ドライバが裏で名前付きのプリペアドを使うのはこのためです。
+
+<Callout type="note" title="Sync までは読み捨てられる">
+  Extended Query では、途中でエラーが起きるとサーバは ErrorResponse を返し、**次の Sync までのメッセージを読み捨てます**。
+  そのため、クライアントは Parse / Bind / Execute を返事を待たずに続けて送り、最後に Sync を 1 つ置く、というまとめ送りができます
+  （[PostgreSQL 文書: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)）。
+  往復の回数がそのまま待ち時間になる、遠いデータベースとの通信で効く性質です。
+</Callout>
+
+## バイト列の形: MySQL
+
+### 長さ 3 バイトと通し番号 1 バイト
+
+MySQL のプロトコルの単位はパケットで、先頭 4 バイトが**中身の長さ 3 バイト（リトルエンディアン）と通し番号 1 バイト**です（[MySQL: Protocol::Packet](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html)）。種別は中身の先頭に来ます。長さの欄が 3 バイトなので、1 パケットの中身は最大 2^24 − 1 バイト（約 16MB）で、それ以上は複数のパケットに分けて送ります。通し番号は、1 つのコマンドのやり取りの中で 0 から 1 ずつ増えます。
+
+### 挨拶と認証プラグイン
+
+PostgreSQL と違い、MySQL は**サーバが先に話します**。接続すると、サーバが版、乱数、能力フラグ、認証プラグインの名前を載せた Server Greeting（Handshake）を送り、クライアントが利用者名と認証データを返します。TLS に切り替えるときの能力フラグの使い方は第 162 回で扱います。
+
+認証の方式はプラグインとして差し替えられ、MySQL 8.0 からの既定は `caching_sha2_password` です。古い `mysql_native_password` は 8.0.34 で非推奨になり、**8.4 では既定で無効**（`--mysql-native-password=ON` で有効にする）、9.0.0 で削除されました（[MySQL 8.4: Native Pluggable Authentication](https://dev.mysql.com/doc/refman/8.4/en/native-pluggable-authentication.html)）。古いドライバや古い設定で 8.4 に移ると認証で失敗するのは、このためです。
+
+`caching_sha2_password` の名前にある「キャッシュ」は、サーバのメモリにある認証済みの記録です。一度認証に成功した利用者は、次からはこの記録との照合だけで済みます。記録に無い初回は `mysql.user` の情報と突き合わせる完全な認証になり、そのとき**接続が TLS で守られていないなら、RSA の鍵でパスワードを暗号化して送る**必要があります。キャッシュは `FLUSH PRIVILEGES`、パスワードの変更、サーバの再起動で消えます（[MySQL 8.4: Caching SHA-2 Pluggable Authentication](https://dev.mysql.com/doc/refman/8.4/en/caching-sha2-pluggable-authentication.html)）。下の実験では、直前に同じ利用者で入っていたので、TShark は `Caching_sha2_password fast_auth_success` と解析しました。
+
+### COM_QUERY と COM_STMT_PREPARE
+
+挨拶の後は、クライアントが**コマンド**を送ってサーバが答える、の繰り返しです。中身の先頭 1 バイトがコマンドの番号です。
+
+- **COM_QUERY**（3）: SQL の文字列を送る。結果は**テキストの形**で返る
+- **COM_STMT_PREPARE**（22）と **COM_STMT_EXECUTE**（23）: サーバ側のプリペアドステートメント。結果は、テキストの代わりに**より詰めた形**（バイナリの形）で返る（[MySQL: Prepared Statements](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_command_phase_ps.html)）
+
+mysql-connector-python で、普通のカーソルと `prepared=True` のカーソルで同じ計算をし、MySQL のコンテナのネットワークで TShark に解析させました（TLS は無効にしています）。
+
+```
+3306	Server Greeting  proto=10 version=8.4.13
+47790	Login Request user=root
+3306	Caching_sha2_password fast_auth_success
+3306	Response  OK
+...
+47790	3	SELECT 41 + 1 AS answer      Request Query
+3306	Response TABULAR Response
+47790	22	SELECT ? + 1 AS answer       Request Prepare Statement
+3306	Response
+47790	26	                             Request Reset Statement
+3306	Response  OK
+47790	23	                             Request Execute Statement
+3306	Response TABULAR Response
+47790	1	                             Request Quit
+```
+
+結果の行の部分だけを抜き出すと、2 つの形の違いがはっきり見えます。
+
+```
+テキスト（COM_QUERY の結果）:
+  03 00 00 04 | 02 34 32                         長さ 2 の文字列 "42"
+
+バイナリ（COM_STMT_EXECUTE の結果）:
+  0a 00 00 04 | 00 | 00 | 2a 00 00 00 00 00 00 00   先頭 0x00、NULL のビット列、8 バイト整数 42
+```
+
+テキストでは数値も文字列として送られ、受け取った側で数値に直します。バイナリでは、列の型（ここでは 8 バイト整数）のまま送られます。送る値も同じで、COM_STMT_EXECUTE の中には、文の ID、値の型（1 バイト整数）、値 `0x29`（41）が SQL の文字列とは別に入っていました。
+
+<Callout type="warn" title="SQL の PREPARE は、プロトコルのプリペアドではない">
+  MySQL でも PostgreSQL でも、SQL として書く `PREPARE stmt FROM ...` / `EXECUTE stmt` は、それ自体が COM_QUERY や Simple Query で送られる 1 つの文です。
+  結果はテキストの形で返り、準備した文はサーバ側のセッションに残ります。
+  ドライバのプリペアドがどちらで実装されているか（サーバ側か、クライアントで値を埋め込んでいるだけか）は、ドライバと設定によって違います。
+  Go の MySQL ドライバのように、既定はサーバ側のプリペアド（準備・実行・解放の 3 往復）で、`interpolateParams=true` にするとクライアント側で値を埋め込んで 1 往復にするものもあります（[go-sql-driver/mysql](https://github.com/go-sql-driver/mysql#interpolateparams)）。
+</Callout>
+
+### 1 メッセージの上限: max_allowed_packet
+
+MySQL には、1 つの通信パケットの大きさの上限 `max_allowed_packet` があります。ここで言う通信パケットは、**サーバへ送る 1 つの SQL 文、クライアントへ返す 1 行**、レプリケーションで送る 1 つのバイナリログのイベントです。既定はサーバが 64MB、mysql クライアントが 16MB で、送れる最大は 1GB です。上限を超えたものを受け取った側は、エラーを出して**接続を切ります**（[MySQL 8.4: Packet Too Large](https://dev.mysql.com/doc/refman/8.4/en/packet-too-large.html)）。
+
+サーバの上限を 1MB（1,048,576 バイト）に下げ、文字列リテラルを含む `SELECT LENGTH('xxx...')` を送りました。
+
+```
+1000000 -> [(1000000,)]
+  next query ok: [(1,)]
+1100000 -> OperationalError 2055: Lost connection to MySQL server at 'll-105-my:3306', system error: Errno 32: Broken pipe
+  next query: OperationalError 2055: Lost connection to MySQL server ...
+```
+
+1,100,000 文字の文を送ったところで、サーバに接続を切られました。エラーは 1 文だけでは済まず、**その接続ごと使えなくなります**。サーバの `Aborted_clients` が増えていました。大きな画像や JSON を 1 行に入れる表、何万行を 1 文にまとめる一括 `INSERT` で突然起きる失敗の典型です。
+
+## サーバから話しかける: LISTEN / NOTIFY
+
+ここまでのやり取りは、どれも「クライアントが聞き、サーバが答える」形でした。PostgreSQL には、**サーバのほうから**クライアントにメッセージを送る仕組みもあります。`LISTEN チャネル名` をしておくと、誰かが同じチャネルに `NOTIFY` したとき、サーバは **NotificationResponse**（種別 `A`）というメッセージを送ってきます。クライアントは、自分が問い合わせをしていないときでも、いつでもこれを受け取れるようにしておく必要があります（[PostgreSQL 文書: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)）。
+
+`NOTIFY` には、文書が明記している決まりがいくつかあります（[PostgreSQL 文書: NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html)）。
+
+- トランザクションの中で `NOTIFY` しても、**コミットされるまで配られない**。ロールバックすれば配られない
+- 通知の行き先は、**その時点で `LISTEN` している**セッションだけ
+- 配る前の通知はサーバの共有のキューに溜まる。大きさは標準で 8GB。いっぱいになると、`NOTIFY` したトランザクションのコミットが失敗する。キューの掃除は、通知を受け取りきっていない `LISTEN` 中のセッションがあると進まない
+- 同じトランザクションの中で、同じチャネル・同じ内容の通知を何度も送ると、1 つにまとめられることがある
+- 内容（ペイロード）は既定の構成で 8,000 バイト未満
+
+### 手元で確かめる
+
+起動と認証を手で書いたのと同じ Python のクライアントで `LISTEN jobs` を送り、その後は何も送らずにソケットを読み続けました。別のコンテナの psql から、いくつかの `NOTIFY` を送ります。時刻はどちらも UTC です。
+
+```
+10:05:12 LISTEN jobs; waiting 10.0 s
+10:05:14 notifier: NOTIFY jobs, 'committed-1'
+10:05:14 A (NotificationResponse) pid=4540 channel=jobs payload=committed-1
+10:05:15 notifier: BEGIN; NOTIFY jobs, 'in-tx'; SELECT pg_sleep(3); COMMIT;
+10:05:18 A (NotificationResponse) pid=4541 channel=jobs payload=in-tx
+10:05:19 notifier: BEGIN; NOTIFY jobs, 'rolled-back'; ROLLBACK;
+10:05:22 disconnected
+10:05:22 notifier: NOTIFY jobs, 'while-away'
+10:05:22 LISTEN jobs; waiting 4.0 s
+10:05:26 disconnected
+```
+
+- `committed-1` は、送ったその秒に届きました。クライアントは何も問い合わせていないのに、`A` のメッセージが**ソケットに勝手に**流れてきます。中には送り手のバックエンドの PID も入っています
+- `in-tx` は、`NOTIFY` を実行したのが 10:05:15 でも、届いたのは 3 秒後の**コミットの時点**（10:05:18）でした
+- `rolled-back` は、**一度も届きませんでした**
+- 受信側が切断している間に送った `while-away` は、その直後に同じチャネルを `LISTEN` し直しても**届きませんでした**。キューに溜まるのは、送った時点で `LISTEN` していたセッションのための通知だけです
+
+### 落ちていた間の通知を、どう取り戻すか
+
+最後の結果が示すとおり、LISTEN / NOTIFY は**届けたことを保証する仕組みではありません**。通知はディスクに永続化されず、受信側のプロセスが落ちていた間、ネットワークが切れていた間、再接続するまでの間の通知は、そのまま失われます。
+
+そのため、通知は「何かが変わった」という**合図**として使い、**本体は表に書く**のが定石です。文書も、大きなデータや大量の情報を伝えたいなら、表に入れてその行のキーを送るのがよい、と書いています（[PostgreSQL 文書: NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html)）。受信側の手順は、`LISTEN` の文書に書かれている決まりそのままです（[PostgreSQL 文書: LISTEN](https://www.postgresql.org/docs/current/sql-listen.html)）。
+
+```
+ 1. LISTEN jobs を実行し、コミットする（LISTEN もコミットで効く）
+ 2. 新しいトランザクションで、表を読んで「まだ処理していないもの」を全部拾う
+ 3. 以後は通知を合図に、2 と同じ読み方で表を読み直す
+```
+
+1 と 2 の順番が大事です。先に表を読んでから `LISTEN` すると、その隙間にコミットされた変更は、表を読んだときにはまだ無く、通知はまだ聞いていなかったので、どちらでも拾えません。先に `LISTEN` すれば、隙間の変更は通知で必ず来ます。2 で読んだものと同じ変更の通知が後から来ることはありますが、文書のとおり、処理済みかを表で判定するようにしておけば無害です。再接続のたびに 1 から始めれば、落ちていた間の変更も 2 で回収できます。
+
+こうしておけば、通知が失われても、まとめられても、遅れても、正しさは表の側で保たれます。通知は「すぐ気づくための近道」で、無くても定期的に表を見に行けば同じ結果になる、という位置付けです。
+
+### プーラーとの相性
+
+`LISTEN` は、それを実行した**バックエンドプロセス**に登録されます。通知の `A` のメッセージも、そのバックエンドがつながっているソケットに流れます。transaction モードの PgBouncer では、`LISTEN` を実行したトランザクションが終わった時点で、そのバックエンドは別のクライアントに回されてしまいます。PgBouncer の表で `LISTEN` が transaction モードで「使えない」とされているのはこのためです（[PgBouncer: Features](https://www.pgbouncer.org/features.html)）。
+
+受信側だけは、プーラーを通さずに PostgreSQL へ直接つなぐか、session モードのプールにつなぐのが普通です。送る側の `NOTIFY` は、コミットで配られるだけなので、transaction モードを通しても問題ありません。
+
+<Callout type="note" title="受信側は 1 本の接続を占有する">
+  `LISTEN` している受信側は、通知を待つ間ずっと接続を 1 本、つまりバックエンドプロセスを 1 つ占有します。
+  受信するワーカーを何十も立てると、その数だけ `max_connections` を使います。
+  1 本で受けてプロセスの中で配る、という作りにしておくほうが安全です。
+</Callout>
+
+## まとめ
+
+- サーバ型のデータベースでは、SQL も結果もソケットを通るバイト列になる。DuckDB や SQLite のような組み込み型との違いはここにある
+- PostgreSQL は接続 1 本ごとに postmaster が `fork` してバックエンドプロセスを作る。手元では、寝ているだけの 1 本で自分だけのメモリが約 1.2MB、接続を張るのに 3〜6 ms かかった（問い合わせ自体は 0.05 ms）
+- MySQL は接続 1 本ごとに `mysqld` の中のスレッドを割り当て、切断後のスレッドはキャッシュして再利用する。1 本あたりのメモリは PostgreSQL より小さいが、1 接続 = 1 実行単位であることは同じ
+- アプリの中のプールは、プロセスの中でしか使い回せない。Go の `database/sql` は既定で上限なし、アイドルは 2 本。データベースが受ける接続数は「プロセス数 × プールの上限」で積み上がる
+- PgBouncer の transaction モードは、少数のサーバ接続に多数のクライアントを束ねる代わりに、`SET`、`LISTEN`、SQL の `PREPARE`、セッション単位の勧告ロックを壊す。プロトコルレベルのプリペアドは 1.21.0 から対応している
+- 同じ機械の中では UNIX ドメインソケットが使える。MySQL のクライアントは `localhost` をソケットに、`127.0.0.1` を TCP に読み替え、TLS の有無や認証されるアカウントまで変わる。コンテナでは、どちらの意味でも「自分のコンテナ」を指すので繋がらない
+- PostgreSQL のメッセージは「種別 1 バイト + 長さ 4 バイト + 中身」。起動は R（認証。SCRAM は 2 往復）→ S → K → Z の順に返る。Simple Query（Q）は文字列 1 つ、Extended Query（P / B / E / S）は SQL と値を別の欄で送り、名前付きの文はセッションの中にだけ残る
+- MySQL のパケットは「長さ 3 バイト + 通し番号 1 バイト」。8.4 の既定の認証は `caching_sha2_password` で、`mysql_native_password` は既定で無効。COM_QUERY はテキスト、COM_STMT_PREPARE / EXECUTE はバイナリの形で結果を返す。`max_allowed_packet` を超える 1 文・1 行は、接続ごと切られる
+- LISTEN / NOTIFY の通知は、コミット時に、その時点で LISTEN しているセッションにだけ配られる。永続化されないので、通知は合図に使い、本体は表から読む。先に LISTEN してから表を読む
+
+ここまでは、1 台のデータベースに、アプリが 1 本ずつ接続を張る話でした。次の第 106 回では、データベースどうしが接続を張り、第 99 回の WAL を流して同じ状態の複製を作る**レプリケーション**を見ます。

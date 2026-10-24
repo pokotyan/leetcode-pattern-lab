@@ -1,0 +1,557 @@
+---
+title: ロックは何に掛かるのか
+description: MVCC で読む人と書く人の待ち合わせは消えたのに、なぜ INSERT が待たされるのか。InnoDB がインデックスのすき間に掛けるロックと、PostgreSQL が行そのものに書き込むロックを、手元で観察します
+chapter: db
+order: 5
+status: published
+topics:
+  - インテンションロック
+  - レコードロック
+  - ギャップロック
+  - ネクストキーロック
+  - 挿入インテンションロック
+  - ファントム
+  - 外部キーのロック
+  - FOR KEY SHARE
+  - MultiXact
+  - デッドロック検出
+  - AUTO-INC ロック
+  - data_locks / pg_locks
+requires:
+  - ll-99-db-wal-mvcc
+  - ll-97-db-index
+  - ll-37-sync
+  - ll-39-deadlock
+---
+
+import Callout from '../../components/Callout.astro'
+
+## MVCC のあとに残る待ち合わせ
+
+第 99 回で見た MVCC は、行の古い版を残すことで、**読む人と書く人が互いを待たない**ようにしました。その回の最後に、ロックがなくなったわけではないと書きました。残っている仕事は、大きく 2 つあります。
+
+**1 つ目は、書く人どうしです。** 2 人が同じ口座の残高を同時に書き換えるとき、古い版を残しても解決しません。どちらかが先に書き、もう一方はその結果を見てから書く必要があります。
+
+**2 つ目は、まだ無い行です。** 次の処理を考えます。
+
+```sql
+BEGIN;
+SELECT count(*) FROM reservations WHERE room = 7 AND day = '2026-11-01' FOR UPDATE;
+-- 0 件なら予約できる
+INSERT INTO reservations (room, day, ...) VALUES (7, '2026-11-01', ...);
+COMMIT;
+```
+
+`FOR UPDATE` は、読んだ行をロックします。ところが 0 件なら、ロックする行がありません。その間に別のトランザクションが同じ部屋と日付で `INSERT` すれば、二重予約になります。**存在しない行を、どうやって守るのか。** これがファントムの問題です。
+
+この回では、データベースのロックが実際には**何に**掛かっているのかを見ます。答えは製品によって大きく違います。InnoDB は**インデックスの項目と、項目どうしのすき間**にロックを掛けます。PostgreSQL は**行そのものに**ロックの印を書き込みます。
+
+## ロックの 2 つの軸
+
+データベースのロックは、2 つの軸で整理できます。
+
+**モード（どう掛けるか）。** 基本は第 37 回の読み書きロックと同じです。**共有ロック（S）** は何人でも同時に持てて、**排他ロック（X）** は 1 人しか持てません。S どうしは両立し、X はどれとも両立しません。
+
+**対象（何に掛けるか）。** テーブル全体、1 行、そしてキーの範囲です。範囲のロックが、先ほどの「まだ無い行」を守る道具になります。
+
+対象の大きさが違うロックが混在すると、1 つ問題が起きます。誰かがテーブル全体に X を掛けたいとき、そのテーブルのどこかの行に誰かがロックを持っていないかを、どう知ればよいのでしょうか。全行を調べていては間に合いません。
+
+そこで、行をロックする前に、テーブルに **インテンションロック**（意図ロック）を掛けます。「このテーブルのどこかの行に S を掛けるつもり」が **IS**、「X を掛けるつもり」が **IX** です。InnoDB では、`SELECT ... FOR SHARE` がテーブルに IS を、`SELECT ... FOR UPDATE` が IX を掛けます（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html)）。
+
+| 要求 ＼ 保持 | X | IX | S | IS |
+| --- | --- | --- | --- | --- |
+| X | 衝突 | 衝突 | 衝突 | 衝突 |
+| IX | 衝突 | 両立 | 衝突 | 両立 |
+| S | 衝突 | 衝突 | 両立 | 両立 |
+| IS | 衝突 | 両立 | 両立 | 両立 |
+
+IX どうしは両立します。別々の行を書き換える 2 人は、テーブルの段階では互いを止めません。止まるのは、テーブル全体への S や X（`LOCK TABLES ... WRITE` など）を求めたときだけです。同じリファレンスも、インテンションロックの目的は「誰かが行をロックしている、あるいはしようとしていることを示すこと」だと書いています。
+
+ロックが複数あれば、第 39 回のデッドロックも起こりえます。データベースはそれを自動で検出しますが、その話は後半で扱います。
+
+## InnoDB: 行ロックはインデックスに掛かる
+
+InnoDB のリファレンスには、次のように書かれています。**レコードロックは常にインデックスレコードをロックする。テーブルにインデックスが無くても、隠れたクラスタ化インデックスを作ってそれをロックに使う**（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html)）。
+
+第 97 回で見たとおり、InnoDB の行はクラスタ化インデックスの葉に住んでいます。「行をロックする」とは、**B+tree の葉に並ぶ項目に印を付けること**です。そして葉の項目はキーの順に並んでいるので、項目と項目の間の**すき間**にも名前を付けられます。これが範囲のロックの土台になります。
+
+主キーが 10、20、30 の 3 行を考えます。
+
+```
+ 主キーの葉:      (−∞)   10     20     30    supremum
+                     ╲   │  ╲   │  ╲   │  ╲    │
+ すき間（gap）:       (−∞,10) (10,20) (20,30) (30,+∞)
+
+ レコードロック        ……  10 そのもの
+ ギャップロック        ……  (10,20) のすき間だけ。10 も 20 も含まない
+ ネクストキーロック    ……  (10,20] = すき間 + その右の項目 20
+```
+
+### 3 種類のロック
+
+| 名前 | 対象 | `data_locks` の `LOCK_MODE` |
+| --- | --- | --- |
+| レコードロック | 項目そのもの | `X,REC_NOT_GAP` |
+| ギャップロック | 項目の**直前の**すき間だけ | `X,GAP` |
+| ネクストキーロック | 項目と、その直前のすき間 | `X` |
+
+**ギャップロック** は、すき間への挿入を止めることだけが目的です。リファレンスは「純粋に抑止的（purely inhibitive）」と表現し、ギャップロックどうしは S でも X でも衝突しない、と書いています。同じすき間に 2 人がギャップロックを持つことは普通にあります。
+
+**ネクストキーロック** は、レコードロックとその直前のギャップロックの組です。`LOCK_MODE` に `GAP` も `REC_NOT_GAP` も付かない `X` が、これを表します。
+
+最後のすき間、つまり最大のキーより大きい側には、右端の項目がありません。そこで InnoDB は、どの値よりも大きい **supremum**（上限）という疑似レコードを葉に置き、そこにネクストキーロックを掛けます。supremum は本物の行ではないので、実質的には「最大値より右のすき間」をロックしていることになります（同上）。
+
+### 挿入インテンションロック
+
+`INSERT` は、行を入れる前に、そのすき間に **挿入インテンションロック** を取ろうとします。これはギャップロックの一種で、同じすき間でも**挿入する位置が違えば互いに待たない**ように作られています（同上）。たとえば (20,30) に 23 と 27 を同時に入れる 2 人は、すき間は同じでも互いを止めません。
+
+一方、他人がそのすき間にギャップロックかネクストキーロックを持っていると、挿入インテンションロックはそれと衝突し、待たされます。**「範囲を読んだ人が、その範囲に新しい行が入るのを止める」** という仕組みは、この衝突でできています。
+
+### ファントムを防ぐ: ロッキングリード
+
+InnoDB の既定の分離レベルは REPEATABLE READ です（第 99 回）。このレベルで `FOR UPDATE` や `FOR SHARE`、`UPDATE`、`DELETE` を実行すると、InnoDB は次のように振る舞います（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html)）。
+
+- 一意インデックスで、一意な条件（`id = 20` など）で 1 件を探したとき: **見つかった項目だけ**をロックする。直前のすき間はロックしない
+- それ以外の条件（範囲、一意でないインデックス、見つからなかった場合）: **走査した範囲**を、ギャップロックかネクストキーロックでロックする
+
+冒頭の予約の例では、`room = 7 AND day = ...` で走査した範囲がネクストキーロックで覆われます。0 件でも、その値が入るはずのすき間はロックされるので、他人の `INSERT` は挿入インテンションロックで待たされます。**存在しない行を、それが入るはずの場所をロックすることで守る**わけです。
+
+<Callout type="warn" title="スナップショットの読み取りと、ロッキングリードは別物">
+  `FOR UPDATE` を付けない普通の `SELECT` は、第 99 回のスナップショットから読むだけで、ロックを一切取りません。
+  REPEATABLE READ でも、普通の `SELECT` で数えて、その結果を前提に `INSERT` するなら、守られるのはスナップショットの中の見え方だけです。
+  **判断の材料にする読み取りは、ロッキングリードにする**のが InnoDB での基本です。
+</Callout>
+
+### READ COMMITTED では、すき間のロックがほぼ消える
+
+分離レベルを READ COMMITTED に下げると、検索とインデックス走査のギャップロックは使われなくなります。残るのは、**外部キーの検査と、重複キーの検査**のときだけです（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html)）。その代わり、他人がすき間に行を挿入できるので、ファントムが起こります。
+
+もう 1 つの違いがあります。READ COMMITTED の `UPDATE` と `DELETE` は、`WHERE` に合わなかった行のロックを、条件を評価した直後に外します（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html)）。リファレンスはこれでデッドロックの確率が大きく下がると書いています。ロックの範囲が狭く、待ちの輪ができにくいからです。
+
+### インデックスが無いと、走査した全行がロックされる
+
+InnoDB は、ロッキングリード、`UPDATE`、`DELETE` で **走査したすべてのインデックスレコード** にロックを掛けます。`WHERE` でその行が除外されるかどうかは関係ありません。InnoDB は `WHERE` の条件そのものを覚えておらず、**どのインデックスの範囲を走査したか**しか知らないからです（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html)）。
+
+したがって、インデックスの無い列を条件に `UPDATE` すると、クラスタ化インデックスを端から端まで走査することになり、**テーブルの全行と、すべてのすき間**がロックされます。同じリファレンスは、これが他のユーザーのすべての挿入を止めるので、よいインデックスを作ることが重要だと述べています。
+
+ロックの範囲は、**クエリがどう実行されるか**で決まるということです。同じ `WHERE` でも、インデックスを使えば数行、使わなければ全行です。
+
+## 外部キーは親の行をロックする
+
+外部キーのある表に子の行を `INSERT` するとき、データベースは「親の行が存在すること」を確かめます。確かめただけでは足りません。確かめた直後に、別のトランザクションが親の行を消すかもしれないからです。そこで、**親の行を、子のトランザクションが終わるまでロックしておきます**。
+
+InnoDB は、外部キーの検査が必要な挿入、更新、削除のたびに、検査で見たレコードに**共有のレコードロック**を掛けます（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html)）。親の行には S が付きます。
+
+これは、よくあるデッドロックの原因になります。親の表に「子の件数」のような集計列を持たせ、子を足すたびに親を更新する設計です。
+
+```
+ T1: INSERT INTO child (parent_id) VALUES (1);   -- 親 1 に S
+ T2: INSERT INTO child (parent_id) VALUES (1);   -- 親 1 に S（S どうしは両立）
+ T1: UPDATE parent SET cnt = cnt + 1 WHERE id = 1;  -- X が要る。T2 の S を待つ
+ T2: UPDATE parent SET cnt = cnt + 1 WHERE id = 1;  -- X が要る。T1 の S を待つ → 輪
+```
+
+2 人とも S を持ったまま、相手の S が外れるのを待つ形になります。第 39 回でいう「保持と待機」です。後の実験で、実際にエラー 1213 になるのを確かめます。
+
+## PostgreSQL: 行ロックは行そのものに書く
+
+PostgreSQL の行ロックは、InnoDB とはまったく違う場所にあります。**ロックの情報は、ロックした行（タプル）のヘッダに書き込まれます。**
+
+第 99 回で見たとおり、タプルには `xmax` という隠れた列があり、その版を消した、あるいは更新したトランザクションの ID が入ります。行ロックは、この `xmax` に**自分のトランザクション ID を書き、`t_infomask` に「これはロックだけで、消したわけではない」という印を立てる**ことで表されます（[PostgreSQL ソース: README.tuplock](https://github.com/postgres/postgres/blob/master/src/backend/access/heap/README.tuplock)）。
+
+```
+ FOR UPDATE する前                  FOR UPDATE した後
+ xmin=754  xmax=0                  xmin=754  xmax=756（自分）
+ infomask: XMAX_INVALID            infomask: XMAX_LOCK_ONLY | XMAX_EXCL_LOCK
+```
+
+ロックを待つ側は、`xmax` に書かれたトランザクション ID を読み、**そのトランザクションの終了を待ちます**。各トランザクションは、ID を割り当てられた時点からその ID に対する排他ロックを持っているので、「その ID の共有ロックを取ろうとして待つ」ことが「そのトランザクションの終了を待つ」ことになります（同上）。
+
+### ロックテーブルが膨らまない
+
+この方式の最大の利点は、**何行ロックしてもメモリを使わない**ことです。PostgreSQL の文書は、変更した行の情報をメモリに覚えないので、同時にロックできる行数に上限は無い、と書いています。その代わり、`SELECT FOR UPDATE` は行にロックの印を書くので、ディスクへの書き込みを起こします（[PostgreSQL 文書](https://www.postgresql.org/docs/current/explicit-locking.html)）。
+
+共有メモリのロックテーブルの大きさを決める `max_locks_per_transaction`（既定 64）も、文書に「ロックできる行の数ではない。それは無制限」と明記されています（[PostgreSQL 文書](https://www.postgresql.org/docs/current/runtime-config-locks.html)）。ロックテーブルに載るのは、テーブルやインデックスなどのオブジェクトのロックです。
+
+複数のトランザクションが同じ行に共有ロックを掛けると、`xmax` 1 つでは足りません。このときは最初のロック保持者の ID を **MultiXactId** という別の番号に置き換え、その番号から「誰が、どの強さで持っているか」の一覧を引けるようにします（[README.tuplock](https://github.com/postgres/postgres/blob/master/src/backend/access/heap/README.tuplock)）。
+
+### 4 段階の行ロックと、外部キー
+
+PostgreSQL の行ロックには 4 つの強さがあります（[PostgreSQL 文書](https://www.postgresql.org/docs/current/explicit-locking.html)）。
+
+| モード | 自動で取る操作 | 衝突する相手 |
+| --- | --- | --- |
+| `FOR UPDATE` | `DELETE`、キー列を変える `UPDATE` | すべて |
+| `FOR NO KEY UPDATE` | キー列を変えない `UPDATE` | `FOR SHARE` 以上 |
+| `FOR SHARE` | （明示したときだけ） | `FOR NO KEY UPDATE` 以上 |
+| `FOR KEY SHARE` | 外部キーの検査 | `FOR UPDATE` だけ |
+
+ここでいう「キー列」は、外部キーから参照されうる一意インデックスの列です。
+
+`FOR KEY SHARE` は、**外部キーの検査にちょうど足りる最弱のロック**として設計されています。外部キーの検査が守りたいのは「親の行が消えない、キーが変わらない」ことだけです。親の行の、キー以外の列（先ほどの `cnt` など）が書き換えられても、参照の整合性は壊れません。そこで `FOR KEY SHARE` は、キーを変えない `UPDATE` が取る `FOR NO KEY UPDATE` とは衝突しないように作られています（[README.tuplock](https://github.com/postgres/postgres/blob/master/src/backend/access/heap/README.tuplock)）。
+
+InnoDB で起きた「子を足して親の件数を更新する」デッドロックは、PostgreSQL では起きません。後の実験で確かめます。
+
+### テーブルロックの 8 つのモード
+
+行とは別に、PostgreSQL はテーブル単位のロックを 8 段階で持ちます。こちらは普通に共有メモリのロックテーブルに載ります（[PostgreSQL 文書](https://www.postgresql.org/docs/current/explicit-locking.html)）。
+
+| モード | 主に取る操作 | 主に止めるもの |
+| --- | --- | --- |
+| `ACCESS SHARE` | `SELECT` | `ACCESS EXCLUSIVE` だけ |
+| `ROW SHARE` | `SELECT ... FOR UPDATE` など | `EXCLUSIVE` 以上 |
+| `ROW EXCLUSIVE` | `INSERT`、`UPDATE`、`DELETE`、`MERGE` | `SHARE` 以上 |
+| `SHARE UPDATE EXCLUSIVE` | `VACUUM`、`ANALYZE`、`CREATE INDEX CONCURRENTLY` | 自分自身と `SHARE` 以上 |
+| `SHARE` | `CREATE INDEX` | 書き込み（`ROW EXCLUSIVE`）など |
+| `SHARE ROW EXCLUSIVE` | `CREATE TRIGGER`、一部の `ALTER TABLE` | 書き込みと自分自身など |
+| `EXCLUSIVE` | `REFRESH MATERIALIZED VIEW CONCURRENTLY` | `ACCESS SHARE` 以外すべて |
+| `ACCESS EXCLUSIVE` | `DROP TABLE`、`TRUNCATE`、多くの `ALTER TABLE` | すべて（`SELECT` も） |
+
+名前に ROW とあっても、どれもテーブル単位のロックです。InnoDB のインテンションロックと同じく、行を触る操作どうし（`ROW SHARE`、`ROW EXCLUSIVE`）は互いを止めず、テーブル全体を作り変える操作とだけぶつかります。
+
+日常の DML が `ACCESS EXCLUSIVE` とぶつかるのは、主にスキーマ変更のときです。`ALTER TABLE` が長い `SELECT` を待っている間、その後ろに来た `SELECT` も並んで止まる、という形で表に出ます。この問題は第 107 回で扱います。
+
+### 述語ロック（SIREAD）
+
+第 99 回で触れた PostgreSQL の Serializable（SSI）も、`pg_locks` に **`SIReadLock`** というモードで現れます。これは誰も待たせないロックで、「このトランザクションはここを読んだ」という記録です。後から誰かがそこに書いたら、読み書きの依存関係として数えられ、危険な形になればどちらかを失敗させます。
+
+記録の単位は、行、ページ、テーブルと粗くなっていきます。1 つのページで `max_pred_locks_per_page`（既定 2）を超える行を読むと、その記録はページ単位にまとめられます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/runtime-config-locks.html)）。手元の PostgreSQL 17.11 で、Serializable のトランザクションから主キーで 3 行を読み、全件を数えると、次のようになりました。
+
+```
+ locktype | relation  | page | tuple |    mode    | granted
+----------+-----------+------+-------+------------+---------
+ page     | acct      |    0 |       | SIReadLock | t        ← 同じページの 3 行がページ単位に
+ page     | acct_pkey |    1 |       | SIReadLock | t        ← 走査したインデックスのページ
+ relation | parent    |      |       | SIReadLock | t        ← 全件走査はテーブル単位
+```
+
+InnoDB のネクストキーロックが「読んだ範囲への書き込みを待たせる」のに対し、SIREAD は「読んだ範囲を記録しておき、後で判定する」方式です。
+
+## デッドロックをどう見つけるか
+
+第 39 回で見たとおり、ロックを複数取る以上、待ちの輪はいずれできます。データベースは、それを自分で見つけて片方を中止します。見つけ方は 2 つの製品で違います。
+
+**InnoDB は、待ちに入るたびに待ちグラフを調べます。** 既定（`innodb_deadlock_detect = ON`）では、ロック待ちが発生した時点で「誰が誰を待っているか」をたどり、輪があれば即座に 1 つのトランザクションをロールバックします。選ぶのは「小さい」ほうで、大きさは挿入、更新、削除した行数で測ります（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-detection.html)）。待ちの列が 200 トランザクションを超えるか、調べるロックが 100 万を超えると、それ自体をデッドロックとみなします（同上）。
+
+並行度が非常に高いと、この検査そのものが重くなります。そのため検査を切って、**`innodb_lock_wait_timeout`**（既定 50 秒）だけに頼る選択肢も用意されています（同上）。2 つは、次のように振る舞いが違います（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-error-handling.html)）。
+
+| | デッドロック（エラー 1213） | ロック待ちタイムアウト（エラー 1205） |
+| --- | --- | --- |
+| いつ | 輪ができた瞬間 | 待ちが `innodb_lock_wait_timeout` を超えたとき |
+| 取り消す範囲 | トランザクション全体 | **待っていた文だけ**（`innodb_rollback_on_timeout` を有効にすると全体） |
+| やり直す単位 | トランザクション全体 | 既定では文 |
+
+1205 のあとはトランザクションが続いているので、アプリがそのまま `COMMIT` すると、**途中の文だけ抜けた状態で確定**しかねません。どちらのエラーでもトランザクションを最初からやり直す、と決めておくのが安全です。
+
+**PostgreSQL は、しばらく待ってから調べます。** ロック待ちに入ってから `deadlock_timeout`（既定 1 秒）が過ぎるまでは、何も調べずに待ちます。文書は、デッドロックの検査は比較的高くつくので、本番ではデッドロックはまれだと楽観して、まず少し待つのだと説明しています（[PostgreSQL 文書](https://www.postgresql.org/docs/current/runtime-config-locks.html)）。どちらが中止されるかは予測できず、それに頼るべきではない、とも書かれています（[PostgreSQL 文書](https://www.postgresql.org/docs/current/explicit-locking.html)）。
+
+デッドロックではない普通の待ちは、PostgreSQL では**無期限に続きます**（同上）。上限が欲しければ `lock_timeout` を自分で設定します。
+
+<Callout type="tip" title="結局、順序をそろえる">
+  検出はあくまで事後の救済です。第 39 回の「すべてのロックに順序を決め、その順序で取る」は、データベースでもそのまま効きます。
+  複数の行を更新するなら主キーの昇順で触る、親と子を触るなら常に親から、と決めておけば、輪ができにくくなります。
+  PostgreSQL の文書も、最善の防御は一貫した順序でロックを取ることだと書いています。
+</Callout>
+
+## AUTO_INCREMENT とシーケンスは巻き戻らない
+
+連番の採番も、本来はロックの問題です。1 つのカウンタを全員で使うので、**次の値を取る操作を直列にしなければなりません**。
+
+InnoDB には、そのための **AUTO-INC ロック**というテーブル単位の特別なロックがあります（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html)）。どこまでこれを使うかを `innodb_autoinc_lock_mode` で選びます（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-auto-increment-handling.html)）。
+
+| 値 | 名前 | 動き |
+| --- | --- | --- |
+| 0 | traditional | すべての挿入文が、文の終わりまで AUTO-INC ロックを持つ |
+| 1 | consecutive | 件数が事前に分からない一括挿入だけが AUTO-INC ロックを持つ。単純な挿入は軽いミューテックスで必要数を確保する |
+| 2 | interleaved | AUTO-INC ロックを使わない。最も速いが、同時に走る文の値が入り交じる |
+
+既定は MySQL 8.0 から 2 です。それ以前は 1 でした（[MySQL 8.0 リファレンス](https://dev.mysql.com/doc/refman/8.0/en/innodb-auto-increment-handling.html)）。理由は、レプリケーションの既定が文ベースから行ベースに変わったためです。文ベースのレプリケーションでは、レプリカで同じ文を流し直して同じ番号が振られる必要があり、番号の並びを決定的にする 1 が要りました。行ベースなら、振られた値そのものが送られるので、その必要がありません（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-auto-increment-handling.html)）。
+
+どのモードでも、**採番した値はロールバックしても戻りません**（同上）。戻そうとすると、自分より後に番号を取った他のトランザクションとの関係を調整しなければならず、結局、カウンタをトランザクションの終わりまでロックすることになるからです。それでは全員の `INSERT` が 1 列に並んでしまいます。欠番は、カウンタをトランザクションの外に置いた代償です。
+
+もう 1 つ、版による違いがあります。MySQL 5.7 までは、カウンタはメモリにしかなく、再起動後の最初の挿入で `SELECT MAX(ai_col) ... FOR UPDATE` 相当を実行して作り直していました。そのため、ロールバック直後に再起動すると、ロールバックで捨てた番号が再び使われることがありました。**8.0 からは、カウンタの最大値が変わるたびに redo log に書かれ、チェックポイントごとにデータディクショナリに保存される**ので、再起動しても巻き戻りません（[MySQL 8.0 リファレンス](https://dev.mysql.com/doc/refman/8.0/en/innodb-auto-increment-handling.html)）。ただし、redo log がディスクに届く前に異常終了した場合は、再利用されないことまでは保証されない、とされています（[MySQL 8.4 リファレンス](https://dev.mysql.com/doc/refman/8.4/en/innodb-auto-increment-handling.html)）。
+
+PostgreSQL のシーケンスも、同じ理由でトランザクションの外にあります。文書は、同じシーケンスから番号を取る他のトランザクションを止めないために、`nextval` で得た値は中止されても回収しない、と書いています。`ON CONFLICT` 付きの `INSERT` は、衝突を検出する前に `nextval` を呼ぶので、中止が無くても欠番が出ます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/functions-sequence.html)）。**欠番の無い連番が要るなら、シーケンスではなく、行ロックで守ったカウンタの表を自分で持つ**ことになります。
+
+## ロックを見る道具
+
+| | InnoDB（MySQL 8.0 以降） | PostgreSQL |
+| --- | --- | --- |
+| 持っている／待っているロック | `performance_schema.data_locks` | `pg_locks` |
+| 誰が誰を待っているか | `performance_schema.data_lock_waits` | `pg_blocking_pids(pid)` |
+| 直近のデッドロック | `SHOW ENGINE INNODB STATUS` の `LATEST DETECTED DEADLOCK` | サーバログ |
+| 行ロックの一覧 | `data_locks` に出る | `pgrowlocks` 拡張でテーブルを走査 |
+
+PostgreSQL の `pg_locks` には、行ロックは基本的に出ません。行ロックを待つプロセスは「保持者のトランザクション ID を待っている」形で現れ、誰が誰を止めているかは `pg_locks` の自己結合より `pg_blocking_pids()` で求めるほうがよい、とされています（[PostgreSQL 文書](https://www.postgresql.org/docs/current/view-pg-locks.html)）。
+
+## 手元で確かめる
+
+Docker の中で、`mysql:8.4`（8.4.13）と `postgres:17`（17.11）を立てて試しました。2 つのセッションは、`docker exec` で起こした別々のクライアントを、片方をバックグラウンドで眠らせておく形で作っています。MySQL の初期値は、`innodb_lock_wait_timeout = 50`、`innodb_autoinc_lock_mode = 2`、`innodb_deadlock_detect = ON`、分離レベル `REPEATABLE-READ` でした。
+
+### ギャップロックで INSERT が待たされる
+
+主キーが 10、20、30 の表 `t`（列 `k` に一意でないインデックス）を作り、セッション A で範囲をロックします。
+
+```sql
+-- A
+BEGIN;
+SELECT * FROM t WHERE id > 25 FOR UPDATE;   -- 30 の 1 行が返る
+```
+
+`data_locks` を見ると、次のとおりです。
+
+```
++-------------+------------+-----------+-----------+-------------+------------------------+
+| object_name | index_name | lock_type | lock_mode | lock_status | lock_data              |
++-------------+------------+-----------+-----------+-------------+------------------------+
+| t           | NULL       | TABLE     | IX        | GRANTED     | NULL                   |
+| t           | PRIMARY    | RECORD    | X         | GRANTED     | 30                     |
+| t           | PRIMARY    | RECORD    | X         | GRANTED     | supremum pseudo-record |
++-------------+------------+-----------+-----------+-------------+------------------------+
+```
+
+テーブルに IX、30 にネクストキーロック（(20,30] を覆う）、そして **supremum にネクストキーロック**（30 より右のすき間）です。ここでセッション B が `INSERT INTO t VALUES (40, 40, 'd')` を実行すると、B は返ってこなくなり、`data_locks` に行が増えます。
+
+```
+| t           | NULL       | TABLE     | IX                 | GRANTED     | NULL                   |
+| t           | PRIMARY    | RECORD    | X,INSERT_INTENTION | WAITING     | supremum pseudo-record |
+```
+
+40 の挿入インテンションロックが、A の supremum のロックとぶつかって待っています。`data_lock_waits` にも、B のトランザクション（1827）が A（1826）を待っている行が 1 つ出ました。
+
+条件を変えると、取られるロックがそのまま変わります。それぞれ別のトランザクションで実行し、レコードロックだけを並べました。
+
+| A の文 | ロック（`index: LOCK_MODE 対象`） |
+| --- | --- |
+| `WHERE id = 20`（主キーで一致） | `PRIMARY: X,REC_NOT_GAP 20` |
+| `WHERE id = 15`（主キーで不一致） | `PRIMARY: X,GAP 20` |
+| `WHERE id BETWEEN 15 AND 25` | `PRIMARY: X 20`、`PRIMARY: X,GAP 30` |
+| `WHERE k = 20`（一意でないインデックス） | `k: X 20`、`k: X,GAP 30`、`PRIMARY: X,REC_NOT_GAP 20` |
+
+一意な検索で見つかれば項目だけ、見つからなければ**入るはずのすき間だけ**（15 は 20 の直前のすき間に入る）、範囲なら走査した範囲を覆うネクストキーロックと、走査を止めた次の項目の直前のすき間です。一意でないインデックス `k` では同じ値の行が後から入りうるので、20 の両側のすき間までロックされ、さらに**クラスタ化インデックスの 20 にもレコードロック**が付きます。セカンダリインデックスから主キーをたどる 2 段階（第 97 回）が、ロックにもそのまま表れています。
+
+### REPEATABLE READ と READ COMMITTED のファントム
+
+A で `SELECT count(*) FROM t WHERE id > 25 FOR UPDATE` を実行し、3 秒眠ってからもう一度数えます。その間に B が 40 を挿入します。
+
+| A の分離レベル | 1 回目 | 2 回目 | B の `INSERT` |
+| --- | --- | --- | --- |
+| REPEATABLE READ | 1 | 1 | A が終わるまで約 2.1 秒待たされた |
+| READ COMMITTED | 1 | **2** | 待たずに通った |
+
+READ COMMITTED でのロックは `PRIMARY: X,REC_NOT_GAP 30` の 1 つだけで、supremum のロックは消えていました。すき間が空いているので B の挿入が通り、2 回目のロッキングリードには新しい行が現れます。これがファントムです。
+
+### インデックスの無い UPDATE
+
+`v` 列にインデックスの無い 5 行の表 `nk` で、1 行だけに合う更新を実行しました。
+
+```sql
+UPDATE nk SET v = v + 100 WHERE v = 3;
+```
+
+REPEATABLE READ では、ロックは次のようになりました。
+
+```
+| PRIMARY    | RECORD    | X         | GRANTED     | 1                      |
+| PRIMARY    | RECORD    | X         | GRANTED     | 2                      |
+| PRIMARY    | RECORD    | X         | GRANTED     | 3                      |
+| PRIMARY    | RECORD    | X         | GRANTED     | 4                      |
+| PRIMARY    | RECORD    | X         | GRANTED     | 5                      |
+| PRIMARY    | RECORD    | X         | GRANTED     | supremum pseudo-record |
+```
+
+更新するのは 1 行なのに、**5 行すべてと supremum**、つまりテーブル全体が押さえられています。この間に別のセッションで無関係の行（`id = 5`）を更新すると、`innodb_lock_wait_timeout = 1` にしておいたところ `ERROR 1205 (HY000): Lock wait timeout exceeded` で失敗しました。
+
+同じ更新を READ COMMITTED で実行すると、残ったのは `X,REC_NOT_GAP 3` の 1 つだけで、`id = 5` の更新はすぐに通りました。条件に合わなかった行のロックが、評価の直後に外されたためです。
+
+### 外部キーのデッドロック
+
+前の節の「子を足して親の件数を更新する」を、そのまま 2 つのセッションで実行しました。A が子を挿入した直後の `data_locks` は次のとおりです。
+
+```
++-------------+------------+-----------+---------------+-----------+
+| object_name | index_name | lock_type | lock_mode     | lock_data |
++-------------+------------+-----------+---------------+-----------+
+| child       | NULL       | TABLE     | IX            | NULL      |
+| parent      | NULL       | TABLE     | IS            | NULL      |
+| parent      | PRIMARY    | RECORD    | S,REC_NOT_GAP | 1         |
++-------------+------------+-----------+---------------+-----------+
+```
+
+親の行 1 に共有ロック、親の表に IS が付いています。挿入した子の行そのもののロックが見えないのは、InnoDB が挿入したばかりの行を、行に書かれたトランザクション ID で暗黙にロックしたことにし、他のトランザクションがぶつかったときに初めて明示的なロックを作るためとされています（[MySQL Blog: InnoDB Data Locking – Part 2](https://dev.mysql.com/blog-archive/innodb-data-locking-part-2-locks/)）。
+
+続けて B も子を挿入し、2 人とも親を更新しにいくと、B が次のエラーで中止され、A は完了しました。
+
+```
+ERROR 1213 (40001) at line 1: Deadlock found when trying to get lock; try restarting transaction
+```
+
+**PostgreSQL で同じことをすると、デッドロックになりません。** A が子を挿入した直後と、B も挿入した後の `pgrowlocks('parent')` は次のとおりです。
+
+```
+ locked_row | locker | multi | xids  |       modes       | pids
+------------+--------+-------+-------+-------------------+-------
+ (0,1)      |    768 | f     | {768} | {"For Key Share"} | {288}
+
+ locked_row | locker | multi |   xids    |               modes               |   pids
+------------+--------+-------+-----------+-----------------------------------+-----------
+ (0,1)      |      1 | t     | {768,769} | {"For Key Share","For Key Share"} | {288,300}
+```
+
+2 人目が来たところで、`xmax` が MultiXactId（`multi = t`、番号 1）に置き換わっています。その後の親の `UPDATE` は `FOR NO KEY UPDATE` なので `FOR KEY SHARE` とは衝突せず、A が先に更新し、B は A の終了を待ってから更新しました。最終的に `cnt` は 2 です。
+
+一方、子が参照している間に親の**キーそのもの**を変える `UPDATE parent SET id = 2 WHERE id = 1` は、`lock_timeout = '1s'` で `canceling statement due to lock timeout` になりました。`FOR KEY SHARE` は、キーの変更だけを確実に止めています。
+
+### 意図的なデッドロック: MySQL
+
+A が `id = 10`、B が `id = 20` を更新し、それぞれ眠った後に相手の行を更新します。
+
+```
+ERROR 1213 (40001) at line 1: Deadlock found when trying to get lock; try restarting transaction
+```
+
+`SHOW ENGINE INNODB STATUS` の `LATEST DETECTED DEADLOCK` には、2 人が持っているロックと待っているロックが並びます（抜粋）。
+
+```
+*** (1) TRANSACTION:
+TRANSACTION 1855, ACTIVE 1 sec starting index read
+LOCK WAIT 3 lock struct(s), heap size 1128, 2 row lock(s), undo log entries 1
+update t set v='A' where id=20
+
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS space id 2 page no 4 n bits 72 index PRIMARY of table `lab`.`t` trx id 1855 lock_mode X locks rec but not gap
+Record lock, heap no 2 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+ 0: len 4; hex 8000000a; asc     ;;
+
+*** (1) WAITING FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 2 page no 4 n bits 72 index PRIMARY of table `lab`.`t` trx id 1855 lock_mode X locks rec but not gap waiting
+Record lock, heap no 3 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+ 0: len 4; hex 80000014; asc     ;;
+
+*** (2) TRANSACTION:
+TRANSACTION 1858, ACTIVE 1 sec starting index read
+update t set v='B' where id=10
+（(2) は 80000014 を持ち、8000000a を待つ。(1) の逆）
+
+*** WE ROLL BACK TRANSACTION (2)
+```
+
+`locks rec but not gap` は `data_locks` の `REC_NOT_GAP` と同じ意味です。`hex 8000000a` と `80000014` は主キーの 10 と 20 で、先頭のビットが立った形で格納されています。**誰が何を持ち、何を待っていたか**が、インデックスのページ番号と項目まで残ります。
+
+検出の速さも測りました。後から待ちに入った側の待ち開始時刻と、もう一方の文が終わった時刻の差は、2 回の試行で 2.6 ミリ秒と 2.5 ミリ秒でした。輪ができた瞬間に検出されています。中止されたのは、1 回目は B、2 回目は A で、どちらも同じ大きさのトランザクションだったので、どちらが選ばれるかに頼ることはできません。
+
+### 意図的なデッドロック: PostgreSQL
+
+同じ手順を PostgreSQL で実行し、`\timing` で各文の時間を測りました。
+
+```
+-- A: 2 つ目の UPDATE
+ERROR:  deadlock detected
+DETAIL:  Process 330 waits for ShareLock on transaction 773; blocked by process 336.
+Process 336 waits for ShareLock on transaction 772; blocked by process 330.
+HINT:  See server log for query details.
+CONTEXT:  while updating tuple (0,20) in relation "acct"
+Time: 1002.784 ms (00:01.003)
+
+-- B: 2 つ目の UPDATE
+Time: 51.832 ms
+```
+
+A は待ちに入ってから **約 1 秒**（`deadlock_timeout` の既定値）たってから検査し、輪を見つけて自分を中止しました。B はその時点で待ち始めて約 50 ミリ秒だったので、A の中止によってすぐに進めています。MySQL の数ミリ秒との違いが、2 つの検出方式の違いです。
+
+`DETAIL` の「`waits for ShareLock on transaction 773`」は、先ほど見た「行ロックの待ちは、`xmax` に書かれたトランザクションの終了待ちになる」ことを表しています。待っている対象は行ではなく、トランザクションです。
+
+### FOR UPDATE は行に書かれる
+
+100 万行の表 `acct`（ヒープ 35MB）で、A が `SELECT * FROM acct WHERE id = 1 FOR UPDATE` を実行した後の `pg_locks` です。
+
+```
+   locktype    | relation  | vxid | xid |     mode      | granted
+---------------+-----------+------+-----+---------------+---------
+ relation      | acct      |      |     | RowShareLock  | t
+ relation      | acct_pkey |      |     | RowShareLock  | t
+ transactionid |           |      | 756 | ExclusiveLock | t
+ virtualxid    |           | 7/2  |     | ExclusiveLock | t
+```
+
+テーブルとインデックスに `ROW SHARE`、自分のトランザクション ID に排他ロック。**ロックした行についての項目はありません。** 行のほうを `pageinspect` 拡張で直接読むと、ここに書かれていました。
+
+```
+ lp | t_xmin | t_xmax | infomask | t_ctid
+----+--------+--------+----------+--------
+  1 |    754 |    756 | 1c0      | (0,1)     ← ロックした行。xmax に自分の ID
+  2 |    754 |      0 | 900      | (0,2)     ← 触っていない行
+```
+
+4 つのモードで、同じ行をそれぞれロックしたときのビットを比べました（`0x100` はどれにも付いている「`xmin` はコミット済み」の印、`infomask2` の下位の `2` は列の数です）。
+
+| モード | `t_infomask` | `t_infomask2` | 立っている印 |
+| --- | --- | --- | --- |
+| `FOR UPDATE` | `0x1c0` | `0x2002` | `LOCK_ONLY`、`EXCL_LOCK`、`KEYS_UPDATED` |
+| `FOR NO KEY UPDATE` | `0x1c0` | `0x0002` | `LOCK_ONLY`、`EXCL_LOCK` |
+| `FOR SHARE` | `0x1d0` | `0x0002` | `LOCK_ONLY`、`EXCL_LOCK` と `KEYSHR_LOCK`（両方で共有を表す） |
+| `FOR KEY SHARE` | `0x190` | `0x0002` | `LOCK_ONLY`、`KEYSHR_LOCK` |
+
+ビットの値は PostgreSQL 17 のソース（[htup_details.h](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/include/access/htup_details.h)）の定義と一致します。`FOR UPDATE` と `FOR NO KEY UPDATE` は `t_infomask` では区別されず、`t_infomask2` の `HEAP_KEYS_UPDATED`（`0x2000`）で区別されています。
+
+次に、**100 万行すべて**を `FOR UPDATE` でロックしました。
+
+```sql
+BEGIN;
+SELECT count(*) FROM (SELECT id FROM acct FOR UPDATE) s;   -- 1000000、517 ms
+```
+
+その間の `pg_locks` は 4 行で、1 行だけロックしたときと**まったく同じ**でした。`tuple` の行は 0 です。100 万行ぶんの情報は、ロックテーブルではなく 100 万個のタプルヘッダにあります。その代わり、ディスクには書いています。チェックポイントの直後に同じことをしてコミットすると、WAL が **88MB** 進みました。35MB の表に対してこれだけ増えたのは、チェックポイント後に初めて触るページが full page writes（第 99 回）で丸ごと WAL に書かれたためと考えられます。「ロックをメモリに持たない」は、「ロックが無料」という意味ではありません。
+
+### pg_blocking_pids で、誰が止めているかを見る
+
+A が `UPDATE acct ... WHERE id = 1` を実行して眠り、B が同じ行を更新しにいったところで、`pg_stat_activity` を見ました。
+
+```
+ pid | pg_blocking_pids | wait_event_type |  wait_event   | state  |                      q
+-----+------------------+-----------------+---------------+--------+----------------------------------------------
+ 257 | {}               | Timeout         | PgSleep       | active | select pg_sleep(4);
+ 263 | {257}            | Lock            | transactionid | active | update acct set bal = bal + 10 where id = 1;
+```
+
+B（263）は A（257）に止められていて、待っている対象は `transactionid` です。`pg_locks` には、B が A のトランザクション ID 763 への `ShareLock` を待つ行（`granted = f`）と、B が持つ `tuple` ロック（ページ 0 の 1 番の行）が出ていました。この `tuple` ロックは、同じ行を待つ人が何人もいるときに順番を決めるためのもので、行ロックの本体ではありません（[README.tuplock](https://github.com/postgres/postgres/blob/master/src/backend/access/heap/README.tuplock)）。
+
+### AUTO_INCREMENT は巻き戻らない
+
+```sql
+INSERT INTO ai (v) VALUES (1),(2),(3);
+BEGIN; INSERT INTO ai (v) VALUES (4),(5); ROLLBACK;
+INSERT INTO ai (v) VALUES (6);
+BEGIN; INSERT INTO ai (v) VALUES (7); ROLLBACK;
+-- ここで docker restart（通常の停止と起動）
+INSERT INTO ai (v) VALUES (8);
+```
+
+```
++----+------+
+| id | v    |
++----+------+
+|  1 |    1 |
+|  2 |    2 |
+|  3 |    3 |
+|  6 |    6 |
+|  8 |    8 |
++----+------+
+```
+
+ロールバックした 4、5、7 は欠番のままです。再起動の直前、表の最大の `id` は 6 で、`SHOW CREATE TABLE` は `AUTO_INCREMENT=8` を示していました。再起動後の挿入は 8 になり、**最大値 + 1 の 7 には戻りませんでした**。5.7 までの「再起動時に `MAX(id)` から作り直す」動きなら 7 になっていたところです。
+
+## まとめ
+
+- MVCC の後も、ロックには 2 つの仕事が残る。書く人どうしを並べることと、まだ無い行を守ること
+- ロックはモード（S / X、インテンションロック IS / IX）と対象（テーブル、行、範囲）の 2 軸で整理できる。インテンションロックは、テーブル全体のロックと行のロックを安く両立させるためにある
+- InnoDB の行ロックは、インデックスの項目に掛かる。項目そのもの（レコードロック）、直前のすき間（ギャップロック）、その両方（ネクストキーロック）があり、最大値の右は supremum 疑似レコードで表す
+- `INSERT` は挿入インテンションロックを取り、他人のギャップロックとぶつかって待つ。REPEATABLE READ のロッキングリードは、この仕組みでファントムを防ぐ。READ COMMITTED ではギャップロックがほぼ消え、ファントムが起きる
+- InnoDB は走査したインデックスの範囲をロックする。インデックスの無い条件の `UPDATE` は、全行とすべてのすき間をロックする
+- 外部キーの検査は親の行をロックする。InnoDB では共有ロックで、親を更新する処理とデッドロックしやすい。PostgreSQL は `FOR KEY SHARE` で、キーを変えない更新とはぶつからない
+- PostgreSQL の行ロックはタプルの `xmax` と infomask に書かれ、ロックテーブルには載らない。100 万行ロックしても `pg_locks` は 4 行のままだが、行に書く以上 WAL は出る
+- デッドロックは、InnoDB では待ちに入った瞬間に、PostgreSQL では `deadlock_timeout`（1 秒）待ってから検出される。InnoDB のロック待ちタイムアウトは既定で文だけを取り消すので、やり直しはトランザクション単位で考える
+- AUTO_INCREMENT とシーケンスは、全員を並ばせないためにトランザクションの外にあり、ロールバックしても戻らない。InnoDB は 8.0 から最大値を redo log に記録し、再起動でも巻き戻らない
+- 見る道具は `performance_schema.data_locks` / `data_lock_waits` と、`pg_locks` / `pg_blocking_pids()`
+
+ここで何度も出てきたように、ロックの範囲を決めていたのは「どのインデックスを、どう走査したか」でした。次は、その走査の方法をデータベースがどうやって選んでいるのか、SQL が実行計画になり、統計をもとに選ばれるまでを見ます。

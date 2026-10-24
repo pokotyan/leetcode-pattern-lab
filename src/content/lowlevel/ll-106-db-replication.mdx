@@ -1,0 +1,695 @@
+---
+title: レプリケーション：変更を別のマシンで繰り返す
+description: 1 台のデータベースに起きた変更を、別のマシンで同じ順序に繰り返すには、何を送り、いつ「書けた」と答えればよいのか。WAL をそのまま流す物理レプリケーションと、行の変更に翻訳して送る論理レプリケーション、非同期・準同期・同期の違いを、PostgreSQL と MySQL で確かめます
+chapter: db
+order: 11
+status: published
+topics:
+  - ストリーミングレプリケーション
+  - ホットスタンバイ
+  - レプリケーションスロット
+  - 論理デコーディング
+  - publication / subscription
+  - binlog（STATEMENT / ROW / MIXED）
+  - binlog_row_image
+  - 内部 XA（2 フェーズコミット）
+  - GTID
+  - synchronous_commit
+  - 準同期レプリケーション
+  - フェイルオーバー
+requires:
+  - ll-99-db-wal-mvcc
+  - ll-105-db-connection
+  - ll-50-durability
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 1 台が落ちたら、どうするか
+
+ここまでの回は、すべて 1 台のデータベースの中の話でした。第 99 回の WAL と第 50 回の `fsync` のおかげで、`COMMIT` が返った変更は、電源が落ちても消えません。しかしそれは、**そのマシンのディスクが無事なら**という前提付きです。ディスクが壊れる、マシンごと燃える、データセンターの電源が落ちる。そうなれば、コミット済みのデータもそのマシンと一緒に失われます。
+
+それならもう 1 台用意して、同じデータを持たせておけばよい。これが **レプリケーション**（複製）です。ただし、同じデータを持たせ続けるのは簡単ではありません。元のデータベースは 1 秒に何千件も書き換えられていて、その間にも複製は追いつかなければなりません。
+
+第 99 回のチェックポイントの節の Callout で、手がかりを 1 つ置いておきました。WAL は「データベースに起きた変更の、順序付きの完全な記録」です。同じ初期状態から始めて、同じ変更を同じ順序で当てれば、同じ状態ができあがります。レプリケーションの仕組みは、ほぼすべてこの 1 文の上に組み立てられています。
+
+```
+  プライマリ（書き込みを受ける）                レプリカ（複製）
+ ┌───────────────────────────┐            ┌───────────────────────────┐
+ │ T1, T2, T3 ... とコミット    │            │                           │
+ │        │                  │  変更の記録  │  同じ順序で当て直す          │
+ │        ▼                  │ ─────────→ │  T1, T2, T3 ...            │
+ │  ログ（WAL / binlog）       │            │                           │
+ └───────────────────────────┘            └───────────────────────────┘
+```
+
+この回では、レプリケーションを 2 つの軸で整理します。
+
+| 軸 | 選択肢 | 決めていること |
+| --- | --- | --- |
+| **何を送るか** | 物理 / 論理 | ページの書き換えをそのまま送るか、「どの行がどう変わったか」に翻訳して送るか |
+| **いつ答えるか** | 非同期 / 準同期 / 同期 | クライアントに「書けた」と返す前に、複製の側にどこまで届いたことを確かめるか |
+
+1 つ目の軸は、複製がどれだけ元と似ていなければならないか、複製を何に使えるかを決めます。2 つ目の軸は、プライマリが落ちたときに**何を失いうるか**と、書き込みがどれだけ遅くなるかを決めます。
+
+## 物理レプリケーション: WAL をそのまま流す
+
+PostgreSQL の標準のレプリケーションは、第 99 回の WAL を**バイトのまま**送ります。WAL のレコードは「このファイルのこのページの、この位置をこう変えた」という記録です。受け取った側は、クラッシュからの回復とまったく同じ処理で、それを自分のページに当てていきます。つまりレプリカは、**永遠に回復処理を続けているデータベース**です。
+
+これを **ストリーミングレプリケーション** と呼びます（[PostgreSQL 文書 26.2.5](https://www.postgresql.org/docs/current/warm-standby.html#STREAMING-REPLICATION)）。登場するプロセスは 3 つです。
+
+```
+  プライマリ                                     スタンバイ
+ ┌────────────────────┐                       ┌─────────────────────────────┐
+ │ バックエンド         │                       │                             │
+ │   │ WAL を書く       │                       │                             │
+ │   ▼                 │   TCP（第 105 回の     │                             │
+ │ pg_wal/  ──→ walsender ──  レプリケーション ──→ walreceiver ──→ pg_wal/     │
+ │                     │      接続）           │                    │        │
+ │                     │ ←── 書いた / flush した / 当てた位置を報告 ──┘        │
+ │                     │                       │  startup プロセスが当てる     │
+ └────────────────────┘                       └─────────────────────────────┘
+```
+
+- **walsender**: プライマリ側で、レプリカ 1 台につき 1 つ動き、WAL を読んで送る
+- **walreceiver**: スタンバイ側で WAL を受け取り、自分の `pg_wal` に書いて `fsync` する
+- **startup**: スタンバイ側で、受け取った WAL をページに当てる（回復処理そのもの）
+
+walreceiver は、どこまで「書いた（write）」「ディスクまで届けた（flush）」「当てた（replay）」かを定期的にプライマリへ報告します。この 3 つの位置が、後で見る同期の度合いの段階にそのまま対応します。
+
+### 同じ版、同じアーキテクチャでなければならない
+
+ページの差分を送るということは、**ページの形が両側で完全に同じ**でなければならない、ということです。第 96 回のページのレイアウト、タプルのヘッダ、整数のバイト順（第 3 回）まで、すべて一致している必要があります。PostgreSQL の文書は、ハードウェアのアーキテクチャは同じでなければならず（32 ビットから 64 ビットへの送り出しは動かない）、メジャーバージョンが異なるサーバの間のログ転送は一般に不可能だ、と書いています（[PostgreSQL 文書 26.2.1](https://www.postgresql.org/docs/current/warm-standby.html#STANDBY-PLANNING)）。
+
+その代わり、物理レプリケーションは**すべて**を写します。全テーブル、全インデックス、シーケンス、ユーザ、DDL。WAL に書かれるものは何でも届きます。複製は、文字どおりバイト単位で同じデータベースです。
+
+### ホットスタンバイ: 当てながら読ませる
+
+回復を続けている最中のデータベースでも、ページの中身は一貫しています。そこで、スタンバイで**読み取りのクエリを受け付ける**ことができます。これを **ホットスタンバイ** と呼び、PostgreSQL では既定で有効です（[PostgreSQL 文書 26.4](https://www.postgresql.org/docs/current/hot-standby.html)）。読み取りの負荷をレプリカに逃がす、いわゆるリードレプリカは、この機能の上に成り立っています。
+
+ただし書き込みはできません。スタンバイで書いた変更は、プライマリの WAL の順序のどこにも入らないからです。
+
+### レプリケーションスロット: 相手が受け取るまで WAL を消さない
+
+第 99 回で、チェックポイントより古い WAL は「レプリケーションやバックアップに使わないなら」捨てられる、と書きました。その「使うなら」の部分がここです。
+
+スタンバイがしばらく止まっていて、その間にプライマリが古い WAL を消してしまうと、スタンバイは戻ってきても続きを受け取れません。作り直すしかなくなります。これを防ぐのが **レプリケーションスロット** です。スロットはプライマリ上に「このスタンバイはこの位置まで受け取った」を記録し、それより新しい WAL を消さないようにします（[PostgreSQL 文書 26.2.6](https://www.postgresql.org/docs/current/warm-standby.html#STREAMING-REPLICATION-SLOTS)）。
+
+裏を返せば、**スロットを作ったまま相手がいなくなると、WAL は無限に溜まります**。文書も、スロットが `pg_wal` の領域を埋め尽くしうると警告し、上限として `max_slot_wal_keep_size` を挙げています。既定値は `-1`（無制限）です。後の実験で、実際にどれだけ溜まるかを見ます。
+
+## 論理レプリケーション: 行の変更に翻訳して送る
+
+物理レプリケーションの制約（同じメジャーバージョン、全部を写す、複製に書けない）が邪魔になる場面があります。一部のテーブルだけを別のデータベースに送りたい、新しいメジャーバージョンへ移りたい、変更をデータベース以外（検索エンジン、データウェアハウス、メッセージキュー）に流したい。
+
+そこで、変更を**ページではなく行の言葉で**表します。「`orders` 表の `id=1` の行の `qty` が 3 から 5 になった」。この形なら、受け取る側のページのレイアウトがどうなっていても、同じ変更を当てられます。
+
+### PostgreSQL: WAL から行の変更を取り出す
+
+PostgreSQL は、論理レプリケーションのために別のログを持つのではなく、**同じ WAL を読み解いて**行の変更を取り出します。これを **論理デコーディング** と呼び、文書は「データベースのテーブルへの永続的な変更をすべて、内部状態の詳しい知識がなくても解釈できる、一貫した分かりやすい形式に取り出す処理」と定義しています（[PostgreSQL 文書](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html)）。
+
+通常の WAL にはページの差分しかないので、行として読み解くための情報（どの列が主キーか、など）を WAL に余分に書いてもらう必要があります。それが `wal_level = logical` です。取り出した変更をどんな形式で渡すかは **出力プラグイン** が決め、組み込みの論理レプリケーションでは `pgoutput` が使われます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/protocol-logical-replication.html)）。
+
+組み込みの論理レプリケーションは、送る側の **publication**（どのテーブルを出すか）と、受ける側の **subscription**（どこから何を受けるか）で組みます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/logical-replication.html)）。受ける側は普通のデータベースなので、書き込みもでき、別の列や別のテーブルを持っていても構いません。
+
+その代わり、行の変更として表せないものは届きません。文書の制約の一覧には、**スキーマ（DDL）は複製されない**、**シーケンスの値は複製されない**、ラージオブジェクトは複製されない、などが並んでいます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/logical-replication-restrictions.html)）。
+
+同じ論理デコーディングを外部のプログラムが読めば、変更をデータベースの外へ流せます。これを **CDC**（Change Data Capture）と呼び、代表的な実装の Debezium は、PostgreSQL では論理デコーディングの出力を、MySQL では次に見る binlog を読んで、変更を Kafka などへのイベントに変えます（[Debezium PostgreSQL コネクタ](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)）。
+
+### MySQL: binlog という第 2 のログ
+
+MySQL は歴史的な事情から、ストレージエンジン（InnoDB）の **redo log** とは別に、サーバ層に **バイナリログ**（binlog）を持っています。redo log は InnoDB のページの回復のためのもので、第 99 回の WAL に当たります。binlog はレプリケーションと時点復旧（第 108 回）のためのもので、エンジンに依存しない「論理的な」記録です。MySQL のレプリケーションは、この binlog を送ります。
+
+binlog の書き方には 3 つの形式があります（[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/replication-formats.html)）。
+
+| 形式 | 書くもの | 例 |
+| --- | --- | --- |
+| `STATEMENT` | 実行した SQL 文そのもの | `UPDATE orders SET qty = 5 WHERE id = 1` |
+| `ROW` | 変更された各行の、変更前と変更後の値 | 「`id=1, qty=3` の行を `id=1, qty=5` にした」 |
+| `MIXED` | 基本は文で、安全でない文だけ行で | |
+
+既定は `ROW` です。既定が `ROW` に変わったのは 5.7.7 で（[MySQL 5.7.7 リリースノート](https://dev.mysql.com/doc/relnotes/mysql/5.7/en/news-5-7-7.html)）、8.4 では `binlog_format` という変数そのものが非推奨になり、文書は「新しいレプリケーションの構成では行ベースのログだけを使うべき」と書いています（[MySQL 文書: binlog_format](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_format)）。
+
+### STATEMENT が危ない理由
+
+文を送るのは、一見効率的です。100 万行を書き換える `UPDATE` も、文なら数十バイトで済みます。問題は、**同じ文を別のマシンで実行して、同じ結果になる保証がない**ことです。
+
+- `UUID()`、`RAND()`、`SYSDATE()`、`USER()` のように、実行するたびに、あるいはマシンごとに値が変わる関数
+- `ORDER BY` のない `UPDATE ... LIMIT 1`。どの 1 行が選ばれるかは、行の物理的な並び順次第
+- `SKIP LOCKED` や `NOWAIT` を付けたロック読み取り
+
+MySQL の文書は、これらを文ベースのレプリケーションで安全でないものとして挙げています（[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/replication-sbr-rbr.html)）。複製の上で関数がもう一度評価されれば、元とは違う値が書かれます。しかもエラーにはならず、**黙って食い違う**のが厄介なところです。後の実験で、実際に食い違わせてみます。
+
+`ROW` 形式なら、関数を評価した**結果の値**が書かれるので、この問題は起きません。代わりに、多くの行を変える文では binlog が大きくなります。
+
+### binlog_row_image: 行のどこまでを書くか
+
+`ROW` 形式で、変更前と変更後の行をどこまで書くかを決めるのが `binlog_row_image` です（[MySQL 文書: binlog_row_image](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_row_image)）。
+
+| 値 | 変更前のイメージ | 変更後のイメージ |
+| --- | --- | --- |
+| `full`（既定） | 全列 | 全列 |
+| `minimal` | 行を特定するのに必要な列だけ（主キーがあれば主キー） | 文で値を指定された列と、自動採番された列だけ |
+| `noblob` | 全列。ただし不要な BLOB / TEXT 列は除く | 同左 |
+
+`minimal` にすると binlog は小さくなりますが、binlog を読む外部のツールから見ると、変更されなかった列の値が分からなくなります。第 107 回の gh-ost や CDC のように binlog を読んで何かを組み立てる道具は、行全体が書かれていることを前提にしていることがあります。
+
+### redo log と binlog を揃える: 内部 XA
+
+ログが 2 つあると、新しい問題が生まれます。**片方にだけ書かれた状態で落ちたらどうなるか**です。
+
+- InnoDB にはコミットされたが、binlog には書かれていない → プライマリにはあるのに、レプリカには永遠に届かない
+- binlog には書かれたが、InnoDB ではコミットされていない → プライマリは再起動時にロールバックするのに、レプリカには届いてしまう
+
+MySQL は、これをトランザクションの内部で **2 フェーズコミット**（2PC）を回して防いでいます。InnoDB とバイナリログを、XA トランザクションの 2 つの参加者として扱うのです（[MySQL 文書 7.4.4](https://dev.mysql.com/doc/refman/8.4/en/binary-log.html)）。
+
+```
+ COMMIT
+   │
+   ├─ 1. InnoDB: prepare（redo log に「準備できた」と書き、fsync）
+   ├─ 2. binlog: トランザクションを書き、fsync      ← ここが本当のコミットの瞬間
+   └─ 3. InnoDB: commit（redo log に「コミットした」と書く）
+
+ 再起動時:
+   binlog に xid が残っている prepare 済みのトランザクション → コミットして完了させる
+   binlog に無い prepare 済みのトランザクション            → ロールバックする
+   binlog の末尾の不完全な部分                            → 切り詰める
+```
+
+文書によれば、8.4 ではこの InnoDB の 2 フェーズコミット対応は常に有効で、再起動時には最新の binlog を読んで xid を集め、binlog に書けていた prepare 済みのトランザクションを InnoDB にコミットさせ、binlog を最後の有効な位置で切り詰めます。これで binlog と InnoDB のデータが一致し、レプリカがロールバックされた文を受け取ることもなくなります（[MySQL 文書 7.4.4](https://dev.mysql.com/doc/refman/8.4/en/binary-log.html)）。
+
+ただしこれは、両方のログが本当にディスクに届いていればの話です。そのための設定が次の 2 つで、MySQL の文書はレプリケーションの構成で最大の耐久性と一貫性を得るには両方を 1 にせよ、と書いています（[MySQL 文書: sync_binlog](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_sync_binlog)）。
+
+| 設定 | 1（既定）のとき | 1 でないとき |
+| --- | --- | --- |
+| `sync_binlog` | コミットの前に binlog を `fsync` する | OS に任せる（0）か、N グループごと。OS ごと落ちると、コミット済みなのに binlog に無いトランザクションが出うる |
+| `innodb_flush_log_at_trx_commit` | コミットごとに redo log を `fsync` する | 第 99 回で見たとおり、最大 1 秒ぶんが消えうる |
+
+2 つのログの `fsync` を 1 回のコミットで 2 回やるのは重そうに見えますが、第 99 回のグループコミットが binlog にも働き、同時にコミットするトランザクションをまとめて 1 回の `fsync` で済ませます。PostgreSQL の論理レプリケーションが WAL 1 本から行の変更を読み解くのに対し、MySQL は 2 本のログを 2PC で揃えている、というのが大きな違いです。
+
+## GTID: どこまで適用したかを集合で持つ
+
+レプリカは「どこまで受け取ったか」を覚えておき、つなぎ直したらその続きから受け取らなければなりません。MySQL では昔、これを **binlog のファイル名と位置**（`binlog.000003` の 1151 バイト目、など）で覚えていました。この方式には弱点があります。ファイル名と位置は**そのサーバの binlog の中でしか意味がない**ので、プライマリが替わると、新しいプライマリの binlog のどこが続きなのかを、人が探さなければなりません。
+
+**GTID**（Global Transaction Identifier）は、トランザクションそのものに世界で一意の名前を付けます（[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html)）。
+
+```
+ GTID = source_id:transaction_id
+        50e52f91-cf92-11f1-96ef-2a97a3f9f688:12
+        └── 最初にコミットしたサーバの server_uuid ──┘ └ そのサーバでの通し番号（1 から）
+```
+
+レプリカは、自分が適用したトランザクションを **GTID の集合**として持ちます。`uuid:1-12` のように区間で縮めて書けるので、何百万件適用しても短く済みます。
+
+| 変数 | 中身 |
+| --- | --- |
+| `gtid_executed` | このサーバで適用済みのすべての GTID の集合 |
+| `gtid_purged` | 適用済みだが、binlog を消したのでもう誰にも送れない GTID の集合（`gtid_executed` の部分集合） |
+
+つなぐときは、レプリカが「受け取った、または適用した GTID の集合」を送り、プライマリは**その集合に入っていないトランザクションをすべて**送り返します。これを自動ポジショニングと呼びます。送るべきトランザクションがすでに `gtid_purged` に入っていたら、エラー（`ER_SOURCE_HAS_PURGED_REQUIRED_GTIDS`）になって始まりません（[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-auto-positioning.html)）。PostgreSQL のレプリケーションスロットとは逆に、MySQL は「相手が受け取っていなくても、期限が来れば binlog を消す」ほうを既定にしていて、その代わりに何が失われたかを集合で正確に言えるわけです。
+
+位置ではなく集合で考えるので、プライマリが替わっても、新しいプライマリに「この集合に無いものをください」と言うだけで済みます。バックアップから作ったレプリカに「このバックアップにはこの GTID まで入っている」と教える `mysqldump --set-gtid-purged` の意味は、第 108 回で見ます。
+
+## いつ「書けた」と答えるか
+
+2 つ目の軸に移ります。プライマリがクライアントに `COMMIT` の成功を返す時点で、レプリカには何が起きていればよいのでしょうか。
+
+### 非同期: 待たない
+
+PostgreSQL も MySQL も、既定は **非同期** です。プライマリは自分のディスクに書けたら成功を返し、レプリカへの送信は後から追いかけます。PostgreSQL の文書は、プライマリが落ちるとコミット済みのトランザクションの一部がスタンバイに届いておらず、データが失われうる、とはっきり書いています（[PostgreSQL 文書 26.2.8](https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION)）。
+
+速い代わりに、「`COMMIT` が返ったのに、フェイルオーバーした先には無い」ことが起こりうる方式です。
+
+### PostgreSQL: synchronous_commit の 5 段階
+
+PostgreSQL では、待つ相手を `synchronous_standby_names` で指定し、どこまで待つかを `synchronous_commit` で決めます。`synchronous_commit` はセッションやトランザクションごとに変えられるので、「この書き込みだけは確実に」という使い分けができます（[PostgreSQL 文書: synchronous_commit](https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT)）。
+
+| 値 | 成功を返す前に待つもの |
+| --- | --- |
+| `off` | 何も待たない。自分の WAL の `fsync` すら待たない（第 99 回） |
+| `local` | 自分の WAL の `fsync` だけ。スタンバイは待たない |
+| `remote_write` | スタンバイが受け取り、OS に書いた（write）こと |
+| `on`（既定） | スタンバイが受け取り、ディスクまで届けた（flush）こと |
+| `remote_apply` | スタンバイがさらに当て終え（replay）、スタンバイのクエリから見えるようになったこと |
+
+walreceiver が報告していた write / flush / replay の 3 つの位置が、そのまま段階になっています。なお、`synchronous_standby_names` が空なら、`on` 以外の `remote_*` と `local` は `on` と同じ意味（自分の `fsync` だけ）になります。既定の `on` が非同期として動くのはこのためです。
+
+`synchronous_standby_names` には、`FIRST 1 (s1, s2)`（優先順位の高い 1 台）や `ANY 2 (s1, s2, s3)`（どれか 2 台）のように、何台からの返事を待つかも書けます（[PostgreSQL 文書: synchronous_standby_names](https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES)）。
+
+### MySQL: 準同期と、待つ位置
+
+MySQL には、プラグインとして **準同期レプリケーション** があります。プライマリは、少なくとも 1 台のレプリカが「受け取った」と返事をするまで、クライアントに成功を返しません。レプリカが返事をするのは、イベントを自分のリレーログに書いてディスクに届けた後で、**適用までは待ちません**（[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html)）。PostgreSQL でいえば `on` に近い段階です。
+
+準同期で大事なのは、**2PC のどの時点で返事を待つか**です。これを `rpl_semi_sync_source_wait_point` で選びます（[MySQL 文書: rpl_semi_sync_source_wait_point](https://dev.mysql.com/doc/refman/8.4/en/replication-options-source.html#sysvar_rpl_semi_sync_source_wait_point)）。
+
+```
+              binlog を fsync      InnoDB に commit        クライアントに返す
+                    │                   │                       │
+ AFTER_SYNC   ──────●── 返事を待つ ──────●───────────────────────●
+ （既定）                         ↑ ここまで他の誰にも見えない
+
+ AFTER_COMMIT ──────●───────────────────●── 返事を待つ ──────────●
+                                        ↑ コミット済みなので、他のクライアントにはもう見える
+```
+
+- **AFTER_SYNC**: 返事を待っている間、変更はまだ InnoDB にコミットされていないので、誰にも見えません。全クライアントが、レプリカに届いた後で同時に変更を見ます。プライマリが落ちてレプリカへ切り替えても、プライマリでコミット済みだったものはすべてレプリカのリレーログにあります
+- **AFTER_COMMIT**: 返事を待つ前にコミットするので、他のクライアントはその変更を**先に読めてしまいます**。その直後にプライマリが落ちてレプリカへ切り替わると、他のクライアントが一度読んだデータが新しいプライマリには無い、ということが起こりえます
+
+もう 1 つの性質として、返事が `rpl_semi_sync_source_timeout`（既定 10 秒）以内に来ないと、プライマリは**非同期に戻ります**。レプリカが落ちたせいでプライマリまで止まることを避けるための設計ですが、その間は非同期と同じ保証しかありません。PostgreSQL の同期レプリケーションにはこのような自動の切り替えはなく、待つ相手がいなければ、コミットはいつまでも待ちます。これも後で確かめます。
+
+### 何を失いうるか
+
+プライマリのマシンが突然失われ、レプリカを昇格させた場合に、`COMMIT` が成功を返したトランザクションがどうなるかをまとめます。
+
+| 方式 | 成功を返したトランザクションは新しいプライマリにあるか | レプリカで読めるか |
+| --- | --- | --- |
+| 非同期 | 末尾のいくらかが無いことがある | 遅れて読める |
+| PostgreSQL `remote_write` | プライマリと、スタンバイの OS が同時に落ちなければある | 遅れて読める |
+| PostgreSQL `on`（同期スタンバイあり） | ある（両方のストレージが壊れない限り） | 遅れて読める |
+| PostgreSQL `remote_apply` | ある | 成功を返した時点で読める |
+| MySQL 準同期 AFTER_SYNC | ある（ただしタイムアウトで非同期に戻っていない限り） | 遅れて読める |
+| MySQL 準同期 AFTER_COMMIT | 成功を返したものはある。ただし他のクライアントが先に読んだものが消えることがある | 遅れて読める |
+
+どの方式も、**右の列が「遅れて読める」である限り、レプリカに読みに行けば古い値が見えうる**ことに注意してください。同期レプリケーションは「失わない」ための仕組みであって、多くの場合「すぐ読める」ことまでは約束しません。
+
+## 遅れて見えるもの
+
+### 自分の書き込みが読めない
+
+リードレプリカを使うアプリでよく起きるのが、次の形の不具合です。
+
+```
+ 1. ユーザがプロフィールを更新する       → プライマリへ UPDATE、COMMIT 成功
+ 2. 画面を再読み込みする                → レプリカから SELECT
+ 3. 古いプロフィールが表示される         ← レプリカがまだ当てていない
+```
+
+利用者から見ると、保存したはずの変更が消えたように見えます。自分が書いたものは自分には必ず見える、という性質を **read-your-writes**（書いたものが読める）と呼び、非同期のレプリカに読みを逃がした途端にこれが崩れます。対処は、データベースの外で行うことがほとんどです。
+
+- 書き込んだ直後の一定時間、そのユーザの読み取りはプライマリに送る
+- 書き込んだときの位置（PostgreSQL の LSN、MySQL の GTID）を覚えておき、レプリカがそこまで当て終えたかを確かめてから読む
+- その読み取りが本当に最新でなければならないなら、最初からプライマリで読む
+
+### ホットスタンバイでクエリが取り消される
+
+物理レプリケーションのスタンバイには、もう 1 つ固有の問題があります。プライマリで VACUUM（第 99 回）が古い版の行を消すと、その「消した」という記録も WAL に乗ってスタンバイに届きます。ところがスタンバイでは、**その古い版を必要とする長いクエリが走っているかもしれません**。プライマリはスタンバイで何が走っているかを知らないからです。
+
+スタンバイは、WAL を当てるのを待ってクエリを守るか、クエリを取り消して WAL を当てるかを選ばなければなりません。待つ上限が `max_standby_streaming_delay`（既定 30 秒）で、それを超えると衝突するクエリは取り消されます（[PostgreSQL 文書 26.4.2](https://www.postgresql.org/docs/current/hot-standby.html#HOT-STANDBY-CONFLICT)）。待っている間は WAL の適用が止まるので、レプリケーションの遅延が伸びます。
+
+もう 1 つの手が `hot_standby_feedback = on` で、スタンバイが「自分はこのトランザクション ID より古い版をまだ使っている」とプライマリに伝え、プライマリの VACUUM がそれを消さないようにします。文書は、その代わりにプライマリで古い行の回収が遅れ、テーブルが膨らみうる、と注意しています。第 99 回の「長いトランザクションは全員の敵」が、マシンをまたいで起きるわけです。
+
+| 選択 | 起きること |
+| --- | --- |
+| `max_standby_streaming_delay` を短く | スタンバイの長いクエリが取り消されやすい。遅延は小さい |
+| `max_standby_streaming_delay` を長く | クエリは守られるが、その間スタンバイの遅延が伸びる |
+| `hot_standby_feedback = on` | どちらも起きにくいが、プライマリのテーブルが膨らむ |
+
+## フェイルオーバー: 誰が新しいプライマリになるか
+
+プライマリが落ちたら、レプリカの 1 台を **昇格**（promote）させ、書き込みを受けるようにします。PostgreSQL では `pg_ctl promote` か `pg_promote()` で回復処理を終わらせ、通常のデータベースとして動き始めます（[PostgreSQL 文書](https://www.postgresql.org/docs/current/warm-standby-failover.html)）。
+
+このとき、次の 3 つを考えなければなりません。
+
+**遅れていたレプリカを昇格させると、その差分は失われる。** 非同期なら、昇格させたレプリカがまだ受け取っていなかったトランザクションは、新しいプライマリには存在しません。複数のレプリカがあるなら、最も先まで受け取っているものを選ぶのが原則です。GTID の集合や LSN を比べれば、どれが先かが分かります。
+
+**残りのレプリカを、新しいプライマリにつなぎ直す。** MySQL の GTID は、ここで本領を発揮します。「この集合に無いものをください」と言い直すだけで済むからです。
+
+**古いプライマリを確実に止める。** プライマリが「落ちた」と判断されたのが、実はネットワークが切れていただけだったとしたらどうでしょう。古いプライマリはまだ動いていて、一部のクライアントから書き込みを受け続けているかもしれません。新しいプライマリと 2 台が同時に書き込みを受ける状態を **スプリットブレイン** と呼び、2 つの食い違った歴史ができてしまいます。後から機械的に統合する方法はありません。これを防ぐには、「誰がプライマリか」を過半数の合意で決める仕組みが要ります。その理論（Quorum や Raft）は <a href={`${import.meta.env.BASE_URL}reading/consensus/`}>CAP・Quorum・Raft</a> で、ログの複製そのものに合意を組み込んだデータベースは第 111 回で扱います。
+
+MySQL には、この合意をデータベース自身に持たせた **Group Replication** があります。Paxos を実装したグループ通信の上で複数のサーバが変更を揃え、シングルプライマリモードでは書き込みを受けるのは 1 台だけで、そのプライマリは自動で選び直されます（[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/group-replication-background.html)）。
+
+<Callout type="warn" title="昇格させた後の古いプライマリは、そのまま戻せない">
+  非同期で動いていた古いプライマリには、新しいプライマリに届かなかったトランザクションが残っていることがあります。
+  そのまま新しいプライマリのレプリカとしてつなぐと、歴史が分かれたまま進んでしまいます。
+  PostgreSQL では `pg_rewind` で新しいプライマリの歴史に巻き戻すか、作り直します。
+  MySQL の準同期 AFTER_SYNC でも、文書は「落ちたソースは binlog に未コミットのトランザクションを含みうるので、再起動させずに捨てなければならない」と書いています
+  （[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/replication-options-source.html#sysvar_rpl_semi_sync_source_wait_point)）。
+</Callout>
+
+## レプリケーションでメジャーバージョンを上げる
+
+物理レプリケーションは同じメジャーバージョンでしか動きませんが、論理レプリケーションは行の言葉で話すので、**版の違うデータベースの間でも動きます**。これを使うと、メジャーバージョンアップの停止時間を、切り替えの瞬間だけに縮められます（[PostgreSQL 文書 18.6.3](https://www.postgresql.org/docs/current/upgrading.html#UPGRADING-VIA-REPLICATION)）。
+
+```
+ 1. 新しい版のデータベースを用意し、スキーマを写す（DDL は複製されないので先に手で）
+ 2. 論理レプリケーションで、古い版 → 新しい版へ変更を流し続ける
+ 3. 追いついたら、書き込みを止め、残りが届いたことを確かめる
+ 4. アプリの接続先を新しい版に切り替える
+ 5. シーケンスの値を合わせる（シーケンスは複製されない）
+```
+
+文書は、この切り替えの停止時間を数秒程度としています。マネージドサービスでは、この手順を自動化したものが提供されています。Amazon RDS の Blue/Green Deployments は、本番（blue）の写しとして green 環境を作ってレプリケーションで同期させ続け、版を上げてテストしたうえで切り替えるもので、RDS for PostgreSQL では条件によって論理レプリケーションで同期させます（[Amazon RDS 文書](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)）。
+
+仕組みとして押さえておくべきなのは、この方法が上で見た論理レプリケーションの制約をそのまま引き継ぐことです。DDL とシーケンスは自分で揃え、主キーのないテーブルは更新や削除を当てられない（第 107 回の表の変更とも衝突しうる）、という点を先に洗い出しておく必要があります。
+
+## 手元で確かめる
+
+### 実験の環境
+
+すべて Docker の中で行いました。ホストは Apple Silicon の macOS で、コンテナは aarch64 で動いています。
+
+| 役割 | イメージ | 版 |
+| --- | --- | --- |
+| PostgreSQL のプライマリ、スタンバイ、論理レプリケーションの受け手 | `postgres:17` | 17.11 |
+| MySQL のソースとレプリカ | `mysql:8.4` | 8.4.13 |
+| `mysqlbinlog`（イメージに含まれないので、同じ版のクライアント RPM を別のコンテナに入れた） | `mysql:8.4` | 8.4.13 |
+| Docker | Docker Engine | 29.4.0 |
+
+PostgreSQL のスタンバイは、プライマリから `pg_basebackup` で丸ごと写して作りました。`-R` を付けると、接続先の設定と `standby.signal` が書かれ、そのまま起動すればスタンバイになります。`-C -S standby1` でレプリケーションスロットも同時に作っています。
+
+```
+$ pg_basebackup -h ll-106-pg1 -U repl -D /tmp/data -R -C -S standby1 -X stream -P
+（postgresql.auto.conf に primary_conninfo と primary_slot_name = 'standby1' が書かれる）
+
+（起動したスタンバイのログ。回復処理として始まり、WAL を受け始める）
+LOG:  entering standby mode
+LOG:  redo starts at 0/2000028
+LOG:  consistent recovery state reached at 0/2000120
+LOG:  database system is ready to accept read-only connections
+LOG:  started streaming WAL from primary at 0/3000000 on timeline 1
+```
+
+プロセスの一覧にも、両側に先ほどの 3 つのプロセスが見えます。
+
+```
+（プライマリ）  79 postgres: walsender repl 192.168.156.3(60470) streaming 0/3FB2748
+（スタンバイ）  12 postgres: startup recovering 000000010000000000000003
+（スタンバイ）  13 postgres: walreceiver streaming 0/3FB2748
+```
+
+### 送った位置、書いた位置、当てた位置
+
+プライマリに 190 万行を挿入しながら、`pg_stat_replication` を約 0.9 秒おきに見ました。`behind` は `sent_lsn` と `replay_lsn` の差（バイト）です。
+
+```
+時刻         current_lsn  sent_lsn   write_lsn  flush_lsn  replay_lsn  behind
+09:57:55.37  0/3FB2780    0/3FB2780  0/3FB2780  0/3FB2780  0/3FB2780          0
+09:57:56.23  0/836E000    0/8000000  0/8000000  0/8000000  0/6FFFFE8   16777240
+09:57:57.14  0/A400000    0/A400000  0/A000000  0/A000000  0/9D1FFD8    7209000
+09:57:58.04  0/E000000    0/DC00000  0/DC00000  0/DC00000  0/D001B38   12575944
+09:57:58.89  0/1117C000   0/11000000 0/11000000 0/11000000 0/11000000         0
+09:57:59.74  0/15940000   0/15800000 0/15000000 0/15000000 0/14BFFFA0  12583008
+```
+
+- プライマリが WAL を書いた位置（`current_lsn`）、送った位置（`sent`）、スタンバイが書いた・flush した位置、当てた位置（`replay`）の順に、少しずつ遅れています
+- この環境では write と flush はほぼ同時で、遅れの大半は**当てる**段階で生じ、最大で約 16MB でした。同じマシンの上のコンテナどうしなので、ネットワークの遅れはほとんどありません
+
+スタンバイで書き込もうとすると、読み取り専用のトランザクションとして断られます。
+
+```
+standby=# INSERT INTO t VALUES (0, 'x');
+ERROR:  cannot execute INSERT in a read-only transaction
+standby=# CREATE TABLE z(i int);
+ERROR:  cannot execute CREATE TABLE in a read-only transaction
+```
+
+### ホットスタンバイのクエリが取り消される
+
+スタンバイで `max_standby_streaming_delay = 5s` にし、`REPEATABLE READ` のトランザクションで行を数えた後に 15 秒眠らせ、その 2 秒後にプライマリでその行を消して `VACUUM` しました。
+
+```
+（スタンバイ）BEGIN ISOLATION LEVEL REPEATABLE READ;
+             SELECT count(*) FROM t WHERE id <= 1000;   → 1000
+             SELECT pg_sleep(15);
+（プライマリ）DELETE FROM t WHERE id <= 1000; VACUUM t;   ← 2 秒後
+
+（スタンバイ）
+ERROR:  canceling statement due to conflict with recovery
+DETAIL:  User query might have needed to see row versions that must be removed.
+Time: 7117.279 ms (00:07.117)
+```
+
+VACUUM の記録が届いてから 5 秒待ったところで、15 秒のはずのクエリが 7.1 秒で取り消されました。`pg_stat_database_conflicts` の `confl_snapshot` が 1 増えています。
+
+次に、スタンバイで `hot_standby_feedback = on` にして同じことをしました。今度はクエリは最後まで走り、2 回目の `count(*)` も消される前の 2000 行を返しました。そのときプライマリの `VACUUM VERBOSE` はこう言っています。
+
+```
+tuples: 40 removed, 2001176 remain, 2000 are dead but not yet removable
+```
+
+消した 2000 行は「死んでいるがまだ回収できない」として残されました。スタンバイのトランザクションが終わった後にもう一度 `VACUUM` すると `2000 removed` になりました。プライマリのスロットの `xmin` には、スタンバイから伝えられたトランザクション ID（757）が入っていて、これがプライマリの VACUUM を止めていたものです。
+
+### 同期スタンバイにすると、何が遅くなるか
+
+プライマリで `synchronous_standby_names = '*'` にすると、`pg_stat_replication` の `sync_state` が `async` から `sync` に変わります。この状態で、`synchronous_commit` を変えながら、1 行の `INSERT` を 1 接続で 5 秒間繰り返し、平均の応答時間を `pgbench` で測りました。3 回測っています。
+
+| `synchronous_commit` | 1 回目 | 2 回目 | 3 回目 |
+| --- | --- | --- | --- |
+| `off` | 0.016 ms | 0.021 ms | 0.016 ms |
+| `local` | 2.135 ms | 2.831 ms | 3.019 ms |
+| `remote_write` | 5.091 ms | 5.875 ms | 6.529 ms |
+| `on` | 6.723 ms | 8.422 ms | 5.634 ms |
+| `remote_apply` | 9.377 ms | 5.169 ms | 6.811 ms |
+
+Docker Desktop の仮想ディスクの上なので `fsync` の時間のばらつきが大きく、`on` と `remote_apply` の順は回によって入れ替わっています。それでも、`fsync` を待たない `off`、自分の `fsync` だけの `local`、スタンバイの返事を待つ 3 つ、という桁の違いははっきり出ています。同じマシンの中でもこれだけ差が出るので、スタンバイが別のデータセンターにあれば、往復の時間がそのまま毎回のコミットに乗ります。
+
+次に、同期のまま**スタンバイを止めて**から `INSERT` しました。
+
+```
+（プライマリ）INSERT INTO s VALUES (42);   ← 返ってこない
+
+（別の接続から）
+ pid | wait_event_type | wait_event | state  |             q
+-----+-----------------+------------+--------+---------------------------
+ 408 | IPC             | SyncRep    | active | insert into s values (42)
+
+（4 秒後に pg_cancel_backend で取り消すと）
+WARNING:  canceling wait for synchronous replication due to user request
+DETAIL:  The transaction has already committed locally, but might not have been replicated to the standby.
+INSERT 0 1
+```
+
+`INSERT` は `SyncRep` という待ちで止まり、待つ相手がいない限りいつまでも返りません。取り消すと、警告とともに `INSERT 0 1` が返り、行はプライマリに残っていました。**ローカルではすでにコミットされていて、待っていたのはスタンバイの返事だけ**だということが、このメッセージから分かります。同期レプリケーションにするなら、スタンバイを 2 台以上にして `ANY 1 (...)` のように書かないと、スタンバイ 1 台の故障で書き込みが全部止まります。
+
+### 相手のいないスロットに溜まる WAL
+
+スタンバイを止めたまま、スロット `standby1` を残して、200 万行の表の全行を `UPDATE` しては `CHECKPOINT` することを 3 回繰り返しました。`max_wal_size` は 1GB、`max_slot_wal_keep_size` は既定の `-1` です。
+
+| 時点 | スロットが保持している量 | `pg_wal` の大きさ | `wal_status` |
+| --- | --- | --- | --- |
+| 開始時 | 552 bytes | 657M | `reserved` |
+| 1 回目の後 | 1215 MB | 1.3G | `extended` |
+| 2 回目の後 | 2591 MB | 2.6G | `extended` |
+| 3 回目の後 | 3702 MB | 3.7G | `extended` |
+
+チェックポイントを取っても、`max_wal_size` を超えても、WAL は 1 バイトも消えずに増え続けました。本番でスタンバイを撤去したのにスロットを消し忘れると、これがディスクがいっぱいになるまで続き、プライマリが止まります。
+
+ここで `max_slot_wal_keep_size = 1GB` にして `CHECKPOINT` すると、スロットは見捨てられました。
+
+```
+LOG:  invalidating obsolete replication slot "standby1"
+DETAIL:  The slot's restart_lsn 0/2A0FD9C8 exceeds the limit by 2800756280 bytes.
+HINT:  You might need to increase "max_slot_wal_keep_size".
+
+ slot_name | active | wal_status | invalidation_reason
+-----------+--------+------------+---------------------
+ standby1  | f      | lost       | wal_removed
+```
+
+`pg_wal` は 945M まで縮みました。プライマリは守られましたが、このスタンバイはもう続きを受け取れないので、作り直すしかありません。上限は「プライマリを守るか、スタンバイを守るか」の選択です。
+
+### 論理デコーディングの中身
+
+`wal_level = logical` のプライマリで、組み込みの `test_decoding` プラグインのスロットを作り、変更を覗きました。
+
+```
+=# SELECT lsn, xid, data FROM pg_logical_slot_peek_changes('peek', NULL, NULL);
+    lsn     |   xid   |                                     data
+------------+---------+------------------------------------------------------------------------------
+ 1/12032BF8 | 1277600 | BEGIN 1277600
+ 1/12032BF8 | 1277600 | table public.orders: INSERT: id[integer]:1 item[text]:'apple' qty[integer]:3
+ 1/12032CE0 | 1277600 | table public.orders: INSERT: id[integer]:2 item[text]:'pear' qty[integer]:1
+ 1/12032D98 | 1277600 | COMMIT 1277600
+ 1/12032D98 | 1277601 | BEGIN 1277601
+ 1/12032D98 | 1277601 | table public.orders: UPDATE: id[integer]:1 item[text]:'apple' qty[integer]:5
+ 1/12032E20 | 1277601 | COMMIT 1277601
+ 1/12032E20 | 1277602 | BEGIN 1277602
+ 1/12032E20 | 1277602 | table public.orders: DELETE: id[integer]:2
+ 1/12032E90 | 1277602 | COMMIT 1277602
+```
+
+ページの差分だった WAL が、トランザクションの区切りと「どの表のどの行がどうなったか」に翻訳されています。既定では `UPDATE` に変更前の値は付かず、`DELETE` には主キーしか付きません。変更前の行全体を WAL に書かせるには、テーブルの **REPLICA IDENTITY** を `FULL` にします。
+
+```
+=# ALTER TABLE orders REPLICA IDENTITY FULL;
+=# UPDATE orders SET qty = 6 WHERE id = 1;
+ table public.orders: UPDATE: old-key: id[integer]:1 item[text]:'apple' qty[integer]:5 new-tuple: id[integer]:1 item[text]:'apple' qty[integer]:6
+```
+
+MySQL の `binlog_row_image` に当たる選択を、PostgreSQL ではテーブルごとに行っているわけです。
+
+### 一部のテーブルだけを別のデータベースへ
+
+3 台目の PostgreSQL を立て、プライマリの `orders` だけを publication で出しました。受け手には、送り手に無い `note` 列を足した `orders` を自分で作っています。
+
+```
+（送り手）CREATE PUBLICATION pub_orders FOR TABLE orders;
+（受け手）CREATE TABLE orders(id int primary key, item text, qty int, note text);
+（受け手）CREATE SUBSCRIPTION sub_orders
+           CONNECTION 'host=ll-106-pg1 user=postgres password=... dbname=postgres'
+           PUBLICATION pub_orders;
+NOTICE:  created replication slot "sub_orders" on publisher
+```
+
+既存の行が最初に写され、その後の `INSERT` と `UPDATE` も届きました。送り手の `audit_log` 表は publication に入れていないので、受け手には表すらありません。受け手では `orders` に自分で行を書き込むこともできました。送り手のスロットは `plugin = pgoutput`、`slot_type = logical` です。
+
+次に、送り手で列を足して行を入れました。
+
+```
+（送り手）ALTER TABLE orders ADD COLUMN price int;
+（送り手）INSERT INTO orders VALUES (11, 'kiwi', 1, 120);
+
+（受け手のログ）
+ERROR:  logical replication target relation "public.orders" is missing replicated column: "price"
+```
+
+DDL は複製されないので、受け手は知らない列を含む行を当てられず、レプリケーションが止まります（同じエラーで再試行を繰り返します）。受け手でも同じ列を足すと、止まっていた行が届きました。メジャーバージョンアップの手順で「DDL は先に手で」と書いたのは、このためです。
+
+### binlog の中身: ROW 形式の前後イメージ
+
+MySQL 8.4.13 の既定値を確かめると、`binlog_format = ROW`、`binlog_row_image = FULL`、`sync_binlog = 1`、`innodb_flush_log_at_trx_commit = 1` でした。GTID は `--gtid-mode=ON --enforce-gtid-consistency=ON` で有効にしています。
+
+`orders` の 1 行の `qty` を 3 から 5 に変えたトランザクションを、`mysqlbinlog --base64-output=DECODE-ROWS --verbose` で読むと、こう見えます（一部を省略）。
+
+```
+#261024 10:05:08 server id 1  end_log_pos 603 CRC32 0xd4ad262e 	GTID	last_committed=1	sequence_number=2	rbr_only=yes ...
+BEGIN
+#261024 10:05:08 server id 1  end_log_pos 746 CRC32 0x2be133ff 	Table_map: `shop`.`orders` mapped to number 88
+#261024 10:05:08 server id 1  end_log_pos 822 CRC32 0xa3ad605c 	Update_rows: table id 88 flags: STMT_END_F
+### UPDATE `shop`.`orders`
+### WHERE
+###   @1=1
+###   @2='apple'
+###   @3=3
+###   @4='2026-10-01 00:00:00'
+### SET
+###   @1=1
+###   @2='apple'
+###   @3=5
+###   @4='2026-10-01 00:00:00'
+#261024 10:05:08 server id 1  end_log_pos 853 CRC32 0x3cdaa6b0 	Xid = 20
+COMMIT
+```
+
+- 各トランザクションの頭に **GTID** のイベントがあります（この表示では、GTID の値そのものは省いた行に出ます）。`last_committed` と `sequence_number` は、レプリカが並列に当ててよいトランザクションを見分けるための番号です
+- `Table_map` で表に番号を振り、`Update_rows` がその番号で行を指します。列は名前ではなく `@1`, `@2` の位置で書かれています
+- `WHERE` の下が変更前、`SET` の下が変更後のイメージです。`FULL` なので、変わっていない列まで全部入っています
+- 最後の `Xid` が、先ほどの内部 XA で再起動時に照合される xid です
+
+`binlog_row_image = MINIMAL` にして同じ形の `UPDATE` をすると、主キーと変わった列だけになりました。
+
+```
+### UPDATE `shop`.`orders`
+### WHERE
+###   @1=1
+### SET
+###   @3=9
+```
+
+10 万行の `v` 列（文字列）を書き換える `UPDATE` 1 つでは、トランザクションの大きさ（GTID イベントの `transaction_length`）が `FULL` で 4,821,420 バイト、`MINIMAL` で 904,244 バイトでした。200 万行の `INSERT` 1 つは 78,335,194 バイト、200 万行の全行 `UPDATE` は 158,699,301 バイトです。`ROW` 形式では、**1 文が 1 行の SQL でも、binlog には変えた行数ぶんが書かれる**ことが分かります。
+
+### STATEMENT 形式で、複製が黙って食い違う
+
+セッションだけ `binlog_format = STATEMENT` にして、`UUID()` を使う `INSERT` と、`ORDER BY` のない `UPDATE ... LIMIT 1` を流しました。
+
+```
+mysql> SET SESSION binlog_format = 'STATEMENT';
+mysql> INSERT INTO shop.u VALUES (UUID(), 1);
+mysql> SHOW WARNINGS;
+Note  1592  Unsafe statement written to the binary log using statement format since BINLOG_FORMAT = STATEMENT.
+            Statement is unsafe because it uses a system function that may return a different value on the replica.
+mysql> UPDATE shop.big SET v = 'y' LIMIT 1;
+Note  1592  ... The statement is unsafe because it uses a LIMIT clause.
+            This is unsafe because the set of rows included cannot be predicted.
+```
+
+警告は出ますが、文は成功し、binlog には文がそのまま書かれます（`insert into shop.u values (uuid(), 1)`）。その結果、ソースとレプリカの表を比べると、
+
+```
+（ソース）  dd9fd9a8-cf92-11f1-b3ff-2a97a3f9f688	1
+（レプリカ）e688645f-cf92-11f1-b048-468d5d3de921	1
+```
+
+同じはずの行が、別の値になっていました。レプリケーションはエラーもなく動き続けています。こうした食い違いは、後で別の文がこの行を条件に使ったときに、初めて表に出てきます。
+
+### GTID の集合と、Seconds_Behind_Source
+
+レプリカは `SOURCE_AUTO_POSITION = 1` でつなぎました。ファイル名も位置も指定していません。
+
+```
+mysql> SHOW REPLICA STATUS\G
+           Replica_IO_Running: Yes
+          Replica_SQL_Running: Yes
+        Seconds_Behind_Source: 0
+           Retrieved_Gtid_Set: 50e52f91-cf92-11f1-96ef-2a97a3f9f688:1-12
+            Executed_Gtid_Set: 50e52f91-cf92-11f1-96ef-2a97a3f9f688:1-12,
+                               50fb723c-cf92-11f1-bc4d-468d5d3de921:1-5
+                Auto_Position: 1
+```
+
+`Executed_Gtid_Set` には、ソースの UUID の 1〜12 に加えて、レプリカ自身の UUID の 1〜5 が入っています。後者は、コンテナの初期化のときにレプリカ自身で実行されたトランザクションです。**レプリカで直接書いたものは、レプリカの UUID で記録される**ので、どこから来た変更かが集合を見れば分かります。
+
+ソースで `PURGE BINARY LOGS TO 'binlog.000003'` を実行すると、消した binlog に入っていた分が `gtid_purged` に移りました。
+
+```
+mysql> SELECT @@gtid_purged;
+50e52f91-cf92-11f1-96ef-2a97a3f9f688:1-9
+```
+
+この先、1〜9 のどれかを持っていないレプリカがつなぎに来ても、ソースはもう送れないので、エラーで断ることになります。
+
+遅延の指標 `Seconds_Behind_Source` も見ました。ソースで 200 万行を 1 つのトランザクションで `INSERT` し（binlog のイベントの時刻では 10:07:42 に始まり、コミットは約 7.5 秒後）、その直後からレプリカで約 1 秒おきに見ています。
+
+```
+19:07:49 Seconds_Behind_Source:7
+19:07:51 Seconds_Behind_Source:9
+19:07:52 Seconds_Behind_Source:10
+19:07:53 Seconds_Behind_Source:11
+19:07:54 Seconds_Behind_Source:12
+19:07:55 Seconds_Behind_Source:13
+19:07:56 Seconds_Behind_Source:0
+```
+
+（左の時刻はホストの JST、binlog の時刻は UTC です。）コミット直後に、遅延がいきなり 7 秒から始まっています。行のイベントに記録される時刻は文が**始まった**時刻なので、7 秒かかった文は、レプリカが受け取った瞬間にすでに 7 秒遅れて見えるわけです。その後レプリカが同じ 200 万行を当てる間、遅延は 1 秒に 1 ずつ増え、当て終わると 0 に戻りました。MySQL の文書も、この値が古い時刻のイベントで一時的に大きく振れることや、0 であっても接続が切れているのにまだ気づいていないだけのことがある、と注意しています（[MySQL 文書](https://dev.mysql.com/doc/refman/8.4/en/replication-administration-status.html)）。大きなトランザクションは、それだけでレプリカを遅らせます。第 107 回の表の作り直しで、これが問題になります。
+
+### 準同期とタイムアウト
+
+ソースとレプリカに準同期のプラグインを入れ、`rpl_semi_sync_source_timeout = 3000`（3 秒）にしました。待つ位置は既定の `AFTER_SYNC` です。
+
+```
+rpl_semi_sync_source_wait_point   AFTER_SYNC
+Rpl_semi_sync_source_status       ON
+Rpl_semi_sync_source_clients      1
+```
+
+1 行の `INSERT` を `docker exec` 越しに 3 回流すと、どれもクライアントの起動込みで 0.08〜0.10 秒で返りました。そこでレプリカの受信スレッドを止め（`STOP REPLICA IO_THREAD`）、同じことをしました。
+
+```
+INSERT (4)   real 3.12
+INSERT (5)   real 0.16
+INSERT (6)   real 0.09
+
+Rpl_semi_sync_source_status   OFF
+Rpl_semi_sync_source_yes_tx   4
+Rpl_semi_sync_source_no_tx    3
+
+[Warning] [MY-011153] [Repl] Timeout waiting for reply of binlog (file: binlog.000004, pos: 5727437),
+          semi-sync up to file binlog.000004, position 5727168.
+```
+
+最初の 1 件だけが 3 秒待たされ、タイムアウトしたところで準同期は `OFF` になり、以後は待たずに返っています。`no_tx` の 3 件は、レプリカに届いたことが確かめられないまま成功を返したトランザクションです。PostgreSQL の同期スタンバイがいつまでも待ち続けたのとは、ちょうど逆の振る舞いです。**準同期は、レプリカが健全な間だけ損失を防ぐ**、と理解しておくのが正確です。
+
+## まとめ
+
+- レプリケーションは「同じ初期状態に、同じ変更を同じ順序で当てる」こと。整理する軸は、何を送るか（物理 / 論理）と、いつ「書けた」と答えるか（非同期 / 準同期 / 同期）の 2 つ
+- PostgreSQL のストリーミングレプリケーションは WAL をそのまま送り、スタンバイは回復処理を続ける。walsender が送り、walreceiver が書き、startup が当てる。ページの差分なので、同じメジャーバージョン・同じアーキテクチャが要る
+- ホットスタンバイは読めるが書けない。プライマリの VACUUM と衝突すると、スタンバイのクエリは取り消される（`max_standby_streaming_delay`）か、プライマリが膨らむ（`hot_standby_feedback`）
+- レプリケーションスロットは相手が受け取るまで WAL を消さない。相手がいなくなると無限に溜まる。実験では 3 回の全行更新で 3.7GB。`max_slot_wal_keep_size` で上限を付けると、スロットのほうが捨てられる
+- 論理レプリケーションは行の言葉で送るので、テーブルを選べ、版をまたげ、受け手に書ける。その代わり DDL とシーケンスは届かない。PostgreSQL は WAL から論理デコーディングで取り出し、MySQL は別のログ binlog を書く
+- binlog の STATEMENT 形式は、非決定的な関数や `LIMIT` で複製が黙って食い違う。既定は ROW で、8.4 では形式の選択自体が非推奨。`binlog_row_image` で前後イメージの量が変わる
+- MySQL は redo log と binlog の 2 つを、内部の 2 フェーズコミットで揃える。`sync_binlog = 1` と `innodb_flush_log_at_trx_commit = 1` が揃って初めて、落ちても食い違わない
+- GTID は `server_uuid:通し番号`。適用済みを集合（`gtid_executed`）で持つので、プライマリが替わっても「集合に無いもの」を頼めばよい。消した分は `gtid_purged` に入る
+- PostgreSQL の `synchronous_commit` は、スタンバイの write / flush / replay のどこまで待つかの段階。待つ相手がいなければ、コミットはいつまでも待つ。MySQL の準同期は AFTER_SYNC が既定で、タイムアウトすると非同期に戻る
+- 同期でも、多くの場合レプリカの読み取りは遅れる。read-your-writes は、アプリ側で読み先を選んで守る
+- フェイルオーバーでは、遅れていたレプリカの差分が失われ、古いプライマリが生きているとスプリットブレインになる。誰がプライマリかを決めるには合意が要る
+
+レプリカが遅れる大きな原因の 1 つが、巨大なトランザクションでした。次の第 107 回では、その最たるものである**動いている表の作り直し**を、ロックとレプリケーションの両方を止めずにどう進めるかを見ます。gh-ost が、この回で見た ROW 形式の binlog を読んで動いていることも、そこで確かめます。

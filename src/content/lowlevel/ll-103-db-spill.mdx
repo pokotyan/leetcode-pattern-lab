@@ -1,0 +1,490 @@
+---
+title: メモリに収まらないとき
+description: 並べ替え、集約、結合は、入力を最後まで見ないと最初の 1 行も返せません。その作業領域がメモリに収まらないとき、データベースはどうやって最後まで計算をやり遂げるのか。PostgreSQL、MySQL、DuckDB で、ディスクにあふれさせる仕組みと、その量を決める設定を確かめます
+chapter: db
+order: 8
+status: published
+topics:
+  - ブロッキング演算子
+  - 外部マージソート
+  - Grace hash join
+  - work_mem
+  - hash_mem_multiplier
+  - maintenance_work_mem
+  - 一時ファイル（pgsql_tmp）
+  - log_temp_files
+  - sort_buffer_size
+  - TempTable
+  - out-of-core 処理
+requires:
+  - ll-101-db-planner
+  - ll-102-db-join
+  - ll-96-db-page
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 最初の 1 行が返せない演算子
+
+第 101 回で見たとおり、実行計画は演算子の木で、上の演算子が下の演算子に「次の 1 行をください」と頼む形（Volcano 方式）で動きます。`WHERE` で絞り込むだけの問い合わせなら、下から 1 行もらうたびに条件を確かめて上へ渡せばよく、手元に置いておく行は 1 行で足ります。`LIMIT 5` なら、5 行渡したところで終わりです。
+
+ところが、次の 3 つはそうはいきません。
+
+- `ORDER BY k`：最初に返すべきは `k` が最も小さい行ですが、それが入力のどこにあるかは、**最後の行を見るまで分からない**
+- `GROUP BY grp` の集約：あるグループの `count(*)` は、そのグループの行が**もう来ないと分かるまで確定しない**
+- 第 102 回のハッシュ結合：probe を始める前に、build 側を**全部読んでハッシュ表を作り終えている**必要がある
+
+こうした演算子は、入力を全部（あるいは片側を全部）手元にためてからでないと先へ進めません。第 101 回で「ためる（ブロッキングな）演算子」として、1 行ずつ流せる演算子と区別したものです。この回では **ブロッキングな演算子** と呼びます。ソート、ハッシュ集約、ハッシュ結合の build 側のほか、`DISTINCT` やウィンドウ関数もこの仲間です。
+
+手元に置く量が入力の大きさに比例する以上、いつかはメモリに収まらなくなります。そのとき、データベースには 2 つの道があります。問い合わせを失敗させるか、**作業の途中の結果をディスクに書き出して（あふれさせて、spill して）、少しずつ読み戻しながら続ける**かです。PostgreSQL、MySQL、DuckDB は、いずれも基本的には後者を選びます。この回では、その書き出し方と、書き出しが始まる境目を決める設定を見ていきます。
+
+外部ソートと外部ハッシュの原理は、分散処理の側から <a href={`${import.meta.env.BASE_URL}reading/compute-common/`}>分散処理の共通項</a> の「メモリに載らないとき」でも扱いました。ここでは 1 台のデータベースの中で、それが EXPLAIN やログにどう現れ、どの設定で動くかに焦点を当てます。
+
+## 外部マージソート: 並べた塊を作り、まとめる
+
+メモリに 1 万行しか置けないのに 100 万行を並べ替えたいとき、使うのは **外部マージソート** です。2 つの段階に分かれます。
+
+1. **ランを作る。** 入力を、メモリに収まるだけ読んではメモリ内で並べ替え、並んだ塊（**ラン**）としてディスクに書き出す。これを入力の終わりまで繰り返す
+2. **マージする。** 各ランの先頭だけをメモリに置き、その中で最小のものを取り出しては出力する。取り出したランからは次の行を補充する。k 本のランを同時にまとめるので **k-way マージ** と呼ぶ
+
+```
+ 入力 1,000,000 行（メモリには 1 回に約 4 万行しか置けないとする）
+
+ 段階 1: ラン作り
+   読む → メモリ内で並べる → 書く   ラン 1  [ 3 8 15 ... ]
+   読む → メモリ内で並べる → 書く   ラン 2  [ 1 9 22 ... ]
+                ...                                ...
+   読む → メモリ内で並べる → 書く   ラン 24 [ 5 6 40 ... ]
+
+ 段階 2: k-way マージ
+   ラン 1 の先頭 ─┐
+   ラン 2 の先頭 ─┼─→ 最小を選ぶ（ヒープ）─→ 1, 3, 5, 6, 8, 9, ...
+       ...       │
+   ラン 24 の先頭 ┘
+```
+
+最小を選ぶ部分は、k 個の候補から最小を何度も取り出す操作なので、ヒープを使えば 1 行あたり log k の比較で済みます。
+
+ここで効いてくるのが **k をいくつにできるか** です。マージ中は、各ランから読み込むためのバッファをメモリに持たなければなりません。メモリが小さいと、一度にまとめられるランの本数が限られます。ランが 98 本あるのに 6 本ずつしかまとめられなければ、まず 6 本ずつまとめて 17 本に減らし、それをまた 6 本ずつまとめて 3 本にし、最後に 3 本をまとめる、という **マージの段（パス）** を重ねることになります。**パスが 1 段増えるたびに、全データをもう 1 回書いて読む**ことになるので、メモリの大きさは「あふれるかどうか」だけでなく、「何回書き直すか」にも効きます。後の実験で、この段数がそのまま一時ファイルへの書き込み量になって現れます。
+
+### PostgreSQL の EXPLAIN に出る 3 つのソート
+
+PostgreSQL の `EXPLAIN ANALYZE` の Sort ノードには、使ったソートの方法と、使ったメモリまたはディスクの量が出ます（[PostgreSQL: 14.1 Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)）。よく見るのは次の 3 つです。
+
+| 表示 | 何が起きたか |
+| --- | --- |
+| `Sort Method: quicksort  Memory: 94889kB` | 全部がメモリに収まり、メモリ内で並べ替えた |
+| `Sort Method: top-N heapsort  Memory: 27kB` | `LIMIT` があるので、上位 N 行だけをヒープで持ち続けた。入力がどれだけ大きくてもメモリは N 行分で済む |
+| `Sort Method: external merge  Disk: 61736kB` | メモリに収まらず、ランを一時ファイルに書いてマージした |
+
+2 つ目は、ブロッキングな演算子でも「全部を覚えておく必要はない」場合があることを示しています。`ORDER BY k LIMIT 10` なら、入力は最後まで見なければなりませんが、覚えておくのは現時点の上位 10 行だけです。
+
+## ハッシュであふれたら: 分けて書き出す
+
+ソートは「並んだ塊を作ってまとめる」であふれに対処しました。ハッシュ表を使う演算子は、別の方法をとります。**キーのハッシュ値で入力をいくつかの区画（パーティション、PostgreSQL の用語では batch）に分け、区画ごとに処理する**のです。
+
+第 102 回のハッシュ結合で考えます。build 側の表 R から作るハッシュ表がメモリに収まらないとします。
+
+1. R を読みながら、結合キーのハッシュ値で行を B 個の区画に振り分ける。区画 0 はメモリ上のハッシュ表に入れ、区画 1〜B−1 は一時ファイルに書き出す
+2. probe 側の表 S も、**同じハッシュ関数**で振り分ける。区画 0 の行はその場でハッシュ表を引いて結合し、ほかの区画の行は一時ファイルに書き出す
+3. 区画 1 について、R の区画 1 を読み戻してハッシュ表を作り、S の区画 1 を流して結合する。これを最後の区画まで繰り返す
+
+```
+          R（build 側）                     S（probe 側）
+              │ hash(key) mod B                 │ hash(key) mod B
+     ┌────────┼────────┐              ┌────────┼────────┐
+     ▼        ▼        ▼              ▼        ▼        ▼
+  区画 0    区画 1 … 区画 B−1        区画 0    区画 1 … 区画 B−1
+ （メモリ）  （ファイル）（ファイル）   （その場で） （ファイル）（ファイル）
+
+   同じキーは必ず同じ番号の区画に入る → 区画 i どうしだけを結合すればよい
+```
+
+同じキーを持つ行は、R でも S でも必ず同じ番号の区画に入ります。だから **区画 i の R と区画 i の S だけを突き合わせれば**、結合の結果は漏れなく得られます。1 つの区画の R がメモリに収まるように B を選べば、どれだけ大きな表でも結合できます。この考え方は、1983 年に喜連川、田中、元岡が発表した GRACE というデータベースマシンの論文に由来し（[Kitsuregawa et al., 1983](https://link.springer.com/doi/10.1007/BF03037022)）、**Grace hash join** と呼ばれています。PostgreSQL のハッシュ結合はこの形で、`EXPLAIN ANALYZE` の Hash ノードに `Batches: 8` のように区画の数が出ます。文書は「batch の数が 1 を超えるなら、ディスクも使われている（その量は表示されない）」と書いています（[PostgreSQL: 14.1](https://www.postgresql.org/docs/current/using-explain.html)）。
+
+ハッシュ集約も同じ発想です。グループごとの途中結果を持つハッシュ表があふれたら、まだ表にないグループの行は、ハッシュ値で区画に分けて一時ファイルに書き出し、後で区画ごとに読み戻して集約します。
+
+### PostgreSQL 13 より前のハッシュ集約は、あふれなかった
+
+PostgreSQL のハッシュ集約がディスクにあふれさせられるようになったのは、13 からです。13 のリリースノートは、次のように書いています（[PostgreSQL 13 リリースノート](https://www.postgresql.org/docs/release/13.0/)）。
+
+- 以前は、`work_mem` を超えると見込まれるハッシュ集約は計画の段階で避けていた。13 からは、超えると見込まれても選べる
+- ハッシュ表が `work_mem` × `hash_mem_multiplier` を超えたら、ディスクにあふれさせる
+- 以前は、いったんハッシュ集約が選ばれると、ハッシュ表は**どれだけ大きくなってもメモリに置かれ続けた**。計画時の見積もりが外れていると、とても大きくなりうる
+
+つまり 12 までは、「統計が古くてグループ数を 10 と見込んだが、実際は 200 万だった」という場合に、`work_mem` が 4MB でも 1 つのプロセスが何百 MB も使うことがありました。後の実験で、12 と 17 を並べて実際に確かめます。
+
+### hash_mem_multiplier
+
+13 では、ハッシュを使う演算子のメモリの上限を、`work_mem` に **`hash_mem_multiplier`** を掛けた値にする設定も入りました。既定は 15 から 2.0 で（[PostgreSQL 15 リリースノート](https://www.postgresql.org/docs/release/15.0/)）、ハッシュの演算子はソートの 2 倍まで使えます（[PostgreSQL: 19.4 Resource Consumption](https://www.postgresql.org/docs/current/runtime-config-resource.html)）。文書は、ハッシュの演算子はソートの演算子よりメモリの量に敏感であることを理由に挙げ、あふれが日常的に起きる環境では、`work_mem` 全体を上げるより先にこちらを上げることを勧めています（同上）。
+
+## 作業メモリは「1 つの演算子」ごとに配られる
+
+ここまで何度も出てきた `work_mem` は、**問い合わせ全体の上限ではありません**。文書の説明は次のとおりです（[PostgreSQL: 19.4](https://www.postgresql.org/docs/current/runtime-config-resource.html)）。
+
+- 1 つの演算子（ソートやハッシュ表）が、一時ファイルに書き始める前に使ってよいメモリの基本量。既定は 4MB
+- 複雑な問い合わせは、いくつものソートやハッシュを同時に行い、**それぞれが `work_mem` まで使える**
+- 複数のセッションが同時にそれを行う。だから全体では `work_mem` の何倍にもなりうる
+
+さらに、並列問い合わせでは、`work_mem` のような資源の上限は **ワーカーごとに個別に適用されます**。文書は、4 ワーカーの並列問い合わせは、ワーカーなしの場合の最大 5 倍のメモリを使いうると書いています（[PostgreSQL: max_parallel_workers_per_gather](https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-MAX-PARALLEL-WORKERS-PER-GATHER)）。後の実験に出てくる次の計画では、3 つのプロセスがそれぞれ、上限 8MB のハッシュ集約と上限 4MB のソートを持っています。`work_mem = 4MB` の 1 本の問い合わせが、最大で 3 × (8 + 4) = 36MB を使う計算です。
+
+```
+         ->  Sort (actual rows=98744 loops=3)
+               Sort Method: external merge  Disk: 2528kB
+               Worker 0:  Sort Method: external merge  Disk: 2512kB
+               Worker 1:  Sort Method: external merge  Disk: 2528kB
+               ->  Partial HashAggregate (actual rows=98744 loops=3)
+                     Batches: 5  Memory Usage: 8241kB  Disk Usage: 1632kB
+                     Worker 0:  Batches: 5  Memory Usage: 8241kB  Disk Usage: 1600kB
+                     Worker 1:  Batches: 5  Memory Usage: 8241kB  Disk Usage: 1640kB
+```
+
+`work_mem` を大きくすればあふれは減りますが、接続数 × 演算子の数 × 並列度 の掛け算で、サーバ全体のメモリを使い切る危険が増えます。全体の既定値は控えめにしておき、**重い集計を流すセッションだけ `SET work_mem` で上げる**、というのがよくある使い方です。
+
+<Callout type="note" title="maintenance_work_mem は別枠">
+  `CREATE INDEX`、`VACUUM`、`ALTER TABLE ADD FOREIGN KEY` のような保守の操作は、`work_mem` ではなく `maintenance_work_mem`（既定 64MB）を使います。
+  1 つのセッションが同時に走らせる保守の操作は 1 つだけなので、`work_mem` よりずっと大きくしても安全だ、と文書は説明しています。
+  ただし autovacuum は、最大で `autovacuum_max_workers` 倍のメモリを使いうるので、それは `autovacuum_work_mem` で別に抑えられます
+  （[PostgreSQL: 19.4](https://www.postgresql.org/docs/current/runtime-config-resource.html)）。
+  B-tree の `CREATE INDEX` は、表の全行をキーで並べ替えてから木を下から組み立てるので、その並べ替えが `maintenance_work_mem` を超えると、ここまでと同じ外部マージソートになります。
+</Callout>
+
+## 一時ファイルはどこに行くか
+
+PostgreSQL があふれさせたデータは、データディレクトリの `base/pgsql_tmp/` の下に `pgsql_tmp<プロセス ID>.<番号>` という名前のファイルとして置かれます。置き場所は `temp_tablespaces` で別のテーブルスペースに変えられ、複数並べると、一時ファイルを作るたびにその中から選ばれます。既定は空で、現在のデータベースの既定のテーブルスペースが使われます（[PostgreSQL: 19.11 Client Connection Defaults](https://www.postgresql.org/docs/current/runtime-config-client.html)）。一時ファイルは問い合わせが終われば消えるので、後から ls しても見つかりません。痕跡を残すための仕組みが 3 つあります。
+
+| 仕組み | 何が分かるか |
+| --- | --- |
+| `log_temp_files` | 一時ファイルを消すときに、パスと大きさ（バイト）をサーバのログに出す。0 なら全部、正の値ならその大きさ以上のものだけ。既定 -1 は出さない（[PostgreSQL: 19.8](https://www.postgresql.org/docs/current/runtime-config-logging.html)） |
+| `pg_stat_database` の `temp_files` / `temp_bytes` | データベースごとの、一時ファイルの累計の個数と書き込んだ量。`log_temp_files` の設定とは無関係に数える（[PostgreSQL: 27.2](https://www.postgresql.org/docs/current/monitoring-stats.html)） |
+| `EXPLAIN (ANALYZE, BUFFERS)` の `temp read / written` | その問い合わせが一時ファイルを何ブロック読み書きしたか |
+
+あふれ続ける問い合わせには、`temp_file_limit` で歯止めを掛けられます。1 つのプロセスが同時に使う一時ファイルの合計の上限で、超えたトランザクションは取り消されます。既定は -1（無制限）です（[PostgreSQL: 19.4](https://www.postgresql.org/docs/current/runtime-config-resource.html)）。手元で `temp_file_limit = '20MB'` にして、約 60MB あふれる並べ替えを流すと、次のように止まりました。
+
+```
+ERROR:  temporary file size exceeds temp_file_limit (20480kB)
+```
+
+<Callout type="warn" title="一時ファイルの置き場所は、データとは別のディスクかもしれない">
+  一時ファイルの置き場所が小さいと、あふれた書き込みが空き容量を使い切り、`write` が `ENOSPC`（第 41 回のシステムコールのエラー番号）で失敗します。メッセージに出るのは「No space left on device」です。
+  マネージドなデータベースでは、この置き場所がデータの置き場所と別になっていることがあります。
+  たとえば Aurora PostgreSQL は、`work_mem` からあふれた一時ファイルを、エラーログなどと同じ **インスタンスのローカルストレージ** に書きます。その量はインスタンスクラスで決まり、増やすにはより大きなクラスに変えるしかありません。空きは CloudWatch の `FreeLocalStorage` で見られます
+  （[AWS: Troubleshooting storage issues in Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.BestPractices.TroubleshootingStorage.html)、[AWS: Managing temporary files with PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/PostgreSQL.ManagingTempFiles.html)）。
+  クラスタのボリュームに余裕があっても、大きなインデックス作成や集計で一時ファイルがローカルストレージを使い切ることがある、ということです。
+</Callout>
+
+## MySQL: filesort と内部一時表
+
+MySQL（InnoDB）でも、同じ問題に同じ形で答えています。ただし、並べ替えと、集約や派生表に使う **内部一時表** とで、仕組みも設定も分かれています。
+
+### filesort と sort_buffer_size
+
+インデックスの順番を使えない `ORDER BY` は、**filesort** という並べ替えの段階を足して実行されます。そのメモリは `sort_buffer_size` まで必要に応じて少しずつ確保され、結果がメモリに収まらなければ一時ファイルを使います。マージの段の数は状態変数 `Sort_merge_passes` で数えられ、文書は、理想的には結果全体がソートバッファに収まる大きさにして、ディスクへの書き込みとマージの段を避けるよう勧めています（[MySQL 8.4: 10.2.1.16 ORDER BY Optimization](https://dev.mysql.com/doc/refman/8.4/en/order-by-optimization.html)、[Server Status Variables](https://dev.mysql.com/doc/refman/8.4/en/server-status-variables.html)）。一時ファイルの置き場所は `tmpdir` です（同上）。`sort_buffer_size` も PostgreSQL の `work_mem` と同じく並べ替え 1 つごとに割り当てられるので、全体の既定値を大きくするのは危険です。
+
+### 内部一時表と TempTable
+
+`GROUP BY` や派生表、`UNION` などで途中の結果をためる表を、MySQL は **内部一時表** として作ります。MySQL 8.0 から、メモリ上の内部一時表の既定のストレージエンジンが **TempTable** になりました。8.4 の文書に書かれている動きは次のとおりです（[MySQL 8.4: 10.4.4 Internal Temporary Table Use in MySQL](https://dev.mysql.com/doc/refman/8.4/en/internal-temporary-tables.html)）。
+
+| 設定 | 意味（8.4） |
+| --- | --- |
+| `tmp_table_size` | TempTable で作る **1 つの** 内部一時表の上限。既定 16MiB。超えると InnoDB のディスク上の内部一時表に変換される |
+| `temptable_max_ram` | TempTable の全体が使える RAM。明示しなければ、サーバのメモリの 3%（1GB 以上、4GB 以下） |
+| `temptable_max_mmap` | RAM を使い切った後、メモリマップしたファイルから確保してよい量。**8.4 の既定は 0（無効）** |
+| ディスク上の内部一時表 | 既定ではデータディレクトリの中の **セッション一時テーブルスペース**（`#innodb_temp/temp_*.ibt`）に作られる |
+
+8.4 の既定では `temptable_max_mmap` が 0 なので、メモリマップしたファイルは使われず、上限を超えた表は InnoDB のディスク上の一時表に移ります。`temptable_use_mmap` は非推奨です（同上）。どちらに移ったかは状態変数 `Created_tmp_disk_tables` で数えられますが、メモリマップしたファイルに作られた分は数えられないという制限があります（[Server Status Variables](https://dev.mysql.com/doc/refman/8.4/en/server-status-variables.html)）。
+
+<Callout type="warn" title="Aurora MySQL v3 のリーダーでは、あふれ先がない">
+  Aurora MySQL v3 は MySQL 8.0 系で、TempTable の動きを引き継いでいますが、既定値とあふれ先が違います。AWS の文書によれば、`temptable_max_ram` の既定はメモリ 16GiB 以上のインスタンスで 1GiB、未満で 16MB、`temptable_max_mmap` の既定は 1GiB です。
+  ライターでは、あふれた分はインスタンスのローカルストレージにあるメモリマップしたファイルか InnoDB の一時表に置かれます。
+  一方 **リーダーはクラスタのボリュームに何も書けない** ので、あふれた分は常にローカルストレージのメモリマップしたファイルに置かれ、`temptable_max_mmap` を 0 にもできません。
+  TempTable 全体の上限に達すると、ライターでは InnoDB のディスク上の一時表に変換されて続きますが、リーダーでは問い合わせが `ERROR 1114 (HY000): The table '/rdsdbdata/tmp/#sql...' is full` で失敗します
+  （[AWS: New temporary table behavior in Aurora MySQL version 3](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/ams3-temptable-behavior.html)）。
+  ライターで通った集計をリーダーに移したら失敗する、という形で表に出ることがあります。対策として文書は、`temptable_max_ram` と `temptable_max_mmap` の合計を作業量に合わせ、`FreeLocalStorage` を監視するよう勧めています（同上）。
+</Callout>
+
+## DuckDB: 分析用のエンジンもあふれさせる
+
+分析用の組み込みデータベースである DuckDB も、メモリより大きい処理をディスクにあふれさせて続けます。文書は、入力全体をためる必要がある **ブロッキングな演算子**、つまり `GROUP BY`、`JOIN`、`ORDER BY`、ウィンドウ関数のすべてについて、メモリより大きいデータの処理に対応していると書いています（[DuckDB: Tuning Workloads](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads.html)）。
+
+| 設定 | 既定 | 意味 |
+| --- | --- | --- |
+| `memory_limit` | RAM の 80% | DuckDB 全体が使うメモリの上限 |
+| `temp_directory` | データベースのファイル名に `.tmp` を付けたディレクトリ（インメモリのときは `.tmp`） | あふれたデータを置く場所 |
+| `max_temp_directory_size` | ディスクの空きの 90% | `temp_directory` に置いてよい量の上限 |
+
+（[DuckDB: Configuration](https://duckdb.org/docs/2.0/configuration/overview.html)）
+
+ただし、文書は限界も書いています。複数のブロッキングな演算子が組み合わさると、それでもメモリ不足の例外が起きうること、`string_agg()` のようにあふれさせられない集約関数があること、スレッドが多すぎると遅くなることがあり `threads` で抑えられること、などです（[DuckDB: Tuning Workloads](https://duckdb.org/docs/2.0/guides/performance/how_to_tune_workloads.html)）。DuckDB の演算子が内部でどう計算しているかは次回扱うので、ここではあふれ方だけを手元で確かめます。
+
+## 手元で確かめる
+
+環境は Apple Silicon の Mac 上の Docker（8 CPU、メモリ約 16GB の仮想マシン）です。PostgreSQL は `postgres:17`（17.11）、比較用に `postgres:12`（12.22）、MySQL は `mysql:8.4`（8.4.13）、DuckDB は Python パッケージの 2.0.0 を使いました。実行時間はぶれが大きいので、桁の違いだけを読んでください。
+
+### PostgreSQL: ソートの方法が切り替わる境目
+
+100 万行、81MB の表を用意し、並列実行を切って `work_mem` だけを変えながら `SELECT * FROM t ORDER BY k` を流しました。サーバは `log_temp_files = 0` で起動しています。
+
+```sql
+CREATE TABLE t AS
+  SELECT g AS id, (random()*1e9)::bigint AS k, g % 100000 AS grp, md5(g::text) AS pad
+  FROM generate_series(1, 1000000) g;
+SET max_parallel_workers_per_gather = 0;
+SET work_mem = '4MB';
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF) SELECT * FROM t ORDER BY k;
+```
+
+| `work_mem` | Sort Method | Memory / Disk | temp written（8KB ブロック） | 実行時間 |
+| --- | --- | --- | --- | --- |
+| 1MB | external merge | Disk: 61664kB | 23220 | 330〜380ms |
+| 4MB | external merge | Disk: 61736kB | 15446 | 290〜340ms |
+| 16MB | external merge | Disk: 61680kB | 7715 | 約 270ms |
+| 64MB | external merge | Disk: 61648kB | 7707 | 250〜340ms |
+| 88MB | external merge | Disk: 61656kB | | |
+| 90MB | external merge | Disk: 61648kB | | |
+| 92MB | quicksort | Memory: 93865kB | | |
+| 128MB | quicksort | Memory: 94889kB | 0 | 160〜210ms |
+
+境目は 90MB と 92MB の間にありました。2 つのことが読み取れます。
+
+1 つ目は、**メモリに置くと 94MB 要るデータが、ディスクには 61MB で書かれている**ことです。メモリ上では行ごとにポインタや割り当ての見出しが付くのに対し、一時ファイルには行が詰めて書かれるからです。
+
+2 つ目は、EXPLAIN の `Disk:` はどの行でも約 61MB なのに、**一時ファイルに書いたブロック数は 3 倍まで違う**ことです。`Disk:` は使った領域の大きさで、何回書き直したかは表しません。何が起きていたかは、`trace_sort` を有効にすると分かります。
+
+```
+SET trace_sort = on; SET client_min_messages = log;
+
+-- work_mem = 4MB
+LOG:  worker -1 switching to external sort with 15 tapes
+LOG:  starting merge pass of 24 input runs on 15 tapes, 262 KB of memory for each input tape
+LOG:  starting merge pass of 2 input runs on 2 tapes, 1975 KB of memory for each input tape
+LOG:  performsort of worker -1 done (except 2-way final merge)
+
+-- work_mem = 1MB
+LOG:  worker -1 switching to external sort with 6 tapes
+LOG:  starting merge pass of 98 input runs on 6 tapes, 153 KB of memory for each input tape
+LOG:  starting merge pass of 17 input runs on 6 tapes, 157 KB of memory for each input tape
+LOG:  starting merge pass of 3 input runs on 3 tapes, 320 KB of memory for each input tape
+LOG:  performsort of worker -1 done (except 3-way final merge)
+
+```
+
+（各行の末尾の CPU 時間は省略しています。）`work_mem` が 1MB のときはランが 98 本でき、一度に 6 本しかまとめられないので、98 → 17 → 3 と段を重ね、最後の 3 本は出力しながらまとめています。4MB ではランが 24 本、15 本ずつまとめて 2 本にし、最後に 2 本をまとめます。64MB ではランが 2 本しかなく（`trace_sort` では 240 本のテープを用意して 2 本だけ使っていました）、出力しながら 1 回まとめるだけです。**書き直しの段数が 3 回、2 回、1 回と減り、それが temp written の 23220、15446、7707 にそのまま対応しています**。
+
+`ORDER BY k LIMIT 10` にすると `top-N heapsort  Memory: 27kB` になり、100 万行を見ても使ったメモリは 27kB でした。
+
+サーバのログには、`log_temp_files` による記録が残っていました。
+
+```
+LOG:  temporary file: path "base/pgsql_tmp/pgsql_tmp275.0", size 63217664
+STATEMENT:  set max_parallel_workers_per_gather=0; set work_mem='4MB'; explain (analyze, costs off, timing off) select * from t order by k;
+```
+
+### PostgreSQL: ハッシュ集約の Batches
+
+同じ表で、10 万グループの `GROUP BY` を流しました。
+
+```sql
+SET max_parallel_workers_per_gather = 0;
+SET enable_sort = off;   -- 比較のため、ハッシュ集約を選ばせる
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+  SELECT grp, count(*), max(pad) FROM t GROUP BY grp;
+```
+
+| `work_mem` | `hash_mem_multiplier` | Batches | Memory Usage | Disk Usage | 実行時間 |
+| --- | --- | --- | --- | --- | --- |
+| 1MB | 2 | 17 | 2065kB | 63520kB | 502ms |
+| 4MB | 2 | 5 | 8241kB | 32264kB | 395〜439ms |
+| 16MB | 1 | 5 | 16433kB | 11392kB | 499ms |
+| 16MB | 2 | 1 | 21521kB | なし | 303ms |
+| 64MB | 2 | 1 | 22545kB | なし | 335ms |
+
+`Memory Usage` は、`work_mem` ではなく `work_mem × hash_mem_multiplier` の近くで止まっています（1MB → 2065kB、4MB → 8241kB）。16MB で倍率を 1 にすると 16MB で止まってあふれ、既定の 2 なら 21MB で全部が収まりました。**ハッシュの演算子にとっての実際の上限は、倍率を掛けた値**です。
+
+### PostgreSQL: ハッシュ結合の Batches と一時ファイルの数
+
+同じ大きさの表 `u`（100 万行）と `id` で結合しました。
+
+| `work_mem` | Buckets | Batches | Memory Usage |
+| --- | --- | --- | --- |
+| 1MB | 65536 | 32 | 1615kB |
+| 4MB | 262144 | 8 | 6446kB |
+| 16MB | 1048576 | 2 | 25778kB |
+| 64MB | 1048576 | 1 | 43349kB |
+
+`work_mem = 4MB` のときの `BUFFERS` を見ると、build 側だけでなく probe 側も一時ファイルに書かれていることが分かります。
+
+```
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=6432 read=12320, temp read=5134 written=5134
+   ->  Hash Join (actual rows=1000000 loops=1)
+         Hash Cond: (t.id = u.id)
+         Buffers: shared hit=6432 read=12320, temp read=5134 written=5134
+         ->  Seq Scan on t (actual rows=1000000 loops=1)
+         ->  Hash (actual rows=1000000 loops=1)
+               Buckets: 262144  Batches: 8  Memory Usage: 6446kB
+               Buffers: shared hit=2432 read=5952, temp written=2560
+               ->  Seq Scan on u (actual rows=1000000 loops=1)
+```
+
+一時ファイルは合わせて 5134 ブロック書かれ、そのうち 2560 ブロックが build 側（Hash ノード）、残りが probe 側です。この前後で `pg_stat_database` の `temp_files` は 109 から 123 へ 14 増えました。区画 0 はメモリで処理するので、残りの 7 区画について build 側と probe 側のファイルが 1 本ずつ、合わせて 14 本です。ログにも、同じプロセスの約 3MB のファイル（`pgsql_tmp403.0` から `pgsql_tmp403.13`）が 14 本並びました。
+
+### PostgreSQL 12 と 17: 見積もりが外れたハッシュ集約
+
+13 より前の動きを確かめるため、`postgres:12` と `postgres:17` に同じ表を作りました。最初に 1,000 行（10 グループ）だけ入れて `ANALYZE` し、自動の `ANALYZE` を止めたまま 200 万グループぶんの行を足します。プランナは「10 グループ」と見込んでハッシュ集約を選びます。
+
+```sql
+CREATE TABLE s2 (grp int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO s2 SELECT g % 10, md5(g::text) FROM generate_series(1, 1000) g;
+ANALYZE s2;
+INSERT INTO s2 SELECT g, md5(g::text) FROM generate_series(1, 2000000) g;
+SET max_parallel_workers_per_gather = 0;
+SET work_mem = '4MB';
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT grp, count(*), max(pad) FROM s2 GROUP BY grp;
+```
+
+実行中のバックエンドのプロセスの `/proc/<pid>/status` の `RssAnon`（共有メモリを除いた、そのプロセスの物理メモリ）を 10 ミリ秒ごとに読み、最大値を記録しました。
+
+```
+-- PostgreSQL 12.22
+HashAggregate (actual rows=2000001 loops=1)
+  Group Key: grp
+  ->  Seq Scan on s2 (actual rows=2001000 loops=1)
+Execution Time: 2182.147 ms
+peak RssAnon 445424 kB
+
+-- PostgreSQL 17.11
+HashAggregate (actual rows=2000001 loops=1)
+  Group Key: grp
+  Batches: 85  Memory Usage: 8369kB  Disk Usage: 122440kB
+  ->  Seq Scan on s2 (actual rows=2001000 loops=1)
+Execution Time: 1170.029 ms
+peak RssAnon 12164 kB
+```
+
+`work_mem` は同じ 4MB なのに、12 のプロセスは **約 435MB** まで膨らみ、17 は 85 の区画に分けてディスクに 122MB 書き、プロセスは 12MB に収まりました。接続が 20 本あって同じことが起きれば、12 では 8GB を超えます。12 にはあふれる仕組みがないので、EXPLAIN にも Batches の行がありません。
+
+### PostgreSQL: CREATE INDEX のソートがあふれる
+
+500 万行（326MB）の表に、文字列の列でインデックスを作りました。並列のインデックス作成を切り、`maintenance_work_mem` を 1MB にしています。
+
+```sql
+SET max_parallel_maintenance_workers = 0;
+SET maintenance_work_mem = '1MB';
+CREATE INDEX big_s ON big (s);
+```
+
+実行中に別の端末から `base/pgsql_tmp` を 0.7 秒おきに見ると、1 本のファイルが育っていきました。
+
+```
+-rw------- 1 postgres postgres  24748032 Oct 24 09:50 pgsql_tmp516.0
+-rw------- 1 postgres postgres  60022784 Oct 24 09:50 pgsql_tmp516.0
+-rw------- 1 postgres postgres  98758656 Oct 24 09:50 pgsql_tmp516.0
+...
+-rw------- 1 postgres postgres 260546560 Oct 24 09:50 pgsql_tmp516.0
+```
+
+`trace_sort` の出力は次のとおりです。
+
+| `maintenance_work_mem` | 方法 | ラン / マージ | 一時ファイル | 時間 |
+| --- | --- | --- | --- | --- |
+| 1MB | 外部 | 370 → 62 → 11 → 2 → 最後のマージ | 260,546,560 バイト | 13.0 秒 |
+| 64MB | 外部 | 6 本を 1 回でマージ | 260,538,368 バイト | 13.5 秒 |
+| 1GB | メモリ内（`internal sort ... 430984 KB used`） | なし | なし | 13.6 秒 |
+
+ここでは、あふれても時間はほとんど変わりませんでした。`trace_sort` の CPU 時間を見ると、13 秒のうち 11 秒前後が利用者モードの CPU で、その多くは照合順序 `en_US.utf8` での文字列の比較（第 98 回）に費やされていると考えられます。一時ファイルは書いた直後に読み戻されるので、OS のページキャッシュ（第 96 回で見たバッファプールの、OS 側にあたるもの）に載ったまま使われ、ディスクの速さが効いていないと考えられます。**あふれは常に遅さの原因になるわけではありません**。問題になるのは、一時ファイルの量がページキャッシュに収まらないほど大きいとき、置き場所の空き容量を使い切るとき、そしてハッシュ集約のように同じデータを何度も読み戻すときです。
+
+### MySQL: sort_buffer_size と Sort_merge_passes
+
+`mysql:8.4` に同じ形の 100 万行の表を作り、インデックスのない列で並べ替えました。`LIMIT 999999,1` は、結果を全部画面に出さずに全体を並べ替えさせるためのものです。
+
+```sql
+SET SESSION sort_buffer_size = 262144;
+FLUSH STATUS;
+SELECT * FROM d.t ORDER BY k LIMIT 999999, 1;
+SHOW SESSION STATUS LIKE 'Sort_merge_passes';
+```
+
+| `sort_buffer_size` | `Sort_merge_passes` | 最初に書き出した塊の数 |
+| --- | --- | --- |
+| 32KB | 337 | |
+| 256KB（既定） | 46 | 275 |
+| 2MB | 6 | |
+| 16MB | 1 | 5 |
+| 64MB | | 2 |
+| 128MB | 0 | 0 |
+
+右の列は、オプティマイザトレース（`SET optimizer_trace = 'enabled=on'`）の `filesort_summary` にある `num_initial_chunks_spilled_to_disk` です。128MB のときの `peak_memory_used` は 72,893,153 バイトで、この大きさを超えれば全部がメモリに収まります。既定の 256KB では、275 本のランを 46 回のマージでまとめていたことになります。
+
+### MySQL: 内部一時表がディスクに移る
+
+100 万通りの値を持つ列で `GROUP BY` すると、計画は `Aggregate using temporary table` になります。
+
+```sql
+SET SESSION tmp_table_size = 1048576;
+FLUSH STATUS;
+SELECT count(*) FROM (SELECT pad, count(*) c FROM d.t GROUP BY pad) x;
+SHOW SESSION STATUS LIKE 'Created_tmp%';
+```
+
+| 設定 | `Created_tmp_disk_tables` | 時間 |
+| --- | --- | --- |
+| `tmp_table_size` = 1MB | 2 | 11.2 秒 |
+| `tmp_table_size` = 16MB（既定） | 2 | |
+| `tmp_table_size` = 256MB | 0 | 1.1 秒 |
+| `tmp_table_size` = 256MB、`temptable_max_ram` = 2MB（全体） | 2 | 10.3 秒 |
+
+1 つの表の上限（`tmp_table_size`）に当たっても、全体の上限（`temptable_max_ram`）に当たっても、InnoDB のディスク上の一時表に変換されて、時間が 10 倍になりました。PostgreSQL のハッシュ集約が「あふれた分だけ区画に分けて書く」のに対し、ここでは表ごと InnoDB の B+tree に移し、以後のグループの更新をその木に対して行うからだと考えられます。実行中に `information_schema.INNODB_SESSION_TEMP_TABLESPACES` を 2 秒おきに見ると、セッション一時テーブルスペースが育っていました。
+
+```
+./#innodb_temp/temp_10.ibt	125829120	INTRINSIC
+./#innodb_temp/temp_10.ibt	197132288	INTRINSIC
+./#innodb_temp/temp_10.ibt	222298112	INTRINSIC
+./#innodb_temp/temp_10.ibt	247463936	INTRINSIC
+./#innodb_temp/temp_10.ibt	272629760	INTRINSIC
+```
+
+集約する `pad` 列は 32 文字 × 100 万行なのに、一時表は 270MB を超えました。
+
+### DuckDB: memory_limit を絞る
+
+DuckDB のファイルに 2,000 万行の表を作り、2,000 万通りの値を持つ列で `GROUP BY` しました。`threads = 4` に固定し、`memory_limit` だけを変えて、`temp_directory` の中のファイルの合計の大きさを 20 ミリ秒ごとに測っています。
+
+```python
+c.execute(f"SET memory_limit = '{lim}'; SET temp_directory = '{tmp}'; SET threads = 4")
+c.execute("SELECT count(*), sum(c) FROM (SELECT pad, count(*) c, max(k) m FROM t GROUP BY pad)").fetchall()
+```
+
+| `memory_limit` | 時間 | 一時ディレクトリの最大 | 結果 |
+| --- | --- | --- | --- |
+| 8GB | 0.6〜1.0 秒 | 0 | 完了 |
+| 1GB | 2.1〜2.3 秒 | 約 0.9GB | 完了 |
+| 500MB | 2.9 秒 | 約 1.3GB | 完了 |
+| 200MB | 5.0〜6.4 秒 | 約 1.6GB | 完了 |
+| 100MB | | | 失敗 |
+
+200MB まで絞っても、時間は 5〜6 倍になりながら最後まで終わりました。100MB では、次の例外で止まりました。
+
+```
+Out of Memory Error: failed to pin block of size 256.0 KiB (95.2 MiB/95.3 MiB used)
+
+Possible solutions:
+* Reducing the number of threads (SET threads=X)
+...
+```
+
+あふれさせる仕組みがあっても、各スレッドが同時に手元に置かなければならないブロックの分は、メモリが要ります。一時ディレクトリには、実行中に `duckdb_temp_6179_0_storage_DEFAULT-0.tmp` や `duckdb_temp_6179_0_storage_S32K-0.tmp` のようなファイルが現れ、終わると消えました。
+
+## まとめ
+
+- ソート、ハッシュ集約、ハッシュ結合の build 側は、入力を全部ためないと先へ進めないブロッキングな演算子。手元に置く量が入力に比例するので、いつかメモリからあふれる
+- ソートは、メモリに収まる分ずつ並べたランを書き出し、k-way でマージする。メモリが小さいと一度にまとめられる本数が減り、マージの段が増えるたびに全データを書き直す
+- ハッシュの演算子は、キーのハッシュ値で区画に分けて書き出し、区画ごとに読み戻して処理する（Grace hash join の考え方）。PostgreSQL では `Batches` に区画の数が出る
+- PostgreSQL のハッシュ集約がディスクにあふれるのは 13 から。12 までは見積もりが外れると、`work_mem` に関係なくメモリを使い続けた
+- `work_mem` は演算子ごと、プロセスごとの量で、ハッシュには `hash_mem_multiplier` が掛かる。1 本の問い合わせでも何倍にもなる。保守の操作は `maintenance_work_mem`
+- 一時ファイルは `base/pgsql_tmp`（`temp_tablespaces` で変更可）に作られ、`log_temp_files`、`pg_stat_database`、`EXPLAIN (BUFFERS)` で量が分かる。置き場所が小さいと空き容量を使い切る。Aurora PostgreSQL ではインスタンスのローカルストレージ
+- MySQL は filesort（`sort_buffer_size`、`Sort_merge_passes`）と内部一時表（TempTable、`tmp_table_size`、`temptable_max_ram`）で分かれる。8.4 では TempTable からあふれた表は InnoDB の一時表に移る。Aurora MySQL v3 のリーダーでは、上限に達すると `The table ... is full` で失敗する
+- DuckDB も `GROUP BY`、`JOIN`、`ORDER BY`、ウィンドウ関数を `temp_directory` にあふれさせるが、絞りすぎるとメモリ不足で止まる
+- あふれは常に遅いわけではない。効くのは、ページキャッシュに収まらないとき、置き場所を使い切るとき、同じデータを何度も読み戻すとき
+
+次回は、この回の最後に出てきた DuckDB が、行を 1 つずつではなく **列ごとにまとめて** 計算することで、大量の行の集計をどう速くしているのかを見ます。

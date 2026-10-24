@@ -1,0 +1,313 @@
+---
+title: Canvas 2D と OffscreenCanvas
+description: canvas は、命令を受け取るとすぐピクセルに変える 1 枚のビットマップです。大きさの 2 つの意味と高解像度の画面でぼやける理由、状態のスタックとパス、GPU で描くことと読み戻しの代償、別オリジンの画像で「汚れる」仕組み、そして Worker に描画を逃がす OffscreenCanvas を、ヘッドレスの Chrome で確かめます
+chapter: graphics
+order: 2
+status: published
+topics:
+  - Canvas 2D
+  - 即時モード
+  - devicePixelRatio
+  - 描画状態のスタック
+  - 塗りつぶしの規則（nonzero / evenodd）
+  - getImageData と読み戻し
+  - willReadFrequently
+  - origin-clean（汚れた canvas）
+  - ImageBitmap
+  - OffscreenCanvas
+requires:
+  - ll-123-drawing-map
+  - ll-117-event-loop
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 1 枚のビットマップ
+
+前回の地図で、canvas は**即時モード**の側に置きました。DOM や SVG では、ブラウザが要素の木を持ち続け、変化があれば描き直してくれます。canvas は違います。`fillRect` を呼べば、その時点でビットマップの画素が塗られ、**何を描いたかという記録は残りません**。残るのは画素だけです。
+
+HTML Standard も、canvas を「解像度に依存するビットマップのキャンバス」と説明しています（[HTML Standard 4.12.5](https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element)）。そして、より適した要素があるならそちらを使うべきで、たとえば見出しを canvas で描くのは不適切だ、とまで書いています。canvas に描いた文字は、支援技術からも検索からも見えない画素だからです。
+
+```
+   DOM / SVG（保持モード）              canvas（即時モード）
+ ┌──────────────────────┐        ┌──────────────────────┐
+ │ ブラウザが木を持つ        │        │ ページが「何を描くか」を持つ  │
+ │   <rect x=10 …>        │        │   state = { x: 10, … }   │
+ │   <circle …>           │        │          │               │
+ │        │ 変化を検知      │        │          ▼ 毎回すべて描く   │
+ │        ▼               │        │   ctx.clearRect(…)       │
+ │  ブラウザが描き直す       │        │   ctx.fillRect(…)        │
+ └──────────────────────┘        │          │               │
+                                 │          ▼               │
+                                 │  ビットマップ（画素だけ）    │
+                                 └──────────────────────┘
+```
+
+この回では、この「画素だけが残る」という性質から出てくることを、順に見ていきます。
+
+## 大きさが 2 つある
+
+canvas には大きさが 2 つあります。
+
+- **ビットマップの大きさ**: `width` と `height` の属性。画素の数そのもの。省略すると 300 × 150（[HTML Standard](https://html.spec.whatwg.org/multipage/canvas.html#attr-canvas-width)）
+- **表示の大きさ**: CSS の `width` と `height`。画面のどれだけの領域に貼るか
+
+2 つが違えば、ブラウザはビットマップを**引き伸ばして**貼ります。`width` の属性を書かずに CSS で 200 × 100 にした canvas は、`canvas.width` が 300 のまま、表示だけが 200px になっていました（手元の Chrome 155）。300 画素を 200px に縮めて貼るので、描いた図形はつぶれて見えます。
+
+### 高解像度の画面でぼやける
+
+もう 1 つのずれは、CSS の 1px と画面の 1 画素の違いです。Retina のような画面では CSS の 1px に物理的な画素が 2 × 2 個あり、その比が `devicePixelRatio` です。ビットマップを CSS の大きさのまま作ると、ブラウザはそれを 2 倍に拡大して貼るので、輪郭がぼやけます。MDN は、`devicePixelRatio` だけビットマップを大きく作り、`ctx.scale` で座標を CSS の px に戻す書き方を示しています（[MDN: Window.devicePixelRatio](https://developer.mozilla.org/en-US/docs/Web/API/Window/devicePixelRatio)）。
+
+```js
+const dpr = devicePixelRatio
+canvas.style.width = '200px'; canvas.style.height = '100px'  // 表示の大きさ
+canvas.width = 200 * dpr;     canvas.height = 100 * dpr      // 画素の数
+ctx.scale(dpr, dpr)  // 以降の座標は CSS の px で書ける
+```
+
+### 手元で確かめる（1）: ぼやけを数字で見る
+
+Playwright からヘッドレスの Chrome 155 を `deviceScaleFactor: 2` で動かし、2 つの canvas に同じ絵を描きました。どちらも CSS では 200 × 100 で、x = 50.5 から幅 1 の黒い縦線を引きます。
+
+- canvas A: ビットマップ 200 × 100（倍率を無視）
+- canvas B: ビットマップ 400 × 200 に `ctx.scale(2, 2)`
+
+スクリーンショットの PNG を読み、線の付近の 1 行（物理的な画素で x = 96〜107）の赤の値を並べました。255 が白、0 が黒です。
+
+```
+A（200×100 を 2 倍に拡大）: 255 255 255 223 160 128 128 160 223 255 255 255
+B（400×200 を等倍）       : 255 255 255 255 255   0   0 255 255 255 255 255
+```
+
+A では、x = 50.5〜51.5 の線が 2 つの画素に半分ずつかかり、どちらも灰色（128）になっています。それをさらに拡大して貼るので、補間で 6 画素にわたる灰色のにじみになりました。B では線がちょうど 2 画素に乗り、真っ黒の 2 画素だけになっています。**同じ描画命令でも、ビットマップの画素の数で結果が決まる**ということです。
+
+## 状態のスタックとパス
+
+即時モードの API ですが、コンテキストは**描画状態**を持っています。HTML Standard が挙げる中身は、変換行列、クリップの領域、塗りと線の色、`globalAlpha`、合成の演算子、影、線の太さ、フォント、`filter` などです（[HTML Standard 4.12.5.1.3](https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-state)）。
+
+`save()` はこの状態の写しをスタックに積み、`restore()` は取り出して戻します。**ビットマップは状態に含まれません**。`restore()` しても、描いた画素は消えません。
+
+```js
+ctx.save()
+ctx.translate(100, 50)       // 変換行列を変える
+ctx.rotate(Math.PI / 6)
+ctx.fillStyle = 'red'
+ctx.fillRect(-20, -20, 40, 40)
+ctx.restore()                // 行列も色も元どおり。赤い四角は残る
+```
+
+第 31 回で見た関数呼び出しが、呼び出し側のレジスタを退避して戻すのと同じ形です。部品ごとに `save` と `restore` で囲めば、部品の中で行列や色をいくら変えても外に漏れません。
+
+### パスと塗りつぶしの規則
+
+図形は**パス**として組み立ててから塗ります。`beginPath()` で空にし、`moveTo`、`lineTo`、`arc` などで線を足し、最後に `fill()` か `stroke()` で初めて画素になります。
+
+パスが自分自身と重なるとき、どこを「内側」とみなすかを決めるのが**塗りつぶしの規則**です（[HTML Standard: CanvasFillRule](https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillrule-nonzero)）。
+
+- `nonzero`（既定）: 点から引いた半直線が、一方の向きに横切る回数と逆向きに横切る回数が等しければ外側
+- `evenodd`: 横切る回数が偶数なら外側
+
+同じ向きに描いた 2 つの同心円を 1 本のパスにし、中心の画素の不透明度を読みました（手元の Chrome 155）。
+
+```
+fill('nonzero') の中心: alpha = 255   ← 塗られる（同じ向きに 2 回横切るので 0 にならない）
+fill('evenodd') の中心: alpha = 0     ← 穴になる（2 回は偶数）
+```
+
+ドーナツ形を描くには、`evenodd` を使うか、内側の円を逆向きに描きます。SVG の `fill-rule` も同じ 2 つの規則です。
+
+### 文字は折り返されない
+
+`fillText(text, x, y, maxWidth)` は 1 行しか描きません。仕様の手順は、文字列の中の空白類をすべて U+0020 の空白に置き換えてから描きます（[HTML Standard: text preparation algorithm](https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm)）。改行も空白になるということです。`maxWidth` を超える場合は、折り返すのではなく、より詰めたフォントにするか、横方向に縮めます（同じ節）。
+
+手元で確かめると、`'一行目\n二行目'` と `'一行目 二行目'` の `measureText` の幅は、どちらも 125.56px で同じでした。幅 395.75px の英文を `maxWidth` 150 で描くと、インクの右端は x = 149 に収まりました。150px の中に押し縮めて描いたわけです。
+
+**折り返し、行間、双方向テキストの並べ替え、文字の選択は、すべて自分で書くことになります。**グラフの凡例やゲームのメニューを canvas で作ると苦労するのはここです。この穴を埋めようとする提案が、第 127 回の HTML-in-Canvas です。
+
+## GPU で描き、CPU で読む
+
+Chrome では、canvas 2D は普通 **GPU で描かれます**。手元の Chrome 155 の `chrome://gpu` には、`Canvas: Hardware accelerated` と `Skia Graphite: Enabled` が出ていました。
+
+HTML Standard も、この選択を次のように書いています（[HTML Standard: will read frequently](https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-will-read-frequently)）。
+
+> On most devices the user agent needs to decide whether to store the canvas's output bitmap on the GPU (this is also called "hardware accelerated"), or on the CPU (also called "software"). Most rendering operations are more performant for accelerated canvases, with the major exception being readback with getImageData(), toDataURL(), or toBlob().
+
+GPU の canvas では、`fillRect` や `arc` を呼んでもその場では画素になりません。命令は記録されるだけで、まとめて GPU プロセスに送られてから描かれます（GPU プロセスについては第 113 回と第 116 回）。
+
+```
+ メインスレッド              GPU プロセス / GPU
+  ctx.arc(); ctx.fill()  ─┐
+  ctx.arc(); ctx.fill()   │ 記録するだけ（ほぼ 0ms）
+  ctx.arc(); ctx.fill()  ─┘
+  ctx.getImageData()  ───────▶ 溜まった命令を描く
+         │ 待つ                    │
+         │                         ▼
+         ◀──────────── 画素を CPU のメモリへ写す
+       ImageData
+```
+
+ふだんは描画とメインスレッドが並行に進みますが、`getImageData()` はこの並行をやめさせます。溜まった命令を描き終え、GPU のメモリから CPU のメモリへ画素を写すまで、メインスレッドは待つしかありません。第 15 回のキャッシュの話と同じで、**遠いメモリにある値を読むのは高い**のです。
+
+### 手元で確かめる（2）: 読み戻しの代償
+
+1024 × 1024 の canvas に半径 60 の円を 200 個描き、そのたびに `getImageData(0, 0, 1, 1)` で 1 画素だけ読む、という操作を 12 回繰り返しました。`willReadFrequently` を付けない canvas と、付けた canvas で比べます（ヘッドレスの Chrome 155、Apple M1 Pro、ANGLE の Metal バックエンド。2 回の実行の片方）。
+
+```
+既定             : 1.9  12.5  1.9  1.5  1.4  1.4  1.6  1.5  1.3  1.2  1.1  1.1  (ms)
+willReadFrequently: 1.7   1.3  1.6  1.5  1.5  1.4  1.3  1.4  1.4  1.5  1.4  1.4  (ms)
+```
+
+読み取れることを並べます。
+
+- 円を 200 個描く呼び出しそのものは、どちらも 0.1ms 以下でした。**時間は描く命令ではなく、読み戻しの側に出ます**。溜まった命令を描くのが `getImageData` の時点だからです
+- 既定の canvas は、2 回目の読み戻しだけ 12〜13ms かかりました（2 回の実行で 12.5ms と 13.4ms）。`willReadFrequently` の canvas ではこの山がありません
+- 同じ実行で、Chrome はコンソールに `Canvas2D: Multiple readback operations using getImageData are faster with the willReadFrequently attribute set to true.` と出していました
+
+2 回目の山は、Chrome が「この canvas は何度も読まれる」と判断して、ビットマップを GPU から CPU に移した時の費用だと考えられます。ただし、Chrome の内部の判断の条件は、この実験と警告の文面から推測したものです。確かなのは、**読み戻しを何度もするなら、最初から `willReadFrequently: true` で CPU の canvas にしておけば、途中で山が出ない**ということです。
+
+```js
+const ctx = canvas.getContext('2d', { willReadFrequently: true })
+```
+
+逆に、読み戻さない canvas に付けると、GPU で描ける利点を捨てることになります。ゲームの画面のように描くだけの canvas には付けず、画素を解析する道具やお絵描きの塗りつぶし（フラッドフィル）のように**毎回画素を読む canvas にだけ**付けます。
+
+<Callout type="note" title="performance.now() の粒度">
+  上の値が 0.1ms 刻みなのは、`performance.now()` の分解能がわざと粗くされているからです。
+  第 136 回で見るクロスオリジン分離をしていないページでは、Spectre 型の攻撃に使われないよう、時刻が丸められます。
+  ここでの比較は、0.1ms の刻みで十分に差が見える範囲に限っています。
+</Callout>
+
+## 汚れた canvas
+
+画素を読めるということは、**canvas に描いたものの中身を JavaScript で取り出せる**ということです。ここで第 130 回の問題がそのまま出てきます。別オリジンの画像は `<img>` で表示はできても、ページの JavaScript に中身を読ませてはいけません。社内のサーバにある画像や、ログインした状態でしか見えない画像を、攻撃者のページが `<img>` で読み込み、canvas に描いて画素を送り出せてしまうからです。
+
+そこで canvas のビットマップには **origin-clean** というフラグがあります。最初は true で、CORS で許可されていない別オリジンの画像や動画を `drawImage` すると false になります（[HTML Standard: origin-clean](https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean)）。false の canvas では、`getImageData`、`toDataURL`、`toBlob` が `SecurityError` を投げます（[HTML Standard: getImageData](https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata)）。
+
+描くことは許され、**読むことだけが止められる**。第 130 回で見た「埋め込めるが読めない」という非対称が、canvas でも同じ形で現れます。
+
+### 手元で確かめる（3）: CORS と crossOrigin
+
+Python の `http.server` を 127.0.0.1 の 18301（ページ）と 18302（画像）で立て、18302 は URL に `cors` を含むときだけ `Access-Control-Allow-Origin: *` を返すようにしました。18301 のページから 8 × 8 の赤い PNG を読み込み、canvas に描いて読み戻します（ヘッドレスの Chrome 155）。
+
+```js
+const img = new Image()
+if (crossOrigin) img.crossOrigin = 'anonymous'
+img.src = url
+await new Promise((ok, ng) => { img.onload = ok; img.onerror = ng })
+ctx.drawImage(img, 0, 0)
+ctx.getImageData(0, 0, 1, 1)   // ここで SecurityError になるか
+```
+
+```
+画像                          crossOrigin   読み込み   getImageData          要求の Origin
+同一オリジン                    なし          成功      255,0,0,255           —
+別オリジン、CORS なし            なし          成功      SecurityError         なし
+別オリジン、CORS あり            なし          成功      SecurityError         なし
+別オリジン、CORS なし            anonymous    失敗      —                     http://127.0.0.1:18301
+別オリジン、CORS あり            anonymous    成功      255,0,0,255           http://127.0.0.1:18301
+```
+
+3 行目が要点です。**サーバが CORS のヘッダを返していても、`crossOrigin` を付けない `<img>` は CORS の要求を送らない**ので、canvas は汚れます。サーバのログを見ても、`Origin` ヘッダが付いていません。`crossOrigin` を付けると CORS の要求になり（第 131 回）、許可がなければ画像の読み込みそのものが失敗します。4 行目の失敗の時、コンソールには `has been blocked by CORS policy` が出ていました。
+
+<Callout type="warn" title="よくある誤解: 「サーバに CORS のヘッダを足したのに、まだ tainted と言われる」">
+  画像の側で `crossOrigin = 'anonymous'`（`<img crossorigin>`）を付けないと、ブラウザは CORS の要求を送りません。
+  さらに、同じ URL の画像を `crossOrigin` なしで先に読み込んでいると、HTTP キャッシュに CORS のヘッダなしの応答が残ることがあります。
+  第 138 回で見るとおり、応答が要求の `Origin` によって変わるなら `Vary: Origin` を返します。
+</Callout>
+
+汚れは伝染します。汚れた canvas を別の canvas に `drawImage` すると、描いた先も汚れます。HTML Standard は、`HTMLCanvasElement`、`ImageBitmap`、`OffscreenCanvas` を描く場合、元の origin-clean が false なら描いた先も false になると決めています（[HTML Standard](https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument-is-not-origin-clean)）。
+
+## 画像を先にほどいておく: ImageBitmap
+
+`<img>` の `load` イベントは、画像が読み込めたことを知らせるだけで、画素にほどき終わった（デコードした）ことまでは約束しません。HTML Standard は、`onload` で画像を DOM に入れる書き方について、その後の描画が**メインスレッドの上で同期的なデコード**を起こし、フレームを落とす原因になると注意しています（[HTML Standard: decode()](https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode)）。canvas の `drawImage` でも同じことが起きます。
+
+`createImageBitmap()` は、画像の元から `ImageBitmap` を作って Promise で返します（[MDN: createImageBitmap](https://developer.mozilla.org/en-US/docs/Web/API/Window/createImageBitmap)）。できた `ImageBitmap` は描く準備が済んだビットマップで、`drawImage` は写すだけで済みます。`ImageBitmap` は Worker でも使え、`postMessage` で転送できます（IDL が `[Exposed=(Window,Worker), Serializable, Transferable]`。[HTML Standard: ImageBitmap](https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#the-imagebitmap-interface)）。
+
+```js
+const res = await fetch('/sprite.png')
+const bmp = await createImageBitmap(await res.blob())  // ほどく仕事はここで、非同期に
+ctx.drawImage(bmp, 0, 0)                                 // 毎フレームは写すだけ
+```
+
+### 手元で確かめる（5）: どこでデコードの時間を払うか
+
+4096 × 4096 のノイズの画像を JPEG（約 10.9MB）にし、512 × 512 の canvas に縮めて描きました。描いた直後に 1 画素を読み、描き終わるまでの時間を測っています（ヘッドレスの Chrome 155、3 回の実行がほぼ同じ値）。
+
+```
+img の load 直後に drawImage                  112〜115ms   ← メインスレッドが止まる
+同じ img をもう一度 drawImage                    約 7ms
+createImageBitmap(blob) の呼び出しが返るまで      0〜0.2ms
+  その Promise が解決するまで                   116〜119ms   ← この間メインスレッドは空いている
+ImageBitmap を drawImage                       1.2〜1.4ms
+```
+
+デコードの費用（約 115ms）はどちらの道でも払っています。違いは**どこで払うか**です。`load` の直後に `drawImage` すると、その 115ms はメインスレッドの 1 つのタスクの中に入り、第 117 回で見た長いタスクになります。`createImageBitmap` なら呼び出しはすぐ返り、メインスレッドは待っている間にほかの仕事ができます。`<img>` のままでよいなら、描く前に `await img.decode()` で待つ手もあります（[HTML Standard: decode()](https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode)）。
+
+## 描画を Worker に逃がす: OffscreenCanvas
+
+ここまでの canvas は、すべてメインスレッドで描いていました。第 117 回で見たとおり、メインスレッドは JavaScript、イベント、スタイル、レイアウトを 1 本で回しています。重い処理が 1 つ入れば、canvas のアニメーションも止まります。第 116 回で見たように、`transform` のアニメーションならコンポジタスレッドで続きますが、canvas の中身を描き直すのは JavaScript なので、その道は使えません。
+
+**OffscreenCanvas** は、canvas を DOM から切り離して Worker でも描けるようにしたものです。web.dev は「名前のとおり、DOM と Canvas API を切り離して画面の外に出す」と説明しています（[web.dev: OffscreenCanvas](https://web.dev/articles/offscreen-canvas)）。
+
+使い方は 2 通りです。
+
+- `new OffscreenCanvas(w, h)`: 画面に出ない canvas を作る。画像の加工や、`ImageBitmap` を作るために使う
+- `canvas.transferControlToOffscreen()`: ページの上の canvas の**描く権利**を OffscreenCanvas として取り出し、Worker に転送する。Worker で描いたものが元の canvas に出る
+
+```js
+// メインスレッド
+const off = document.querySelector('canvas').transferControlToOffscreen()
+const worker = new Worker('worker.js')
+worker.postMessage({ canvas: off }, [off])   // 転送。以後メインスレッドからは描けない
+
+// worker.js
+onmessage = (e) => {
+  const ctx = e.data.canvas.getContext('2d')
+  const loop = (t) => {
+    ctx.fillStyle = `hsl(${(t / 5) % 360},80%,50%)`
+    ctx.fillRect(0, 0, 200, 100)
+    requestAnimationFrame(loop)   // Worker にも rAF がある
+  }
+  requestAnimationFrame(loop)
+}
+```
+
+Worker の中の `requestAnimationFrame` は、HTML Standard で専用 Worker（`DedicatedWorkerGlobalScope`）に用意されています（[HTML Standard: AnimationFrameProvider](https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#animation-frames)）。以前は描いた結果を `commit()` で明示的に送る書き方がありましたが、web.dev は代わりに Worker の `requestAnimationFrame` を使うよう書いています（[web.dev](https://web.dev/articles/offscreen-canvas)）。
+
+### 手元で確かめる（4）: メインスレッドを塞ぐ
+
+同じページに 2 つの canvas を置きました。片方はメインスレッドの `requestAnimationFrame` で、もう片方は `transferControlToOffscreen` で Worker に渡し、Worker の `requestAnimationFrame` で、毎フレーム色を変えて塗ります。1 秒ふつうに回したあと、メインスレッドを空のループで 1 秒塞ぎ、それぞれのコールバックが何回呼ばれたかを数えました（ヘッドレスの Chrome 155、3 回とも同じ傾向）。
+
+```
+                         塞ぐ前の 1 秒   塞いだ 1 秒
+メインスレッドの canvas        60            2
+Worker の OffscreenCanvas     57〜59         60
+```
+
+メインスレッドの側は、塞いでいる間に 2 回しか描けていません（どちらも塞ぐ直前に始まったフレームのものです）。Worker の側は、塞いでいる間も 1 秒に 60 回、描き続けていました。web.dev も、メインスレッドが忙しくても Worker で動いているアニメーションには影響しない、と書いています（[web.dev](https://web.dev/articles/offscreen-canvas)）。
+
+ただし、この実験で数えたのは Worker の中でコールバックが呼ばれた回数です。描いた結果が実際に画面に届いたかまでは、ヘッドレスの環境では確かめていません。
+
+### 逃がせないもの
+
+OffscreenCanvas で Worker に移せるのは**描く仕事だけ**です。
+
+- 入力のイベントはメインスレッドに届く。クリックの座標を Worker に `postMessage` で渡す必要があり、メインスレッドが塞がっていれば、その入力も Worker に届かない
+- Worker には DOM が無い。文字のレイアウトに DOM を使う手は使えない
+- 転送した canvas は、メインスレッドからは `getContext` できなくなる
+
+**描画が滑らかでも、反応が遅ければ INP は悪いまま**です（第 119 回）。OffscreenCanvas は長いタスクを切る代わりにはなりません。描画の重さとメインスレッドの重さを切り離す道具です。
+
+## まとめ
+
+- canvas は即時モードのビットマップ。描いたものの記録は残らず、画素だけが残る。より適した要素があるなら canvas を使わない
+- 大きさは 2 つある。`width` / `height` の属性が画素の数（既定は 300 × 150）、CSS が表示の大きさ。高解像度の画面では `devicePixelRatio` 倍のビットマップを作り、`ctx.scale` で座標を戻す。手元では、そうしないと 1px の線が 6 画素の灰色になった
+- コンテキストは描画状態（変換行列、クリップ、色、フォントなど）のスタックを持つ。`save` / `restore` は状態だけを戻し、画素は戻さない
+- 自分自身と重なるパスの内側は、`nonzero` と `evenodd` の規則で決まる
+- `fillText` は 1 行だけ描く。改行は空白になり、`maxWidth` を超えると縮めて描く。折り返しは自分で書く
+- Chrome の canvas は普通 GPU で描かれ、描く命令は記録されるだけ。`getImageData` は GPU を待って画素を CPU に写すので高い。何度も読むなら `willReadFrequently: true` にする
+- CORS で許可されていない別オリジンの画像を描くと canvas は汚れ（origin-clean が false）、読み戻しが `SecurityError` になる。サーバの CORS のヘッダだけでなく、`crossOrigin` の指定が要る
+- `load` 直後の `<img>` を `drawImage` すると、デコードの時間（手元では約 115ms）がメインスレッドに乗る。`createImageBitmap` や `img.decode()` で先に、非同期に済ませておける
+- OffscreenCanvas と Worker の `requestAnimationFrame` で、メインスレッドが塞がっても描き続けられる。手元ではメインスレッドを 1 秒塞いでも、Worker 側は 60 回描いた。ただし入力はメインスレッドを通る
+
+canvas 2D は、図形を描く命令を 1 つずつ受け取り、ブラウザ（の中の Skia）が画素に変えてくれる API でした。GPU で描かれているとはいえ、GPU に何をさせるかはブラウザが決めています。次の第 125 回では、GPU そのものに近づきます。WebGL では、頂点をどこに置き、画素を何色にするかを、**シェーダという小さなプログラムを自分で書いて GPU に渡します**。

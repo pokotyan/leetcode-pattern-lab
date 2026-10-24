@@ -1,0 +1,614 @@
+---
+title: バックアップと時点復旧
+description: レプリカがあれば、バックアップは要らないのでしょうか。動いているデータベースから一貫したコピーをどう取り、「昨日の 14:03 の状態」にどう戻すのか。論理と物理の 2 つの取り方と、ログを足して任意の時点に戻す仕組みを、手元で実際に戻しながら確かめます
+chapter: db
+order: 13
+status: published
+topics:
+  - 論理バックアップ
+  - 物理バックアップ
+  - pg_dump / pg_restore
+  - mysqldump --single-transaction
+  - gtid_purged
+  - pg_basebackup
+  - backup_label
+  - WAL アーカイブ
+  - 時点復旧（PITR）
+  - RPO / RTO
+  - pg_verifybackup
+  - 増分バックアップ
+requires:
+  - ll-99-db-wal-mvcc
+  - ll-106-db-replication
+---
+
+import Callout from '../../components/Callout.astro'
+
+## レプリカは、間違いも複製する
+
+第 106 回で、プライマリの変更をログごと別のマシンへ送り、同じ状態のデータベースをもう 1 台作るレプリケーションを見ました。プライマリのディスクが壊れても、レプリカを昇格させれば数秒から数分でサービスを続けられます。
+
+では、誰かが本番で次の文を流してしまったらどうでしょうか。
+
+```sql
+DELETE FROM orders WHERE id > 1000;   -- 本当は WHERE id > 1000 AND status = 'test' のつもりだった
+```
+
+この `DELETE` も、立派な「コミット済みの変更」です。WAL にも binlog にも正しく記録され、**レプリカへ忠実に届き、すべてのレプリカで同じように行が消えます**。レプリケーションが守るのは「機械が壊れたときに、最新の状態を失わないこと」であって、「人や不具合が書いた誤った変更から、過去の状態を取り戻すこと」ではありません。
+
+後者のために必要なのが**バックアップ**です。そして多くの場合、ほしいのは「昨夜のバックアップの状態」ではなく「誤った `DELETE` が走る直前、たとえば 14:03 の状態」です。この回では、
+
+- 動き続けているデータベースから、**一貫した**コピーをどう取るのか
+- そのコピーに**ログを足して**、任意の時点まで進めるにはどうするのか
+
+を、第 99 回の WAL とチェックポイント、第 106 回の GTID を土台に見ていきます。
+
+## 2 つの取り方: 論理と物理
+
+バックアップの取り方は、大きく 2 つに分かれます。
+
+| | 論理バックアップ | 物理バックアップ |
+| --- | --- | --- |
+| 中身 | `CREATE TABLE` と `COPY` / `INSERT` の列。**SQL として読み直せる形** | データディレクトリのファイルそのもの（ページの並び） |
+| 代表 | `pg_dump`、`mysqldump`、MySQL Shell の dump | `pg_basebackup`、Percona XtraBackup、MySQL Enterprise Backup、ストレージのスナップショット |
+| 取る速さ | 全行を SELECT して文字にするので遅め | ファイルを読むだけなので速い |
+| 戻す速さ | 行を 1 件ずつ入れ直し、索引も作り直すので**遅い** | ファイルを置いて起動するだけなので速い |
+| 版をまたぐ | 新しいメジャーバージョンへ持っていける | 同じメジャーバージョン、同じ CPU アーキテクチャが前提 |
+| 部分復元 | 1 テーブルだけ戻す、といったことが容易 | 基本はクラスタ全体 |
+| ログを足して時点復旧 | できない（その時点で止まった写真） | **できる** |
+
+MySQL の文書は `mysqldump` について、大量のデータをバックアップする速くて伸びる手段ではなく、**SQL を再実行するために復元がとても遅くなりうる**、大規模なら物理バックアップのほうが適していると明記しています（[MySQL 8.4: mysqldump](https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html)）。
+
+逆に、論理バックアップにしかできないこともあります。PostgreSQL の `pg_dump` の出力は**新しいメジャーバージョンのサーバに読み込める**ことが期待されていて、版の移行に使われます（[PostgreSQL 17: pg_dump](https://www.postgresql.org/docs/17/app-pgdump.html)）。物理バックアップは、ディスク上のページの形式そのものなので、そうはいきません。
+
+どちらか一方ではなく、**時点復旧のための物理バックアップ**と、**取り出しや移行のための論理バックアップ**を併用するのが一般的です。
+
+## 論理バックアップ: 1 つのスナップショットで全部読む
+
+論理バックアップの難しさは、**読んでいる間にもデータが変わる**ことです。`orders` を読み終えてから `order_items` を読むまでの間に新しい注文が入ると、明細だけあって注文の無い行が混ざります。
+
+答えは第 99 回の MVCC にあります。**1 つのトランザクションの中で、1 つのスナップショットを使って全テーブルを読めばよい**のです。スナップショットは開始時点の版だけを見せるので、ダンプに何分かかっても、出てくるのは開始時点の状態です。書き込みをする人を止める必要もありません。
+
+### pg_dump
+
+`pg_dump` は、接続すると最初に次の 2 文を送ります。手元でサーバのログ（`log_statement=all`）から拾ったものです。
+
+```
+LOG:  statement: BEGIN
+LOG:  statement: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY
+```
+
+REPEATABLE READ のトランザクションは、最初の文の時点でスナップショットを固定し、終わるまでそれを使い続けます。文書の言い方では「データベースが同時に使われていても一貫したバックアップを作り、読む人も書く人も妨げない」です（[PostgreSQL 17: pg_dump](https://www.postgresql.org/docs/17/app-pgdump.html)）。
+
+<Callout type="warn" title="スナップショットを長く持つことの代償">
+  第 99 回で見たとおり、古い版は「それを必要とするスナップショットが 1 つでもある限り」片付けられません。
+  何時間もかかる `pg_dump` は、その間ずっと VACUUM の手を止める長いトランザクションです。
+  大きなデータベースでは、ダンプをプライマリではなくレプリカで取ることが多いのはこのためです。
+</Callout>
+
+### 出力形式と pg_restore
+
+`pg_dump` には 4 つの出力形式があります（[PostgreSQL 17: pg_dump](https://www.postgresql.org/docs/17/app-pgdump.html)）。
+
+| 形式 | 指定 | 中身 | 戻し方 | 圧縮 | 並列ダンプ |
+| --- | --- | --- | --- | --- | --- |
+| plain | `-Fp`（既定） | SQL のテキスト | `psql` に流す | なし | できない |
+| custom | `-Fc` | 1 ファイルのアーカイブ | `pg_restore` | 既定で圧縮 | できない |
+| directory | `-Fd` | テーブルごとのファイル + 目次 | `pg_restore` | 既定で gzip | **`-j` でできる** |
+| tar | `-Ft` | directory 形式を tar にしたもの | `pg_restore` | なし | できない |
+
+plain の中身は、ただの SQL です。2 行だけの表をダンプすると、コメントと空行を除いて次のようになります（PostgreSQL 17.11）。
+
+```sql
+\restrict ZkxMYWuYdDqJOWle7jpLBG6WuVFQl6HvDZ4v8mSVAivkgzLateNpdSghNkR4Nl4
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+...
+CREATE TABLE public.small (
+    id integer NOT NULL,
+    name text
+);
+ALTER TABLE public.small OWNER TO postgres;
+COPY public.small (id, name) FROM stdin;
+1	alice
+2	bob
+\.
+ALTER TABLE ONLY public.small
+    ADD CONSTRAINT small_pkey PRIMARY KEY (id);
+\unrestrict ZkxMYWuYdDqJOWle7jpLBG6WuVFQl6HvDZ4v8mSVAivkgzLateNpdSghNkR4Nl4
+```
+
+いくつか読み取れることがあります。
+
+- `SET client_encoding = 'UTF8'` で、後に続くデータの文字コードを宣言しています。第 98 回で見たとおり、文字列は「バイト列と、その読み方」の組なので、読み方を一緒に運ぶ必要があります
+- データは 1 行ずつの `INSERT` ではなく、`COPY ... FROM stdin` の後にタブ区切りで並びます。`COPY` は行ごとに文を解析しないので、入れ直しが速くなります
+- **主キーの制約は、データを入れた後に**付けています。行を入れるたびに索引を更新するより、入れ終わってから一度に作るほうが速いからです
+- 先頭の `\restrict` は 17.6 で入った対策で、ダンプの中のデータが psql のメタコマンドとして解釈され、復元する人のシェルを乗っ取ることを防ぎます（[PostgreSQL 17.6 リリースノート](https://www.postgresql.org/docs/release/17.6/)、CVE-2025-8714）
+
+custom 形式は、先頭が `PGDMP` という 5 バイトで始まるバイナリで、`pg_restore -l` で目次を読めます。
+
+```
+$ pg_restore -l small.dump
+220; 1259 16412 TABLE public small postgres
+3428; 0 16412 TABLE DATA public small postgres
+3282; 2606 16418 CONSTRAINT public small small_pkey postgres
+```
+
+表の定義、表のデータ、制約が別々の項目になっています。だから custom や directory 形式では、**1 つの表だけを選んで戻す**、**並べ替えて戻す**、**`-j` で並列に戻す**ことができます。plain はただの SQL の列なので、`psql` で頭から流すしかありません。
+
+### mysqldump --single-transaction
+
+MySQL の `mysqldump` は、既定では表を読む前に `LOCK TABLES` を掛けます。InnoDB の表だけなら、代わりに `--single-transaction` を付けて、pg_dump と同じくスナップショットで読ませます。このオプションは分離レベルを REPEATABLE READ にして `START TRANSACTION` を送り、**アプリを止めずに、その時点の一貫した状態を書き出します**（[MySQL 8.4: mysqldump](https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html)）。
+
+ただし、効くのはトランザクションを持つエンジンだけです。文書は次の 2 点をはっきり書いています。
+
+- 一貫した状態で書き出されるのは InnoDB の表だけ。**MyISAM や MEMORY の表は、ダンプ中にも変わりうる**
+- ダンプ中に別の接続が `ALTER TABLE`、`CREATE TABLE`、`DROP TABLE`、`RENAME TABLE`、`TRUNCATE TABLE` を流してはいけない。一貫読み取りはこれらの文から隔離されていないので、**中身が間違ったり、ダンプが失敗したりする**
+
+第 107 回で見たオンラインのスキーマ変更と、夜間のダンプが同じ時間帯に重なると、ここに当たります。
+
+### --set-gtid-purged: どこまで含まれているかを書き込む
+
+第 106 回で見たとおり、GTID を有効にしたサーバでは、すべてのトランザクションに `サーバの UUID:通し番号` という名前が付き、各サーバは自分が実行済みの GTID の集合（`gtid_executed`）を持っています。
+
+ダンプを別のサーバに戻すときに問題になるのは、「このダンプには、どの GTID までの変更が含まれているのか」です。これが分からないと、後で binlog を足して時点復旧するとき、ダンプに既に含まれている変更をもう一度当ててしまいます。
+
+`--set-gtid-purged` は、これをダンプに書き込むオプションです。既定値の `AUTO` では、GTID が有効で `gtid_executed` が空でなければ、ダンプに `SET @@GLOBAL.gtid_purged` を入れ、さらに復元中に binlog を書かないよう `SET @@SESSION.sql_log_bin=0` を入れます。`gtid_purged` を設定された復元先は、その GTID の変更を「実行済み」として扱います（[MySQL 8.4: mysqldump](https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html)）。
+
+| 値 | `SET @@GLOBAL.gtid_purged` | `sql_log_bin=0` |
+| --- | --- | --- |
+| `AUTO`（既定） | GTID 有効で `gtid_executed` が空でなければ入れる | GTID 有効なら入れる |
+| `ON` | 入れる。GTID が無効ならエラー | 入れる |
+| `OFF` | 入れない | 入れない |
+| `COMMENTED` | コメントとして入れる（自動では効かない） | 入れる |
+
+文書は、ここに入る GTID の集合が**ダンプに含めなかったデータベースへの変更も含めて、サーバの `gtid_executed` 全体**であることにも注意を促しています。一部のデータベースだけをダンプすると、警告が出ます。
+
+<Callout type="note" title="mysqlpump と MySQL Shell">
+  `mysqlpump` は 8.0.34 で非推奨になり、8.4 で削除されました（[MySQL 8.4: What Is New](https://dev.mysql.com/doc/refman/8.4/en/mysql-nutshell.html)）。
+  並列に速く取りたい場合、MySQL の文書は MySQL Shell の dump ユーティリティ（`util.dumpInstance()` など）を勧めています。
+  形式は違いますが、「1 つの一貫した時点で読む論理バックアップ」という位置付けは同じです。
+</Callout>
+
+## 物理バックアップ: ファイルをそのまま写す
+
+### cp では壊れる理由
+
+物理バックアップとは、データディレクトリのファイルを写すことです。では、動いているサーバのデータディレクトリを `cp -r` や `tar` で写せばよいかというと、**そのままでは使えないコピーになります**。PostgreSQL の文書は、ファイル単位でコピーするならサーバを止めなければならず、接続を断つといった中途半端な手段では足りないと書いています（[PostgreSQL 17: 25.2 File System Level Backup](https://www.postgresql.org/docs/17/backup-file.html)）。
+
+理由は、第 99 回の仕組みそのものにあります。
+
+```
+ 時刻 →
+ cp:        [ファイル A を写す] ........ [ファイル B を写す] ........ [pg_control を写す]
+ サーバ:          ↑ページ書き出し           ↑チェックポイント完了
+                  （A の 8KB のうち          （「この LSN より前は
+                    前半 4KB だけ反映）         全部書き出し済み」と記録）
+```
+
+- **ファイルごとに写した時刻が違う。** A は 10:00 の状態、B は 10:05 の状態で、どの時点の状態でもない
+- **ページが途中で写る。** 第 99 回の torn page と同じことが、コピーの側で起きる。8KB のページを読んでいる途中で、サーバがそのページを書き換える
+- **チェックポイントの記録が嘘になる。** 回復は最後のチェックポイントから WAL を当て直すが、コピーの最後に写した制御ファイルが「10:05 のチェックポイントで全部書き出し済み」と言っていても、10:00 に写したファイル A には 10:05 までの変更は入っていない。回復はそれより前の WAL を当てないので、**変更が抜けたまま「正常に」起動してしまう**
+
+最後の点が一番怖いところです。エラーで止まってくれず、黙って一部の変更を失います。
+
+### pg_basebackup: 開始点を記録し、その間の WAL も持つ
+
+PostgreSQL の考え方は、逆にこの性質を利用します。文書の言葉では「完全に一貫したファイルのコピーは要らない。コピーの中の不整合は、ログの再生で直る。これはクラッシュからの回復と大差ない」（[PostgreSQL 17: 25.3 Continuous Archiving](https://www.postgresql.org/docs/17/continuous-archiving.html)）。
+
+必要なのは 2 つです。
+
+1. **どこから当て直せばよいか**を、コピーの中に正しく書いておく
+2. **コピーしていた間の WAL**を、全部持っておく
+
+`pg_basebackup` はこれを自動でやります。最初にチェックポイントを取り、その位置を **`backup_label`** というファイルに書いてコピーに入れます。手元で取ったものです。
+
+```
+START WAL LOCATION: 0/3000028 (file 000000010000000000000003)
+CHECKPOINT LOCATION: 0/3000080
+BACKUP METHOD: streamed
+BACKUP FROM: primary
+START TIME: 2026-10-24 18:59:44 JST
+LABEL: base1
+START TIMELINE: 1
+```
+
+このコピーから起動すると、サーバは制御ファイルではなく `backup_label` の `START WAL LOCATION` から WAL を当て直します。コピー中に変わったページは、その後の WAL で正しい状態に上書きされます。文書は、このファイルが単なる情報ではなく、**回復処理が正しく動くために決定的に重要**だと書いています（[PostgreSQL 17: 25.3.4](https://www.postgresql.org/docs/17/continuous-archiving.html)）。
+
+コピーしていた間の WAL は、`-X stream`（既定）なら 2 本目の接続で並行して受け取り、コピーの `pg_wal` に入れます（[PostgreSQL 17: pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html)）。こうして、取得した時点に戻すのに必要なものが 1 つのディレクトリに揃います。取得中も、他のクライアントには影響しません。
+
+### MySQL: XtraBackup と MySQL Enterprise Backup
+
+InnoDB の物理バックアップも、考え方は同じです。Percona XtraBackup は InnoDB のクラッシュ回復の仕組みの上に作られています（[Percona XtraBackup 8.4: How it works](https://docs.percona.com/percona-xtrabackup/8.4/how-xtrabackup-works.html)）。
+
+1. 開始時の LSN を記録し、InnoDB のデータファイルをコピーする。コピーには時間がかかるので、**ファイルごとに違う時点の状態**になる
+2. その間、裏のプロセスが **redo log を見張り、変更を写し続ける**
+3. 後で **prepare** という工程を走らせる。写した redo を、写したデータファイルに当て直し（第 99 回の redo）、未コミットの変更を undo で取り消す。つまり**コピーに対してクラッシュ回復をする**
+
+InnoDB 以外の表（MyISAM など）はロックを掛けないと一貫しないので、XtraBackup はそれらを写す間だけ、`FLUSH TABLES WITH READ LOCK` より軽い backup lock を使います。Oracle の MySQL Enterprise Backup（`mysqlbackup`）も、同じく InnoDB のファイルとログを写して後で揃える方式の商用ツールです。
+
+### ストレージのスナップショット
+
+クラウドのブロックストレージ（Amazon EBS など）や LVM、ZFS は、ボリューム全体のある瞬間の状態を、ほぼ一瞬でスナップショットに取れます。これは**電源を抜いた瞬間のディスク**と同じ状態、つまり**クラッシュ一貫**（crash-consistent）なコピーです。
+
+WAL を持つデータベースは、もともと電源断から回復できるように作られています。だから、データとログを含むボリューム全体が**同じ瞬間**で写っていれば、そこから起動すれば第 99 回のクラッシュ回復が走って、一貫した状態になります。PostgreSQL の文書も、凍結スナップショットからなら動作中でも使えるバックアップになり、起動すると前のサーバがクラッシュしたと見なして WAL を再生する、と説明しています（[PostgreSQL 17: 25.2](https://www.postgresql.org/docs/17/backup-file.html)）。
+
+<Callout type="warn" title="複数のボリュームは、同じ瞬間でなければならない">
+  データファイルと WAL を別々のディスクに置いている、テーブル空間が別のファイルシステムにある、といった構成では、
+  **全部のスナップショットが厳密に同時**でなければ、上の「cp で壊れる」と同じことが起きます（[PostgreSQL 17: 25.2](https://www.postgresql.org/docs/17/backup-file.html)）。
+  EBS の文書も、スナップショットには要求した時点でボリュームに書かれたデータだけが入り、
+  アプリや OS がキャッシュしているデータは入らないと書いています（[Amazon EBS: Create snapshots](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-creating-snapshot.html)）。
+  複数ボリュームを同時に取る機能（multi-volume snapshots）があるのはこのためです。
+</Callout>
+
+## 時点復旧: ベースバックアップに、ログを足していく
+
+ここまでで手に入るのは、「バックアップを取った時点」の状態です。誤った `DELETE` が 14:03 に走ったのに、手元にあるのが昨夜 2:00 のバックアップなら、その間の 12 時間分の正しい変更まで失います。
+
+物理バックアップには、ここで決定的な利点があります。第 99 回で見たとおり、WAL は「データベースに起きた変更の、順序付きの完全な記録」でした。
+
+```
+ ベースバックアップ（2:00）       WAL / binlog（2:00 以降の全変更）
+ ┌──────────────┐    ┌──────────────────────────────────────────────┐
+ │ 2:00 の状態   │ +  │ 2:00 ... 9:00 ... 13:59 ... 14:03 │ 14:03:05 DELETE │ ...
+ └──────────────┘    └──────────────────────────────────────────────┘
+                                                        ↑ ここで止める
+                       = 14:03 の状態
+```
+
+ベースバックアップを起点に、その後のログを**ほしい時刻の直前まで**当て直せば、その時刻の状態が作れます。これが**時点復旧**（PITR、Point-In-Time Recovery）です。発想は第 106 回のレプリカと同じで、違いは「ログを当て続けるか、指定した所で止めるか」だけです。
+
+### PostgreSQL: WAL アーカイブ
+
+普段、PostgreSQL はチェックポイントより古い WAL を消したり再利用したりします。時点復旧のためには、それを消す前にどこかへ保管しなければなりません。これが **WAL アーカイブ**です。
+
+```
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+```
+
+WAL のセグメント（既定 16MB）が 1 つ埋まるたびに、`archive_command` が呼ばれます。`%p` は WAL ファイルのパス、`%f` はファイル名です。文書は、このコマンドが**成功したときに限って** 0 を返すことを重要だとしています。0 を受け取ったサーバはそのファイルを消してよいと判断するので、失敗を成功と報告するとログに穴が開きます。0 以外なら、成功するまで繰り返します（[PostgreSQL 17: 25.3.1](https://www.postgresql.org/docs/17/continuous-archiving.html)）。シェルのコマンドを呼ぶ代わりに、共有ライブラリのモジュールを `archive_library` で指定することもできます。
+
+復元するときは、ベースバックアップを置き、`recovery.signal` という空のファイルを作って、次を設定して起動します。
+
+```
+restore_command = 'cp /archive/%f %p'
+recovery_target_time = '2026-10-24 18:59:56.864741+09'
+recovery_target_action = 'promote'
+```
+
+サーバは `restore_command` でアーカイブから WAL を 1 つずつ取り出して当て直し、指定の時刻を過ぎるコミットに当たったところで止まります。目標を指定しなければ、手に入る WAL を最後まで当て直します（[PostgreSQL 17: 25.3.5](https://www.postgresql.org/docs/17/continuous-archiving.html)、[19.5.6 Recovery Target](https://www.postgresql.org/docs/17/runtime-config-wal.html#RUNTIME-CONFIG-WAL-RECOVERY-TARGET)）。
+
+止めた後に書き込みを再開すると、元の歴史（`DELETE` が起きた歴史）とは別の未来が始まります。PostgreSQL はこれを **タイムライン** の番号で区別し、新しい WAL のファイル名の先頭 8 桁を 1 つ進めます。元の歴史の WAL とファイル名がぶつからないので、同じアーカイブを使い続けられ、必要なら別の時刻でやり直すこともできます。
+
+### MySQL: フルバックアップ + binlog
+
+MySQL では、第 106 回のレプリケーションに使った **binlog** が同じ役目を果たします。手順は次のとおりです（[MySQL 8.4: 9.5 Point-in-Time Recovery](https://dev.mysql.com/doc/refman/8.4/en/point-in-time-recovery.html)）。
+
+1. フルバックアップ（`mysqldump` や XtraBackup）を戻す
+2. その後の binlog を `mysqlbinlog` で SQL に戻し、`mysql` に流す。止める位置は次のどれかで指定する
+
+| オプション | 止める位置 |
+| --- | --- |
+| `--stop-datetime` | タイムスタンプがその時刻**以降**の最初のイベントの手前 |
+| `--stop-position` | binlog 上のバイト位置。その位置以降で始まるイベントを含めない |
+| `--exclude-gtids` | 指定した GTID のトランザクションだけを飛ばす |
+
+（[MySQL 8.4: mysqlbinlog](https://dev.mysql.com/doc/refman/8.4/en/mysqlbinlog.html)）
+
+`--stop-datetime` は秒単位なので、誤った操作と正しい操作が同じ秒にあると切り分けられません。そのときは binlog の中身を見てバイト位置か GTID で指定します。`--exclude-gtids` を使えば、**誤ったトランザクションだけを飛ばして、その後の正しい変更は当てる**こともできます。
+
+### RPO と RTO
+
+時点復旧の設計は、2 つの数字で語られます。
+
+| 用語 | 意味 | 何で決まるか |
+| --- | --- | --- |
+| **RPO**（Recovery Point Objective） | どれだけ前までのデータを失ってよいか | ログをどれだけ頻繁に、どれだけ安全な場所へ送っているか |
+| **RTO**（Recovery Time Objective） | 戻すのにどれだけ時間を掛けてよいか | ベースバックアップを置く時間 + 当て直すログの量 |
+
+WAL アーカイブは、セグメントが埋まるたびに送るので、書き込みの少ない時間帯には何十分も送られないことがあります。`archive_timeout` で一定時間ごとに強制的に切り替えれば、失うかもしれない範囲がその時間に収まります（[PostgreSQL 17: archive_timeout](https://www.postgresql.org/docs/17/runtime-config-wal.html#GUC-ARCHIVE-TIMEOUT)）。さらに RPO を詰めたければ、`pg_receivewal` で WAL をストリームで受け取り続けます。
+
+RTO 側では、**ベースバックアップが古いほど、当て直す WAL が増えて戻すのが遅くなります**。ベースバックアップを取る頻度は、この当て直しの時間と、バックアップの容量との交換です。次に見る増分バックアップは、ここを安くする仕組みです。
+
+## 戻せることを確かめる
+
+「バックアップを取っている」ことと「戻せる」ことは別物です。アーカイブのコマンドが黙って失敗していた、必要な WAL の 1 つが欠けていた、保管先で壊れていた、復元の手順を誰も知らなかった。どれも、実際に戻そうとした日に初めて分かります。
+
+確かめる方法は、軽い順に次のとおりです。
+
+- **ファイルの検証。** `pg_basebackup` は既定で **backup manifest** を作ります。コピーに入れたすべてのファイルの大きさ、更新時刻、チェックサム（既定は CRC32C）と、復元に必要な WAL の範囲を並べた JSON です。`pg_verifybackup` はこれと突き合わせて、ファイルの欠けや壊れ、必要な WAL が揃っているかを確かめます（[PostgreSQL 17: pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html)、[pg_verifybackup](https://www.postgresql.org/docs/17/app-pgverifybackup.html)）
+- **復元の試験。** 定期的に、別のマシンへ実際に戻して起動し、件数や最新の行を確かめる。復元にかかった時間が、そのまま現実の RTO になる
+- **論理的な検査。** 戻したデータベースで `pg_dump` を取り切る（全行を読むので、壊れたページがあれば当たる）、`amcheck` で索引を検査する、など
+
+<Callout type="note" title="チェックサムは、悪意のある改ざんには効かない">
+  manifest の既定のチェックサム CRC32C は、偶然の破損を見つけるには十分ですが、
+  意図的な改ざんには耐性がないと文書に書かれています。改ざんまで疑うなら `--manifest-checksums=SHA256` などを選びます
+  （[PostgreSQL 17: pg_basebackup](https://www.postgresql.org/docs/17/app-pgbasebackup.html)）。
+</Callout>
+
+### PostgreSQL 17 の増分バックアップ
+
+PostgreSQL 17 から、`pg_basebackup` が**前回のバックアップから変わったブロックだけ**を取れるようになりました（[PostgreSQL 17: 25.3.3 Making an Incremental Backup](https://www.postgresql.org/docs/17/continuous-archiving.html#BACKUP-INCREMENTAL-BACKUP)）。
+
+- サーバ側で `summarize_wal = on` にしておく。WAL サマライザという裏のプロセスが WAL を読み、「どの LSN の範囲で、どのブロックが変わったか」の要約を `pg_wal/summaries` に書き溜める
+- `pg_basebackup --incremental=前回の backup_manifest` で取る。サーバは前回の manifest にある開始 LSN と、要約とを突き合わせて、変わったブロックだけを送る
+- 戻すときは `pg_combinebackup 完全 増分1 増分2 ... -o 出力先` で、1 つの完全なバックアップに合成してから使う
+
+要約が前回のバックアップの開始 LSN から今回の開始 LSN までを覆っていないと、増分バックアップは失敗します。つまり、**WAL の要約は、ブロック単位の差分を計算するための索引**です。WAL 自体を全部読み直さずに、どのブロックを送ればよいかが分かります。
+
+## 実験の環境
+
+すべて Docker のコンテナの中で行いました。
+
+| 役割 | イメージ | 版 |
+| --- | --- | --- |
+| PostgreSQL（元のサーバと、復元先） | `postgres:17` | 17.11 |
+| MySQL（元のサーバと、復元先） | `mysql:8.4` | 8.4.13 |
+
+`mysql:8.4` の公式イメージ（8.4.13）には `mysqlbinlog` が入っていなかったので、同じ版の `mysql-community-client` の RPM を MySQL の公式リポジトリから取ってきて入れました。コンテナの時刻帯は `Asia/Tokyo` にしています。
+
+## 手元で確かめる 1: 誤った DELETE の直前に戻す
+
+PostgreSQL を WAL アーカイブを有効にして起動し、10 万行の `orders` を作ってからベースバックアップを取りました。
+
+```
+$ pg_basebackup -D /backup/base -Fp -X stream -c fast -l base1 -v
+pg_basebackup: initiating base backup, waiting for checkpoint to complete
+pg_basebackup: checkpoint completed
+pg_basebackup: write-ahead log start point: 0/3000028 on timeline 1
+pg_basebackup: starting background WAL receiver
+...
+pg_basebackup: write-ahead log end point: 0/3000120
+pg_basebackup: base backup completed
+```
+
+まずチェックポイントを取り、その位置 `0/3000028` を開始点にしています。アーカイブ側には、開始と終了の位置を記した `000000010000000000000003.00000028.backup` というファイルも置かれます。
+
+その後、2 万行を足し（計 12 万行）、時刻を記録してから、誤った `DELETE` を流しました。
+
+```
+ count  |              now
+--------+-------------------------------
+ 120000 | 2026-10-24 18:59:53.632794+09
+
+         before_delete
+-------------------------------
+ 2026-10-24 18:59:56.864741+09
+
+DELETE 119000
+ count
+-------
+  1000
+```
+
+ベースバックアップには 10 万行しか入っていません。12 万行の状態は、**ベースバックアップの後の WAL にしか無い**ことに注意してください。
+
+ベースバックアップとアーカイブを、別のコンテナに写しました。`recovery.signal` を置き、`recovery_target_time` に `DELETE` の直前の時刻を指定して起動したときのログです。
+
+```
+LOG:  starting backup recovery with redo LSN 0/3000028, checkpoint LSN 0/3000080, on timeline ID 1
+LOG:  restored log file "000000010000000000000003" from archive
+LOG:  starting point-in-time recovery to 2026-10-24 18:59:56.864741+09
+LOG:  redo starts at 0/3000028
+LOG:  restored log file "000000010000000000000004" from archive
+LOG:  completed backup recovery with redo LSN 0/3000028 and end LSN 0/3000120
+LOG:  consistent recovery state reached at 0/3000120
+LOG:  recovery stopping before commit of transaction 741, time 2026-10-24 18:59:56.900241+09
+LOG:  last completed transaction was at log time 2026-10-24 18:59:53.628215+09
+LOG:  selected new timeline ID: 2
+LOG:  archive recovery complete
+LOG:  database system is ready to accept connections
+```
+
+- `backup_label` の開始点 `0/3000028` から当て直しを始めている
+- 終了点 `0/3000120` まで当てたところで「一貫した状態に達した」。ここより前で止めることはできない。コピー中の不整合が残っているから
+- 18:59:56.900 にコミットされたトランザクション 741（`DELETE`）の**手前**で止まった。最後に当てたのは 18:59:53 の `INSERT`
+- 新しいタイムライン 2 を選んで、書き込みを受け付け始めた
+
+```
+$ psql -Atc "select pg_is_in_recovery(), count(*), max(id) from orders"
+f|120000|120000
+```
+
+`DELETE` の前の 12 万行に戻りました。復元先の `pg_wal` には、`000000020000000000000004` のようにタイムライン 2 の WAL と、分岐の記録 `00000002.history` が作られていました。
+
+## 手元で確かめる 2: pg_dump は開始時点を書き出す
+
+100 万行の `big` と 2 行の `small` を、`pg_dump` で書き出している最中に、別のセッションから変更を入れました。ダンプの出力を `(sleep 6; cat)` を通してから書き込むようにして、`pg_dump` がパイプの詰まりで待たされ、数秒間スナップショットを持ち続けるようにしています。
+
+```
+-- ダンプ開始から 2 秒後、別のセッションで
+UPDATE big SET v = 'late' WHERE id <= 5000;
+INSERT INTO small VALUES (3, 'carol');
+DELETE FROM small WHERE id = 1;
+-- 直後にサーバ上で数えると: big の 'late' は 5000 行、small は bob,carol
+```
+
+できあがったダンプの中身です。
+
+```
+$ grep -c "	late$" during.sql
+0
+$ sed -n '/^COPY public.small/,/^\\\./p' during.sql
+COPY public.small (id, name) FROM stdin;
+1	alice
+2	bob
+\.
+```
+
+ダンプが走っている間にコミットされた変更は、1 つも入っていません。消したはずの `alice` が残り、足したはずの `carol` がいません。ダンプはその開始時点の写真です。
+
+同じデータベース（`pg_database_size` で 114MB）を 3 つの形式で書き出しました。
+
+| 形式 | 大きさ | 時間 |
+| --- | --- | --- |
+| plain（`-Fp`） | 57,955,267 バイト | 0.50 秒 |
+| custom（`-Fc`） | 3,275,450 バイト | 1.06 秒 |
+| directory（`-Fd -j 4`） | 3,208 KB（表ごとの `.dat.gz` と `toc.dat`） | 0.91 秒 |
+
+custom と directory の小ささは、`big` の値が `repeat()` で作った同じ文字の並びで、極端に圧縮が効いたためです。実データではここまで縮みません。インデックスは中身ではなく `CREATE INDEX` の文として入るので、どの形式でも元の 114MB より小さくなります。
+
+custom 形式から `pg_restore -d r1 -t small all.dump` で `small` だけを別のデータベースに戻すことも、directory 形式を `pg_restore -j 4` で並列に戻すこと（2.5 秒、100 万行）もできました。
+
+## 手元で確かめる 3: 検証と増分バックアップ
+
+手順 1 のベースバックアップを `pg_verifybackup` で検証し、次に、そのコピーの `orders` のデータファイルの途中に 4 バイトを書き込んでから、もう一度検証しました。
+
+```
+$ pg_verifybackup /backup/base
+backup successfully verified
+$ pg_verifybackup /tmp/broken
+pg_verifybackup: error: checksum mismatch for file "base/5/16384"
+```
+
+manifest には 971 個のファイルの記録と、復元に必要な WAL の範囲が入っていました。
+
+```
+"WAL-Ranges": [
+{ "Timeline": 1, "Start-LSN": "0/3000028", "End-LSN": "0/3000120" }
+],
+```
+
+手順 1 の `pg_basebackup` が表示した開始点と終了点そのものです。この範囲の WAL が揃っていなければ、コピーは一貫した状態に達しません。
+
+次に増分バックアップです。100 万行の `big`（データファイル 84,459,520 バイト）を作ってから完全バックアップを取り、1 万行に 1 行、計 100 行だけを更新して、増分バックアップを取りました。
+
+```
+$ pg_basebackup -D /backup/full3 -c fast
+$ psql -c "UPDATE big SET v = 'changed' WHERE id % 10000 = 0;"
+$ pg_basebackup -D /backup/incr3 -c fast --incremental=/backup/full3/backup_manifest
+```
+
+| | 完全バックアップ | 増分バックアップ |
+| --- | --- | --- |
+| `big` のファイル | `16405`：84,459,520 バイト | `INCREMENTAL.16405`：827,392 バイト |
+| バックアップ全体 | 148,528 KB | 23,952 KB |
+
+827,392 バイトは 8KB のページ約 101 枚分で、100 行の更新で書き換わったページの分だけになっています。増分バックアップ全体の 2 万 KB 余りの大半は、どちらのバックアップにも入る WAL のセグメント（16MB）です。
+
+```
+$ pg_combinebackup /backup/full3 /backup/incr3 -o /backup/comb3
+$ pg_verifybackup /backup/comb3
+backup successfully verified
+```
+
+合成した結果の `big` は、元と同じ 84,459,520 バイトに戻り、検証も通りました。
+
+## 手元で確かめる 4: mysqldump の先頭
+
+GTID を有効にした MySQL 8.4.13 で、`shop.orders` に 1000 行を入れ、`--single-transaction --source-data=2` でダンプしました。先頭の部分です。
+
+```sql
+SET @@SESSION.SQL_LOG_BIN= 0;
+--
+-- GTID state at the beginning of the backup
+--
+SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ '16faf99e-cf92-11f1-ab41-729964cd8aa2:1-8';
+--
+-- Position to start replication or point-in-time recovery from
+--
+-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='binlog.000002', SOURCE_LOG_POS=10824;
+```
+
+- `SQL_LOG_BIN= 0` で、復元中の `INSERT` に新しい GTID が付かないようにしている
+- `GTID_PURGED` に、ダンプ時点の `gtid_executed`（`:1-8`）が入っている。MySQL 8.0 以降なら先頭に `+` が付き、復元先の既存の集合に**足す**意味になる
+- `--source-data=2` で、binlog 上の位置がコメントとして入っている。時点復旧は、ここから先の binlog を当てればよい
+
+サーバの general log で、`mysqldump` が送った文を見ました。
+
+```
+FLUSH /*!40101 LOCAL */ TABLES
+FLUSH /*!40101 LOCAL */ TABLES WITH READ LOCK
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ
+START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */
+SELECT @@GLOBAL.GTID_EXECUTED
+SHOW BINARY LOG STATUS
+UNLOCK TABLES
+```
+
+スナップショットを開始し、その瞬間の `gtid_executed` と binlog の位置を読むまでの**ごく短い間だけ**、グローバルな読み取りロックを掛けています。ロックを外さずに読まないと、スナップショットと GTID の集合がずれるからです。`--set-gtid-purged=OFF` かつ `--source-data` なしでダンプすると、`FLUSH TABLES WITH READ LOCK` は送られませんでした。文書も、GTID が有効で `--set-gtid-purged` が `ON` か `AUTO` のときは `--single-transaction` に `RELOAD` か `FLUSH_TABLES` の権限が要ると書いています（[MySQL 8.4: mysqldump](https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html)）。
+
+<Callout type="warn" title="最初の一瞬のロックが、長く止まることがある">
+  `FLUSH TABLES WITH READ LOCK` は、実行中の長い更新が終わるまで待ちます。待っている間は、後から来た更新も止まります。
+  文書の例でも、長い更新文が走っているとサーバが止まったようになりうると注意されています。
+  「ロックなしでダンプできる」のは、この最初の一瞬を越えた後の話です。
+</Callout>
+
+## 手元で確かめる 5: binlog で時点復旧
+
+ダンプを取った後、200 行を足して 1200 行にし、2 秒おいてから誤った `DELETE` を流しました。
+
+```
+count(*)  now()
+1200      2026-10-24 19:03:52
+before_delete
+2026-10-24 19:03:54
+count(*)
+10
+```
+
+binlog の中身を、ダンプに書かれた位置 10824 から見ると、次の 2 つのトランザクションが並んでいました（抜粋）。
+
+```
+# at 10824
+#261024 19:03:52 server id 1  end_log_pos 10903 ... GTID ...
+SET @@SESSION.GTID_NEXT= '16faf99e-cf92-11f1-ab41-729964cd8aa2:9'/*!*/;
+# at 11034
+#261024 19:03:52 server id 1  end_log_pos 13269 ... Write_rows: table id 153 flags: STMT_END_F
+# at 13300
+#261024 19:03:54 server id 1  end_log_pos 13379 ... GTID ...
+SET @@SESSION.GTID_NEXT= '16faf99e-cf92-11f1-ab41-729964cd8aa2:10'/*!*/;
+# at 13510
+#261024 19:03:54 server id 1  end_log_pos 21716 ... Delete_rows: table id 153
+```
+
+GTID `:9` が 200 行の `INSERT`、`:10` が誤った `DELETE` です。
+
+新しい MySQL のコンテナにダンプを戻すと 1000 行、`gtid_purged` は `:1-8` になりました。そこへ、binlog の**先頭から**、`DELETE` の時刻の手前までを流します。
+
+```
+$ mysqlbinlog --stop-datetime='2026-10-24 19:03:54' binlog.000002 | mysql
+$ mysql -e "select count(*), max(id) from shop.orders; select @@gtid_executed"
+count(*)  max(id)
+1200      1200
+@@gtid_executed
+16faf99e-cf92-11f1-ab41-729964cd8aa2:1-9,
+e73a9627-cf92-11f1-abf4-f6cc1730da96:1-5
+```
+
+1200 行に戻りました。binlog の先頭には、データベースや表を作った `:1-8` のトランザクションも入っていましたが、エラーにはなっていません。復元先は `:1-8` を「実行済み」と知っているので、それらを**飛ばして** `:9` だけを当てたのです。
+
+`--set-gtid-purged=OFF` で取ったダンプで同じことをすると、こうなりました。
+
+```
+$ mysqlbinlog --stop-datetime='2026-10-24 19:03:54' binlog.000002 | mysql
+ERROR 1007 (HY000) at line 38: Can't create database 'shop'; database exists
+```
+
+復元先は、ダンプに含まれている変更がどの GTID のものか知らないので、binlog の最初の `CREATE DATABASE` から当て直そうとして失敗します。`--set-gtid-purged` が書き込む 1 行は、**「ダンプとログの継ぎ目」を、ファイル名や位置ではなく GTID の集合で表す**ためのものです。
+
+## マネージドサービスでは
+
+Amazon RDS の自動バックアップは、ここまでの組み合わせをサービスの側でやっています。バックアップの時間帯にストレージボリュームのスナップショットを取り（2 回目以降は変わった分だけの増分）、保持期間内の任意の時点に戻せるようにしています（[Amazon RDS: Introduction to backups](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithAutomatedBackups.html)）。トランザクションログは 5 分ごとに S3 に送られ、戻せる最新の時刻は `LatestRestorableTime` で確かめられます。時点復旧は、元のインスタンスを書き換えずに**新しいインスタンスを作る**操作です（[Amazon RDS: Restoring a DB instance to a specified time](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIT.html)）。
+
+つまり、スナップショットという物理バックアップに、ログを足して時点を合わせる。仕組みは手順 1 や手順 5 と同じです。ログが 5 分ごとに送られるなら、インスタンスごと失われたときに失いうる範囲も、その間隔が目安になります。
+
+## まとめ
+
+- レプリケーションは機械の故障から守るが、誤った `DELETE` も忠実に複製する。過去に戻るにはバックアップが要る
+- 論理バックアップは SQL の形で、版をまたげて部分復元もしやすいが、戻すのが遅く、時点復旧はできない。物理バックアップはファイルの形で、速く戻せてログを足せる
+- `pg_dump` も `mysqldump --single-transaction` も、1 つの REPEATABLE READ のスナップショットで読むことで、書き込みを止めずに一貫したダンプを作る。MySQL では MyISAM などと、ダンプ中の DDL が例外になる
+- `--set-gtid-purged` はダンプに含まれる GTID の集合を書き込み、後で binlog を当てるとき二重に適用しないようにする
+- 動いているサーバのファイルを単に写すと、時点のずれたファイルと嘘のチェックポイントが残る。`pg_basebackup` は `backup_label` に開始点を書き、その間の WAL を一緒に持つことで、コピーにクラッシュ回復を掛けて一貫させる。XtraBackup の prepare も同じ考え方
+- 時点復旧は、ベースバックアップ + アーカイブしたログを、ほしい時刻の手前まで当て直すこと。PostgreSQL は `recovery_target_time`、MySQL は `mysqlbinlog --stop-datetime` などで止める
+- RPO はログを送る頻度で、RTO はベースバックアップの新しさと当て直す量で決まる
+- 戻せることは、`pg_verifybackup` と定期的な復元の試験で確かめる。PostgreSQL 17 の増分バックアップは、WAL の要約を使って変わったブロックだけを取る
+
+RDS の時点復旧は、スナップショットとログをサービスの側で組み合わせていました。次の第 109 回では、さらに一歩進んで、**ストレージの層そのものがログを受け取り、自分でページを作り、自分でバックアップを取る**データベース、Aurora のように計算とストレージを分けた設計を見ます。

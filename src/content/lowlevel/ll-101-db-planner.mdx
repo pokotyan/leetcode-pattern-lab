@@ -1,0 +1,582 @@
+---
+title: SQL が実行されるまで：計画と統計
+description: 同じ SQL でも、索引を使うか、表を頭から読むかで手間は桁で変わる。データベースはその選択を何を材料に、どう決めているのか。実行計画の木、コストの見積もり、統計情報、そして見積もりが外れる理由を、PostgreSQL と MySQL で確かめます
+chapter: db
+order: 6
+status: published
+topics:
+  - クエリプランナ
+  - オプティマイザ
+  - Volcano モデル
+  - コストベース最適化
+  - 選択率
+  - Bitmap Heap Scan
+  - 統計情報
+  - pg_stats
+  - CREATE STATISTICS
+  - ヒストグラム
+  - EXPLAIN ANALYZE
+  - 汎用計画
+requires:
+  - ll-96-db-page
+  - ll-97-db-index
+  - ll-100-db-lock
+---
+
+import Callout from '../../components/Callout.astro'
+
+## やり方を決めるのは誰か
+
+第 96 回から前回の第 100 回までで、データベースが行を **どう置き、どう守るか** を見てきました。行はページに詰められ、ページはバッファプールに載り、B+tree の索引が行の在りかを指し、変更は WAL に先に書かれ、同時に触る人どうしはロックと MVCC で整理されます。
+
+しかし、アプリが送ってくるのは SQL です。SQL には「何がほしいか」が書かれているだけで、「どの索引を、どの順に使って取りに行くか」は書かれていません。
+
+```sql
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'shipped';
+```
+
+この 1 文にも、やり方は何通りもあります。
+
+- 表を頭から全部読み、条件に合う行だけを残す
+- `customer_id` の索引で行の在りかを集め、その行だけを読む
+- `status` の索引を使う
+- 2 つの索引の結果を突き合わせてから読む
+
+どれが速いかは、**条件に合う行がどれだけあるか** と **その行がディスク上でどう散らばっているか** で決まり、桁で違うこともあります。この回では、データベースがこの選択を何を材料にどう決めるのか、そしてその材料がどんなときに外れるのかを見ます。
+
+## 4 つの段階
+
+PostgreSQL の文書は、SQL 1 文が結果になるまでを次の段階に分けています（[PostgreSQL 文書: 問い合わせの通り道](https://www.postgresql.org/docs/current/query-path.html)）。
+
+```
+ SQL の文字列
+     │
+     ▼
+ ┌──────────────┐  構文を検査し、構文木を作る
+ │ パーサ        │  表や列の名前を、カタログの実体に結び付ける
+ └──────────────┘
+     │ 問い合わせ木
+     ▼
+ ┌──────────────┐  ビューを展開するなど、規則による書き換え
+ │ リライタ      │
+ └──────────────┘
+     │ 書き換えた問い合わせ木
+     ▼
+ ┌──────────────┐  実行の仕方を列挙し、コストを見積もって 1 つ選ぶ
+ │ プランナ      │
+ └──────────────┘
+     │ 実行計画（プランの木）
+     ▼
+ ┌──────────────┐  木をたどって行を取り出し、結果を返す
+ │ エグゼキュータ │
+ └──────────────┘
+```
+
+- **パーサ** は文法の誤りを見つけ、構文木を作ります。その後、`orders` がどの表で `customer_id` がどの型の列かをシステムカタログで調べ、意味の通った **問い合わせ木** にします。存在しない列を書いたときのエラーはここで出ます。
+- **リライタ** は、カタログに登録された規則を当てはめます。代表がビューで、ビューを参照する問い合わせは、ここでビューの定義を展開した形に書き換わります。
+- **プランナ**（オプティマイザ）が、この回の主役です。同じ結果を出す実行の仕方を列挙し、それぞれのコストを見積もって、最も安いものを **実行計画** にします。
+- **エグゼキュータ** は、計画の木をたどって実際にページを読み、行を返します。
+
+MySQL も、文を解析し、名前を解決し、最適化してから実行する、という流れは同じです。後で見るように、MySQL 8.0 以降の実行部は、計画を **イテレータの木** として持っています（[MySQL 8.4 リファレンス: EXPLAIN](https://dev.mysql.com/doc/refman/8.4/en/explain.html)）。
+
+段階を分けておく利点は、**何がほしいかと、どう取りに行くかを切り離せる** ことです。アプリは同じ SQL を送り続けても、索引を足したり、データが増えたりすれば、プランナは別のやり方を選び直します。
+
+## 実行計画は木で、行は上へ引き出される
+
+プランナが作る実行計画は、**演算子（ノード）の木** です。葉にあるのは表や索引を読む演算子で、上に行くほど、フィルタ、結合、集約、ソート、件数の制限といった加工の演算子が並びます。
+
+```
+          Limit
+            │
+          Sort            ← 子から来た行を並べ替える
+            │
+     Hash Join            ← 2 つの入力を突き合わせる
+       ┌────┴────┐
+   Seq Scan   Hash
+   (orders)     │
+             Index Scan
+             (customers)
+```
+
+### open / next / close
+
+この木の動かし方として広く使われているのが、**Volcano モデル**（イテレータモデル）です。Graefe が 1990 年代前半に Volcano という研究用の実行系で整理した形で、今日の多くの行指向データベースの実行部がこれを下敷きにしています（[Graefe, "Volcano — An Extensible and Parallel Query Evaluation System", IEEE TKDE, 1994](https://doi.org/10.1109/69.273032)）。
+
+すべての演算子は、同じ 3 つの操作だけを持ちます。
+
+| 操作 | 意味 |
+| --- | --- |
+| `open()` | 準備する。子の `open()` も呼ぶ |
+| `next()` | **次の 1 行** を返す。もう無ければ「終わり」を返す |
+| `close()` | 後片付けをする。子の `close()` も呼ぶ |
+
+いちばん上の演算子の `next()` を呼ぶと、その演算子は自分の子の `next()` を呼び、子はさらにその子の `next()` を呼びます。葉の Seq Scan がページから 1 行取り出して返すと、それが 1 段ずつ加工されながら上へ戻ってきます。**上の演算子が、要るぶんだけ下から行を引き出す** 形です。
+
+```
+ クライアント ── next() ──→ Limit ── next() ──→ Filter ── next() ──→ Seq Scan
+                                                                       │ ページから 1 行
+             ←── 1 行 ─── Limit ←── 1 行 ─── Filter ←── 1 行 ────────┘
+                                     （条件に合わなければ、もう一度 next()）
+```
+
+PostgreSQL のエグゼキュータのソースに付いている説明も、計画の木を「要求に応じて引き出す（demand-pull）パイプライン」と呼び、各ノードは呼ばれるたびに出力の次の 1 行を返すと書いています（[PostgreSQL ソース: executor/README](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/executor/README)）。
+
+この形には、うれしい性質が 3 つあります。
+
+- **演算子を自由に組み合わせられる。** どの演算子も `next()` で行を出すので、Filter の下が Seq Scan でも Index Scan でも Hash Join でも構わない
+- **途中の結果をためなくてよい。** 1 行ずつ流れるので、100 万行を処理しても、多くの演算子は 1 行ぶんの場所しか使わない
+- **必要なぶんだけで止まれる。** `LIMIT 5` なら、Limit が 5 行受け取った時点で、下にもう `next()` を呼ばなければよい
+
+一方で弱点もあります。**1 行ごとに関数呼び出しが何段も重なる** ことです。1 億行を処理すれば、演算子の数だけ何億回もの呼び出しと分岐が起き、第 12 回で見た CPU の得意な「同じ計算をまとめて流す」形になりません。第 104 回では、この点を改めるために **何行かずつまとめて** 渡すベクトル化の実行を見ます。
+
+### 流せる演算子と、ためる演算子
+
+すべての演算子が 1 行受け取ってすぐ 1 行返せるわけではありません。
+
+| 種類 | 例 | 最初の 1 行を返せるのは |
+| --- | --- | --- |
+| 流せる（パイプライン） | Seq Scan、Index Scan、Filter、Limit、ハッシュ結合の探索側 | 子から 1 行来た直後 |
+| ためる（ブロッキング） | Sort、ハッシュ集約、ハッシュ結合の構築側 | 子の行を **全部** 読み終えた後 |
+
+並べ替えは、最後の 1 行が最小値かもしれない以上、全部見るまで 1 行目を決められません。`GROUP BY` のハッシュ集約も、どのグループにいつ行が来るか分からないので、全部数え終えるまで結果を出せません。ためる演算子はメモリを使い、それが足りないときにディスクへあふれさせる話は第 103 回で扱います。
+
+この違いは、手元の PostgreSQL 17 でもはっきり見えます（100 万行の表 `t`。作り方は後の実験の節で示します）。
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM t ORDER BY v LIMIT 5;     -- v には索引がある
+--  Limit  (cost=0.42..0.86 rows=5 width=93) (actual time=0.038..0.099 rows=5 loops=1)
+--    ->  Index Scan using t_v on t  (cost=0.42..86173.34 rows=1000000 width=93)
+--                                   (actual time=0.038..0.098 rows=5 loops=1)
+--  Execution Time: 0.110 ms
+
+EXPLAIN ANALYZE SELECT * FROM t ORDER BY v % 1000 LIMIT 5;   -- 索引の順では並ばない式
+--  Limit  (cost=44494.64..44494.65 rows=5 width=97) (actual time=297.170..297.172 rows=5 loops=1)
+--    ->  Sort  (cost=44494.64..46994.64 rows=1000000 width=97) (actual time=297.169..297.170 rows=5 loops=1)
+--          Sort Key: ((v % 1000))
+--          Sort Method: top-N heapsort  Memory: 26kB
+--          ->  Seq Scan on t  (cost=0.00..27885.00 rows=1000000 width=97)
+--                             (actual time=0.017..196.134 rows=1000000 loops=1)
+--  Execution Time: 297.185 ms
+```
+
+1 つ目では、索引が最初から `v` の順に行を出してくれるので、Index Scan は **実際には 5 行しか出していません**（`actual rows=5`）。Limit が 5 行で `next()` を呼ぶのをやめたからです。2 つ目では、Sort が 100 万行を全部受け取るまで 1 行目を出せないので、Seq Scan は 100 万行を出し切っています。
+
+`cost=0.42..0.86` の 2 つの数は、**最初の 1 行を出すまでのコスト** と **全部出し切るまでのコスト** です（[PostgreSQL 文書: EXPLAIN の使い方](https://www.postgresql.org/docs/current/using-explain.html)）。Sort の最初の数が大きいのは、全部ためてからでないと何も出せないことを表しています。プランナは、Limit の付いた問い合わせでは「最初のほうだけ安く出せる計画」を優先するので、この 2 つの数を区別して持っています。
+
+## コストで選ぶ
+
+### コストの単位
+
+プランナは、候補の計画ごとに **コスト** という数を見積もり、最小のものを選びます。PostgreSQL のコストは秒ではなく、**ページを 1 枚順番に読む手間を 1 とした相対値** です。その換算表が設定値として公開されています（[PostgreSQL 文書: プランナのコスト定数](https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS)）。
+
+| 設定 | 既定値 | 何の手間か |
+| --- | --- | --- |
+| `seq_page_cost` | 1.0 | 順番に読む 1 ページ |
+| `random_page_cost` | 4.0 | 飛び飛びの位置から読む 1 ページ |
+| `cpu_tuple_cost` | 0.01 | 1 行を処理する |
+| `cpu_index_tuple_cost` | 0.005 | 索引の 1 項目を処理する |
+| `cpu_operator_cost` | 0.0025 | 演算子や関数を 1 回評価する |
+
+`random_page_cost` が 4 なのは、ランダムな読み取りが本当に順番の読み取りの 4 倍で済むからではありません。文書は、ストレージのランダムな読み取りは本来 4 倍よりずっと高いが、索引経由の読み取りの多くはキャッシュに当たると見込んで低めの値にしている、と説明しています（同上）。データがほぼメモリに収まる環境や SSD では、この値を下げることがよく行われます。
+
+Seq Scan のコストは単純です。文書の式どおり、**読むページ数 × `seq_page_cost` + 行数 × `cpu_tuple_cost`** に、条件の評価ぶんを足したものになります（[PostgreSQL 文書: EXPLAIN の使い方](https://www.postgresql.org/docs/current/using-explain.html)）。後の実験の表 `t` は 15,385 ページ、100 万行なので、
+
+```
+ 15,385 × 1.0  +  1,000,000 × 0.01  +  1,000,000 × 0.0025（v < … の比較）
+ = 15,385 + 10,000 + 2,500
+ = 27,885
+```
+
+となり、実際の EXPLAIN に出る `cost=0.00..27885.00` と一致します。Seq Scan のコストは、**条件に合う行が何件あっても変わりません**。全部読むからです。
+
+### 索引を使うと安くなるとは限らない
+
+Index Scan は、索引の B+tree をたどって条件に合う項目を順に見つけ、そのたびに **行の在りかのページを読みに行きます**。第 97 回で見たとおり、PostgreSQL の索引の葉には `ctid`（ページ番号と行番号）が並んでいます。
+
+問題は、索引の順番とテーブルのページの順番が一致しているとは限らないことです。
+
+```
+ 索引（v の順）              ヒープ（挿入した順）
+ v=3   → (812, 4)     ──→  ページ 812
+ v=5   → (17, 22)     ──→  ページ 17
+ v=8   → (9001, 1)    ──→  ページ 9001
+ v=9   → (17, 40)     ──→  ページ 17（さっき読んだのに、また読む）
+```
+
+`v` の値が行の置き場所と無関係なら、条件に合う 1 行ごとに **別のページを飛び飛びに** 読むことになります。1 万行が条件に合えば、ほぼ 1 万回のランダムな読み取りです。表全体が 1.5 万ページしかないなら、索引など使わず頭から 1.5 万ページを順に読むほうが安い、ということが起こります。
+
+これが「条件に合う行が多いと索引が使われない」理由です。分かれ目は、条件に合う行の割合、つまり **選択率** で決まります。
+
+逆に、`v` の値と置き場所が揃っていれば、索引の順に読んでも同じページに続けて当たるので、読むページは少なくて済みます。PostgreSQL のプランナは、列の値の順と行の物理的な順がどれだけ揃っているかを表す **correlation**（相関、-1〜+1）を統計として持ち、Index Scan の読み取りコストを「まったく揃っていない場合」と「完全に揃っている場合」の間で、correlation の 2 乗を使って補間します（[PostgreSQL ソース: costsize.c の cost_index](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/optimizer/path/costsize.c)）。
+
+### 間を取る: Bitmap Index Scan
+
+Index Scan と Seq Scan の中間にあるのが、**Bitmap Heap Scan** です。2 段に分かれています。
+
+1. **Bitmap Index Scan**: 索引をたどって、条件に合う行の在りかを全部集め、ページごとの印（ビットマップ）にする
+2. **Bitmap Heap Scan**: 印の付いたページを **ページ番号の順に** 1 回ずつ読み、中の行を条件で確かめ直す
+
+```
+ 索引から集めた在りか          ビットマップ（ページ番号順）     読む順
+ (812,4) (17,22) (9001,1)  →  17: ■  812: ■  9001: ■   →  17 → 812 → 9001
+ (17,40)                       （17 は 1 回だけ）
+```
+
+同じページを何度も読まずに済み、読む順番もファイルの先頭から末尾へ向かう順になります（[PostgreSQL 文書: EXPLAIN の使い方](https://www.postgresql.org/docs/current/using-explain.html)）。その代わり、在りかを全部集め終わるまで 1 行も返せないので、「最初の 1 行」は遅くなります。`ORDER BY ... LIMIT` のように最初の数行だけほしい問い合わせに Bitmap が選ばれにくいのはこのためです。
+
+ビットマップは、別々の索引から作ったものを AND や OR で重ねることもできます。冒頭の例の「2 つの索引の結果を突き合わせる」は、これで実現されます。
+
+## 手元で確かめる: 選択率で計画が変わる
+
+PostgreSQL 17.11（Docker の `postgres:17`、設定は既定のまま）で、100 万行の表を作りました。
+
+```sql
+CREATE TABLE t (
+  id   int PRIMARY KEY,
+  v    int,      -- 0〜999,999 の乱数。行の置き場所と無関係
+  c    int,      -- id と同じ値。挿入した順、つまり置き場所の順に並ぶ
+  pad  text
+);
+INSERT INTO t
+SELECT i, (random()*999999)::int, i, repeat('x', 80)
+FROM generate_series(1, 1000000) AS i;
+CREATE INDEX t_v ON t (v);
+CREATE INDEX t_c ON t (c);
+VACUUM ANALYZE t;
+-- relpages = 15385, reltuples = 1e+06
+```
+
+`WHERE v < N` の `N` を変えながら、EXPLAIN が選ぶ計画を並べました。
+
+| 条件 | 見積もり行数 | 選ばれた計画 | コスト（全部出すまで） |
+| --- | ---: | --- | ---: |
+| `v < 5` | 3 | Index Scan | 16.48 |
+| `v < 7` | 4 | Index Scan | 20.49 |
+| `v < 8` | 5 | Bitmap Heap Scan | 24.26 |
+| `v < 100` | 86 | Bitmap Heap Scan | 330.88 |
+| `v < 10000` | 8,803 | Bitmap Heap Scan | 13,949.46 |
+| `v < 100000` | 101,480 | Bitmap Heap Scan | 18,420.40 |
+| `v < 400000` | 399,339 | Bitmap Heap Scan | 27,324.04 |
+| `v < 410000` | 409,806 | Seq Scan | 27,885.00 |
+
+数行なら Index Scan、数行を超えると Bitmap Heap Scan、全体の 4 割ほどを超えると Seq Scan に切り替わりました。Seq Scan のコストが 27,885 で一定なので、Bitmap のコストがそれを追い越したところで入れ替わっています。
+
+`v < 10000`（約 1%）のときに、3 つの計画を強制して実際に流し、読んだページ数（`BUFFERS`）を比べました。並列実行を止め（`max_parallel_workers_per_gather = 0`）、`enable_bitmapscan` などを切り替えています。
+
+| 計画 | 見積もりコスト | 実際の行数 | 触ったページ |
+| --- | ---: | ---: | --- |
+| Index Scan（強制） | 27,620.66 | 9,880 | 9,906 |
+| Bitmap Heap Scan（既定の選択） | 13,949.46 | 9,880 | ヒープ 7,383 + 索引 26 |
+| Seq Scan（強制） | 27,885.00 | 9,880 | 15,385 |
+
+Index Scan は 9,880 行のために 9,906 回ページを触っています。**ほぼ 1 行ごとに 1 ページ** です。Bitmap は同じ 9,880 行を 7,383 ページにまとめ、しかも順番に読みます。Seq Scan は表を全部読みます。プランナの見積もりも、この順序を正しく反映しています。
+
+置き場所と揃っている列 `c` ではどうなるでしょうか。
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t WHERE c < 10000;
+--  Index Scan using t_c on t  (cost=0.42..471.50 rows=10576 width=93)
+--                             (actual time=0.166..3.280 rows=9999 loops=1)
+--    Index Cond: (c < 10000)
+--    Buffers: shared hit=154 read=30
+```
+
+ほぼ同じ 1 万行なのに、触ったのは 184 ページ、コストは 471 です。`c` の順に索引をたどると、ヒープの先頭の 150 ページほどを順に読むだけで済むからです。`c` では `c < 600000`（6 割）まで Index Scan が選ばれ、`c < 700000` で Seq Scan に変わりました。**同じ件数でも、行の散らばり方で答えが変わる** ことが分かります。
+
+<Callout type="note" title="時間は比べていない理由">
+  この実験では、表がすべて共有バッファに載った状態で測っています（`read` がほとんど 0）。
+  ディスクを読まないので、実行時間の差はランダム読み取りの本当の重さを表しません。
+  ここでは、プランナが見積もりに使う「何ページ触るか」のほうを比べています。
+</Callout>
+
+第 97 回の最後で、索引に載せただけの列 `name` で検索すると Seq Scan になる例を見ました。あれは索引が使えなかった例です。ここで見たのは、**索引は使えるが、使わないほうが安いと判断された** 例です。どちらも EXPLAIN では同じ Seq Scan に見えるので、区別して読む必要があります。
+
+## 見積もりの材料: 統計情報
+
+ここまでの判断は、すべて **「条件に合う行が何件あるか」の見積もり** に乗っています。プランナは問い合わせを実際に流す前にそれを知る必要があるので、表の中身を要約した **統計情報** を前もって持っています。
+
+### pg_stats に何が入っているか
+
+PostgreSQL の統計は `pg_statistic` というカタログに入り、人が読める形にしたビューが `pg_stats` です。列ごとに次のような値を持ちます（[PostgreSQL 文書: pg_stats](https://www.postgresql.org/docs/current/view-pg-stats.html)）。
+
+| 項目 | 中身 | 何に使うか |
+| --- | --- | --- |
+| `null_frac` | NULL の割合 | `IS NULL` の選択率 |
+| `n_distinct` | 異なる値の数。負なら「行数に対する割合」の符号反転 | `=` の選択率、`GROUP BY` の結果の件数 |
+| `most_common_vals` / `most_common_freqs` | よく出る値と、その出現割合 | 偏った値に対する `=` の選択率 |
+| `histogram_bounds` | よく出る値を除いた残りを、ほぼ同じ件数の区間に分ける境界 | `<` や `BETWEEN` の選択率 |
+| `correlation` | 値の順と行の物理的な順の相関（-1〜+1） | Index Scan のコスト |
+
+先ほどの表 `t` と、偏りのある値を持つ表 `addr`（後で使います）で中身を見ました。
+
+```sql
+SELECT attname, n_distinct, correlation FROM pg_stats WHERE tablename = 't';
+--  attname | n_distinct | correlation
+--  id      |         -1 |           1
+--  v       |  -0.519257 | 0.008177114
+--  c       |         -1 |           1
+
+SELECT (histogram_bounds::text::int[])[1:6] FROM pg_stats
+ WHERE tablename = 't' AND attname = 'v';
+--  {49,11357,21291,30365,40324,49267}
+
+SELECT attname, n_distinct, (most_common_vals::text::int[])[1:5] AS mcv5,
+       (most_common_freqs)[1:5] AS freq5
+  FROM pg_stats WHERE tablename = 'addr';
+--  city |  1000 | {632,131,317,955,328} | {0.0017333333,0.0015333333,...}
+--  pref |    50 | {16,6,33,28,31}       | {0.022066666,0.021266667,...}
+```
+
+`id` と `c` の `n_distinct = -1` は「行数と同じだけ異なる値がある」、つまり一意という意味です。`correlation` も、`c` は 1、乱数の `v` はほぼ 0 です。先ほど `c` の Index Scan だけが安く見積もられたのは、この値のためです。
+
+`v` のヒストグラムは、0〜100 万の範囲を 100 区間に分け、各区間にほぼ 1% ずつの行が入るように境界を置いたものです。`v < 10000` なら、最初の区間（49〜11357）のうち 1 万までの部分なので、全体の 1% 弱と見積もれます。実際の見積もりは 8,803 行、本当は 9,880 行でした。
+
+### ANALYZE は一部しか読まない
+
+統計を集めるのは `ANALYZE`（自動では autovacuum の自動 analyze）です。大きな表では、**全行ではなく無作為に選んだ一部の行** だけを読みます（[PostgreSQL 文書: ANALYZE](https://www.postgresql.org/docs/current/sql-analyze.html)）。
+
+読む行数は、統計の細かさを決める **統計ターゲット**（`default_statistics_target`、既定 100）の 300 倍です。ソースのコメントには、ヒストグラムの区間の誤差を一定以下に抑えるのに必要な標本数から 300 という係数を導いた計算が書かれています（[PostgreSQL ソース: analyze.c](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/commands/analyze.c)）。既定なら 30,000 行です。100 万行の表でも 1 億行の表でも、読むのは 3 万行です。統計ターゲットは、`most_common_vals` と `histogram_bounds` の最大の個数でもあります（[PostgreSQL 文書: プランナが使う統計](https://www.postgresql.org/docs/current/planner-stats.html)）。
+
+標本からの推定なので、外れることがあります。表 `t` の `v` は、実際には 632,641 種類の値を持っていました。
+
+```sql
+SELECT count(DISTINCT v) FROM t;   -- 632641
+```
+
+`pg_stats` の `n_distinct = -0.519` は、100 万行に対して約 52 万種類という意味です。分布の形（ヒストグラム）は 3 万行の標本でもよく当たりますが、**異なる値の数** は標本から当てるのが本質的に難しく、ずれやすい項目です。
+
+<Callout type="tip" title="統計が古いと、計画も古い">
+  統計は ANALYZE した時点の写しです。大量にロードした直後や、値の範囲が日々伸びていく列（作成日時など）では、
+  統計が実態に追いつかず、「この範囲には行が無いはず」と見積もって悪い計画を選ぶことがあります。
+  バッチで大きく書き換えた後は、明示的に `ANALYZE` を流すのが定石です。
+</Callout>
+
+## 列どうしの関係は知らない
+
+統計は **列ごと** に取られています。では、条件が 2 つの列にまたがったらどうなるでしょうか。
+
+プランナは、特に情報が無ければ **条件どうしは独立している** と仮定し、選択率を掛け算します（[PostgreSQL 文書: プランナが使う統計](https://www.postgresql.org/docs/current/planner-stats.html)）。都道府県と市区町村のように、片方が決まればもう片方も決まる列では、この仮定は大きく外れます。
+
+100 万行の表 `addr` を作りました。`city` は 1,000 種類、`pref` は `city` を 20 で割った値で 50 種類です。`city` が決まれば `pref` は 1 つに決まります。
+
+```sql
+CREATE TABLE addr (id int, city int, pref int);
+INSERT INTO addr SELECT i, i % 1000, (i % 1000) / 20 FROM generate_series(1, 1000000) i;
+ANALYZE addr;
+```
+
+`city = 5` の行は 1,000 行で、その `pref` はすべて 0 です。
+
+| 条件 | 見積もり | 実際 |
+| --- | ---: | ---: |
+| `city = 5` | 996 | 1,000 |
+| `city = 5 AND pref = 0` | 19 | 1,000 |
+| `city = 5 AND pref = 1` | 20 | 0 |
+
+`city = 5` だけなら正確です。ところが `pref = 0` を足すと、プランナは「1,000 種類のうちの 1 つ」×「50 種類のうちの 1 つ」で 100 万 × 1/1000 × 1/50 = 20 行と見積もり、**実際の 50 分の 1** になりました。`pref = 0` は `city = 5` から自動的に成り立つので、本当は何も絞り込んでいないのです。
+
+このように少なく見積もると、プランナは「数行しか来ないなら」と、件数が多いと破綻するやり方（索引を何千回も引く、ネステッドループで結合する、など）を選びかねません。結合方式との関係は次回の第 102 回で詳しく見ます。
+
+### CREATE STATISTICS で関係を教える
+
+PostgreSQL 10 以降では、列の組について **拡張統計** を集めさせることができます（[PostgreSQL 文書: CREATE STATISTICS](https://www.postgresql.org/docs/current/sql-createstatistics.html)）。
+
+```sql
+CREATE STATISTICS addr_dep (dependencies) ON city, pref FROM addr;
+ANALYZE addr;
+
+SELECT dependencies FROM pg_stats_ext WHERE statistics_name = 'addr_dep';
+--  {"2 => 3": 1.000000}
+```
+
+`"2 => 3": 1.0` は、2 番目の列（`city`）が決まれば 3 番目の列（`pref`）が 100% 決まる、という **関数従属性** が見つかったという意味です。同じ問い合わせをもう一度見積もらせると、こうなりました。
+
+| 条件 | 見積もり（統計なし） | 見積もり（dependencies あり） | 実際 |
+| --- | ---: | ---: | ---: |
+| `city = 5 AND pref = 0` | 19 | 995 | 1,000 |
+| `city = 5 AND pref = 1` | 20 | 995 | 0 |
+
+1 行目は正しく直りました。一方 2 行目は、ありえない組み合わせなのに 995 行と見積もっています。関数従属性の統計は「`pref` の条件は `city` の条件に追加の絞り込みをしない」と扱うだけで、**`pref = 1` が `city = 5` と両立するかどうかは見ていない** からです。文書も、関数従属性は単純な等号の条件にしか使われず、範囲や `LIKE` には効かないと書いています（[PostgreSQL 文書: プランナが使う統計](https://www.postgresql.org/docs/current/planner-stats.html)）。組み合わせそのものの頻度を持たせたいときは、`mcv` という種類の拡張統計を使います。
+
+拡張統計にはもう 1 種類、列の組の **異なる値の数**（`ndistinct`）があります。`GROUP BY city, pref` の結果の件数を見積もらせると、違いが計画の形にまで出ました。
+
+```sql
+EXPLAIN ANALYZE SELECT city, pref, count(*) FROM addr GROUP BY city, pref;
+--  HashAggregate  (cost=22906.00..23406.00 rows=50000 width=16) (actual ... rows=1000 loops=1)
+
+CREATE STATISTICS addr_nd (ndistinct) ON city, pref FROM addr;
+ANALYZE addr;
+EXPLAIN ANALYZE SELECT city, pref, count(*) FROM addr GROUP BY city, pref;
+--  Finalize GroupAggregate  (cost=13757.52..14015.87 rows=1000 width=16) (actual ... rows=1000 loops=1)
+--    ->  Gather Merge ...
+--          ->  Partial HashAggregate ...
+--                ->  Parallel Seq Scan on addr ...
+```
+
+統計が無いときは、1,000 種類 × 50 種類 = 5 万グループと見積もり、全行を 1 か所で集約していました。正しく 1,000 グループと分かると、並列のワーカーに部分集約させてから合わせる計画に変わりました。
+
+## MySQL の統計
+
+MySQL（InnoDB）も、統計を元にコストで計画を選ぶ点は同じです。ただ、統計の取り方と置き場所が違います。
+
+### 永続統計とサンプリングするページ数
+
+InnoDB は既定で、統計を `mysql.innodb_table_stats`（表ごと）と `mysql.innodb_index_stats`（索引ごと）に保存し、再起動しても保ちます。集めるときは、**索引ごとに無作為に選んだページ** を読んで、行数や索引の値の種類数を推定します。読むページ数は `innodb_stats_persistent_sample_pages` で、既定は **20 ページ** です（[MySQL 8.4 リファレンス: 永続統計](https://dev.mysql.com/doc/refman/8.4/en/innodb-persistent-stats.html)）。PostgreSQL が「行」を 3 万件集めるのに対し、InnoDB は「ページ」を 20 枚読む、という違いです。
+
+統計は、表の行の 10% 超が変わると裏で自動的に計算し直されます（`innodb_stats_auto_recalc`、既定で有効）。この再計算は非同期で、数秒遅れることがあると文書に書かれています（同上）。
+
+### table_rows は count(*) ではない
+
+この見積もりは、`information_schema.tables` の `table_rows` にも出てきます。これを表の件数として使うと、ずれます。MySQL 8.4.13（Docker の `mysql:8.4`）で確かめました。
+
+```sql
+CREATE TABLE t (id INT PRIMARY KEY, v INT, pad CHAR(80), KEY (v));
+-- 100 万行を入れて ANALYZE TABLE t;
+SELECT table_rows FROM information_schema.tables WHERE table_name = 't';  -- 993016
+SELECT count(*) FROM t;                                                    -- 1000000
+```
+
+入れた直後でも 0.7% ずれています。20 ページの標本から推定しているからです。次に 9 割の行を消しました。
+
+```sql
+DELETE FROM t WHERE id % 10 <> 0;
+SELECT count(*) FROM t;                                         -- 100000
+SELECT table_rows FROM information_schema.tables ...;           -- 993016（消す前のまま）
+SELECT n_rows FROM mysql.innodb_table_stats WHERE table_name = 't';
+-- 直後: 993016
+-- 15 秒ほど待って再確認: 99320（自動の再計算が走った）
+
+SELECT table_rows FROM information_schema.tables ...;           -- 993016（まだ古い）
+SET SESSION information_schema_stats_expiry = 0;
+SELECT table_rows FROM information_schema.tables ...;           -- 99320
+```
+
+ずれは 3 段に重なっていました。
+
+1. **標本による推定の誤差。** 再計算後も 99,320 で、10 万ちょうどではない
+2. **再計算の遅れ。** 10% 超の変更で自動的に計算し直されるが、裏で非同期に走る
+3. **`information_schema` のキャッシュ。** `TABLES` の統計の列は、既定で 86,400 秒（24 時間）キャッシュされる。`information_schema_stats_expiry = 0` にするか `ANALYZE TABLE` を流すと更新される
+
+MySQL の文書は、InnoDB の `table_rows` は概算で、実際の値と 40〜50% ずれることもあるので、正確な件数には `SELECT COUNT(*)` を使うように、と書いています（[MySQL 8.4 リファレンス: INFORMATION_SCHEMA TABLES](https://dev.mysql.com/doc/refman/8.4/en/information-schema-tables-table.html)）。管理画面やツールが表示する「行数」がこの値であることは多いので、件数の確認に使ってはいけません。
+
+<Callout type="note" title="なぜ InnoDB は件数を覚えていないのか">
+  MVCC（第 99 回）のもとでは、「いま何行あるか」はトランザクションごとに答えが違います。
+  まだコミットしていない挿入が見える人と見えない人がいるからです。
+  そのため InnoDB には全員に共通の正確な件数というものが無く、`count(*)` は毎回索引を数えて答えます。
+  PostgreSQL も同じ理由で、`count(*)` は表か索引を読みます。
+</Callout>
+
+### ヒストグラムは自分で作る
+
+InnoDB の永続統計は、主に **索引** についてのものです。索引の無い列の値の分布は、既定では知りません。そこで MySQL 8.0 からは、列ごとの **ヒストグラム** を作れるようになりました（[MySQL 8.4 リファレンス: オプティマイザの統計](https://dev.mysql.com/doc/refman/8.4/en/optimizer-statistics.html)）。
+
+10 万行のうち 99% が `status = 0` で、残りが 1〜7 に散らばる表を作り、索引の無い `status` で絞りました。
+
+```sql
+EXPLAIN SELECT * FROM o WHERE status = 3;
+--  type: ALL  rows: 100256  filtered: 10.00
+
+EXPLAIN ANALYZE SELECT * FROM o WHERE status = 3;
+--  -> Filter: (o.`status` = 3)  (cost=10082 rows=10026) (actual time=0.804..13.8 rows=143 loops=1)
+--      -> Table scan on o  (cost=10082 rows=100256) (actual time=0.559..10.1 rows=100000 loops=1)
+```
+
+分布を知らないので、等号の条件は一律 10% 残ると見積もり、1 万行と出ています。実際は 143 行です。ヒストグラムを作ります。
+
+```sql
+ANALYZE TABLE o UPDATE HISTOGRAM ON status WITH 16 BUCKETS;
+-- information_schema.column_statistics の中身:
+--   histogram-type: "singleton", sampling-rate: 1.0
+--   buckets[0] = [0, 0.99]      ← 値 0 までの累積が 99%
+--   buckets[3] = [3, 0.99428]
+
+EXPLAIN ANALYZE SELECT * FROM o WHERE status = 3;
+--  -> Filter: (o.`status` = 3)  (cost=10082 rows=143) (actual time=0.598..24.3 rows=143 loops=1)
+```
+
+見積もりが 143 行になりました。異なる値の数がバケット数以下なので、値 1 つにつき 1 バケットの **singleton** 型になっています。値の種類がバケットより多い列では、範囲ごとにほぼ同じ件数を入れる **equi-height** 型になります。
+
+ヒストグラムには、PostgreSQL の統計と違う点が 2 つあります（同上、[MySQL 8.4 リファレンス: ANALYZE TABLE](https://dev.mysql.com/doc/refman/8.4/en/analyze-table.html)）。
+
+- **索引のある列では使われないことが多い。** 索引のある列の等号や範囲の条件は、オプティマイザが実際に B+tree の端を下りて件数を数える **index dive** で見積もれるので、そちらが優先される
+- **既定では自動で更新されない。** 作ったときの写しのまま古くなっていく。8.4 の文書では、`UPDATE HISTOGRAM` に `AUTO UPDATE` を付けると、統計の自動再計算のときに一緒に更新されるようになる
+
+## EXPLAIN と EXPLAIN ANALYZE の読み方
+
+ここまでの実験で何度も使ってきた 2 つを、改めて整理します。
+
+| | 問い合わせを実行するか | 出るもの |
+| --- | --- | --- |
+| `EXPLAIN` | しない | 選ばれた計画と、各ノードの **見積もり**（コスト、行数） |
+| `EXPLAIN ANALYZE` | **する** | 見積もりに加えて、各ノードの **実測**（時間、行数、ループ回数） |
+
+`EXPLAIN ANALYZE` は本当に実行するので、`UPDATE` や `DELETE` に付ければ本当に書き換わります。PostgreSQL の文書は、試すなら `BEGIN` と `ROLLBACK` で囲むよう勧めています（[PostgreSQL 文書: EXPLAIN の使い方](https://www.postgresql.org/docs/current/using-explain.html)）。
+
+### 見積もりと実測を並べて見る
+
+読むときにいちばん大事なのは、**同じノードの `rows=`（見積もり）と `actual rows=`（実測）を比べる** ことです。
+
+```
+ Gather  (cost=1000.00..12657.90 rows=19 width=12) (actual time=0.258..21.162 rows=1000 loops=1)
+                                 ^^^^^^^                                     ^^^^^^^^^
+                                 見積もり 19 行                               実際 1,000 行
+```
+
+先ほどの `city = 5 AND pref = 0` の出力です。50 倍ずれています。ずれを見つけたら、**木の下から順に** どこで最初にずれたかを探します。下でずれた見積もりは、その上の結合や集約の見積もりをすべて狂わせるので、直すべきなのは最初にずれたノードです。原因はたいてい次のどれかです。
+
+- 統計が古い（`ANALYZE` を流す）
+- 列どうしに関係がある（拡張統計を作る）
+- 統計の細かさが足りない（その列の統計ターゲットを上げる）
+- 関数や式で包んだ条件なので、統計が使えない
+
+読むときの注意が 2 つあります。
+
+- **`loops`**: 結合の内側などで何度も呼ばれるノードでは、`actual rows` と時間は **1 回あたりの平均** で、全体はそれに `loops` を掛けたものです
+- **並列実行**: たとえば `Parallel Seq Scan ... (actual ... rows=333 loops=3)` と出ていれば、3 つのプロセス（リーダーとワーカー 2 つ）がそれぞれ平均 333 行を出した、という意味です
+
+### BUFFERS
+
+`EXPLAIN (ANALYZE, BUFFERS)` は、各ノードが触ったページの数を出します（[PostgreSQL 文書: EXPLAIN の使い方](https://www.postgresql.org/docs/current/using-explain.html)）。
+
+| 表示 | 意味 |
+| --- | --- |
+| `shared hit` | 共有バッファ（第 96 回のバッファプール）に載っていたページ |
+| `shared read` | 載っていなかったので読みに行ったページ。OS のページキャッシュから来たかディスクから来たかは区別しない |
+| `dirtied` / `written` | このノードが汚した、あるいは書き出したページ |
+
+実行時間は、キャッシュが温まっているかどうかで何倍も変わります。ページの数は、その日の運に左右されにくい指標です。先ほどの実験で、Index Scan と Bitmap と Seq Scan を時間ではなくページ数で比べたのはこのためです。PostgreSQL 18 からは、`EXPLAIN ANALYZE` だけで `BUFFERS` が自動的に付くようになりました（[PostgreSQL 18 リリースノート](https://www.postgresql.org/docs/release/18.0/)）。17 までは明示が必要です。
+
+### MySQL では
+
+MySQL では、`EXPLAIN ANALYZE` は 8.0.18 で加わりました（[MySQL 8.0.18 リリースノート](https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-18.html)）。出力は常に **`FORMAT=TREE`** の形で、ノードがイテレータを表します（[MySQL 8.4 リファレンス: EXPLAIN](https://dev.mysql.com/doc/refman/8.4/en/explain.html)）。
+
+```
+ -> Index range scan on t using v over (NULL < v < 1000), with index condition: (t.v < 1000)
+      (cost=39.9 rows=88) (actual time=2.12..4 rows=88 loops=1)
+```
+
+`(cost=… rows=…)` が見積もり、`(actual time=最初の行..全部の行 rows=… loops=…)` が実測で、読み方は PostgreSQL とほぼ同じです。従来の表形式の `EXPLAIN` は、`rows`（読む行数の見積もり）と `filtered`（そのうち条件を通る割合の見積もり、%）を分けて出します。先ほどのヒストグラムの例で `Filter` の見積もりが 10,026 行から 143 行に変わったのは、この割合の見積もりが直ったということです。
+
+## 計画を使い回す: プリペアドと汎用計画
+
+計画を立てるのにも時間がかかります。同じ形の問い合わせを何度も送るなら、計画を使い回したくなります。プリペアドステートメントがそのための仕組みです。
+
+ただし、使い回す計画は **パラメータの値を知らない** ことになります。この回で見たとおり、`v < 5` と `v < 400000` では最適な計画がまったく違いました。値によって最適な計画が変わる問い合わせで、1 つの計画を使い回すと、どこかの値で外れます。
+
+PostgreSQL は、値ごとに立て直す **カスタム計画** と、値に依存しない **汎用計画** を使い分けます。既定（`plan_cache_mode = auto`）では、最初の 5 回はカスタム計画で実行してそのコストの平均を取り、汎用計画のコストがそれと大きく変わらなければ、以後は汎用計画を使います（[PostgreSQL 文書: PREPARE](https://www.postgresql.org/docs/current/sql-prepare.html)）。`force_custom_plan` / `force_generic_plan` で強制もできます。
+
+最初の数回だけ偏りの無い値が来て汎用計画に切り替わり、その後で偏った値が来て遅くなる、という問題はこの仕組みから生まれます。アプリのドライバが裏でプリペアドを使っていることも多いので、「psql で試すと速いのに、アプリからだと遅い」ときに疑う場所の 1 つです。
+
+## まとめ
+
+- SQL は「何がほしいか」だけを書く。パーサ、リライタ、プランナ、エグゼキュータの順に処理され、「どう取りに行くか」はプランナが決める
+- 実行計画は演算子の木。Volcano モデルでは各演算子が `open` / `next` / `close` を持ち、上の演算子が下から 1 行ずつ引き出す。`LIMIT` で途中で止まれる一方、1 行ごとの呼び出しが重い
+- ソートやハッシュ集約は、子の行を全部読むまで 1 行目を出せない
+- プランナは候補の計画ごとにコストを見積もって選ぶ。PostgreSQL のコストは「1 ページを順に読む手間 = 1」の相対値
+- 索引を使うと安いとは限らない。条件に合う行が多く、行が散らばっているほど、表を頭から読むほうが安くなる。手元の 100 万行では、乱数の列で数行まで Index Scan、4 割まで Bitmap Heap Scan、それを超えると Seq Scan だった
+- 見積もりの材料は統計情報。PostgreSQL は ANALYZE で約 3 万行（統計ターゲット × 300）を標本にして、よく出る値、ヒストグラム、異なる値の数、物理的な並びとの相関を持つ
+- 統計は列ごとなので、関係のある列の条件を掛け算して少なく見積もる。手元では 1,000 行を 19 行と見積もった。`CREATE STATISTICS` で列の組の関係を教えられる
+- InnoDB は 20 ページの標本で推定し、`table_rows` はその推定値でキャッシュもされる。件数には `count(*)` を使う。索引の無い列の分布はヒストグラムで教える
+- `EXPLAIN` は見積もり、`EXPLAIN ANALYZE` は実際に流した実測。見積もりと実測の行数が最初にずれたノードを、木の下から探す
+
+この回では、表 1 つを読むやり方の選び方を見ました。次の第 102 回では、表が 2 つになったときに、行どうしを突き合わせる 3 つのやり方、ネステッドループ、ハッシュ結合、マージ結合を見ます。
