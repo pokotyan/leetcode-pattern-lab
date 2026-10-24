@@ -7,11 +7,14 @@ type Props = {
   description?: string
   /** 今いる区画。ヘッダーの強調とサブナビに使う */
   area?: string
+  /** 左右に列を持つページで、本文の幅を確保する */
+  wide?: boolean
 }
-const { title, description = SITE_TAGLINE, area } = Astro.props
+const { title, description = SITE_TAGLINE, area, wide = false } = Astro.props
 const base = import.meta.env.BASE_URL
 const current = area ? areaById.get(area) : undefined
 const subItems = current?.items ?? []
+const width = wide ? 'max-w-7xl' : 'max-w-6xl'
 ---
 
 <!doctype html>
@@ -38,7 +41,7 @@ const subItems = current?.items ?? []
       class="sticky top-0 z-20 border-b backdrop-blur"
       style="border-color: var(--border); background: color-mix(in srgb, var(--bg) 88%, transparent)"
     >
-      <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
+      <div class:list={['mx-auto flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3', width]}>
         <a href={base} class="font-bold tracking-tight no-underline" style="color: var(--fg)">
           <span style="color: var(--accent)">▲</span> {SITE_NAME}
         </a>
@@ -66,7 +69,7 @@ const subItems = current?.items ?? []
       {
         subItems.length > 0 && (
           <div class="border-t" style="border-color: var(--border)">
-            <nav class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2 text-xs">
+            <nav class:list={['mx-auto flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2 text-xs', width]}>
               <a
                 href={`${base}${current!.path}`}
                 class="font-bold no-underline"
@@ -85,7 +88,7 @@ const subItems = current?.items ?? []
       }
     </header>
 
-    <main class="mx-auto max-w-6xl px-4 py-10">
+    <main class:list={['mx-auto px-4 py-10', width]}>
       <slot />
     </main>
 

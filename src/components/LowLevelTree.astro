@@ -1,0 +1,77 @@
+---
+import { LOWLEVEL_CHAPTERS } from '../lib/curriculum'
+import { loadLowLevelNotes } from '../lib/prereq'
+
+type Props = {
+  /** 今読んでいる回の slug */
+  current?: string
+  /** 一覧ページでは、章の見出しをページ内の章へのリンクにする */
+  chapterAnchors?: boolean
+}
+const { current, chapterAnchors = false } = Astro.props
+const base = import.meta.env.BASE_URL
+const { notes } = await loadLowLevelNotes()
+
+const chapters = LOWLEVEL_CHAPTERS.map((chapter) => ({
+  chapter,
+  items: notes.filter((n) => n.data.chapter === chapter.id && n.data.status === 'published'),
+})).filter((g) => g.items.length > 0)
+
+const currentChapter = notes.find((n) => n.id === current)?.data.chapter
+const episodeNumber = (id: string) => id.match(/^ll-(\d+)-/)?.[1] ?? ''
+---
+
+<nav class="ll-tree text-[13px] leading-snug" aria-label="低レイヤの章">
+  <ul class="m-0 list-none space-y-0.5 p-0">
+    {
+      chapters.map(({ chapter, items }) => (
+        <li>
+          <details open={chapter.id === currentChapter}>
+            <summary
+              class="cursor-pointer rounded px-1.5 py-1 font-bold"
+              style={chapter.id === currentChapter ? 'color: var(--fg)' : 'color: var(--fg-muted)'}
+            >
+              {chapterAnchors ? (
+                <a href={`#ch-${chapter.id}`} class="no-underline" style="color: inherit">
+                  {chapter.title}
+                </a>
+              ) : (
+                chapter.title
+              )}
+            </summary>
+            <ol class="m-0 mb-1 ml-2 list-none border-l p-0 pl-2" style="border-color: var(--border)">
+              {items.map((n) => (
+                <li>
+                  <a
+                    href={`${base}lowlevel/${n.id}/`}
+                    class="flex gap-1.5 rounded px-1.5 py-0.5 no-underline hover:underline"
+                    style={
+                      n.id === current
+                        ? 'color: var(--accent); font-weight: 700; background: var(--bg-soft)'
+                        : 'color: var(--fg-muted)'
+                    }
+                    aria-current={n.id === current ? 'page' : undefined}
+                    data-current={n.id === current ? '' : undefined}
+                  >
+                    <span class="shrink-0 font-mono text-[11px] tabular-nums">{episodeNumber(n.id)}</span>
+                    <span>{n.data.title}</span>
+                  </a>
+                </li>
+              ))}
+            </ol>
+          </details>
+        </li>
+      ))
+    }
+  </ul>
+</nav>
+
+<script is:inline>
+  // ツリーだけをスクロールして、今の回を見える位置に出す。ページ全体は動かさない
+  for (const box of document.querySelectorAll('[data-ll-tree-scroll]')) {
+    const el = box.querySelector('[data-current]')
+    if (el && box.scrollHeight > box.clientHeight) {
+      box.scrollTop = el.offsetTop - box.clientHeight / 2
+    }
+  }
+</script>
