@@ -278,7 +278,7 @@ fixed 版にも 1,515 個の生き残りがあります。初回の操作で一�
 - **Allocation instrumentation on timeline**：記録中の割り当てを時刻つきで残す。文書は時間軸に出る青い棒について「Those blue bars represent new memory allocations. Those new memory allocations are your candidates for memory leaks.」と書いており、棒の区間を選ぶと、その間に作られたオブジェクトだけに絞り込める
 - **Allocation sampling**：割り当てを一定の量ごとに抜き取り、関数ごとに集計する。文書は「Use the Allocation sampling profile type in the Memory panel to view memory allocation by JavaScript function.」と書いている（どちらも [Fix memory problems](https://developer.chrome.com/docs/devtools/memory-problems)）
 
-Allocation sampling は、第 239 回で見た CPU のサンプリングプロファイラのメモリ版です。leak 版を 30 回開いて閉じる間、1 KiB ごとに抜き取って集計すると、記録の終わりに生きていた割り当てはこうなりました。
+Allocation sampling は、第 240 回で見た CPU のサンプリングプロファイラのメモリ版です。leak 版を 30 回開いて閉じる間、1 KiB ごとに抜き取って集計すると、記録の終わりに生きていた割り当てはこうなりました。
 
 ```text
 2,559,456  ListView        （leak.html 14 行目、コンストラクタ）

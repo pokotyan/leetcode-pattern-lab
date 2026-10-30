@@ -82,7 +82,7 @@ ALPN の識別子は IANA が登録しています。HTTP 用の `http/1.1`、`h
 
 | プロトコル | 切り替えの合図 | 仕様 |
 | --- | --- | --- |
-| SMTP | `STARTTLS` コマンド → `220` | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html)（第 197 回） |
+| SMTP | `STARTTLS` コマンド → `220` | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html)（第 198 回） |
 | IMAP | `STARTTLS` コマンド → `OK` | [RFC 9051](https://www.rfc-editor.org/rfc/rfc9051.html) |
 | POP3 | `STLS` コマンド → `+OK` | [RFC 2595 4](https://www.rfc-editor.org/rfc/rfc2595.html#section-4) |
 | FTP | `AUTH TLS` コマンド → `234` | [RFC 4217 4](https://www.rfc-editor.org/rfc/rfc4217.html#section-4)（第 165 回） |
@@ -125,9 +125,9 @@ DTLS（UDP の上の TLS。第 92 回）や QUIC（TLS 1.3 のハンドシェイ
 | プロトコル | 土台 | ポート | 型 | 扱う回 |
 | --- | --- | --- | --- | --- |
 | HTTPS | TLS（HTTP/3 は QUIC） | 443 | 1（ALPN で `h2` などを選ぶ） | 第 139、140 回、第 80 回 |
-| SMTP の中継 | TLS | 25 | 2（STARTTLS） | 第 197 回 |
-| メールの提出 | TLS | 587 / 465 | 2 / 1 | 第 197 回 |
-| IMAP | TLS | 143 / 993 | 2 / 1 | 第 202 回、この回 |
+| SMTP の中継 | TLS | 25 | 2（STARTTLS） | 第 198 回 |
+| メールの提出 | TLS | 587 / 465 | 2 / 1 | 第 198 回 |
+| IMAP | TLS | 143 / 993 | 2 / 1 | 第 203 回、この回 |
 | POP3 | TLS | 110 / 995 | 2（STLS） / 1 | この回 |
 | FTPS | TLS | 21 / 990 | 2（AUTH TLS） / 1（標準化されていない） | 第 165 回 |
 | SFTP、SCP | SSH | 22 | 3（subsystem、exec） | 第 164 回 |
@@ -144,7 +144,7 @@ DTLS（UDP の上の TLS。第 92 回）や QUIC（TLS 1.3 のハンドシェイ
 | syslog | TLS | 6514 | 1 | 第 170 回 |
 | RDP | TLS / CredSSP | 3389 | 2（X.224 で交渉） | この回 |
 | DoT / DoH / DoQ | TLS / HTTPS / QUIC | 853 / 443 / 853（UDP） | 1 | 第 76 回、第 90 回 |
-| NTS | TLS で鍵、NTP で時刻 | 4460 → 123（UDP） | 部品 | 第 170 回、第 210 回 |
+| NTS | TLS で鍵、NTP で時刻 | 4460 → 123（UDP） | 部品 | 第 170 回、第 211 回 |
 | RADIUS/TLS（RadSec） | TLS | 2083 | 1 | 第 170 回 |
 | EAP-TLS | EAP の中の TLS | （IP の前） | 部品 | 第 170 回 |
 | stunnel | TLS | 任意 | 1（平文のサービスを包む） | 第 168 回 |
@@ -168,7 +168,7 @@ DTLS（UDP の上の TLS。第 92 回）や QUIC（TLS 1.3 のハンドシェイ
 
 ### 1. 切り替えの申し出を消される
 
-平文の段階で「TLS を話せます」と申し出るので、途中の機器はそれを消せます。クライアントが「申し出がなければ平文で続ける」作りなら、それだけで全部が平文に落ちます。メールの `250 STARTTLS` の行を書き換える攻撃と、それが実際に行われた例は、第 197 回で再現しました。
+平文の段階で「TLS を話せます」と申し出るので、途中の機器はそれを消せます。クライアントが「申し出がなければ平文で続ける」作りなら、それだけで全部が平文に落ちます。メールの `250 STARTTLS` の行を書き換える攻撃と、それが実際に行われた例は、第 198 回で再現しました。
 
 同じ構図は、メール以外にもあります。
 
@@ -202,7 +202,7 @@ PostgreSQL の文書にも、同じ種類の注意があります。SSLRequest �
 
 ### 3. 平文の段階で聞いたことを信じる
 
-3 つ目は、平文の段階で得た情報を、TLS の後も使い続けることです。各仕様は、切り替えの後にそれを捨てるよう求めています。POP3 の STLS では、クライアントは前に受け取った能力の一覧を捨て、`CAPA` を送り直すべき（SHOULD）とされ、理由は平文の間に攻撃者が一覧を書き換えうるからです（[RFC 2595 4](https://www.rfc-editor.org/rfc/rfc2595.html#section-4)）。SMTP の RFC 3207 が EHLO の送り直しを求めるのも同じ理由です（第 197 回）。
+3 つ目は、平文の段階で得た情報を、TLS の後も使い続けることです。各仕様は、切り替えの後にそれを捨てるよう求めています。POP3 の STLS では、クライアントは前に受け取った能力の一覧を捨て、`CAPA` を送り直すべき（SHOULD）とされ、理由は平文の間に攻撃者が一覧を書き換えうるからです（[RFC 2595 4](https://www.rfc-editor.org/rfc/rfc2595.html#section-4)）。SMTP の RFC 3207 が EHLO の送り直しを求めるのも同じ理由です（第 198 回）。
 
 PostgreSQL の文書は、SSLRequest への応答としてエラーが返ってきた場合、**サーバはまだ認証されていないので、そのエラーの文面を利用者に表示してはならない**、とまで書いています（[CVE-2024-10977](https://www.cve.org/CVERecord?id=CVE-2024-10977)、[PostgreSQL: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)）。平文の段階で届いたものは、中身を表示することさえ危ないということです。
 
@@ -228,7 +228,7 @@ RFC 2595 の論点のうち、「TLS を使える相手なら使う」ことの�
 - **XMPP** は、STARTTLS の 5222 番に加えて、XEP-0368 で最初から TLS の接続先を SRV で知らせる方式を足しました。HTTPS しか通さないファイアウォールを越えられることと、往復が減ることを利点に挙げています（[XEP-0368](https://xmpp.org/extensions/xep-0368.html)）
 - **PostgreSQL** は 17 で `sslnegotiation=direct` を加え、SSLRequest を送らずに TCP の直後から TLS を始められるようにしました。往復が 1 回減り、プロトコルを知らない TLS の道具も使えるようになる、と説明されています。この方式ではクライアントは ALPN の `postgresql` を使わなければならず、また `sslmode=require` 以上でしか使えません。弱い設定で使うと、サーバが対応していないときに平文の認証に意図せず戻りうるからです（[libpq: sslnegotiation](https://www.postgresql.org/docs/current/libpq-connect.html)、[PostgreSQL: Message Flow](https://www.postgresql.org/docs/current/protocol-flow.html)）
 
-一方、MTA 同士の 25 番のように、相手が TLS を話せるか分からないまま誰とでも通信しなければならない場面では、型 2 から離れられません。そこで MTA-STS や DANE のように「消されたら気づける」仕組みを外から足しました（第 197 回）。**型 2 を使い続けるなら、TLS を必須にする情報を別の経路で持つ**、というのがここでの答えです。
+一方、MTA 同士の 25 番のように、相手が TLS を話せるか分からないまま誰とでも通信しなければならない場面では、型 2 から離れられません。そこで MTA-STS や DANE のように「消されたら気づける」仕組みを外から足しました（第 198 回）。**型 2 を使い続けるなら、TLS を必須にする情報を別の経路で持つ**、というのがここでの答えです。
 
 ## 実験の環境
 
@@ -287,7 +287,7 @@ a1 CAPABILITY
 a1 OK Pre-login capabilities listed, post-login capabilities have more.
 ```
 
-TLS の中の一覧からは `STARTTLS` と `LOGINDISABLED` が消え、`AUTH=PLAIN` が現れました。第 197 回の SMTP で、TLS の後に `AUTH` が現れたのと同じ振る舞いです。先頭の `. OK` の行は、`s_client` が切り替えの前に自動で送る `. CAPABILITY`（タグが `.`）への応答の文面です。何も送らずにつないでも TLS の確立の後に表示されましたが、`s_client` がどの段階でこの行を受け取ったのかは、ここでは追っていません。
+TLS の中の一覧からは `STARTTLS` と `LOGINDISABLED` が消え、`AUTH=PLAIN` が現れました。第 198 回の SMTP で、TLS の後に `AUTH` が現れたのと同じ振る舞いです。先頭の `. OK` の行は、`s_client` が切り替えの前に自動で送る `. CAPABILITY`（タグが `.`）への応答の文面です。何も送らずにつないでも TLS の確立の後に表示されましたが、`s_client` がどの段階でこの行を受け取ったのかは、ここでは追っていません。
 
 ### 993 番は最初から TLS
 
@@ -446,7 +446,7 @@ RFC 7301 は、クライアントが出した識別子をサーバが 1 つも�
 
 <Callout type="warn" title="よくある誤解: 型を選べば、相手の確認もできている">
   型が決めるのは、**いつ TLS を始めるか**だけです。始めた TLS で相手の証明書を確かめるかどうかは別の話で、
-  第 197 回の MTA 同士の STARTTLS は、型 2 で TLS を始めても証明書を確かめないのが普通でした。
+  第 198 回の MTA 同士の STARTTLS は、型 2 で TLS を始めても証明書を確かめないのが普通でした。
   型 1 でも、クライアントが `verify=False` で接続していれば、相手が誰かは分かりません（第 159 回）。
   データベースのドライバやライブラリの既定値がどこまで確かめているかは、第 167 回と第 172 回で見ます。
 </Callout>
@@ -461,7 +461,7 @@ RFC 7301 は、クライアントが出した識別子をサーバが 1 つも�
 | 証明書の検証 | どの型でも、相手を確かめるのはここ | 第 155 回、第 159 回 |
 | SSH のチャネル | 型 3 の土台。subsystem と exec | 第 161 回 |
 | SSH の権限の絞り込み | 型 3 で SSH の利用者の権限と上のプロトコルの権限を切り離す | 第 162 回、第 164 回、第 166 回 |
-| 方針の外付け（MTA-STS、DANE） | 型 2 を使い続けるときに、TLS を必須にする情報を別の経路で与える | 第 197 回 |
+| 方針の外付け（MTA-STS、DANE） | 型 2 を使い続けるときに、TLS を必須にする情報を別の経路で与える | 第 198 回 |
 
 ## まとめ
 

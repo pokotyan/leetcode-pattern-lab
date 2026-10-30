@@ -244,7 +244,7 @@ AWS の Builders' Library の記事（[Timeouts, retries, and backoff with jitte
  3 回試す   3 回試す  3 回試す
 ```
 
-C が失敗を返すと、B は C を 3 回呼びます。B の失敗を見た A は B を 3 回呼び、そのたびに B は C を 3 回呼びます。利用者も A を 3 回呼びます。**C には、元の 1 回が 3 × 3 × 3 = 27 回になって届きます**。第 226 回のサービスメッシュの回で改めて扱う**リトライストーム**です。上の図の「3 回試す」が「1 回目のあとに 3 回再試行する」なら、4 × 4 × 4 = 64 回です。AWS の記事は 5 段のスタックで各段が独立に再試行すれば、データベースへの負荷は 243 倍（3 の 5 乗）になり、回復の見込みはほぼ無くなる、と書いています（[AWS Builders' Library](https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter)）。
+C が失敗を返すと、B は C を 3 回呼びます。B の失敗を見た A は B を 3 回呼び、そのたびに B は C を 3 回呼びます。利用者も A を 3 回呼びます。**C には、元の 1 回が 3 × 3 × 3 = 27 回になって届きます**。第 227 回のサービスメッシュの回で改めて扱う**リトライストーム**です。上の図の「3 回試す」が「1 回目のあとに 3 回再試行する」なら、4 × 4 × 4 = 64 回です。AWS の記事は 5 段のスタックで各段が独立に再試行すれば、データベースへの負荷は 243 倍（3 の 5 乗）になり、回復の見込みはほぼ無くなる、と書いています（[AWS Builders' Library](https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter)）。
 
 この掛け算を止める手は、大きく 3 つあります。
 
@@ -286,7 +286,7 @@ HTTP には、残り時間を運ぶ標準のヘッダはありません。HTTP �
   下流のサービスの遅延のうちそれに対応するパーセンタイル（この例では p99.9）を見る、という方法を書いています
   （[AWS Builders' Library](https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter)）。
   平均値から決めると、裾の遅い要求のかなりの部分が「失敗」になり、それが再試行を呼んで負荷を増やします。
-  パーセンタイルをどう集めるかは第 235 回で扱います。
+  パーセンタイルをどう集めるかは第 236 回で扱います。
 </Callout>
 
 ## 手元で確かめる

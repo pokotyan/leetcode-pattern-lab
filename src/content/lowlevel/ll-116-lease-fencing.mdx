@@ -79,7 +79,7 @@ UPDATE settings SET value = 'new', version = version + 1
 -- 更新件数が 0 なら、誰かが先に書いた。読み直してやり直す
 ```
 
-これを**楽観ロック**（楽観的並行性制御）と呼びます。第 100 回で見た `SELECT ... FOR UPDATE` は、読む時点で行にロックを掛け、相手を待たせる**悲観ロック**でした。楽観ロックは誰も待たせず、書く瞬間にぶつかったかどうかだけを確かめます。ぶつかることがまれなら速く、ロックを持ったまま落ちる人もいません。その代わり、ぶつかったら読み直してやり直す処理を自分で書く必要があります。第 222 回と第 229 回で扱う Kubernetes の `resourceVersion` も、API の単位で同じことをしています。
+これを**楽観ロック**（楽観的並行性制御）と呼びます。第 100 回で見た `SELECT ... FOR UPDATE` は、読む時点で行にロックを掛け、相手を待たせる**悲観ロック**でした。楽観ロックは誰も待たせず、書く瞬間にぶつかったかどうかだけを確かめます。ぶつかることがまれなら速く、ロックを持ったまま落ちる人もいません。その代わり、ぶつかったら読み直してやり直す処理を自分で書く必要があります。第 223 回と第 230 回で扱う Kubernetes の `resourceVersion` も、API の単位で同じことをしています。
 
 ### オブジェクトストレージの CAS
 
@@ -130,7 +130,7 @@ Iceberg や Delta Lake のようなテーブル形式も、「最新版はこれ
       → 同じことを考えた C と同時になっても、勝つのは 1 人（他は 412）
 ```
 
-ここに時計の問題が入り込みます。`expires_at` を書いたのは A の壁時計で、それを判定するのは B の壁時計です。第 210 回で詳しく扱いますが、別のマシンの時計は完全には揃わず、NTP の step で戻ることもあります。B の時計が進んでいれば、まだ有効なロックを奪ってしまいます。
+ここに時計の問題が入り込みます。`expires_at` を書いたのは A の壁時計で、それを判定するのは B の壁時計です。第 211 回で詳しく扱いますが、別のマシンの時計は完全には揃わず、NTP の step で戻ることもあります。B の時計が進んでいれば、まだ有効なロックを奪ってしまいます。
 
 より安全なのは、**相手の時刻を信用せず、自分の単調時計で測る**ことです。「同じ ETag のまま、自分の時計で期限の長さだけ変化が無かったら奪う」とすれば、比べるのは自分の時計の経過時間だけになります。後で見る Kubernetes の leaderelection は、まさにこのやり方をしています。
 
@@ -211,7 +211,7 @@ Redis の文書は、5 台の独立した Redis に同じキーを `SET NX PX` �
 
 etcd には選出の API があり、`etcdctl elect` で試せます。候補はそれぞれ自分のリース付きのキーを作り、作られた順（create_revision の小さい順）で最初の 1 人がリーダーになります。ロック（`etcdctl lock`）も同じ作りで、Go のクライアントの実装は、「自分のキーの create_revision が 0（まだ無い）なら作る」という `Txn` を投げ、プレフィックスの中で最も古いキーの持ち主をロックの持ち主としています（[concurrency/mutex.go](https://github.com/etcd-io/etcd/blob/main/client/v3/concurrency/mutex.go)）。
 
-Kubernetes では、`coordination.k8s.io` の **Lease** オブジェクトがこの役を担います（[Kubernetes: Leases](https://kubernetes.io/docs/concepts/architecture/leases/)）。HA 構成の `kube-controller-manager` や `kube-scheduler` は、Lease を取れた 1 つだけが動き、残りは待機します。第 229 回で、自作のコントローラを冗長にするときに使うのもこれです。Lease の `spec` には次のフィールドがあります（[Lease v1](https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/lease-v1/)）。
+Kubernetes では、`coordination.k8s.io` の **Lease** オブジェクトがこの役を担います（[Kubernetes: Leases](https://kubernetes.io/docs/concepts/architecture/leases/)）。HA 構成の `kube-controller-manager` や `kube-scheduler` は、Lease を取れた 1 つだけが動き、残りは待機します。第 230 回で、自作のコントローラを冗長にするときに使うのもこれです。Lease の `spec` には次のフィールドがあります（[Lease v1](https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/lease-v1/)）。
 
 | フィールド | 意味 |
 | --- | --- |
@@ -230,7 +230,7 @@ Go のクライアントの `leaderelection` パッケージには、時計に�
 - Lease の更新は、読んだときの Lease をそのまま書き戻す `Update` なので、`resourceVersion` による楽観ロックがかかり、2 人が同時に奪おうとしても片方は拒否されます（[resourcelock/leaselock.go](https://github.com/kubernetes/client-go/blob/master/tools/leaderelection/resourcelock/leaselock.go)）
 - そしてパッケージの冒頭には、**この実装は、同時にリーダーとして振る舞うクライアントが 1 つだけであることを保証しない（フェンシング）**と明記されています
 
-つまり Kubernetes のリーダー選出も、期限切れに気付かない元リーダーの問題からは自由ではありません。組み込みのコントローラがそれでも成り立つのは、書き込み先の API サーバが `resourceVersion` で衝突を拒み、調整ループが「最新の状態を読んで差を埋める」作りなので、二重に動いても結果が壊れにくいからです（第 222 回で扱います）。
+つまり Kubernetes のリーダー選出も、期限切れに気付かない元リーダーの問題からは自由ではありません。組み込みのコントローラがそれでも成り立つのは、書き込み先の API サーバが `resourceVersion` で衝突を拒み、調整ループが「最新の状態を読んで差を埋める」作りなので、二重に動いても結果が壊れにくいからです（第 223 回で扱います）。
 
 <Callout type="note" title="リースの長さは、何と何の交換か">
   リースを短くすれば、リーダーが落ちてから次が動き出すまでが短くなります。

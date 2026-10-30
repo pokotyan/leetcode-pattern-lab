@@ -38,7 +38,8 @@ import Callout from '../../components/Callout.astro'
 | 第 186 回 | IdP をセルフホストすると何を引き受けるか |
 | 第 188 回 | 人ではなく機械の ID |
 | 第 190 回 | 部品を組み合わせた構成の型（第 18〜22 章の総まとめ） |
-| 第 191 回 | 部品が絡み合って起きた障害と事件 |
+| 第 191 回 | プロダクトをまたいで、利用者として API を呼ぶ（共通 audience、トークン交換、入口での作り替え） |
+| 第 192 回 | 部品が絡み合って起きた障害と事件 |
 
 この回はその土台として、**SSO がどういう仕組みで「1 回のログイン」を実現しているか**を、Keycloak を相手に SAML のやり取りを手で追いながら見ます。
 
@@ -209,7 +210,7 @@ SP-A に届いた `SAMLResponse` を Base64 で戻すと、7,762 バイトの XM
 
 - 署名を検証する
 - `Recipient` が、応答を受け取った ACS の URL と一致する
-- `NotOnOrAfter` が過ぎていない（IdP との時計のずれは許容する。第 210 回）
+- `NotOnOrAfter` が過ぎていない（IdP との時計のずれは許容する。第 211 回）
 - `InResponseTo` が、自分の出した `AuthnRequest` の ID と一致する
 - さらに POST バインディングでは、**アサーションは署名されていなければならず**、SP は使い終わったアサーションの ID を有効期間のあいだ覚えておき、**2 回目を拒否しなければならない**（[Profiles 4.1.4.5](https://docs.oasis-open.org/security/saml/v2.0/saml-profiles-2.0-os.pdf)）
 
