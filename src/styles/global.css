@@ -75,6 +75,48 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* 低レイヤの各回: 左の章ツリー・本文・右の目次。閉じた列は開くボタンだけの細い帯になる */
+.ll-grid {
+  display: grid;
+  gap: 2rem;
+}
+@media (min-width: 1024px) {
+  .ll-grid {
+    grid-template-columns: var(--ll-left, 15rem) minmax(0, 1fr);
+  }
+}
+@media (min-width: 1280px) {
+  .ll-grid {
+    grid-template-columns: var(--ll-left, 15rem) minmax(0, 1fr) var(--ll-right, 14rem);
+  }
+}
+html[data-ll-left] .ll-grid {
+  --ll-left: 2rem;
+}
+html[data-ll-right] .ll-grid {
+  --ll-right: 2rem;
+}
+html[data-ll-left] [data-ll-toggle='left'] + .ll-side-body,
+html[data-ll-right] [data-ll-toggle='right'] + .ll-side-body {
+  display: none;
+}
+/* 片側でも閉じたら本文の上限を広げる。64rem は本文 16px で 1 行 64 字。これより長いと行頭へ戻る目の移動がつらくなる */
+html[data-ll-left] .ll-grid .prose,
+html[data-ll-right] .ll-grid .prose {
+  max-width: 64rem;
+}
+.ll-toggle {
+  display: block;
+  margin-bottom: 0.5rem;
+  padding: 0.125rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  background: var(--bg);
+  cursor: pointer;
+}
+
 /* 記事本文のタイポグラフィは base レイヤーに置く。
    Tailwind のユーティリティ (utilities レイヤー) が常に勝つので、
    .not-prose を付けたコンポーネント側で m-0 / list-none が効く。 */
