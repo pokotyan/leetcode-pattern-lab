@@ -123,7 +123,7 @@ HTML Standard 自身が、canvas の使いどころを強く制限していま�
 
 失うものがこれだけあっても、大きなアプリケーションはあえて canvas 側に移ってきました。
 
-- **Figma** は、HTML と SVG は余計な荷物が多く、DOM へのアクセスのせいで 2D canvas の API よりずっと遅いことが多いとして、描画をすべて WebGL で一から実装しました。エディタ本体は C++ で書き、emscripten で JavaScript（asm.js）にコンパイルしています（[Figma のブログ](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/)）。いまなら Wasm（第 204 回）の役割です
+- **Figma** は、HTML と SVG は余計な荷物が多く、DOM へのアクセスのせいで 2D canvas の API よりずっと遅いことが多いとして、描画をすべて WebGL で一から実装しました。エディタ本体は C++ で書き、emscripten で JavaScript（asm.js）にコンパイルしています（[Figma のブログ](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/)）。いまなら Wasm（第 205 回）の役割です
 - **Google ドキュメント**は 2021 年に、HTML による描画から canvas による描画へ実装を移すと告知しました。理由は、性能と、プラットフォームの違いによる見え方のずれを減らすことでした（[Google Workspace Updates](https://workspaceupdates.googleblog.com/2021/05/Google-Docs-Canvas-Based-Rendering-Update.html)）
 - **Skia** は Chrome、Android、Flutter などの描画エンジンになっている 2D グラフィックスのライブラリです（[Skia](https://skia.org/)）。この Skia を Wasm にコンパイルした CanvasKit も公開されていて、WebGL のコンテキストを Skia の描画先として HTML の canvas に直接描けます（[Skia: CanvasKit](https://skia.org/docs/user/modules/canvaskit/)）。ブラウザの中に、もう 1 つ描画エンジンを持ち込む形です
 
@@ -143,7 +143,7 @@ HTML Standard 自身が、canvas の使いどころを強く制限していま�
 | 橋渡し | HTML-in-Canvas | ブラウザ（DOM）と自分の両方 | ブラウザが撮った DOM の写しを、自分が配置する | 第 132 回 |
 | 素材 | WebCodecs、`<video>` のフレーム | 自分 | 復号器が作ったフレームを、どこかに描く | 第 133 回 |
 | ライブラリ | Three.js、PixiJS、deck.gl など | ライブラリ（保持モードに戻す） | WebGL / WebGPU | 各回で触れる |
-| 持ち込み | Wasm に移植した描画エンジン（CanvasKit など） | 自分のエンジン | WebGL / WebGPU | 第 204 回 |
+| 持ち込み | Wasm に移植した描画エンジン（CanvasKit など） | 自分のエンジン | WebGL / WebGPU | 第 205 回 |
 
 ライブラリの行に注目してください。[Three.js](https://threejs.org/) や [PixiJS](https://pixijs.com/) は、即時モードの WebGL の上に、**シーングラフという保持モードをもう一度作り直す**ものです。シーンにメッシュやスプライトを足し、位置を変えると、ライブラリが毎フレーム全部を描き直します。保持モードを捨てたのは、ブラウザ汎用の場面のモデルが重かったからで、場面そのものが要らなかったわけではありません。**自分の用途に合った軽い場面を、自分の側に持ち直す**のです。
 
@@ -231,7 +231,7 @@ Canvas 2D の 30 万個では、style と layout は 0.1ms でした。ブラウ
   これはヘッドレスの Chrome の、点の描画という最も単純な場面での目安です。
   `requestAnimationFrame` は vsync に揃うので（第 121 回）、間隔は 16.7ms の倍数に張り付きます。
   WebGL の JS の時間は「命令を積んだ時間」であって、GPU が描き終えた時間ではありません。GPU の側が詰まれば、フレームの間隔に表れます。
-  場面が変われば崩れる場所も変わります。自分の場面で、自分の端末で測ってください（第 233 回）。
+  場面が変われば崩れる場所も変わります。自分の場面で、自分の端末で測ってください（第 234 回）。
 </Callout>
 
 ## 確かめる: canvas に描いた文字はどこにもない

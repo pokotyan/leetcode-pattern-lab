@@ -261,7 +261,7 @@ Lighthouse の文書は、この方式を「request-level throttling」と呼び
 
 Network パネルの記録は、HAR（HTTP Archive）という JSON の形式で書き出せます。障害の報告に添えたり、別の道具で読み込んだりするのに使います。HAR の各要求の `timings` には `blocked`、`dns`、`connect`、`ssl`、`send`、`wait`、`receive` があり、`blocked` は「Time spent in a queue waiting for a network connection.」と定義されています。ただし、この仕様書は「This document was never published by the W3C Web Performance Working Group and has been abandoned.」とあるとおり、W3C の勧告にはならずに放棄された草案で、実際には各ツールがこの形に従っている状態です（[HTTP Archive (HAR) format](https://w3c.github.io/web-performance/specs/HAR/Overview.html)）。
 
-書き出すときの既定に注意があります。文書によれば「by default you can export the "sanitized" network log in HAR format that excludes sensitive information such as Cookie, Set-Cookie, and Authorization headers.」で、Cookie、Set-Cookie、Authorization のヘッダを除いたものが既定です（[Save all network requests to a HAR file](https://developer.chrome.com/docs/devtools/network/reference#save-as-har)）。機密を含む版を明示的に選ぶこともできますが、それを他人に渡せば、ログインしたままのセッションを渡すのと同じです（第 175 回）。除かれるのはヘッダだけなので、URL のクエリや応答の本文に含まれる個人情報は、既定の書き出しでも残ります。
+書き出すときの既定に注意があります。文書によれば「by default you can export the "sanitized" network log in HAR format that excludes sensitive information such as Cookie, Set-Cookie, and Authorization headers.」で、Cookie、Set-Cookie、Authorization のヘッダを除いたものが既定です（[Save all network requests to a HAR file](https://developer.chrome.com/docs/devtools/network/reference#save-as-har)）。機密を含む版を明示的に選ぶこともできますが、それを他人に渡せば、ログインしたままのセッションを渡すのと同じです（第 176 回）。除かれるのはヘッダだけなので、URL のクエリや応答の本文に含まれる個人情報は、既定の書き出しでも残ります。
 
 ## まとめ
 

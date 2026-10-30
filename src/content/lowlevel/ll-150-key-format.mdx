@@ -289,7 +289,7 @@ $ sed '1d;$d' id_ed25519 | base64 -d | xxd | head -3
 
 ## JWK と PKCS#12
 
-**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 176 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
+**JWK** は、鍵を JSON で表す形式です（[RFC 7517](https://www.rfc-editor.org/rfc/rfc7517.html)）。第 177 回の JWT の検証で、公開鍵はこの形で配られます。Node で先ほどの EC の鍵を書き出すと、こうなります。
 
 ```
 $ node -e 'const c=require("crypto"),fs=require("fs");

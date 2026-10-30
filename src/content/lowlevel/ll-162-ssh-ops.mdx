@@ -331,7 +331,7 @@ Authentication key ED25519-CERT SHA256:9DvP... revoked by file /etc/ssh/revoked.
 
 ```
  利用者 ──(1) ブラウザで SSO ログイン──→ IdP
-   │   ←──(2) ID トークン（第 178 回）──┘
+   │   ←──(2) ID トークン（第 179 回）──┘
    │ ──(3) 公開鍵 + ID トークン ──→ SSH CA
    │                                  IdP の署名を検証し、グループから principals を決め
    │ ←──(4) 8 時間だけのユーザ証明書 ──┘ CA の秘密鍵で署名（KMS や HSM の中）
@@ -351,7 +351,7 @@ Authentication key ED25519-CERT SHA256:9DvP... revoked by file /etc/ssh/revoked.
 | SSM Session Manager | インスタンス上のエージェントがシェルを渡し、sshd の受信ポートを開けずに済む。「受信ポート、踏み台、SSH の鍵が要らない」 | [AWS](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html) |
 | IAP の TCP 転送 | 外部 IP の無い VM への SSH を、IAM で許された利用者にだけトンネルで通す | [Google Cloud](https://docs.cloud.google.com/iap/docs/using-tcp-forwarding) |
 
-上の 3 つは **SSH 証明書を短命に発行する型**、OS Login と EC2 Instance Connect は **authorized_keys の中身をクラウドの IAM から引く型**、下の 2 つは **SSH の入口そのものをクラウドの ID で守る型**です。どれも、長く生きる公開鍵をサーバに置かない点で共通しています。この組み立ては第 189 回で、構成の型の 1 つとしてもう一度見ます。
+上の 3 つは **SSH 証明書を短命に発行する型**、OS Login と EC2 Instance Connect は **authorized_keys の中身をクラウドの IAM から引く型**、下の 2 つは **SSH の入口そのものをクラウドの ID で守る型**です。どれも、長く生きる公開鍵をサーバに置かない点で共通しています。この組み立ては第 190 回で、構成の型の 1 つとしてもう一度見ます。
 
 ## 鍵の種類を選ぶ
 
@@ -387,7 +387,7 @@ gpgsig -----BEGIN SSH SIGNATURE-----
 | --- | --- | --- | --- |
 | ssh-agent | 秘密鍵を持ち出させない | 話しかけられる者に署名させないこと | ファイルの権限（第 43 回）、`ssh-add -t` `-c` `-h` |
 | ProxyJump | 踏み台に鍵も平文も渡さない | 踏み台に入れる人の管理 | 内側のホスト鍵の確認（第 161 回） |
-| ユーザ証明書 | この鍵が、この principals で、この期間使える | 鍵の向こうの人が誰か | CA の鍵の保管（第 151 回）、IdP（第 178 回） |
+| ユーザ証明書 | この鍵が、この principals で、この期間使える | 鍵の向こうの人が誰か | CA の鍵の保管（第 151 回）、IdP（第 179 回） |
 | ホスト証明書 | このホスト鍵が、この名前のもの | そのサーバの中身が安全か | `@cert-authority`、第 161 回の鍵交換と署名 |
 | KRL / 短命化 | 使わせたくない証明書を止める | 配り損ねたサーバでの失効 | 構成管理、正しい時計 |
 

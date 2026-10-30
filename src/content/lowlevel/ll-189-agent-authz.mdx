@@ -1,0 +1,463 @@
+---
+title: AI エージェントに権限を渡す：MCP の認可
+description: AI エージェントが利用者の代わりに外部のツールやデータを使うとき、誰の権限で、どの範囲まで、どの宛先に対して動いてよいのか。MCP の認可仕様が OAuth のどの部品をどう組み合わせてこの問いに答えているかを、401 からトークンまでの流れを Keycloak で実際にたどりながら見ます
+chapter: sso
+order: 7
+status: published
+topics:
+  - MCP（Model Context Protocol）
+  - Protected Resource Metadata（RFC 9728）
+  - Resource Indicators（RFC 8707）
+  - token passthrough
+  - confused deputy
+  - Client ID Metadata Document
+  - ID-JAG / Cross App Access
+  - スコープの段階的な要求
+  - プロンプトインジェクションと認可
+requires:
+  - ll-188-workload-identity
+  - ll-181-token-verify
+  - ll-178-oauth
+  - ll-179-oidc
+  - ll-180-client-registration
+  - ll-182-authz-model
+---
+
+import Callout from '../../components/Callout.astro'
+
+## エージェントは、誰の権限で動くのか
+
+第 188 回では、人ではなく機械が自分の身元を示す方法を見ました。CI のジョブや Pod は、**自分自身の権限**でクラウドの API を呼んでいました。
+
+AI エージェントは、その中間にいます。チャットの画面で利用者が「先週の議事録を読んで、関係者の予定を押さえて」と頼むと、エージェントはファイルのサービスとカレンダーのサービスを呼びに行きます。動いているのはプログラムですが、読んでいるのは**利用者のファイル**で、押さえているのは**利用者の予定**です。つまりこれは第 178 回の委任、「この利用者の代わりに、この範囲のことだけを、しばらくの間だけ許す」の問題です。
+
+ただ、印刷サービスの例と違うところが 3 つあります。
+
+- **つなぐ先が事前に決まっていない**。利用者が設定画面で URL を貼れば、エージェントは初めて見るサーバにもつながる。クライアントとサーバの間に、事前の取り決めがない
+- **つなぐ先が多い**。1 つのエージェントが十数のサーバを使い、そのサーバがさらに別の API を呼ぶ
+- **指示を出しているのは、利用者だけではない**。エージェントは読んだ文書やツールの結果に書かれた文章にも影響される
+
+この回の問いは、**誰の権限で、どの範囲まで、どの宛先に対して動いてよいのか**です。MCP（Model Context Protocol）は、エージェントと外部のツールをつなぐための公開のプロトコルで、その認可仕様はこの問いに、**新しい仕組みを作らず、OAuth の既存の部品を選んで組み合わせる**形で答えています。どの部品が、どの問いに答えているのかを順に見ていきます。
+
+<Callout type="note" title="この回が読んだ仕様の版">
+  MCP の仕様は日付で版を区切っています。この回は、執筆時点（2026 年 10 月）で `specification/latest` が指している **2026-07-28 版**を読みました（[MCP: Authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)）。
+  認可の仕組みは版ごとに大きく動いています。2025-06-18 版で MCP サーバを OAuth のリソースサーバと位置づけ、RFC 8707 を必須にしました（[2025-06-18 Key Changes](https://modelcontextprotocol.io/specification/2025-06-18/changelog)）。2025-11-25 版で Client ID Metadata Document を推奨の登録方式に加え（[2025-11-25 Key Changes](https://modelcontextprotocol.io/specification/2025-11-25/changelog)）、2026-07-28 版で動的クライアント登録を非推奨にしました（[2026-07-28 Key Changes](https://modelcontextprotocol.io/specification/2026-07-28/changelog)）。
+  参照している OAuth 2.1 や Client ID Metadata Document もまだ IETF のドラフトです。実装するときは、相手がどの版に対応しているかを必ず確かめてください。
+</Callout>
+
+## 登場人物を OAuth に当てはめる
+
+MCP の仕様は、役割をそのまま OAuth に写しています（[MCP: Authorization, Roles](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#roles)）。
+
+| MCP の言葉 | OAuth の役割 | 例 |
+| --- | --- | --- |
+| 利用者 | リソースオーナ | チャットを使っている人 |
+| MCP クライアント（エージェントを動かすホストの中にある接続部品） | クライアント | チャットアプリ、AI 付きのエディタ |
+| MCP サーバ | リソースサーバ | ファイル、カレンダー、チケット管理などのツールを提供するサーバ |
+| 認可サーバ | 認可サーバ | 利用者を認証し、アクセストークンを発行する。MCP サーバと同居してもよいし、別でもよい |
+
+第 178 回の 4 人の表と同じ形です。**MCP サーバは認可サーバではなく、トークンを受け取って検証する側**です。仕様は認可サーバの作り方を範囲外としており、既存の IdP（第 185 回）をそのまま使えるようになっています。
+
+適用範囲にも注意が要ります。この認可の仕組みは**HTTP で動く MCP サーバ**のためのもので、手元のプロセスを標準入出力でつなぐ STDIO のサーバは「この仕様に従うべきではなく（SHOULD NOT）、認証情報は環境から取る」とされています（[Protocol Requirements](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#protocol-requirements)）。手元のサーバは利用者の権限でそのまま動くので、OAuth の出番がありません。
+
+## 最初の 401 から、トークンまで
+
+MCP クライアントが知っているのは、利用者が貼った **MCP サーバの URL だけ**です。そこから認可サーバを見つけ、自分を登録し、宛先を縛ったトークンを取るまでの流れは次のとおりです（[Authorization Flow Steps](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#authorization-flow-steps) を簡略化）。
+
+```
+ MCP クライアント                    MCP サーバ                       認可サーバ
+     │ ① トークンなしで要求              │                                 │
+     ├──────────────────────────────────→│                                 │
+     │ ② 401  WWW-Authenticate:          │                                 │
+     │    Bearer resource_metadata="…"   │                                 │
+     │←──────────────────────────────────┤                                 │
+     │ ③ Protected Resource Metadata     │                                 │
+     │    （RFC 9728）を取得             │                                 │
+     ├──────────────────────────────────→│                                 │
+     │    authorization_servers: [AS]    │                                 │
+     │←──────────────────────────────────┤                                 │
+     │ ④ 認可サーバのメタデータ（RFC 8414 / OIDC Discovery）               │
+     ├────────────────────────────────────────────────────────────────────→│
+     │ ⑤ クライアント登録（事前登録 / CIMD / 動的登録）                    │
+     │ ⑥ 認可コード + PKCE + resource=MCP サーバの URL                     │
+     ├────────────────────────────────────────────────────────────────────→│
+     │    aud が MCP サーバだけのアクセストークン                           │
+     │←────────────────────────────────────────────────────────────────────┤
+     │ ⑦ Authorization: Bearer …         │                                 │
+     ├──────────────────────────────────→│ aud が自分か確かめる            │
+```
+
+1 つずつ、どの部品かを見ます。
+
+**② 401 と `WWW-Authenticate`**。トークンを持たずに来た要求に、MCP サーバは 401 を返し、ヘッダの `resource_metadata` に自分のメタデータの URL を書きます（[RFC 9728 5.1](https://www.rfc-editor.org/rfc/rfc9728.html#section-5.1)）。MCP は、このヘッダか、決まった場所（`/.well-known/oauth-protected-resource`）のどちらかでメタデータを公開することを求め、クライアントには両方に対応することを求めています（[Authorization Server Discovery](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery)）。ヘッダには、この操作に要るスコープを `scope` で添えるべき（SHOULD）とされています。
+
+**③ Protected Resource Metadata**（[RFC 9728](https://www.rfc-editor.org/rfc/rfc9728.html)、2025 年 4 月）。リソースサーバが「自分は何者で、どの認可サーバのトークンを受け付けるか」を JSON で公開する仕様です。必須の項目は自分の識別子 `resource` だけで、`authorization_servers` に認可サーバの発行者（issuer）を並べます（[2](https://www.rfc-editor.org/rfc/rfc9728.html#section-2)）。第 179 回の Discovery が「認可サーバが自分を説明する文書」だったのに対し、これは**リソースサーバが自分を説明する文書**です。MCP サーバはこれを実装しなければなりません（MUST）。
+
+**④ 認可サーバのメタデータ**。発行者の URL から、RFC 8414 の `/.well-known/oauth-authorization-server` と OIDC の `/.well-known/openid-configuration` を、決まった順で試します。取れた文書の `issuer` が、URL を組み立てるのに使った発行者と完全に一致しなければ、使ってはいけません（[Authorization Server Metadata Discovery](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery#authorization-server-metadata-discovery)）。さらに `code_challenge_methods_supported` がなければ PKCE に対応していないとみなし、**先に進むことを拒まなければなりません**（[Security Considerations](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#authorization-code-protection)）。
+
+**⑤ クライアント登録**。次の節で見ます。
+
+**⑥ 認可コード + PKCE + `resource`**。流れそのものは第 178 回の認可コードフローです。足されているのは `resource` パラメータで、MCP クライアントは認可要求とトークン要求の**両方に**、使う MCP サーバの URL を入れなければなりません。認可サーバが対応しているかどうかに関係なく、常に送ります（[Resource Parameter Implementation](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#resource-parameter-implementation)）。2026-07-28 版からは、認可応答に入る `iss`（[RFC 9207](https://www.rfc-editor.org/rfc/rfc9207.html)）を、④ で記録した発行者と比べることも求められています。複数の認可サーバを相手にするクライアントが、ある認可サーバのコードを別の認可サーバに送ってしまう取り違え（mix-up）を防ぐためです。
+
+**⑦ 検証**。MCP サーバはトークンを第 181 回の手順で検証し、**自分宛てに発行されたものか**を確かめなければなりません（[Token Handling](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#token-handling)）。同じ節は「他のトークンを受け付けることも、通過させることもしてはならない（MUST NOT accept or transit）」と続きます。この一文が、後で見る token passthrough の禁止です。
+
+### クライアント登録: 事前の取り決めがないとき
+
+第 178 回の OAuth では、クライアントは認可サーバに**事前に登録**され、`client_id` をもらっていました。ところが MCP では、エージェントが初めて見るサーバにつながるのが普通です。事前に知り合いでない相手を受け入れる 2 つの方式、動的クライアント登録と Client ID Metadata Document（CIMD）の仕組みと弱さは、第 180 回で Keycloak を使って見ました。動的な登録は中身が自己申告で登録が溜まり続けること、CIMD は `client_id` を HTTPS の URL にして、その URL のドメインの持ち主が書いた文書を認可サーバが読みに行くことです。MCP は、事前登録を含めた 3 つの方式を次の優先順で使うよう勧めています（[Client Registration](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration)）。
+
+| 方式 | 2026-07-28 版での位置づけ |
+| --- | --- |
+| 事前登録 | 使えるなら最優先 |
+| CIMD | 推奨（SHOULD） |
+| 動的クライアント登録（[RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html)） | 非推奨。CIMD に対応していない認可サーバとの後方互換のために残す |
+
+CIMD の文書を受け取った認可サーバが確かめること（文書の `client_id` が URL と完全に一致すること、認可要求の `redirect_uri` が文書に載っていること）は、第 180 回で見た草案の決まりと同じで、MCP の仕様もそれを繰り返しています。MCP が参照している CIMD の草案は -00 で、執筆時点の最新は -02 です（[datatracker](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/)）。
+
+<Callout type="warn" title="誤解 1: CIMD なら、名乗ったアプリ本人だと分かる">
+  第 180 回で見たとおり、`redirect_uri` が `localhost` のような手元の URL だけのクライアントは、**同じ文書を指して手元で待ち受ける別のアプリ**と区別できません。
+  MCP はこの点について、認可サーバは `localhost` だけのリダイレクト先に追加の警告を出すべき（SHOULD）で、同意画面にリダイレクト先のホスト名をはっきり示さなければならない（MUST）としています（[Localhost Redirect URI Risks](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#localhost-redirect-uri-risks)）。
+  認可サーバがクライアントの指定した URL を取りに行くことが、第 188 回で見た SSRF の入口になる点も、同じページで挙げられています。
+</Callout>
+
+## 手元で確かめる 1: 401 から認可サーバを見つける
+
+ここからは Docker の中で確かめます。Keycloak 26.8.1 を開発用モードで起動し、ホストにはポートを公開せず、専用の Docker ネットワークの中だけで、Python 3.13 のコンテナから呼びます。Keycloak は MCP 向けの案内で、RFC 8707 の対応を**実験的な機能**として `--features=resource-indicators` で有効にすると説明しています（[Keycloak: Integrating with MCP](https://www.keycloak.org/securing-apps/mcp-authz-server)）。
+
+```
+$ docker network create ll-188-net
+$ docker run --rm -d --name ll-188-kc --network ll-188-net --network-alias kc \
+    -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+    quay.io/keycloak/keycloak:latest start-dev --hostname http://kc:8080 --features=resource-indicators
+... WARN  [org.keycloak.common.Profile] Experimental features enabled: resource-indicators:v1
+... Keycloak 26.8.1 on JVM (powered by Quarkus 3.40.1) started in 13.217s.
+$ docker run --rm -d --name ll-188-py --network ll-188-net \
+    --network-alias mcp --network-alias calendar --network-alias storage python:3.13-slim sleep infinity
+```
+
+管理 API で realm `agents` を作り、次のクライアントと利用者 `alice` を登録しました。
+
+| クライアント | 役 | 設定 |
+| --- | --- | --- |
+| `agent-host` | MCP クライアント（エージェントのホスト） | 公開クライアント、PKCE は `S256` 必須、任意のスコープ `files:read` と `calendar:read` |
+| `mcp-files` | ファイル用の MCP サーバ | 属性 `resource_url` = `http://mcp:8000/mcp` |
+| `mcp-calendar` | カレンダー用の MCP サーバ | 属性 `resource_url` = `http://calendar:8001/mcp` |
+| `storage-api` | ファイル用 MCP サーバの裏にある上流の API | 実験 3 で使う |
+
+MCP サーバ役は、Python の標準ライブラリと PyJWT 2.15 で書いた 100 行ほどの模型です。`/.well-known/oauth-protected-resource/mcp` でメタデータを返し、トークンのない要求には 401 を返し、トークンが来たら JWKS で署名を検証して、`aud` に自分の URL が入っているかを確かめます。JSON-RPC は `tools/list` と `tools/call` だけを真似ています。
+
+クライアント役のスクリプトは、MCP サーバの URL だけを受け取り、仕様の手順をそのままたどります。各段の応答を並べます。
+
+```
+$ POST http://mcp:8000/mcp                     （tools/list、トークンなし）
+  -> 401
+  WWW-Authenticate: Bearer resource_metadata="http://mcp:8000/.well-known/oauth-protected-resource/mcp",
+                    scope="files:read"
+
+$ GET http://mcp:8000/.well-known/oauth-protected-resource/mcp
+  -> 200
+  {"resource": "http://mcp:8000/mcp", "authorization_servers": ["http://kc:8080/realms/agents"],
+   "scopes_supported": ["files:read"], "bearer_methods_supported": ["header"]}
+
+$ GET http://kc:8080/.well-known/oauth-authorization-server/realms/agents
+  -> 200
+  issuer: "http://kc:8080/realms/agents"
+  authorization_endpoint: "http://kc:8080/realms/agents/protocol/openid-connect/auth"
+  token_endpoint: "http://kc:8080/realms/agents/protocol/openid-connect/token"
+  registration_endpoint: "http://kc:8080/realms/agents/clients-registrations/openid-connect"
+  code_challenge_methods_supported: ["plain", "S256"]
+  authorization_response_iss_parameter_supported: true
+  client_id_metadata_document_supported: (なし)
+```
+
+発行者 `http://kc:8080/realms/agents` はパスを含むので、MCP の決まりでは最初に `/.well-known/oauth-authorization-server` を**ホストの直後に差し込んだ** URL を試します。Keycloak はこの形で答えました。`client_id_metadata_document_supported` がないのは、CIMD の実験的な機能（`--features=cimd`）を有効にしていないからです。そこでクライアントは、優先順のとおり事前登録した `agent-host` を使います。
+
+```
+$ (ブラウザでログイン) -> 302 http://127.0.0.1:33418/callback?code=...&state=...&iss=http://kc:8080/realms/agents
+
+$ POST http://kc:8080/realms/agents/protocol/openid-connect/token
+  （grant_type=authorization_code, code_verifier=..., resource=http://mcp:8000/mcp）
+  -> 200
+  {"iss": "http://kc:8080/realms/agents", "sub": "1315f894-...", "aud": "http://mcp:8000/mcp",
+   "azp": "agent-host", "scope": "profile email files:read", "exp": 1792839139, "iat": 1792838839}
+
+$ POST http://mcp:8000/mcp                     （tools/list、Authorization: Bearer ...）
+  -> 200
+  {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "read_file", ...}]}}
+```
+
+ログイン画面はスクリプトがフォームを送って代わりに通しました。読み取れることは 3 つです。
+
+- 認可応答に `iss` が付いてきました。クライアントは、メタデータで記録した発行者と一致することを確かめてから、コードをトークンエンドポイントに送ります
+- アクセストークンの `aud` は、`resource` に渡した **MCP サーバの URL ただ 1 つ**です。`azp`（どのクライアントに出したか）は `agent-host` です
+- `exp - iat` は 300 秒で、Keycloak の既定のアクセストークンの寿命（5 分）です
+
+## 宛先を縛る: resource と aud
+
+第 181 回で、`aud` のないトークンや `aud` を並べたトークンは、**受け取った API が別の API に使い回せる**と見ました。MCP ではこの危険が大きくなります。エージェントは利用者が貼った任意の URL につながるので、**つなぐ先の MCP サーバの中に、悪意のあるものが混ざりうる**からです。
+
+RFC 9728 は、この筋書きをはっきり書いています。宛先を限定しないトークンを使っていると、悪意のあるリソースサーバ RS1 は `WWW-Authenticate` で、**正規のリソースサーバ RS2 のスコープ**のトークンをクライアントに取らせ、送られてきたトークンを RS2 で使い回せます。動的に設定されるクライアントではこれが起きやすくなるので、RFC 8707 による宛先の限定を推奨する、という説明です（[RFC 9728 7.4](https://www.rfc-editor.org/rfc/rfc9728.html#section-7.4)）。MCP はこれを受けて、クライアントには `resource` を、サーバには `aud` の確認を、どちらも必須にしています（[Token Audience Binding and Validation](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#token-audience-binding-and-validation)）。
+
+`resource` の値は、RFC 8707 の決まりで**絶対 URI で、フラグメントを含まない**ものです（[RFC 8707 2](https://www.rfc-editor.org/rfc/rfc8707.html#section-2)）。MCP はこれを MCP サーバの「正規の URI」と呼び、末尾のスラッシュは付けない形にそろえるよう勧めています（[Canonical Server URI](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#canonical-server-uri)）。サーバが `aud` と文字列で比べるので、表記の揺れはそのまま拒否につながります。
+
+### 手元で確かめる 2: 別の宛先のトークンは通らない
+
+同じスクリプトをカレンダー用の MCP サーバの URL で実行し、`aud` が `http://calendar:8001/mcp` のトークンも取りました。2 枚のトークンを、2 つのサーバに交差させて送ります。
+
+```
+mcp 向けのトークン      -> http://mcp:8000/mcp:      200 {"jsonrpc": "2.0", "id": 1, "result": {"tools": [...]}}
+mcp 向けのトークン      -> http://calendar:8001/mcp: 401
+    WWW-Authenticate: Bearer resource_metadata="http://calendar:8001/...", scope="calendar:read", error="invalid_token"
+    {"error": "invalid_token", "detail": "aud に http://calendar:8001/mcp がない"}
+calendar 向けのトークン -> http://mcp:8000/mcp:      401
+    {"error": "invalid_token", "detail": "aud に http://mcp:8000/mcp がない"}
+calendar 向けのトークン -> http://calendar:8001/mcp: 200 {"jsonrpc": "2.0", "id": 1, "result": {"tools": [...]}}
+```
+
+署名も発行者も期限も正しいトークンが、**宛先が違うだけで**拒否されました。カレンダーのサーバが悪意を持っていて、受け取ったトークンをファイルのサーバに持ち込んでも通りません。
+
+認可サーバの側の振る舞いも、`resource` の渡し方を変えて確かめました（スコープは `files:read calendar:read` を両方求めています）。
+
+```
+resource なし                        : 200 aud=['mcp-files', 'mcp-calendar', 'account']
+resource=http://mcp:8000/mcp         : 200 aud=http://mcp:8000/mcp  scope='profile email files:read calendar:read'
+resource=未登録の URL                : 400 {"error":"invalid_target","error_description":"The requested resource is invalid, missing, unknown, or malformed."}
+認可は mcp、トークン要求は calendar  : 400 {"error":"invalid_target","error_description":"The requested resource is not matching the original request."}
+```
+
+- `resource` を省くと、Audience マッパーで足した 2 つの MCP サーバと Keycloak 自身の `account` が `aud` に並びます。**どちらのサーバでも使えるトークン**です。MCP クライアントが `resource` を常に送らなければならない理由が、ここに出ています
+- 未登録の URL は `invalid_target`（[RFC 8707 2](https://www.rfc-editor.org/rfc/rfc8707.html#section-2) の誤りの符号）で拒否されました。この実験では、ログイン画面までは進み、トークン要求の段階で止まりました
+- 認可要求とトークン要求で `resource` を変えることはできません
+- 2 行目に注意してください。`aud` はファイルのサーバだけに絞られましたが、**スコープには `calendar:read` も残っています**。この設定の Keycloak は、スコープを宛先に合わせて絞りませんでした。宛先とスコープは別の軸で、どちらも絞る必要があります
+
+<Callout type="tip" title="クライアントの側も、メタデータを疑う">
+  宛先の確認はサーバだけの仕事ではありません。RFC 9728 は、`resource_metadata` で指された URL から取ったメタデータの `resource` が、**クライアントが実際に要求を送った URL と完全に一致しなければ使ってはならない**としています（[3.3](https://www.rfc-editor.org/rfc/rfc9728.html#section-3.3)）。
+  これを確かめるため、401 で**ファイル用サーバのメタデータを指す**だけの偽のサーバを `http://calendar:8002/mcp` に立てました。
+
+  ```
+  $ POST http://calendar:8002/mcp
+    -> 401  WWW-Authenticate: Bearer resource_metadata="http://mcp:8000/.well-known/oauth-protected-resource/mcp", scope="files:read"
+  $ GET http://mcp:8000/.well-known/oauth-protected-resource/mcp
+    -> 200  {"resource": "http://mcp:8000/mcp", ...}
+  AssertionError: RFC 9728 3.3: resource が要求した URL と一致しない
+  ```
+
+  この確認がなければ、クライアントはファイル用サーバ宛てのトークンを取り、それを偽のサーバに送っていたはずです。
+  なお、クライアントが `resource_metadata` などで指された URL を取りに行くこと自体が、悪意のある MCP サーバに内部のアドレスやクラウドのメタデータサービスを叩かせる SSRF の入口になります（[Security Best Practices: SSRF](https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices)）。
+</Callout>
+
+## token passthrough: 受け取ったトークンを上流へ流さない
+
+多くの MCP サーバは、自分でデータを持たず、既存の API の前に置かれた**中継**です。ファイル用の MCP サーバがストレージの API を呼ぶとき、手元にある利用者のトークンをそのまま上流に転送したくなります。MCP はこれを **token passthrough** と呼び、明示的に禁じています（[Security Best Practices: Token Passthrough](https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices)）。
+
+> If the MCP server makes requests to upstream APIs, it may act as an OAuth client to them. The access token used at the upstream API is a separate token, issued by the upstream authorization server. The MCP server MUST NOT pass through the token it received from the MCP client.
+> （[Access Token Privilege Restriction](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#access-token-privilege-restriction)）
+
+理由として仕様が挙げているのは、上流のレート制限や監視が「どの宛先のトークンか」に頼っているのに迂回されること、MCP サーバも上流も**誰が呼んだのかを区別できなくなる**こと、1 つのサービスが侵害されれば同じトークンで他のサービスにも届くこと、などです（同じページ）。
+
+### 手元で確かめる 3: 上流は何を見て受け入れてしまうか
+
+ファイル用の MCP サーバの `read_file` ツールに、受け取ったトークンをそのまま `http://storage:9000` へ転送する**悪い中継**を書きました。上流のストレージ API は、まず署名・`iss`・`exp` だけを見る作りにします。
+
+```
+MCP の tools/call read_file:      200 {"result": {"upstream": 200, "body": {"owner": "alice", "content": "Q3 の売上見込み ..."}}}
+同じトークンでストレージを直接:   200 {"owner": "alice", "content": "Q3 の売上見込み ..."}
+
+（ストレージ API のログ）
+[storage] 受理: sub=1315f894.. azp=agent-host aud=http://mcp:8000/mcp act=None path=/files/report.txt
+[storage] 受理: sub=1315f894.. azp=agent-host aud=http://mcp:8000/mcp act=None path=/files/report.txt
+```
+
+1 行目が MCP サーバ経由、2 行目が**エージェントが MCP サーバを飛ばしてストレージを直接呼んだ**場合です。上流のログは 2 行とも同じで、どちらが MCP サーバを通ったのかは分かりません。`azp` は `agent-host` のままで、実際に呼んできた MCP サーバはどこにも現れません。MCP サーバに置いたはずの入力の検査や記録は、2 行目では最初から通っていません。そして `aud=http://mcp:8000/mcp` という「このトークンはストレージ宛てではない」という印は、上流が見ていないので何の意味もありませんでした。
+
+上流が `aud` を確かめるように直すと、悪い中継も、直接の呼び出しも、どちらも止まります。
+
+```
+MCP の tools/call read_file:      200 {"result": {"upstream": 401, "body": {"error": "invalid_token", "detail": "Audience doesn't match"}}}
+同じトークンでストレージを直接:   401 {"error": "invalid_token", "detail": "Audience doesn't match"}
+```
+
+では、正しい中継はどうするか。MCP の仕様は「MCP サーバは上流に対して OAuth クライアントとして振る舞い、**上流用の別のトークン**を使う」とだけ書いています。手段の 1 つが第 181 回のトークン交換（[RFC 8693](https://www.rfc-editor.org/rfc/rfc8693.html)）です。Keycloak の標準のトークン交換で、MCP サーバが受け取ったトークンを `subject_token` にし、`audience=storage-api` を求めるように書き換えました。
+
+```
+[mcp] 交換後: {'sub': '1315f894-...', 'aud': 'storage-api', 'azp': 'http://mcp:8000/mcp',
+               'scope': 'profile email', 'act': None}  寿命 300  issued_token_type ...:access_token
+[storage] 受理: sub=1315f894.. azp=http://mcp:8000/mcp aud=storage-api act=None path=/files/report.txt
+[storage] 拒否: Audience doesn't match              ← 元のトークンでの直接の呼び出し
+```
+
+交換後のトークンは、利用者（`sub`）はそのままで、`aud` がストレージ API、`azp` が **MCP サーバ自身**になりました。上流のログに「MCP サーバが、alice のために呼んだ」と残ります。元のトークンで直接ストレージを呼ぶ道は閉じたままです。`files:read` のスコープは引き継がれず、交換後のトークンには入りませんでした。
+
+この形にするまでに、Keycloak 側で 2 つの設定が要りました。
+
+- 最初は `Client is not within the token audience` で拒否されました。Keycloak の標準のトークン交換は、**交換を求めたクライアントが元のトークンの `aud` に含まれていること**を条件にします。ところが `resource` で取ったトークンの `aud` は URL `http://mcp:8000/mcp` で、MCP サーバのクライアント ID `mcp-files` とは別の文字列です。そこで MCP サーバのクライアント ID を、`resource_url` と同じ **URL そのもの**に付け替えました
+- 次に `Requested audience not available: storage-api` で拒否されました。MCP サーバのクライアントに、`storage-api` を対象にする Audience マッパーを足して通りました。**どのクライアントがどの上流への交換を許されるか**を、認可サーバの側の設定で決めていることになります
+
+`act` クレームは、この版の Keycloak の出力には入りませんでした。第 181 回の模型では `act` で「実際に動いているのは誰か」を表しましたが、ここでは `azp` がその役を担っています。
+
+<Callout type="warn" title="誤解 2: 上流が aud を見ないなら、中継が丁寧に検証すれば同じこと">
+  中継の MCP サーバがどれほど丁寧に検証しても、上流が `aud` を見ない限り、**同じトークンを持つ者は中継を飛ばして上流を直接呼べます**。実験の 2 行目がそれです。
+  宛先の限定は、トークンを受け取る**すべての**サーバが確かめて初めて効きます。第 181 回の DPoP で「縛りが効くのは、受け取る側が確かめたときだけ」と見たのと同じ構図です。
+</Callout>
+
+## confused deputy: 静的な client_id を共有する中継
+
+中継型の MCP サーバには、もう 1 つ特有の穴があります。MCP の仕様が **confused deputy**（混乱した代理人）と呼んでいるものです（[Security Best Practices: Confused Deputy Problem](https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices)）。
+
+前提はこうです。MCP サーバ（以下、中継）は、上流のサービスの認可サーバに対して**1 つの固定の `client_id`** で登録されています。上流の認可サーバが動的登録に対応していないので、どの MCP クライアントから来た利用者も、上流から見れば同じ「中継」というクライアントです。一方で中継自身は、MCP クライアントに対しては認可サーバとして振る舞い、動的登録で `client_id` を配っています。
+
+```
+ 利用者のブラウザ          中継（MCP サーバ兼、MCP クライアント向けの認可サーバ）     上流の認可サーバ
+       │                                     │                                         │
+ 1回目 │ 正規の MCP クライアントで接続 ───────→│── client_id=中継（固定）で認可要求 ────→│
+       │                                     │                       同意画面 → 承認   │
+       │←──────────── 「中継には同意済み」の Cookie ───────────────────────────────────┤
+                                                                                       │
+ 後日  │ 攻撃者が動的登録したクライアントの、│                                         │
+       │ redirect_uri=攻撃者のサイト の      │                                         │
+       │ 認可リンクを踏まされる ────────────→│── client_id=中継（同じ）で認可要求 ────→│
+       │                                     │                 Cookie があるので       │
+       │                                     │                 同意画面を出さない      │
+       │                                     │←────── 上流の認可コード ────────────────┤
+       │                                     │ 上流のトークンを取得                    │
+       │←── 中継の認可コードを攻撃者の redirect_uri へ ─────────── 攻撃者が引き換える
+```
+
+上流の認可サーバは「中継というクライアントに、この利用者は同意済み」としか覚えていません。その中継の後ろに**どの MCP クライアントがいるのか**は見えないので、攻撃者の作ったクライアントの要求も、同じ同意で通ってしまいます。中継は、上流の同意を、自分が配った別のクライアントのために使わされた代理人です。
+
+仕様の対策は、中継が**MCP クライアントごとの同意を、上流へ送る前に自分で取る**ことです（同じページ、[Confused Deputy Problem](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#confused-deputy-problem)）。
+
+- 利用者ごとに、承認した `client_id` の一覧を中継の側に持ち、上流の認可を始める**前に**確かめる
+- 中継の同意画面には、要求しているクライアントの名前、上流のスコープ、**トークンが送られる `redirect_uri`** を示す。iframe への埋め込みを禁じ、CSRF の対策をする
+- 同意の Cookie は `__Host-` 接頭辞、`Secure`、`HttpOnly`、`SameSite=Lax` で、署名し、**特定の `client_id` に結びつける**（「この利用者は同意済み」だけにしない）
+- `state` は同意が承認された**後で**保存し、1 回限り、短い期限で使う
+
+最後の Cookie の条件は、第 176 回の Cookie の属性そのものです。confused deputy の根は、**同意の記録が「誰に対する同意か」を十分に区別していない**ことにあります。
+
+## 同意の数が爆発する: 企業 IdP がまとめて許可する
+
+ここまでの仕組みを会社で使うと、別の問題が出てきます。社員 1,000 人が、3 種類のエージェントから、20 の社内向け MCP サーバを使うとします。利用者は、エージェントと MCP サーバの組ごとに認可の画面を通り、同意します。しかも、その同意はエージェントと MCP サーバの間で直接行われるので、**会社の IdP からは見えません**。誰がどのエージェントにどのデータへの権限を渡したのかを、管理者は把握できません。
+
+社員は、エージェントにも MCP サーバにも、すでに会社の IdP で SSO しています（第 183 回、第 185 回）。この**既存の信頼関係を使って、IdP に橋渡しをさせる**のが、IETF で議論されている Identity Assertion JWT Authorization Grant（ID-JAG）です。ドラフトは自身を Cross-App Access（XAA）とも呼んでいます（[draft-ietf-oauth-identity-assertion-authz-grant-04](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.html)）。
+
+<Callout type="note" title="まだドラフトの段階">
+  ID-JAG は、執筆時点で OAuth 作業部会の文書（Working Group Document）の -04（2026 年 5 月 21 日）で、RFC ではありません。土台の Identity Chaining Across Trust Domains は RFC 編集者の待ち行列に入っています（[datatracker](https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-assertion-authz-grant/)、[identity-chaining](https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-chaining/)）。
+  MCP では、本体の仕様ではなく**認可の拡張**「Enterprise-Managed Authorization」として、この方式の使い方が決められています。拡張は任意で、採用するかは実装が選びます（[MCP ext-auth: Enterprise-Managed Authorization](https://github.com/modelcontextprotocol/ext-auth/blob/main/specification/stable/enterprise-managed-authorization/2026-07-28/enterprise-managed-authorization.mdx)）。細部は今後も変わりうるので、ここでは骨格だけを見ます。
+</Callout>
+
+骨格は、既存の 2 つの RFC の組み合わせです（拡張の 2 節）。
+
+```
+ エージェント（MCP クライアント）          企業の IdP                 MCP サーバの認可サーバ
+       │ ① SSO でログイン → ID トークン        │                               │
+       │←─────────────────────────────────────┤                               │
+       │ ② トークン交換（RFC 8693）            │                               │
+       │   subject_token = ID トークン         │                               │
+       │   requested_token_type = ...:id-jag   │                               │
+       │   audience = MCP サーバの認可サーバ    │                               │
+       │   resource = MCP サーバ               │                               │
+       ├─────────────────────────────────────→│ 管理者のポリシーを評価         │
+       │   ID-JAG（宛先限定の署名付き JWT）     │                               │
+       │←─────────────────────────────────────┤                               │
+       │ ③ JWT による認可グラント（RFC 7523）                                   │
+       │   grant_type = ...:jwt-bearer, assertion = ID-JAG                      │
+       ├──────────────────────────────────────────────────────────────────────→│
+       │   aud が MCP サーバのアクセストークン   │                 ID-JAG を検証 │
+       │←──────────────────────────────────────────────────────────────────────┤
+```
+
+ID-JAG の中身は ID トークンに似ていますが、**宛先が違います**。ID トークンの `aud` はエージェント（RP）でした（第 179 回）。ID-JAG の `aud` は **MCP サーバの認可サーバの発行者**で、`resource` に MCP サーバ、`client_id` にその認可サーバでのエージェントのクライアント ID が入ります（[3.1](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.html#section-3.1)）。拡張の例では、ID-JAG の応答の `expires_in` は 300 秒です。
+
+それぞれが確かめることは、次のとおりです。
+
+| 誰が | 何を確かめるか | 出典 |
+| --- | --- | --- |
+| IdP（② で） | 差し出された ID トークンの `aud` が、交換を求めたクライアントであること。そのうえで、管理者のポリシーで、このクライアントがこの利用者の代わりにこの宛先・スコープへ動いてよいかを決める。許すスコープは求めたものより狭くてよい | [4.3.3](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.html#section-4.3.3) |
+| MCP サーバの認可サーバ（③ で） | `typ` が `oauth-id-jag+jwt`。`aud` が**自分の発行者ただ 1 つ**。`client_id` が、この要求でクライアント認証した相手と一致する。そのうえで自分のポリシーで、発行するスコープを決める（さらに狭くてよい） | [4.4.1](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.html#section-4.4.1) |
+| 発行されたアクセストークン | MCP の拡張では、ID-JAG の `resource` にある MCP サーバに宛先を限定しなければならない | 拡張 5.1 |
+
+この方式では、**利用者が同意画面を見る段がありません**。ドラフトは ID-JAG を「認可サーバでの利用者の直接の承認なしに、委任されたアクセスを与える」ものと説明しています（[3](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.html#section-3)）。同意の代わりを務めるのは、**IdP の管理者が書いたポリシー**です。拡張の例では「エンジニアリング部門は、AI 付きのエディタからソースコード管理の MCP サーバに読み取りだけ」のような決め方を挙げています（7.2）。第 182 回で判定（PDP）を 1 か所に集めた考え方を、会社全体の委任に広げたものと言えます。
+
+ただし、見えなくなるものもあります。
+
+- IdP が見ているのは**トークンを発行する場面だけ**で、エージェントと MCP サーバの間の実際のやり取りは見えません（拡張 7.2）
+- ドラフトは、この方式を**機密クライアントだけ**に使うべき（SHOULD）とし、公開クライアントは従来どおり利用者の同意を挟む認可コードフローを使うよう勧めています（[9.1](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.html#section-9.1)）。秘密を持てないクライアントに、同意なしの発行を許したくないからです
+- 1 枚の ID-JAG を、別の宛先の認可サーバに使い回してはなりません。次の段には新しい ID-JAG を出すか、別の手段を使います（[9.3](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.html#section-9.3)）
+
+## 範囲を絞る: スコープ、寿命、ステップアップ
+
+宛先を縛っても、その宛先の中で何ができるかは別の問題です。MCP の仕様と Security Best Practices は、次の道具を組み合わせるよう求めています。
+
+**スコープを最初から全部取らない**。`scopes_supported` は「基本の機能に要る最小限のスコープ」を表すものとされ、追加のスコープは、必要になった操作のときに求めます（[Scope Selection Strategy](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#scope-selection-strategy)）。Best Practices は、`files:*` や `admin:*` のような広いスコープを最初にまとめて取ったトークンが漏れると、関係のないツールまで使われ、取り消せば全部の作業が止まる、と書いています。よくある誤りとして、全スコープを `scopes_supported` に並べること、`*` や `full-access` のようなまとめたスコープを作ること、**トークンにスコープがあるだけで十分とみなし、サーバの側の認可の判定を省くこと**を挙げています（[Scope Minimization](https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices)）。最後の 1 つは第 182 回の「スコープと権限は別の軸」そのものです。
+
+**足りなくなったら、その場で求める**。実行中にスコープが足りなければ、MCP サーバは 403 と次のヘッダを返すべき（SHOULD）です（[Scope Challenge Handling](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#scope-challenge-handling) の例）。
+
+```
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope",
+                         scope="files:write",
+                         resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource",
+                         error_description="File write permission required for this operation"
+```
+
+クライアントは、**これまで求めたスコープと、新しく求められたスコープの和**で認可をやり直します。和にしないと、書き込みの権限を取った代わりに読み取りの権限を失います。サーバはスコープを 1 つずつ小出しにせず、その操作に要るものを 1 回で示すべきとされています（同じ節）。第 181 回で見た `insufficient_user_authentication`（[RFC 9470](https://www.rfc-editor.org/rfc/rfc9470.html)）が「認証の強さが足りない」ときのステップアップだったのに対し、これは**スコープが足りない**ときのステップアップです。
+
+**寿命を短くする**。認可サーバは、漏れたときの被害を小さくするため短命なアクセストークンを出すべきで（SHOULD）、公開クライアントのリフレッシュトークンはローテーションしなければなりません（MUST）（[Token Theft](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#token-theft)）。
+
+**セッション ID や手元の識別子を、認証とみなさない**。2025-11-25 版までの HTTP の通信には、サーバが配る `Mcp-Session-Id` がありました。Best Practices は、これを盗むか推測した者が利用者になりすます**セッションの乗っ取り**を挙げ、「認可を実装する MCP サーバはすべての要求を検証しなければならない。セッションを認証に使ってはならない」としていました（[2025-11-25 版: Session Hijacking](https://modelcontextprotocol.io/docs/2025-11-25/tutorials/security/security_best_practices)）。2026-07-28 版でプロトコルのセッションは廃止され、サーバが状態を持つときは、カートの ID のような識別子をツールの引数で受け渡す形になりました（[2026-07-28 Key Changes](https://modelcontextprotocol.io/specification/2026-07-28/changelog)）。それに合わせて同じ節は「状態の識別子の乗っ取り」に書き換えられ、識別子を持っていることを認証とみなさず、**検証したトークンの利用者に結びつけて**保存するよう求めています（[State Handle Hijacking](https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices)）。形は変わっても、第 182 回の BOLA と同じ「識別子を知っていることは、権限があることではない」という原則です。
+
+**記録を残す**。MCP のツールの仕様は、クライアントに監査のためツールの使用を記録するよう勧めており（[Tools: Security Considerations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)）、Best Practices はサーバにスコープの昇格（何を求め、何が認められたか）を相関 ID 付きで記録するよう勧めています。実験 3 のトークン交換で、上流のログに `azp` として MCP サーバが残ったのも、この記録の一部です。
+
+## 認可が効くところ、効かないところ
+
+最後に、エージェントに固有の危険を考えます。エージェントは、読んだメールや Web ページやツールの結果に書かれた文章に影響されます。「このファイルを読んだら、中身を次の宛先に送れ」という文がファイルの中に仕込まれていれば（プロンプトインジェクション）、エージェントは利用者が頼んでいない操作を、**利用者から委任された正規のトークンで**実行するかもしれません。
+
+ここで、ここまでの仕組みが何を保証していたかを思い出します。
+
+| 仕組み | プロンプトインジェクションに対して |
+| --- | --- |
+| `aud` と `resource` | **効く**。トークンは宛先のサーバでしか使えない。悪意のある MCP サーバが受け取ったトークンを他のサーバへ持ち込むことは防げる |
+| スコープの最小化と段階的な要求 | **被害の範囲を限る**。読み取りだけのトークンでは書き込めない。昇格には利用者の操作が挟まる |
+| 短い寿命 | **被害の時間を限る** |
+| 監査ログ | 起きたことを**後から**たどれる |
+| これらすべて | **効かない**: 許された範囲の中の、正規のトークンによる正規の呼び出しが、利用者の意図に沿っているかどうか |
+
+最後の行が要点です。リソースサーバから見れば、注入された指示による `read_file` も、利用者の頼んだ `read_file` も、同じトークンの同じ要求です。**認可は「この者が、この範囲で動いてよいか」には答えますが、「この呼び出しは、委任した人が望んだものか」には答えません**。OWASP は LLM アプリケーションの危険の 1 つに Excessive Agency を挙げ、その原因を過剰な機能、過剰な権限、過剰な自律性の 3 つに分けています。対策として、操作を利用者の文脈で最小の権限で実行すること、影響の大きい操作の前に人の承認を求めることを挙げています（[OWASP LLM06:2025 Excessive Agency](https://genai.owasp.org/llmrisk/llm062025-excessive-agency/)）。認可が減らせるのは、このうち「過剰な権限」だけです。
+
+MCP の仕様自身も、この境界を認めています。プロトコルの水準ではこれらの原則を強制できないとしたうえで、ホストは**ツールを呼ぶ前に利用者の明示的な同意を得なければならない**こと、ツールの説明は信頼できるサーバから得たものでなければ信用しないことを原則に挙げています（[Specification: Security and Trust & Safety](https://modelcontextprotocol.io/specification/2026-07-28)）。ツールの仕様は、ツールの呼び出しを拒めるよう**常に人が介在すべき**（SHOULD）とし、呼び出す前にツールへの入力を利用者に見せて、意図しないデータの持ち出しを防ぐよう勧めています（[Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)）。
+
+<Callout type="warn" title="誤解 3: OAuth で正しく認可すれば、エージェントは安全になる">
+  OAuth が決めるのは、**委任の上限**です。上限の内側でエージェントが何をするかは、エージェントの判断と、それを止められる人の確認に任されています。
+  たとえば「メールを読む」と「外部へ送る」の両方のスコープを持ち、信頼できない文書を読むエージェントは、トークンが完全に正しくても、読んだ内容を外へ出せます。
+  防ぎ方は、その組み合わせを 1 つのエージェントに持たせないこと、送信のような影響の大きい操作の前に人の確認を挟むこと、そして記録を残すことです。認可はそれらの土台であって、代わりではありません。
+</Callout>
+
+## どの部品と組み合わさっているか
+
+| 問い | 答えている部品 | 前の回 |
+| --- | --- | --- |
+| どの認可サーバに聞けばよいか | 401 の `WWW-Authenticate` と Protected Resource Metadata（RFC 9728） | 第 181 回（リソースサーバ） |
+| 認可サーバの窓口はどこか、PKCE に対応しているか | 認可サーバのメタデータ（RFC 8414、OIDC Discovery）、`issuer` の一致 | 第 179 回 |
+| 初めて会うクライアントは何者か | 事前登録、CIMD（HTTPS の URL を `client_id` にする）、動的登録（非推奨） | 第 178 回、第 180 回 |
+| 誰の代わりに動くか | 認可コード + PKCE + `state`、応答の `iss` | 第 178 回 |
+| どの宛先で使えるか | `resource`（RFC 8707）と `aud` の確認。メタデータの `resource` の一致 | 第 177 回、第 181 回 |
+| 上流を呼ぶときは | token passthrough の禁止。トークン交換（RFC 8693）か別の認可 | 第 181 回 |
+| 中継の同意が使い回されないか | MCP クライアントごとの同意、`client_id` に結びつけた Cookie | 第 176 回 |
+| 会社全体でまとめて許可するには | ID-JAG（RFC 8693 + RFC 7523、ドラフト）、IdP のポリシー | 第 179 回、第 183 回 |
+| どこまでしてよいか | スコープの最小化、`insufficient_scope` での段階的な要求、短い寿命、サーバ側の認可判定 | 第 181 回、第 182 回 |
+| 利用者の意図どおりか | **OAuth は答えない**。人の確認、操作の組み合わせの制限、監査ログ | 第 182 回 |
+
+MCP の認可仕様は、新しい暗号も新しいトークンも作っていません。**最初は何も知らないクライアントが、URL 1 つから安全に委任を受けられるように**、既存の部品を順番に並べ、どれを省いてはならないかを MUST で固めた文書です。
+
+## まとめ
+
+- MCP クライアントは OAuth のクライアント、MCP サーバはリソースサーバ、認可サーバは別に立ててよい。仕様の対象は HTTP のサーバで、STDIO のサーバは環境から認証情報を取る。この回は 2026-07-28 版を読んだ
+- 流れは、401 の `resource_metadata` → Protected Resource Metadata（RFC 9728）→ 認可サーバのメタデータ（`issuer` の一致と PKCE 対応の確認）→ クライアント登録 → 認可コード + PKCE + `resource` → 応答の `iss` の確認 → `aud` を限ったトークン
+- 登録は、事前登録、CIMD、動的登録の順。CIMD は `client_id` をドメインに結びつけるが、`localhost` のなりすましと SSRF には別の備えが要る。動的登録は 2026-07-28 版で非推奨になった
+- Keycloak 26.8.1（`resource-indicators` は実験的機能）で、`resource` を送ると `aud` が MCP サーバの URL 1 つになり、別の宛先のトークンは模型のサーバで拒否された。`resource` を省くと `aud` に 3 つが並んだ。スコープは宛先に合わせて絞られなかった
+- token passthrough は禁止。上流が `aud` を見なければ、中継を通った呼び出しと直接の呼び出しをログで区別できず、`azp` にも中継は現れなかった。トークン交換で作り直すと、`aud` が上流、`azp` が MCP サーバになった
+- confused deputy は、固定の `client_id` で上流に登録した中継が、上流の同意 Cookie を別のクライアントのために使わされる問題。中継が MCP クライアントごとの同意を先に取る
+- ID-JAG は、SSO 済みの ID トークンを IdP で宛先限定の JWT に交換し（RFC 8693）、それを MCP サーバの認可サーバでアクセストークンに換える（RFC 7523）。同意の代わりに IdP のポリシーが判断する。まだドラフトで、MCP では任意の拡張
+- スコープは最小から始めて、`insufficient_scope` で和を取って求め直す。寿命は短く、セッション ID や状態の識別子は認証とみなさない
+- 認可が決めるのは委任の上限で、上限の内側の呼び出しが利用者の意図どおりかには答えない。プロンプトインジェクションには、人の確認、影響の大きい操作の組み合わせを避けること、監査ログで備える
+
+ここまでで、人、機械、そして人の代わりに動くエージェントへの権限の渡し方が揃いました。次の第 190 回では、これらの部品を組み合わせた構成の型を並べ、それぞれで**どの部品が何を保証し、どこが弱いのか**を読み直します。

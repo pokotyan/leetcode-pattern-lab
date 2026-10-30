@@ -20,7 +20,7 @@ requires:
   - ll-136-cors
   - ll-140-security-headers
   - ll-159-tls-ops
-  - ll-175-session-cookie
+  - ll-176-session-cookie
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -396,7 +396,7 @@ https://www.google.com/
 | ログインした利用者ごとのページ | `private` または `no-store` | **ヘッダを無視して全部キャッシュする規則を作らない** |
 | 認証付きの API（`Authorization`） | `private` または `no-store` | 規則（RFC 9111 3.5）を守らない実装がある。nginx なら `proxy_no_cache` を設定する |
 | `Access-Control-Allow-Origin` を要求で変える API | `Vary: Origin`（第 136 回） | キーに `Origin` を含めるか確かめる |
-| トークン、パスワードのリセットなど | `no-store`（OAuth のトークンの応答は RFC 6749 の要求、第 177 回） | — |
+| トークン、パスワードのリセットなど | `no-store`（OAuth のトークンの応答は RFC 6749 の要求、第 178 回） | — |
 | プロキシの後ろでホスト名を使ってリンクを作るページ | 独自のヘッダの値を信用しない | `X-Forwarded-Host` などは手前で上書きする |
 
 ## 実装ごとの違い

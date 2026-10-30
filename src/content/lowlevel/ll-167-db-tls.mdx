@@ -216,7 +216,7 @@ C->S plaintext: X....
 psql: error: ... server does not support SSL, but SSL was required
 ```
 
-これは第 163 回の STARTTLS の除去と同じ構図で、第 196 回で見たメールの日和見の暗号化とも同じ弱さです。ただし、メールの中継には「TLS を話せない相手にも届けなければならない」という事情がありました。**データベースの接続には、そういう事情はほとんどありません**。接続先は自分たちで管理しているサーバだからです。
+これは第 163 回の STARTTLS の除去と同じ構図で、第 197 回で見たメールの日和見の暗号化とも同じ弱さです。ただし、メールの中継には「TLS を話せない相手にも届けなければならない」という事情がありました。**データベースの接続には、そういう事情はほとんどありません**。接続先は自分たちで管理しているサーバだからです。
 
 ### パスワードは漏れていないが、なりすましは通った
 
@@ -257,7 +257,7 @@ $ tshark -r direct.pcap -Y "tcp.len>0 && tcp.dstport==5432" -T fields -e tcp.str
 0	1573	16030106200100061c0303cb4d754711439f2dc2103f95e14c277a78f9735ce948af9f3d2...
 ```
 
-ALPN（第 158 回）は、直接の TLS では**必須**です。プロトコルの文書は、プロトコルの取り違え（protocol confusion）の攻撃を防ぐために ALPN を使うことをクライアントに求め、IANA に登録された `postgresql` という名前を指定しています（[PostgreSQL: 54.2.10](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SSL)）。取り違えの攻撃は第 171 回の ALPACA で詳しく見ます。`openssl s_client` で ALPN を付けずに直接つなぐと、TLS のハンドシェイク自体は終わりますが、サーバは次のログを残して接続を閉じました。
+ALPN（第 158 回）は、直接の TLS では**必須**です。プロトコルの文書は、プロトコルの取り違え（protocol confusion）の攻撃を防ぐために ALPN を使うことをクライアントに求め、IANA に登録された `postgresql` という名前を指定しています（[PostgreSQL: 54.2.10](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SSL)）。取り違えの攻撃は第 172 回の ALPACA で詳しく見ます。`openssl s_client` で ALPN を付けずに直接つなぐと、TLS のハンドシェイク自体は終わりますが、サーバは次のログを残して接続を閉じました。
 
 ```
 LOG:  received direct SSL connection request without ALPN protocol negotiation extension

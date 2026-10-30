@@ -281,7 +281,7 @@ IMS の仕様 [TS 23.228](https://www.etsi.org/deliver/etsi_ts/123200_123299/123
 
 SMS の仕様 [TS 23.040](https://www.etsi.org/deliver/etsi_ts/123000_123099/123040/19.00.00_60/ts_123040v190000p.pdf)（V19.0.0）は、SMS の要となる SC（Service Centre。一般には SMSC と呼ばれます）を「function responsible for the relaying and store-and-forwarding of a short message between an SME and an MS」（SMS を送る側と端末のあいだで、短いメッセージを中継し、いったん蓄えてから送り出す機能）と定義しています。宛先の端末が圏外にいれば、SMSC が預かったまま、届けられるようになるのを待ちます。1 通の大きさは「up to 140 octets」（最大 140 オクテット）で、7 ビットの文字なら 140 × 8 ÷ 7 = 160 文字になります。長い文は、複数の SMS に分けて送り、端末の側でつなぎ直します。
 
-SMSC は宛先の端末に届けるために、まず加入者のデータベース（2G/3G の HLR、4G の HSS、5G の UDM）に「この加入者は今どこの配下にいるか」を問い合わせます。この問い合わせの答えを書き換えられると SMS が攻撃者に届いてしまうことは、第 174 回で見ました。
+SMSC は宛先の端末に届けるために、まず加入者のデータベース（2G/3G の HLR、4G の HSS、5G の UDM）に「この加入者は今どこの配下にいるか」を問い合わせます。この問い合わせの答えを書き換えられると SMS が攻撃者に届いてしまうことは、第 175 回で見ました。
 
 ### 世代ごとの通り道
 
@@ -305,7 +305,7 @@ SIM カードは、契約を変えるたびに差し替える物理的な部品�
 書き込まれる単位は**プロファイル**と呼ばれ、同じ文書は「combination of a file structure, data and applications to be provisioned onto, or present on, an eUICC」（eUICC に書き込まれる、ファイルの構造とデータとアプリケーションの組み合わせ）と定義しています。この回で見た加入者番号や鍵 K、ホームの網の公開鍵は、このプロファイルの中身です。プロファイルを届ける経路について、同じ文書は「There shall be an additional secure mechanism providing the capability for authorization, authentication, integrity and confidentiality for the loading and installation of Profiles」（プロファイルの読み込みと導入のために、認可、認証、完全性、秘匿性を提供する追加の安全な仕組みがなければならない）を要件に挙げています（REQ-12-EU-04-03）。消費者向けの端末の具体的な方式は、業界団体 GSMA の SGP.22 などの仕様が定めています（GSMA の文書は執筆時点で取得できなかったため、この回では中身を確かめていません）。
 
 <Callout type="note" title="SIM が変わったことは、外からは見えにくい">
-  プロファイルを別の端末に移す手続きは、事業者の本人確認に依存します。物理的な SIM カードの差し替えと同じく、その確認を突破されれば、電話番号は攻撃者の端末に移ります。第 174 回の SIM スワップは、eSIM でも同じように起こります。
+  プロファイルを別の端末に移す手続きは、事業者の本人確認に依存します。物理的な SIM カードの差し替えと同じく、その確認を突破されれば、電話番号は攻撃者の端末に移ります。第 175 回の SIM スワップは、eSIM でも同じように起こります。
 </Callout>
 
 ## まとめ

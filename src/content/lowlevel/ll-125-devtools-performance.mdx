@@ -35,9 +35,9 @@ import DevtoolsFlameChart from '../../components/sim/problems/DevtoolsFlameChart
 
 ## パネルが記録しているもの
 
-最初に、パネルが何を材料にしているのかを確認しておきます。第 238 回で、CPU プロファイラが持っているのは「一定間隔で覗いたスタックの束」だと書きました。Performance パネルの記録は、それより少し豊かです。
+最初に、パネルが何を材料にしているのかを確認しておきます。第 239 回で、CPU プロファイラが持っているのは「一定間隔で覗いたスタックの束」だと書きました。Performance パネルの記録は、それより少し豊かです。
 
-- **トレースイベント**: ブラウザのコードに埋め込まれた計測点が、「ここからここまでスタイルを再計算した」「ここからここまでレイアウトした」と、開始と終了の時刻を記録したもの。第 238 回の言葉でいえば**計装**です
+- **トレースイベント**: ブラウザのコードに埋め込まれた計測点が、「ここからここまでスタイルを再計算した」「ここからここまでレイアウトした」と、開始と終了の時刻を記録したもの。第 239 回の言葉でいえば**計装**です
 - **JavaScript の標本**: V8 の CPU プロファイラが、一定間隔で JavaScript のスタックを覗いたもの。こちらは**サンプリング**です
 
 パネルは、この 2 つを 1 本の時間軸に重ねて描きます。`Layout` や `Paint` のようなブラウザの処理は正確な開始と終了を持ち、その間に挟まる自分の関数（`relayout` など）の幅は標本から推定したもの、という混成になっています。
@@ -123,11 +123,11 @@ Interactions トラックは、INP の目安を超えた操作に印を付けま
 
 ### 横は時刻、上が原因
 
-Main トラックは、第 238 回の言葉でいう**フレームチャート**です。文書の説明はこうです。
+Main トラックは、第 239 回の言葉でいう**フレームチャート**です。文書の説明はこうです。
 
 > The Performance panel represents main thread activity in a flame chart. The x-axis represents the recording over time. The y-axis represents the call stack. The events on top cause the events below.
 
-第 238 回のフレームグラフ（Brendan Gregg の形式）と、上下が逆になっている点に注意してください。フレームグラフは根を下に置いて上へ積みますが、DevTools は**根を上に置いて下へ垂らします**。いちばん上の灰色の帯が **Task** で、イベントループが 1 回に取り出した仕事（第 122 回）です。その下に、そのタスクの中で何が起きたかが積まれます。
+第 239 回のフレームグラフ（Brendan Gregg の形式）と、上下が逆になっている点に注意してください。フレームグラフは根を下に置いて上へ積みますが、DevTools は**根を上に置いて下へ垂らします**。いちばん上の灰色の帯が **Task** で、イベントループが 1 回に取り出した仕事（第 122 回）です。その下に、そのタスクの中で何が起きたかが積まれます。
 
 色にも決まりがあります。文書は、スクリプトごとの色は見分けるための乱数だと断ったうえで、「The darker yellow represents scripting activity, and the purple event represents rendering activity. These darker yellow and purple events are consistent across all recordings.」と書いています。黄色が JavaScript、紫がスタイルとレイアウトです。描画（Painting）の処理も、それとは別の決まった色で塗られます。
 
@@ -192,18 +192,18 @@ Main トラックは、これを見た目で示します。
 - Bottom-up：「Use the Bottom-up tab to view which activities directly took up the most time in aggregate.」
 - Event log：「Use the Event log tab to view activities in the order in which they occurred during the recording.」
 
-これは第 238 回の 4 つの表示と同じものを、別の名前で呼んでいるだけです。
+これは第 239 回の 4 つの表示と同じものを、別の名前で呼んでいるだけです。
 
-| DevTools のタブ | 第 238 回の表示 | 向いている問い |
+| DevTools のタブ | 第 239 回の表示 | 向いている問い |
 | --- | --- | --- |
 | Main トラック | フレームチャート | 何がどの順で起きたか |
 | Call tree | コールツリー（トップダウン） | どの起点（イベント、タイマー、読み込み）が仕事を生んだか |
 | Bottom-up | ボトムアップ | どの関数・処理そのものが時間を食ったか |
 | Event log | 時刻順の一覧 | 選んだ範囲で起きたことを順に確かめる |
 
-Call tree と Bottom-up には、第 238 回と同じ 2 つの列があります。文書は「Self Time represents the time directly spent in that activity. Total Time represents the time spent in that activity or any of its children.」と説明しています。Call tree のいちばん上に並ぶのは、文書が **root activities** と呼ぶ「ブラウザに仕事をさせた起点」です。文書の例では、クリックすると Event が起点になり、その Event がハンドラを動かします。
+Call tree と Bottom-up には、第 239 回と同じ 2 つの列があります。文書は「Self Time represents the time directly spent in that activity. Total Time represents the time spent in that activity or any of its children.」と説明しています。Call tree のいちばん上に並ぶのは、文書が **root activities** と呼ぶ「ブラウザに仕事をさせた起点」です。文書の例では、クリックすると Event が起点になり、その Event がハンドラを動かします。
 
-実験のクリックのタスクの中身を、トレースイベントの種類ごとに足し上げると、Layout が 400 回で 30.9ms、Recalculate style が 400 回で 4.7ms、残りの約 65ms が JavaScript（ほぼ `busy(60)`）でした。Bottom-up は、このように処理の種類や関数ごとに self 時間を足し上げる表です。フレームチャートでは 400 本の細い帯に散らばって目立たない Layout も、ここでは 1 行にまとまって上位に出ます。第 238 回で見たとおり、**あちこちから呼ばれる小さな処理を探すときはボトムアップ**です。
+実験のクリックのタスクの中身を、トレースイベントの種類ごとに足し上げると、Layout が 400 回で 30.9ms、Recalculate style が 400 回で 4.7ms、残りの約 65ms が JavaScript（ほぼ `busy(60)`）でした。Bottom-up は、このように処理の種類や関数ごとに self 時間を足し上げる表です。フレームチャートでは 400 本の細い帯に散らばって目立たない Layout も、ここでは 1 行にまとまって上位に出ます。第 239 回で見たとおり、**あちこちから呼ばれる小さな処理を探すときはボトムアップ**です。
 
 <Callout type="tip" title="自分のコードではないものも写る">
   実験のトレースの JavaScript の標本には、`InjectedScript` や `querySelectorAll` など、Playwright がページに差し込んだ関数も少しだけ写っていました。自動化の道具も、拡張機能も、同じメインスレッドで動きます。
@@ -344,7 +344,7 @@ INP を縮めるには、3 区間のうち**長いものから**手を付けま�
 | 強制レイアウトの合計 | 35.6ms | 150.6ms |
 | INP | 268.4ms | 420.1ms |
 
-レイアウトは 4 倍前後に伸びたのに、`busy()` の 3 つはほとんど変わっていません。`busy()` は `performance.now()` が指定の時刻になるまで回り続ける関数なので、CPU が遅くなっても**壁時計で決まった時間だけ回って終わる**からです。第 235 回の言葉でいえば、経過時間で終わる仕事は、CPU 時間で決まる仕事と違ってスロットリングで伸びません。
+レイアウトは 4 倍前後に伸びたのに、`busy()` の 3 つはほとんど変わっていません。`busy()` は `performance.now()` が指定の時刻になるまで回り続ける関数なので、CPU が遅くなっても**壁時計で決まった時間だけ回って終わる**からです。第 236 回の言葉でいえば、経過時間で終わる仕事は、CPU 時間で決まる仕事と違ってスロットリングで伸びません。
 
 実際のページの JavaScript は、決まった量の計算をする仕事なので、スロットリングで伸びます。実験のページで INP が 1.6 倍にしかならなかったのは、待ち時間を `busy()` で作った模型だからです。**スロットリングの結果を読むときは、その遅さが計算の量で決まっているのか、時刻で決まっているのか**を区別してください。ネットワークの待ちやタイマーの待ちは、CPU を絞っても伸びません。
 
@@ -354,7 +354,7 @@ INP を縮めるには、3 区間のうち**長いものから**手を付けま�
 - 記録の前にライブ指標で遅い操作の当たりをつけ、CPU とネットワークのスロットリングを設定する。CPU の倍率は手元のマシンに対する相対値で、特定の端末の再現ではない
 - Main トラックはフレームチャート。横が時刻で、上の帯が下の帯を起こした原因。灰色の Task の下に、Scripting（黄）、Rendering（紫）、Painting が積まれ、第 17 章のパイプラインの段にほぼ 1 対 1 で対応する
 - 50ms を超えたタスクには赤い三角が付き、超えた部分だけが赤く塗られる
-- Call tree、Bottom-up、Event log は、第 238 回のコールツリー、ボトムアップ、時刻順の一覧と同じもの
+- Call tree、Bottom-up、Event log は、第 239 回のコールツリー、ボトムアップ、時刻順の一覧と同じもの
 - Insights の LCP breakdown と INP breakdown は、第 124 回の区間をそのまま出す。区間が分かれば、何を直すべきかが決まる
 - 書いてすぐ読むと、読むたびにスタイル再計算とレイアウトが走る。Forced reflow の Insight と Main トラックの細かい紫の帯で見つかる
 - INP は長い区間から直す。関係のない長いタスクが入力の遅れを作っていることも多い

@@ -345,7 +345,7 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'atop',
     title: '第22章　SSH と TLS の上に載るもの',
-    summary: 'SSH と TLS は、それだけで使われることは少なく、別のプロトコルの下に敷かれる。最初から包むか途中で切り替えるか、SFTP と SCP、FTP と FTPS、SSH のトンネルと Git、データベースの TLS、TLS で作る VPN、外向きの接続だけで内側に届ける逆向きのトンネル、無線の認証や時刻合わせの裏方、そしてプロトコル同士が混線する攻撃と選び方',
+    summary: 'SSH と TLS は、それだけで使われることは少なく、別のプロトコルの下に敷かれる。最初から包むか途中で切り替えるか、SFTP と SCP、FTP と FTPS、SSH のトンネルと Git、データベースの TLS、TLS で作る VPN、外向きの接続だけで内側に届ける逆向きのトンネル、無線の認証や時刻合わせの裏方、利用者が信頼させた CA で TLS を途中で開ける道具、そしてプロトコル同士が混線する攻撃と選び方',
   },
   {
     id: 'identity',

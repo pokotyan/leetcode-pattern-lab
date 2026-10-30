@@ -1,0 +1,403 @@
+---
+title: 通信を途中で開けて読む道具
+description: mitmproxy、Charles、Fiddler、Burp Suite、Proxyman のように、HTTPS の通信を途中で受け止めて中身を見たり書き換えたりする道具は、中で何をしているのか。自前の CA が接続先ごとに証明書をその場で作る様子、アドオンでページにスクリプトを差し込む様子を手元で確かめ、使いみちと、開けられない通信、そして CA の秘密鍵や記録した通信が抱える危険を見ます
+chapter: atop
+order: 9
+status: published
+topics:
+  - 中間者プロキシ（MITM プロキシ）
+  - mitmproxy
+  - Charles / Fiddler / Burp Suite / Proxyman
+  - 証明書のその場での発行
+  - 上流の証明書の確認（ssl_insecure）
+  - アドオンとフック
+  - 応答の書き換えとモック
+  - 証明書のピン留め
+  - CSP と差し込んだスクリプト
+  - CA の秘密鍵の漏洩
+requires:
+  - ll-155-pki-chain
+  - ll-168-tls-vpn
+  - ll-159-tls-ops
+  - ll-140-security-headers
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 自分の端末の通信を、自分で読みたい
+
+ブラウザの開発者ツールを開けば、そのブラウザが送った要求と受け取った応答は読めます。ところが、次のような場面では開発者ツールが使えません。
+
+- スマートフォンのアプリや、アプリの中に埋め込まれた WebView が、どんな API をどんな順で呼んでいるかを知りたい
+- 自分では書き換えられない本番のページに、計測用のタグやスクリプトを足したら動くかどうかを、公開する前に確かめたい
+- サーバがまだできていない API の応答を、仮の値に差し替えて画面を作りたい
+- 自社のサービスに、外から要求を書き換えて送ったら何が起きるかを診断したい
+
+どれも、**端末とサーバの間を流れる HTTPS の中身**を見たり変えたりしたい、という要求です。これに応える道具が、mitmproxy、Charles、Fiddler、Burp Suite、Proxyman などの、通信を途中で受け止めるプロキシです。
+
+| 道具 | 形 | 公式の説明 |
+| --- | --- | --- |
+| mitmproxy | オープンソース（MIT ライセンス）。端末で使う `mitmproxy`、Web の画面を持つ `mitmweb`、画面のない `mitmdump` の 3 つ。Python でアドオンを書ける | 「mitmproxy is a free and open source interactive HTTPS proxy.」（[mitmproxy.org](https://mitmproxy.org/)、[GitHub](https://github.com/mitmproxy/mitmproxy)） |
+| Charles | 有償（試用版あり）の GUI アプリ | 「Web Debugging Proxy Application for Windows, Mac OS and Linux」（[charlesproxy.com](https://www.charlesproxy.com/)） |
+| Fiddler | Windows・macOS・Linux 向けの Fiddler Everywhere と、従来からの Fiddler Classic | 「Capture, inspect, and modify HTTP/S traffic」（[telerik.com/fiddler](https://www.telerik.com/fiddler)） |
+| Burp Suite | Web アプリのセキュリティ診断用。Community と Professional の版がある | 「The best manual tools to start web security testing.」（[portswigger.net/burp](https://portswigger.net/burp)） |
+| Proxyman | macOS のアプリ。iOS と Android のアプリもある | 「native macOS app to capture, decrypt, and mock your HTTP(s) requests/ responses」（[proxyman.com](https://proxyman.com/)） |
+
+画面や得意分野は違いますが、**中でやっていることは同じ**です。この回では、オープンソースで中を確かめやすい mitmproxy を使って、その共通の仕組みを見ます。
+
+## 中間者攻撃と同じ形を、端末の持ち主の同意で作る
+
+第 148 回で、鍵交換だけでは**中間者**を防げないことを見ました。間に入った者が両側とそれぞれ別の暗号化通信を張れば、中身を読み、書き換え、もう一方へ流せます。TLS はこれを証明書で防いでいます。中間者は、接続先の名前の正しい証明書を出せないからです。
+
+通信を途中で開けるプロキシは、**この中間者とまったく同じ形**をとります。違いは 1 点だけで、端末の持ち主が、プロキシの CA を自分の端末のトラストストアに入れることに同意している点です。第 155 回の「TLS 検査プロキシ」で見たとおり、**トラストストアにルートを 1 枚足すことは、そのルートの持ち主に、あらゆるサイトの証明書を作る権限を与えること**でした。会社が管理する端末に配るか、開発者が自分の端末に入れるかが違うだけで、仕組みは同じです。
+
+1 本の HTTPS の要求について、プロキシの中では次のことが起きます。
+
+1. **通信を受け取る**。いちばん普通なのは、端末に「このプロキシを使え」と設定する方法です。ブラウザは第 168 回で見た `CONNECT shop.example:443` をプロキシに送ります。ほかに、網の層で通信をプロキシへ曲げる透過型、プロキシ自身が WireGuard の VPN サーバになる型、同じ機械のアプリの通信を拾う型などがあります（[mitmproxy: Proxy Modes](https://docs.mitmproxy.org/stable/concepts/modes/)）
+2. **端末との TLS を、プロキシが終える**。端末が名乗った接続先（SNI）の名前で、**証明書をその場で作り**、自分の CA で署名して返します
+3. **接続先との TLS を、プロキシが別に張る**。ここではプロキシがクライアントになり、本物のサーバの証明書を確かめます
+4. 2 本の TLS の間で、**平文の HTTP を手に入れる**。表示する、記録する、書き換えるのはここです
+5. 書き換えた結果を、もう一方の TLS で暗号化し直して送る
+
+2 で作る証明書には、接続先の名前を入れなければなりません。mitmproxy は、**端末を待たせたまま先に接続先へつなぎ、本物の証明書の中身を覗いてから**、それに合わせて作ります。文書は、これを upstream certificate sniffing と呼んでいます（「it puts the client on hold and first makes a connection to the upstream server to "sniff" the contents of its TLS certificate.」、[mitmproxy: Certificates](https://docs.mitmproxy.org/stable/concepts/certificates/)）。設定の `upstream_cert` で切れます（既定は有効）。
+
+## 実験の環境
+
+| 項目 | 版 |
+| --- | --- |
+| Docker Engine | 29.4.0（macOS 上、arm64） |
+| mitmproxy | 12.3.1（`mitmproxy/mitmproxy` イメージ、Python 3.15.1、OpenSSL 4.0.3） |
+| クライアントのコンテナ | Alpine Linux 3.22.7、curl 8.14.1、OpenSSL 3.5.9、Python 3.12.16 |
+| ブラウザ | Chromium 157.0.8103.27 のヘッドレス版（`chromedp/headless-shell` イメージ） |
+
+接続先として、手元で作った CA（`CN=LL172 Origin CA`）で署名した証明書を持つ HTTPS のサーバ `shop.ll172.test` を、Python の標準ライブラリで書きました。HTML のページ（`/`）、同じページに `Content-Security-Policy: script-src 'self'` を付けたもの（`/csp`）、`Authorization` ヘッダが無ければ 401 を返す JSON の API（`/api/me`）の 3 つを返します。クライアントが `Accept-Encoding: gzip` を送れば、本体を gzip で圧縮します。
+
+すべて Docker の中に作ったネットワークで動かし、mitmproxy はそのネットワークの中のプロキシ（`ll172-mitm:8080`）として、`mitmdump` で起動しました。
+
+```bash
+mitmdump -s rewrite.py \
+  --set ssl_verify_upstream_trusted_ca=/c/origin-ca.crt \
+  -w /m/flows.mitm
+```
+
+`ssl_verify_upstream_trusted_ca` は、上の 3 で接続先の証明書を確かめるための CA です。手元の CA で作ったサーバなので、これを渡さないと mitmproxy 自身が接続先を信用しません。`-w` は、流れた通信をファイルに記録する指定です。
+
+## 実験 1: CA を入れる前と、入れた後
+
+最初に起動したとき、mitmproxy は設定のディレクトリ（既定は `~/.mitmproxy`）に CA を作ります。
+
+```
+-rw-r--r--  mitmproxy-ca-cert.cer
+-rw-r--r--  mitmproxy-ca-cert.p12
+-rw-r--r--  mitmproxy-ca-cert.pem
+-rw-------  mitmproxy-ca.p12
+-rw-------  mitmproxy-ca.pem
+-rw-r--r--  mitmproxy-dhparam.pem
+```
+
+`-cert` の付いたものが端末に配るための CA の証明書で、`mitmproxy-ca.pem` は文書の言葉で「The certificate and the private key in PEM format.」、つまり**秘密鍵を含みます**（[mitmproxy: Certificates](https://docs.mitmproxy.org/stable/concepts/certificates/)）。権限が `600` になっているのはこの 2 つだけです。
+
+まず、プロキシの CA を信頼させずに、プロキシ経由で接続します。
+
+```
+$ curl -x http://ll172-mitm:8080 --cacert origin-ca.crt https://shop.ll172.test/
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+```
+
+curl は本物のサーバの CA しか知らないので、プロキシが出した証明書を拒否しました。**CA を入れていない端末にとって、このプロキシはただの中間者**で、TLS は期待どおりに守っています。
+
+次に、mitmproxy の CA を信頼させます。
+
+```
+$ curl -x http://ll172-mitm:8080 --cacert mitmproxy-ca-cert.pem https://shop.ll172.test/
+<!doctype html><html><head><title>shop</title><script>console.log('injected script ran')</script></head>
+<body><h1>shop</h1><p id="msg">original</p></body></html>
+```
+
+つながり、しかも本物のサーバが返していない `<script>` が入っています（これは後の実験 3 のアドオンが足したものです）。curl から見ると、**証明書の検証は正しく通っています**。エラーも警告もありません。
+
+curl が受け取った証明書を見ます。
+
+```
+$ openssl s_client -proxy ll172-mitm:8080 -connect shop.ll172.test:443 -servername shop.ll172.test ... | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+subject=CN=shop.ll172.test
+issuer=CN=mitmproxy, O=mitmproxy
+notBefore=Oct 28 06:13:45 2026 GMT
+notAfter=May 15 06:13:45 2027 GMT
+X509v3 Subject Alternative Name:
+    DNS:shop.ll172.test
+```
+
+名前は接続先のとおりで、発行者だけが `mitmproxy` です。実験をしたのは 10 月 30 日なので、**有効期間の始まりが 2 日前にずらしてあります**。端末の時計が少し遅れていても弾かれないようにするためと考えられます。終わりは作った時点から 197 日後で、changelog の「Reduce generated leaf certificate validity from 199 to 197 days」（12.2.3）のとおりです（[CHANGELOG](https://github.com/mitmproxy/mitmproxy/blob/main/CHANGELOG.md)）。ずらした 2 日を含めると 199 日になり、第 156 回で見た、2026 年 3 月からの公開のサーバ証明書の上限（200 日）にちょうど収まります。プロキシが作る証明書も、端末から見れば普通のサーバ証明書なので、上限を超えると拒否するクライアントに合わせているのでしょう。一方、CA 自身は 10 年有効でした。
+
+試しに、インターネットの `example.com` にもプロキシ経由でつなぎ、作られた証明書の公開鍵のハッシュを並べました。
+
+```
+CA                   : eeAC6pIHiCeSem+LKae0PKNjkVU7Sze2UZEE9FNEnVw=
+leaf shop.ll172.test : eeAC6pIHiCeSem+LKae0PKNjkVU7Sze2UZEE9FNEnVw=
+leaf example.com     : eeAC6pIHiCeSem+LKae0PKNjkVU7Sze2UZEE9FNEnVw=
+```
+
+この版の mitmproxy は、**接続先ごとに証明書は作り分けますが、鍵は CA と同じものを使い回していました**。接続のたびに鍵を作る手間を省いているのだと考えられます。端末から見れば、どのサイトにつないでも同じ公開鍵が返ってくることになります。
+
+<Callout type="note" title="ブラウザに CA を入れずに試すには">
+  ブラウザに CA を入れる代わりに、この実験では Chromium の `--ignore-certificate-errors-spki-list` に上のハッシュを渡しました。指定した公開鍵を持つ証明書だけをエラーにしない、という起動時の指定です。
+  鍵が使い回されているので、1 つのハッシュですべてのサイトが通ります。端末に入れた CA を消し忘れる心配がないので、手元の確認にはこちらのほうが安全です。
+</Callout>
+
+## 実験 2: 接続先の確認を切ると
+
+プロキシが通信を開くとき、端末は**本物のサーバの証明書を見ていません**。端末が確かめたのはプロキシが作った証明書で、本物のサーバを確かめるのは、上の 3 でクライアントになったプロキシです。では、プロキシがそれを怠るとどうなるでしょうか。
+
+別のネットワークに、同じ名前 `shop.ll172.test` で、**自己署名の偽の証明書**を出すサーバを置きました。直接つなぐと、curl は拒否します。
+
+```
+$ curl --cacert origin-ca.crt https://shop.ll172.test/
+curl: (60) SSL certificate problem: self-signed certificate
+```
+
+既定の設定の mitmproxy を通すと、プロキシが接続先の証明書を拒否し、端末には 502 が返りました。
+
+```
+$ curl -x http://ll172-mitm-strict:8080 --cacert mitmproxy-ca-cert.pem https://shop.ll172.test/
+<html>
+<head>
+    <title>502 Bad Gateway</title>
+
+[mitmproxy のログ] Server TLS handshake failed. Certificate verify failed: self-signed certificate
+```
+
+次に、`--set ssl_insecure=true` を付けて起動した mitmproxy を通します。
+
+```
+$ curl -x http://ll172-mitm-insecure:8080 --cacert mitmproxy-ca-cert.pem https://shop.ll172.test/
+<!doctype html><html><head><title>shop</title></head>
+<body><h1>shop</h1><p id="msg">original</p></body></html>
+```
+
+偽のサーバの応答が、**正しく検証された HTTPS として**端末に届きました。端末から見た証明書は、実験 1 とまったく同じ `issuer=CN=mitmproxy` のものです。接続先が本物か偽物かは、端末からはもう区別できません。
+
+`ssl_insecure` は、自己署名の証明書を使う開発用のサーバを相手にするとき、真っ先に試したくなる設定です。文書はこれを「certificate validation is skipped and mitmproxy itself will be vulnerable to TLS interception」と説明しています（[mitmproxy: Options](https://docs.mitmproxy.org/stable/concepts/options/)）。第 172 回で見る「検証を切ったクライアント」と同じ状態を、**プロキシを通る全員について**作ることになります。手元の CA で作ったサーバなら、この実験のように `ssl_verify_upstream_trusted_ca` でその CA を渡すほうが安全です。
+
+## 実験 3: アドオンで書き換える
+
+mitmproxy は、通信の節目ごとに**フック**（決まった名前の関数）を呼びます。HTTP では、要求のヘッダが届いたとき（`requestheaders`）、要求の本体まで届いたとき（`request`）、応答のヘッダが届いたとき（`responseheaders`）、応答の本体まで届いたとき（`response`）、通信が失敗したとき（`error`）です。WebSocket のメッセージにも `websocket_message` があります（[mitmproxy: Event Hooks](https://docs.mitmproxy.org/stable/api/events.html)）。
+
+これを使うと、**ある社内ツール**とほぼ同じことが数十行でできます。そのツールは、mitmproxy の上に 100 行ほどの Python のアドオンを載せたもので、次のように動いていました。
+
+- 置き換えの規則（URL の正規表現、本文の中で探す正規表現、置き換える文字列）を表計算のシートに並べ、60 秒ごとに読み直す
+- `response` のフックで、URL が規則に合い、応答が HTML か JSON なら、本文を正規表現で置き換える
+- 置き換えでページにスクリプトを差し込み、そのスクリプトが WebSocket で別のサーバにつなぐ。サーバから送った JavaScript の文字列をページの中で実行して結果を返すので、開発者ツールを開けない WebView の中でも、外からコンソールを操作できる
+
+利用者がすることは、端末の HTTP プロキシの設定と、mitmproxy の CA の導入の 2 つだけでした。
+
+ここでは、規則を JSON のファイルから読む形で同じものを書きました。ついでに、API の応答を差し替える処理も `request` のフックに入れています。
+
+```python
+import json, re, time
+from mitmproxy import http
+
+RULES_FILE = "/m/rules.json"
+TTL = 60
+
+_cache = {"at": 0.0, "rules": []}
+
+def rules():
+    if time.monotonic() - _cache["at"] > TTL:
+        with open(RULES_FILE) as f:
+            _cache["rules"] = json.load(f)
+        _cache["at"] = time.monotonic()
+    return _cache["rules"]
+
+def request(flow: http.HTTPFlow) -> None:
+    if flow.request.pretty_url == "https://shop.ll172.test/api/me":
+        flow.response = http.Response.make(
+            200, json.dumps({"user": "alice", "plan": "premium"}),
+            {"Content-Type": "application/json"})
+
+def response(flow: http.HTTPFlow) -> None:
+    ctype = flow.response.headers.get("content-type", "")
+    if "text/html" not in ctype:
+        return
+    for r in rules():
+        if re.search(r["url"], flow.request.pretty_url):
+            flow.response.text = re.sub(r["pattern"], r["replace"], flow.response.text)
+```
+
+規則のファイルは次のとおりです。
+
+```json
+[
+  {"url": "^https://shop\\.ll172\\.test/", "pattern": "</head>",
+   "replace": "<script>console.log('injected script ran')</script></head>"}
+]
+```
+
+実験 1 の出力にあった `<script>` は、この規則が足したものでした。API のほうは、こうなります。
+
+```
+$ curl -x http://ll172-mitm:8080 --cacert mitmproxy-ca-cert.pem \
+    -H "Authorization: Bearer sk_live_7f3a9c" https://shop.ll172.test/api/me
+{"user": "alice", "plan": "premium"}
+```
+
+サーバは `"plan": "free"` を返すはずですが、`request` のフックで `flow.response` を先に入れたので、**要求はサーバへ送られず**、アドオンの作った応答がそのまま返りました。サーバがまだ無い API のモックも、障害の応答（500 や遅延）を作って画面の振る舞いを確かめるのも、同じ書き方でできます。
+
+### 圧縮と長さは、mitmproxy が直す
+
+`Accept-Encoding: gzip` を付けて要求し、応答のヘッダを見ました。
+
+```
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 135
+Content-Encoding: gzip
+```
+
+本体を展開すると、`<script>` の入った HTML でした。アドオンは `flow.response.text` を文字列として読み書きしただけですが、mitmproxy が**読むときに gzip を展開し、書くときに圧縮し直して、`Content-Length` も合わせています**。自分で書いた中継（第 69 回）で同じことをするなら、展開、文字コードの解釈、再圧縮、長さの計算をすべて自分で書くことになります。この面倒を引き受けてくれることが、専用の道具を使う理由の 1 つです。
+
+## 使いみち
+
+| 使いみち | すること |
+| --- | --- |
+| 実機・WebView のデバッグ | 端末のプロキシを手元の PC に向け、アプリが送る要求と応答を読む |
+| 変えられないページでの検証 | 本番のページに、計測用のタグや修正版のスクリプトを差し込んで動きを見る。公開の前に、影響を自分の端末だけで確かめられる |
+| モックと障害の再現 | まだ無い API の応答を作る。遅延、500、壊れた JSON を返して、画面の振る舞いを見る |
+| 記録と再送 | 流れた通信をファイルに残し、あとで同じ要求を送り直す。mitmproxy では `-w` で記録したものを、クライアント側の再送（`-C`）やサーバ側の再生（`-S`）に使える |
+| セキュリティ診断 | 要求を止めて書き換え、権限のない操作が通らないかを確かめる。Burp Suite が主にこの用途。自動で要求を送る DAST（第 241 回の ZAP）と組み合わせて使われる |
+
+同じ考え方は、プロキシ以外の場所にもあります。ブラウザの開発者ツールには、応答を手元のファイルで差し替える機能（Chrome の Local Overrides）があります。Service Worker はページの要求を受け止めて別の応答を返せるので、**ページの中に置いた書き換えの層**と見ることができます。CDN のエッジで HTML を書き換える機能も、置き場所がサーバの側にあるだけで同じことをしています。違いは**どこに置くか**で、プロキシは端末の外、端末の持ち主の手元にあります。そのため、アプリでもブラウザでも、端末から出る通信にはまとめて効きます。
+
+社内ツールのような「差し込んだスクリプトから外のコンソールにつなぐ」形にも、先例があります。古くは weinre が、ページに読み込ませたスクリプトを通じて、PC のブラウザからスマートフォンのページを調べる仕組みを作っていました。いまは、ページの中にコンソールそのものを表示する Eruda（「Console for Mobile Browsers.」、[GitHub](https://github.com/liriliri/eruda)）や vConsole（「A lightweight, extendable front-end developer tool for mobile web page.」、[GitHub](https://github.com/Tencent/vConsole)）がよく使われます。プロキシで差し込めば、ページのソースを変えずにこれらを載せられます。
+
+## 開けられない通信
+
+CA を信頼させても、すべての通信が開けるわけではありません。
+
+### 証明書のピン留め
+
+アプリが接続先の公開鍵を自分で覚えていて、それと照らし合わせている場合です（第 159 回のピン留め）。接続先の証明書の公開鍵のハッシュを覚えておき、合わなければ拒否するクライアントを Python で書いて、直接とプロキシ経由で比べました。
+
+```
+## 直接
+issuer: CN=LL172 Origin CA
+pin ok
+
+## プロキシ経由（mitmproxy の CA は信頼させてある）
+proxy: HTTP/1.1 200 Connection established
+issuer: O=mitmproxy,CN=mitmproxy
+pin mismatch: got eeAC6pIHiCeSem+LKae0PKNjkVU7Sze2UZEE9FNEnVw=
+```
+
+プロキシ経由では、TLS の検証そのものは通っています（CA を信頼させたので）。その上で、**アプリ自身の照合が、知らない鍵を拒否しました**。mitmproxy の文書も、ピン留めをするアプリは手を加えない限りプロキシの証明書を受け入れない、と書いています（「mitmproxy's certificates will not be accepted by these applications without modifying them.」、[mitmproxy: Certificates](https://docs.mitmproxy.org/stable/concepts/certificates/)）。
+
+### 自分のトラストストアを持つプログラム、ユーザの CA を信頼しないアプリ
+
+第 155 回で見たとおり、Node.js や Python のように OS とは別のトラストストアを持つプログラムは、OS に入れた CA を知りません。プロキシの環境変数（`HTTPS_PROXY` など）を読むかどうかも、プログラムごとに違います。
+
+Android では、利用者が後から入れた CA を、アプリが信頼するとは限りません。Android の文書は、既定ではすべてのアプリが OS に最初から入っている CA を信頼し、**API レベル 23 以下を対象にしたアプリは、利用者が足した CA も既定で信頼する**、と書いています（「apps targeting Android 6.0 (API level 23) and lower also trust the user-added CA store by default.」、[Android: Network security configuration](https://developer.android.com/privacy-and-security/security-config)）。それより新しい版を対象にしたアプリでは、開発者が設定で許していない限り、端末に CA を入れてもその通信は開けません。開発中の自分のアプリなら、デバッグ用のビルドでだけ利用者の CA を許す設定にするのが普通です。
+
+### HTTP/3
+
+第 168 回で見たとおり、`CONNECT` が運ぶのは TCP だけです。端末にプロキシを設定する方法では、UDP の上の QUIC は運べません。網の層で通信を曲げる透過型なら QUIC も届きますが、それを開けるには、プロキシが QUIC を理解しなければなりません。mitmproxy は 11.0.0 で透過型の HTTP/3 に対応しました（「mitmproxy now supports transparent HTTP/3 proxying.」、[CHANGELOG](https://github.com/mitmproxy/mitmproxy/blob/main/CHANGELOG.md)）。道具によっては、HTTP/3 の通信がプロキシを素通りしたり、記録に現れなかったりします。
+
+### CSP は差し込んだスクリプトを止める。ただし、ヘッダごと消されなければ
+
+第 140 回で見た CSP の `script-src` は、ページに直接書かれたスクリプトを、許可していない限り実行させません。プロキシが差し込んだ `<script>` も、ブラウザから見ればページに直接書かれたスクリプトです。ヘッドレスの Chromium で、CSP の無い `/` と、`script-src 'self'` を付けた `/csp` を開き、コンソールの出力を見ました。
+
+```
+## /
+"injected script ran", source: https://shop.ll172.test/ (1)
+
+## /csp
+"Executing inline script violates the following Content Security Policy directive 'script-src 'self''. Either the 'unsafe-inline' keyword, a hash ('sha256-UQhYsatDuGXr23JN/I7SSwgQZVxXpgRoBq/CaKyvar0='), or a nonce ('nonce-...') is required to enable inline execution. ...
+```
+
+CSP を付けたページでは、差し込んだスクリプトは実行されませんでした。ところが、プロキシは応答のヘッダも書き換えられます。`response` のフックで `Content-Security-Policy` を消すだけのアドオンを、先ほどのアドオンの前に足しました。
+
+```python
+def response(flow):
+    flow.response.headers.pop("content-security-policy", None)
+```
+
+```
+## /csp（CSP のヘッダを消した場合）
+"injected script ran", source: https://shop.ll172.test/csp (1)
+```
+
+今度は実行されました。CSP は、**ページの中に紛れ込んだもの**からページを守る仕組みで、応答そのものを書き換えられる立場の相手は防げません。検証の道具として使う場合は、次の点に注意が要ります。CSP を消したページで動いたからといって、本番の CSP の下で動くとは限りません。差し込むものを本番に載せる予定なら、CSP は残したまま、許可の側（ハッシュや nonce、読み込み元）を足して試すべきです。
+
+<Callout type="warn" title="よくある誤解: HSTS のプリロードに入っているサイトは開けない">
+  第 159 回の HSTS は、HTTPS 以外での接続と、**証明書のエラーを利用者が無視して進むこと**を禁じる仕組みです。
+  端末がプロキシの CA を信頼していれば、プロキシの証明書はエラーになりません。したがって、HSTS もプリロードも、信頼された CA を使うプロキシを止めません。
+  HSTS が効くのは、CA を入れていない端末で、利用者が警告を無視して進もうとしたときです。開けない理由になるのは、ピン留めや、アプリが自分のトラストストアを持つことのほうです。
+</Callout>
+
+## 危険
+
+プロキシの中では、通信が平文になっています。そして、それを許しているのは端末に入れた CA です。危険も、この 2 つから生まれます。
+
+### CA の秘密鍵は、あらゆるサイトの証明書を作れる
+
+`mitmproxy-ca.pem` を別の場所にコピーし、OpenSSL だけで `bank.example` の証明書を作りました。mitmproxy は動かしていません。
+
+```
+$ openssl x509 -req -in bank.csr -CA stolen.pem -CAkey stolen.pem -out bank.crt -days 7 ...
+$ openssl x509 -in bank.crt -noout -subject -issuer
+subject=CN=bank.example
+issuer=CN=mitmproxy, O=mitmproxy
+$ openssl verify -CAfile mitmproxy-ca-cert.pem bank.crt
+bank.crt: OK
+```
+
+**この CA を入れたままの端末は、この偽の証明書を正しいものとして受け入れます。** 鍵を手に入れた人は、その端末と同じ網にいるだけで、どのサイトへの通信でも開けるようになります。実験 1 で見たように、CA は 10 年有効です。端末から CA を消さない限り、この状態が 10 年続きます。
+
+mitmproxy が CA を各端末で初回の起動時に作るのは、このためです（「For security reasons, the mitmproxy CA is generated uniquely on the first start and is not shared between mitmproxy installations on different devices.」、[mitmproxy: Certificates](https://docs.mitmproxy.org/stable/concepts/certificates/)）。チームで使いやすいように、1 つの CA を共有のサーバに置いたり、リポジトリに入れたりすると、その前提が崩れます。
+
+- CA の秘密鍵（`mitmproxy-ca.pem`、`mitmproxy-ca.p12`）は、作った機械から出さない
+- 端末に入れた CA は、検証が終わったら消す。スマートフォンに入れた CA は特に忘れやすい
+- 共有の検証環境が必要なら、使う人ごと、期間ごとに CA を作り直す
+
+### 接続先の確認を切ると、利用者の代わりに確かめる者がいなくなる
+
+実験 2 のとおり、`ssl_insecure` を付けたプロキシを通る端末は、偽のサーバの応答を正しい HTTPS として受け取ります。端末は、プロキシが確かめてくれていると信じるしかありません。プロキシを共有の検証環境として何人かで使っているなら、その全員の通信が、**途中の網にいる別の誰か**に開けられる状態です。
+
+### 記録した通信には、秘密がそのまま残る
+
+実験で `-w` に記録したファイルを探しました。
+
+```
+$ grep -a -o "Bearer [A-Za-z0-9_]*" flows.mitm | sort -u
+Bearer sk_live_7f3a9c
+```
+
+プロキシの中は平文なので、記録も平文です。`Authorization` ヘッダのトークン、Cookie、フォームに入力したパスワード、API が返した個人情報が、そのままファイルに残ります。不具合の報告に記録のファイルや HAR を添付すると、それを読める全員にこれらを渡すことになります。共有する前に、トークンや Cookie を消すか、検証用の使い捨てのアカウントで記録し直すほうが安全です。
+
+### 道具の画面や、差し込んだコンソールが入口になる
+
+mitmweb の画面は、流れた通信をすべて見せ、プロキシの設定も変えられます。2025 年に公表された CVE-2025-23217 では、mitmweb 11.1.0 以前で、**プロキシ（既定で `*:8080`）を通る要求から、`127.0.0.1:8081` で待つ mitmweb の内部の API に届いてしまう**ことが報告されました。勧告は、これがリモートからのコード実行に発展しうると書いています（[GHSA-wg33-5h85-7q5p](https://github.com/mitmproxy/mitmproxy/security/advisories/GHSA-wg33-5h85-7q5p)）。11.1.2 からは、mitmweb の API に既定で認証用のトークンが要るようになりました。プロキシは「誰の要求でも中継する」ものなので、**プロキシと同じ機械の `127.0.0.1` で待つものは、プロキシを使える全員から届く**と考える必要があります。第 169 回で、中継が CDP を外にさらした話と同じ構図です。
+
+差し込んだコンソールは、さらに直接的です。社内ツールの「WebSocket で受け取った文字列をページの中で実行する」サーバには、認証がありませんでした。このサーバにつなげる人は誰でも、**プロキシを通っている端末が開いているページの中で、そのページのオリジンの権限で任意のコードを実行できます**。HttpOnly でない Cookie、localStorage、画面に表示された内容、ログイン済みの利用者として送れる要求のすべてに届きます。検証用の端末で、本物のアカウントにログインしていればなおさらです。この種のサーバは、手元の機械でだけ待ち受け、つなぐ側にトークンを要求し、使わないときは止めておくべきです。
+
+<Callout type="warn" title="他人の通信を開けてはいけない">
+  ここで見た手順は、そのまま攻撃の手順でもあります。違いは、通信の持ち主が同意しているかどうかだけです。
+  自分の端末、自分のアカウント、検証用に用意した環境以外の通信を開けることは、会社の規程や法律に反しえます。
+  また、会社の網ではすでに TLS 検査プロキシ（第 155 回）が通信を開けていることがあり、その上に自分のプロキシを重ねると、どちらの証明書を誰が確かめているのかが分からなくなります。
+  会社の網や端末で使う前に、情報システムの担当者のルールを確認してください。
+</Callout>
+
+## 次回へ
+
+この回では、利用者が信頼させた CA を使って TLS を途中で終える道具を見ました。TLS の検証は「この名前の証明書を、信頼している CA が署名したか」を確かめるだけで、**その接続の先にいるのが本当に話したい相手なのかは、信頼の置き方と設定次第**だ、ということでもあります。次の第 172 回では、この問いを別の方向から見ます。検証に通った相手が、そもそも話したいプロトコルのサーバだったのか（ALPACA）、ライブラリが既定で検証を切っていたら何が通るのかを確かめ、用途ごとにどの載せ方を選ぶかをまとめて、この章を締めます。
+
+## まとめ
+
+- mitmproxy、Charles、Fiddler、Burp Suite、Proxyman は、どれも中間者攻撃と同じ形をとる。端末との TLS と接続先との TLS を別々に張り、その間で平文の HTTP を読み書きする。成り立つのは、端末の持ち主がプロキシの CA を信頼させているから
+- 証明書は接続先ごとにその場で作る。mitmproxy は先に接続先へつないで本物の証明書を覗き、名前を合わせる。手元では、有効期間を 2 日前から始めて作成から 197 日後に終え、鍵は CA と同じものを使い回していた
+- CA を入れていない端末にとって、プロキシはただの中間者で、curl は検証に失敗した。入れた端末では、書き換えられた応答がエラーなしで届いた
+- 接続先の証明書を確かめるのはプロキシの役目になる。`ssl_insecure` を付けると、自己署名の偽のサーバの応答が、端末には正しい HTTPS として届いた
+- mitmproxy のアドオンは、`request` や `response` のフックで通信を書き換える。数十行で、規則に従ったスクリプトの差し込みや API のモックが書け、gzip の展開と再圧縮、`Content-Length` の計算は mitmproxy が引き受ける
+- 開けられない通信がある。ピン留めをするアプリ、自分のトラストストアを持つプログラム、利用者の CA を信頼しない Android のアプリ、プロキシを通らない QUIC。HSTS は、信頼された CA を使うプロキシを止めない
+- CSP は差し込んだインラインのスクリプトを止めたが、プロキシがヘッダごと消すと実行された。CSP を消して動いたものが、本番の CSP の下で動くとは限らない
+- CA の秘密鍵があれば、mitmproxy が無くても、その CA を信頼する端末に対してどのサイトの証明書でも作れた。CA は 10 年有効なので、使い終わったら端末から消す
+- 記録した通信にはトークンが平文で残っていた。道具の画面や、差し込んだコンソールのサーバは、プロキシを使える全員から届く入口になる

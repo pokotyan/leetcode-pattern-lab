@@ -1,0 +1,309 @@
+---
+title: SMS とプッシュ通知の多要素はどこで破られるか
+description: SMS のコードは携帯網を通って届き、プッシュ通知の承認はボタン 1 つで済む。その手軽さの裏で、番号の乗っ取り、網の中での横取り、送らせて稼ぐ詐欺、承認疲れ、中継が起きる。どこを突かれ、番号照合や送信の上限が何を防いで何を防がないのかを、模型を動かして確かめます
+chapter: identity
+order: 3
+status: published
+topics:
+  - SMS 認証
+  - SMSC
+  - SIM スワップ
+  - SS7
+  - SMS ポンピング
+  - プッシュ通知の承認
+  - 承認疲れ攻撃（MFA fatigue / push bombing）
+  - 番号照合
+  - 制限付きの認証器（restricted authenticator）
+  - 認証の試行回数の制限
+requires:
+  - ll-174-password-mfa
+---
+
+import Callout from '../../components/Callout.astro'
+import MfaRelay from '../../components/sim/problems/MfaRelay'
+
+## 2 つ目の要素は、届くまでの経路で破られる
+
+第 174 回では、パスワードに 2 つ目の要素を足しても、偽サイトがその場で中継すれば破られることを見ました。破られなかったのは、署名の対象にオリジンを含める WebAuthn だけでした。
+
+ただし、実際に最も広く使われている 2 つ目の要素は、TOTP の認証アプリでも WebAuthn でもなく、**SMS で届く確認コード**と、**スマートフォンに届く「承認しますか」の通知**です。利用者にとって追加の準備がほとんど要らないことが、普及した理由です。
+
+この 2 つには、中継に弱いことのほかにも弱点があります。コードや通知が利用者に**届くまでの経路**が、サイトの管理の外にあることです。SMS は携帯電話会社の網を、プッシュ通知は OS の事業者の配信基盤を通ります。この回では、その経路のどこが突かれるのかを順に見たうえで、**サイトの側の数え方**（送信の上限、試行回数の制限、登録の変更）で防げるものと防げないものを分けます。
+
+下のシミュレーターは、利用者・偽サイト・本物のサイト・携帯網（またはプッシュの配信基盤）の 4 者のあいだを流れるメッセージを 1 通ずつ追います。2 つ目の要素を切り替えて、どこで止まるか、止まらないかを比べてください。
+
+<MfaRelay client:visible />
+
+SMS、プッシュ、番号照合付きのプッシュは、いずれも最後に本物のサイトがセッション Cookie を偽サイトへ渡して終わります。WebAuthn だけが、利用者のブラウザで止まります。以下では、中継以外の破られ方も含めて、1 つずつ中身を見ていきます。
+
+## SMS のコードはどう届くか
+
+サイトが「確認コードを送りました」と表示するまでに、コードは次のような経路をたどります。
+
+```
+サイト ──→ SMS 配信事業者（API） ──→ 携帯電話会社の SMSC ──→ 利用者が今いる基地局 ──→ 端末
+                                       │
+                                       └─ 加入者のデータベースに「この番号は今どこにいるか」を問い合わせる
+```
+
+**SMSC**（Short Message Service Centre）は、SMS をいったん預かってから端末へ届ける蓄積交換の拠点です。SMS の技術的な仕組みは 3GPP の [TS 23.040](https://www.3gpp.org/dynareport/23040.htm) に定められています。SMSC は宛先の番号について、加入者のデータベース（2G/3G の HLR、4G の HSS）に「この加入者は今どの交換機の配下にいるか」を問い合わせ、その交換機へ SMS を渡します。この問い合わせと受け渡しに使われるのが、通信事業者同士をつなぐ**シグナリング**の網で、2G/3G では SS7 の上の MAP（[TS 29.002](https://www.3gpp.org/dynareport/29002.htm)）、4G では Diameter です。携帯網そのものの仕組みは、第 57 回で見ます。
+
+この経路で、サイトが確かめられるのは「API にコードを渡した」ところまでです。その先で、**誰がその番号の端末として扱われているか**は、携帯電話会社の網が決めます。ここに 2 つの攻め方があります。番号の持ち主を書き換えさせる **SIM スワップ**と、網の中で SMS の行き先を変える **SS7 の悪用**です。
+
+NIST の SP 800-63B-4 は、電話網（PSTN）で秘密を届ける方式を、この文書で唯一の**制限付きの認証器**としています。「At the time of publication of these guidelines, there is one restricted authenticator: the use of the PSTN for out-of-band authentication」（この指針の発行時点で、制限付きの認証器は 1 つだけである。電話網を使った経路外の認証である）（[SP 800-63B-4 3.2.9](https://pages.nist.gov/800-63-4/sp800-63b.html#restricted)）。制限付きの認証器を使う組織には、制限のない代わりの認証器を少なくとも 1 つ提供し、リスクを利用者に知らせ、将来使えなくなった場合の移行計画を立てることが求められます。
+
+## 番号を奪う: SIM スワップ
+
+**SIM スワップ**は、攻撃者が携帯電話会社に「端末をなくしたので新しい SIM に番号を移してほしい」と申し込み、被害者の番号を自分の SIM に移させる手口です。米国の CISA は次のように説明しています。
+
+> SIM Swap is a form of social engineering in which cyber threat actors convince cellular carriers to transfer control of the user’s phone number to a threat actor-controlled SIM card, which allows the threat actor to gain control over the user’s phone
+>
+> （SIM スワップはソーシャルエンジニアリングの一種で、攻撃者が携帯電話会社を説得し、利用者の電話番号の制御を攻撃者の持つ SIM カードに移させる。これにより攻撃者は利用者の電話を制御できるようになる）
+>
+> （[CISA: Implementing Phishing-Resistant MFA](https://www.cisa.gov/sites/default/files/publications/fact-sheet-implementing-phishing-resistant-mfa-508c.pdf)）
+
+番号の移転が通れば、以後のコードはすべて攻撃者の端末に届きます。被害者の端末は圏外になるだけで、何が起きたのかすぐには分かりません。これは暗号の問題ではなく、**携帯電話会社の窓口の本人確認**の問題です。サイトの側からは、正しい番号に正しく SMS を送り、正しいコードが返ってきたようにしか見えません。
+
+米国の FCC は 2023 年に規則を改め、携帯電話会社に対して、番号を新しい端末や事業者へ移す前に安全な方法で本人を確かめることと、SIM の変更や他社への転出の申し込みがあったらすぐ利用者に知らせることを義務づけました。要旨は「require wireless providers to adopt secure methods of authenticating a customer before redirecting a customer's phone number to a new device or provider」（顧客の電話番号を新しい端末や事業者に向け直す前に、顧客を認証する安全な方法を採ることを無線事業者に求める）です（[FCC: Protecting Consumers from SIM-Swap and Port-Out Fraud, Federal Register 2023-12-08](https://www.federalregister.gov/documents/2023/12/08/2023-26338/protecting-consumers-from-sim-swap-and-port-out-fraud)）。皮肉なことに、同じ文書は SIM の変更の申し込みを SMS で確認すること自体は禁じず、ほかの方法と組み合わせることを強く勧めるにとどめています。
+
+サイトの側でできることもあります。NIST は、電話網でコードを送る前に危険の兆候を確かめるよう勧めています。
+
+> Verifiers SHOULD consider risk indicators (e.g., device swap, SIM change, number porting, other abnormal behavior) before using the PSTN to deliver an out-of-band authentication secret.
+>
+> （検証者は、電話網で経路外の認証用の秘密を届ける前に、危険の兆候〔端末の交換、SIM の変更、番号の移転、その他の異常な振る舞いなど〕を考慮すべきである）
+>
+> （[SP 800-63B-4 3.1.3.3](https://pages.nist.gov/800-63-4/sp800-63b.html#pstnOOB)）
+
+SMS 配信事業者の中には、番号ごとに「最後に SIM が変わったのはいつか」を問い合わせる手段を用意しているところがあります。たとえば Twilio の Lookup には、その情報を返す SIM Swap という機能があります（執筆時点〔2026 年 10 月〕では限定公開。[Twilio: SIM Swap](https://www.twilio.com/docs/lookup/v2-api/sim-swap)）。直前に SIM が変わった番号にはコードを送らず、ほかの方法に切り替える、という使い方ができます。
+
+## 網の中で横取りする: SS7
+
+SIM スワップは窓口を突く手口でしたが、**シグナリングの網そのもの**を使う手口もあります。SS7 は、通信事業者同士が互いを信頼していた時代に設計された仕組みで、網に接続できる者が送ってきた位置登録の要求を、基本的にはそのまま受け入れてしまいます。
+
+欧州の ENISA は、この攻撃を次のように説明しています。
+
+> An attacker can alter current subscriber’s location and profile in order to receive mobile terminating and/or mobile originating calls, SMS, or data traffic.
+>
+> （攻撃者は加入者の現在の位置と加入者情報を書き換え、その加入者宛ての、あるいはその加入者からの通話、SMS、データ通信を受け取ることができる）
+
+さらに、その目的として 2 つ目の要素を名指ししています。
+
+> As SMS is commonly used for a second authentication factor (2FA), attackers may also eavesdrop SMS in part of a larger attack, to circumvent 2FA.
+>
+> （SMS は 2 つ目の認証要素として広く使われているので、攻撃者はより大きな攻撃の一部として SMS を盗み見て、2 要素認証をすり抜けることがある）
+>
+> （[ENISA: Signalling Security in Telecom SS7/Diameter/5G, 2018](https://www.enisa.europa.eu/sites/default/files/publications/Interconnect%20Security%20SS7-Diameter.pdf)）
+
+同じ報告書は、ドイツの O2 が、SS7 で銀行の送金確認用の SMS（mTAN）を攻撃者の電話へ転送され、口座から引き出された顧客がいたと認めたことを挙げています。
+
+位置登録を書き換えると、加入者のデータベースは「この加入者は攻撃者の交換機の配下にいる」と信じ、SMSC はコードを攻撃者へ渡します。**被害者の端末は何も受け取らず、SIM スワップと違って圏外にもならない**ことがあるので、さらに気づきにくくなります。携帯電話会社は、外から来たシグナリングを選別するフィルタや、SMS の配送を自社の網の中で終わらせる仕組み（SMS home routing）で対策しています。ENISA の調査では、回答した事業者の 87% が SMS home routing を実装していました。ただし、対策の度合いは事業者ごとに異なり、サイトの側からは確かめられません。
+
+## 送らせて稼ぐ: SMS ポンピング
+
+ここまでは利用者のアカウントを狙う攻撃でしたが、SMS 認証には**サイトの財布**を狙う攻撃もあります。SMS は 1 通ごとに送り手が料金を払い、その一部は宛先の携帯電話会社に入ります。これを悪用するのが **SMS ポンピング**です。
+
+> SMS pumping fraud happens when fraudsters take advantage of a phone number input field to receive a one-time passcode, an app download link, or anything else via SMS.
+>
+> （SMS ポンピング詐欺は、詐欺師が電話番号の入力欄を悪用し、ワンタイムパスコードやアプリのダウンロードリンクなどを SMS で受け取るときに起きる）
+>
+> （[Twilio: What is SMS Pumping Fraud?](https://www.twilio.com/docs/glossary/what-is-sms-pumping-fraud)）
+
+同じ文書によれば、宛先は特定の携帯電話会社が持つ番号の範囲で、詐欺師はそこで生じた収入の分け前を受け取ります。兆候として、**隣り合った番号の並び**に送信が急増すること、そして OTP の場合は**送ったコードが入力されない**（検証が完了しない）ことが挙げられています。
+
+攻撃者はアカウントを乗っ取る必要がなく、ログイン画面や会員登録の画面で「コードを送る」を押し続けるだけです。対策は、利用者の安全ではなく**送信の流量**の問題として考えます。電話番号ごと・番号の範囲ごと・送信元 IP ごとの送信回数の上限、送信先の国の許可リスト、そして「送った数に対して入力された数」の比率の監視です。
+
+## プッシュ通知は何を承認しているのか
+
+プッシュ通知の方式では、ログインの途中でサイトが利用者の登録済みのアプリに通知を送り、利用者が「承認」を押すとログインが完了します。通知は Apple や Google の配信基盤を通りますが、承認の返事はアプリからサイトへ、TLS で守られた経路で直接届きます。SIM スワップや SS7 は効きません。
+
+問題は、**承認が何に対する承認なのか**が利用者の画面と結びついていないことです。シミュレーターの「プッシュで承認」で見たとおり、ログインを始めたのが偽サイトでも、利用者は自分の操作だと思って承認します。さらに、攻撃者がパスワードを知っているだけで、**通知を好きなだけ送らせることができます**。
+
+### 承認疲れ攻撃
+
+攻撃者がログインを何度もやり直し、通知を送り続けて、利用者がうっかり、あるいはうるさくなって承認するのを待つ手口を、**承認疲れ攻撃**（MFA fatigue、push bombing）と呼びます。CISA の定義は次のとおりです。
+
+> Cyber threat actors bombard a user with push notifications until they press the “Accept” button, thereby granting threat actor access to the network.
+>
+> （攻撃者は利用者にプッシュ通知を浴びせ、利用者が「承認」ボタンを押すまで続ける。これにより攻撃者はネットワークに入れるようになる）
+>
+> （[CISA: Implementing Phishing-Resistant MFA](https://www.cisa.gov/sites/default/files/publications/fact-sheet-implementing-phishing-resistant-mfa-508c.pdf)）
+
+当事者が公表した事例として、Cisco は 2022 年 8 月、社員のアカウントを足がかりに社内へ侵入された経緯を報告しています。攻撃者は、社員の個人の Google アカウントに同期されていた認証情報を入手したうえで、2 つ目の要素を音声の電話による詐欺と承認疲れで突破しようとしました。Cisco は承認疲れを「the process of sending a high volume of push requests to the target’s mobile device until the user accepts, either accidentally or simply to attempt to silence the repeated push notifications they are receiving」（標的の端末に大量のプッシュ要求を送り、利用者が誤って、あるいは繰り返される通知を黙らせるために承認するまで続けること）と説明しています。最終的に承認が得られ、攻撃者は「enrolled a series of new devices for MFA and authenticated successfully to the Cisco VPN」（多要素認証に新しい端末を次々に登録し、Cisco の VPN への認証に成功した）とあります（[Cisco Talos, 2022-08-10](https://blog.talosintelligence.com/recent-cyber-attack/)）。**1 回の承認で、攻撃者が自分の端末を 2 つ目の要素として登録できた**ことに注意してください。この点は後で設計の話に戻ります。
+
+NIST の SP 800-63B-4 は、通知の送信回数の上限を求めています。
+
+> Out-of-band verifiers that send a push notification to a subscriber device SHOULD implement a reasonable limit on the rate or total number of push notifications that will be sent since the last successful authentication.
+>
+> （加入者の端末にプッシュ通知を送る経路外の検証者は、最後に認証が成功してから送る通知の頻度または総数に、妥当な上限を設けるべきである）
+>
+> （[SP 800-63B-4 3.1.3.2](https://pages.nist.gov/800-63-4/sp800-63b.html#out-of-band-verifiers)）
+
+そして、画面と電話に同じ秘密を出して「一致していれば承認してください」と比べさせる方式を、もう認めていません。「This method is no longer considered acceptable because it increases the likelihood that the subscriber would approve an authentication request without actually comparing the secrets as required.」（この方式は、加入者が求められたとおりに秘密を比べないまま認証要求を承認してしまう可能性を高めるので、もはや受け入れられないとみなす）とし、承認疲れの攻撃で実際に観察されたことを理由に挙げています（[SP 800-63B-4 3.1.3](https://pages.nist.gov/800-63-4/sp800-63b.html#out-of-band)）。代わりに求めるのは、**秘密をどちらかの経路からもう一方へ、利用者に実際に運ばせる**ことです。
+
+### 番号照合
+
+その形の代表が**番号照合**です。Microsoft の Authenticator では、すべてのプッシュ通知で番号照合が有効になっています。
+
+> When users respond to an MFA push notification by using Authenticator, they see a number. They need to enter that number into the app to complete the approval.
+>
+> （利用者が Authenticator で多要素認証のプッシュ通知に応えるとき、利用者には数字が表示される。承認を完了するには、その数字をアプリに入力する必要がある）
+>
+> （[Microsoft Learn: How number matching works in MFA push notifications for Authenticator](https://learn.microsoft.com/en-us/entra/identity/authentication/how-to-mfa-number-match)）
+
+数字が表示されるのは**ログインを始めた画面**です。承認疲れの攻撃では、ログインを始めたのは攻撃者なので、数字は攻撃者の画面にしか出ていません。利用者が電話に正しい数字を入れることはできず、うるさいから押す、という逃げ道がなくなります。
+
+Microsoft はさらに、通知に**ログインを求めているアプリの名前と、IP アドレスから推定した接続元の地域**を出す機能を提供しています。説明は「they see the name of the application that requests the approval and the location based on the IP address from where the sign-in originated」（承認を求めているアプリの名前と、サインインが始まった IP アドレスに基づく場所が表示される）です（[Microsoft Learn: Use additional context in Authenticator notifications](https://learn.microsoft.com/en-us/entra/identity/authentication/how-to-mfa-additional-context)）。
+
+### 番号照合が防がないもの
+
+ところが、**中継型のフィッシングは番号照合でも止まりません**。シミュレーターの「番号照合付きプッシュ」で見たとおり、ログインを始めた画面は偽サイトであり、偽サイトは本物から受け取った数字をそのまま利用者に見せるからです。番号照合が確かめているのは「画面を見ている人と、電話を持っている人が同じである」ことであって、**その画面が本物かどうか**ではありません。手がかりになるのは接続元の地域の表示ですが、これは利用者が気づくかどうかにかかっています。NIST も、経路外の認証全般について「Out-of-band authentication is not phishing-resistant.」（経路外の認証はフィッシング耐性を持たない）と明記しています（[SP 800-63B-4 3.1.3](https://pages.nist.gov/800-63-4/sp800-63b.html#out-of-band)）。
+
+| 方式 | 承認疲れ | 中継型のフィッシング | 番号の乗っ取り・SS7 |
+| --- | --- | --- | --- |
+| SMS のコード | 該当しない（コードを知らないと入力できない） | 破られる | 破られる |
+| 承認だけのプッシュ | 破られる | 破られる | 該当しない |
+| 番号照合付きのプッシュ | 防げる | 破られる（数字も中継される） | 該当しない |
+| WebAuthn | 該当しない | 防げる | 該当しない |
+
+### 手元で確かめる: 中継の模型
+
+本物のサイト、偽サイト、利用者のブラウザと電話を、localhost 上の HTTP サーバと Python のオブジェクトで組んだ模型を作りました（Python 3.14.0、cryptography 50.0.2、Apple M1 Pro / macOS 26.2）。本物のサイトは `https://bank.example`、偽サイトは `https://bank-login.example` を名乗ります。偽サイトは受け取ったリクエストを本物へそのまま送り、本物が返す `Set-Cookie` だけを手元に残して、利用者には偽の完了画面を返します。中継のときは、偽サイトのサーバの IP（`203.0.113.50`）が接続元として本物に届きます。
+
+WebAuthn の部分は第 174 回の模型と同じ考え方で、ブラウザは「いま開いているページのオリジン」が要求された RP ID を名乗れるかを確かめ、名乗れるときだけ clientDataJSON にそのオリジンを書き込んで署名を頼みます。
+
+```
+=== sms ===
+1. 利用者が偽サイトにパスワードを入力 → 中継 → 200 {'tx': '49a1edef', 'method': 'sms'}
+2. 電話に SMS が届く: [bank.example] 確認コード 287979
+3. 利用者が偽サイトにコードを入力 → 中継 → 200 {'status': 'ok（偽の画面）'}
+4. 攻撃者が Cookie sid=cc4dd0ecc51d9b0d で /account → 200 {'balance': '1,234,567'}
+
+=== push ===
+1. 利用者が偽サイトにパスワードを入力 → 中継 → 200 {'tx': '403881ac', 'method': 'push'}
+2. 電話に「ログインを承認しますか」。表示される接続元 IP: 203.0.113.50。利用者は自分の操作だと思って承認
+3. 偽サイトが完了を問い合わせる → 200 {'status': 'ok（偽の画面）'}
+4. 攻撃者が Cookie sid=1efebc8d09bb88ca で /account → 200 {'balance': '1,234,567'}
+
+=== push-number ===
+1. 利用者が偽サイトにパスワードを入力 → 中継 → 200 {'tx': '919c0352', 'method': 'push-number', 'show_number': '22'}
+2. 偽サイトの画面に、本物のサイトが返した数字 22 がそのまま表示される
+   電話に「画面の数字を入力」。接続元 IP: 203.0.113.50。利用者は 22 を入力
+   → (200, {'status': 'approved'})
+3. 偽サイトが完了を問い合わせる → 200 {'status': 'ok（偽の画面）'}
+4. 攻撃者が Cookie sid=d8d721c84c665ba2 で /account → 200 {'balance': '1,234,567'}
+
+=== webauthn ===
+1. 利用者が偽サイトにパスワードを入力 → 中継 → 200 {'tx': 'f9fabd23', 'method': 'webauthn', 'challenge': 'e85f761cebbaf8227f259a0845e1dee4', 'rpId': 'bank.example'}
+2. ブラウザ / 認証器が拒否: PermissionError: origin https://bank-login.example は rpId bank.example を名乗れない
+4. 盗めた Cookie なし
+
+=== webauthn（偽サイトが rpId を自分のものに書き換え） ===
+1. 利用者が偽サイトにパスワードを入力 → 中継 → 200 {'tx': 'e67053bf', 'method': 'webauthn', 'challenge': '3c38d2d6e6ae1a6f273b89cd8205d80c', 'rpId': 'bank.example'}
+2. ブラウザ / 認証器が拒否: LookupError: rpId=bank-login.example の鍵はない
+4. 盗めた Cookie なし
+```
+
+SMS、プッシュ、番号照合付きのプッシュでは、本物のサイトはどの段階でも正しい入力を受け取っています。それでも、**セッションは「ログインを始めた相手」である偽サイトに渡ります**。2 つ目の要素は「この利用者がいま操作している」ことは示しても、「どの画面で操作しているか」は示していないからです。
+
+### 手元で確かめる: 送信の上限と番号照合
+
+次に、中継ではなく承認疲れの攻撃について、サーバの数え方だけを模型にしました。攻撃者はパスワードを知っていて、通知を最大 30 回送らせます。利用者の振る舞いは測定ではなく**仮定**で、承認だけの通知なら、身に覚えがなくても 7 回目に「うるさいので」承認するとします。番号照合では、画面の数字を知らないので、00〜99 から当てずっぽうに 1 つ入力するとします。実際の利用者は、身に覚えのない数字入力の通知に当てずっぽうで答えるより、無視することのほうが多いはずなので、番号照合の行の数字は**上限の見積もり**と読んでください。
+
+```
+承認疲れの模型: 攻撃者は最大 30 回送る。承認だけなら利用者は 7 回目で承認する
+  承認だけ・上限なし      1 回の攻撃: 7 回目で承認
+                 1 万回の攻撃で突破された割合: 100.00%
+  承認だけ・上限 5 回    1 回の攻撃: 5 回送ったところで送信停止
+                 1 万回の攻撃で突破された割合: 0.00%
+  番号照合・上限なし      1 回の攻撃: 30 回送っても承認されず
+                 1 万回の攻撃で突破された割合: 25.63%
+  番号照合・上限 5 回    1 回の攻撃: 5 回送ったところで送信停止
+                 1 万回の攻撃で突破された割合: 4.99%
+```
+
+番号照合の値は計算と合います。100 通りの数字を 30 回当てずっぽうに試して 1 回でも当たる確率は 1 − 0.99<sup>30</sup> ≈ 26.0%、5 回なら 1 − 0.99<sup>5</sup> ≈ 4.9% です。
+
+この表から言えるのは 2 つです。**送信の上限は、攻撃者の粘り強さに効く**。上限が 5 回なら、7 回目で折れる利用者は守られます。ただし、1 回目で押してしまう利用者は守れません。**番号照合は、利用者が折れることそのものを無効にする**。うるさいから押す、という行動では通らなくなり、残るのは当てずっぽうが当たる確率だけになります。両方を組み合わせると、その確率も小さく抑えられます。どちらも、前の節で見た中継には効きません。
+
+## メールで届くコード
+
+SMS の代わりにメールで確認コードを送るサイトもあります。NIST は、経路外の認証にメールを使うことを禁じています。
+
+> Email SHALL NOT be used for out-of-band authentication
+>
+> （メールを経路外の認証に使ってはならない）
+>
+> （[SP 800-63B-4 3.1.3.1](https://pages.nist.gov/800-63-4/sp800-63b.html#ooba)）
+
+理由として、パスワードだけでメールボックスに入れてしまうこと、途中のメールサーバで読まれうること、DNS の偽装などで配送先を変えられうることを挙げています。メールが届くまでの経路とメールボックスの守り方は、第 25 章で見たとおりです。メールのコードは、**メールボックスのパスワードという 1 つ目の要素の強さを、そのまま引き継ぐ**だけです。ただし、メールアドレスの確認やアカウント回復のために送るコードは認証ではないので、この禁止の対象外とされています。
+
+## 6 桁を数える側の設計
+
+ここからは、どの方式を選んでもサイトの側で守るべき数え方です。経路外の認証で使う秘密について、NIST は次のように定めています（[SP 800-63B-4 3.1.3.2](https://pages.nist.gov/800-63-4/sp800-63b.html#out-of-band-verifiers)）。
+
+- 10 分以内に完了しなければ無効にする
+- 同じ秘密は有効期間中に 1 回しか受け付けない
+- 秘密は承認された乱数生成器で作った 6 桁以上とし、64 ビットに満たないなら、連続した失敗の回数を制限する
+- 「Generating a new authentication secret SHALL NOT reset the failed authentication count.」（新しい秘密を作っても、認証の失敗回数を戻してはならない）
+
+最後の 1 行は見落とされやすい点です。失敗回数をコードごとに数えて、再送のたびに 0 に戻していると、「数回試しては再送する」を繰り返すだけで、総当たりの回数に上限がなくなります。6 桁のコードを 1 つにつき 5 回ずつ試し、外れたら再送させる攻撃を、失敗の上限 100 回のサーバ 2 種類で模型にしました（同じ環境、乱数の種は固定）。
+
+```
+OTP の総当たり（6 桁、1 コードあたり 5 回まで試して再送、失敗の上限 100 回）
+  再送で失敗回数を 0 に戻すサーバ: 試行 422,675 回（再送 84,535 回）で一致
+  再送しても失敗回数を戻さないサーバ: 失敗 100 回でロック。試行 100 回、再送 21 回
+```
+
+失敗回数を戻すサーバは、約 42 万回の試行で破られました。1 回あたりの当たる確率は 100 万分の 1 なので、平均すると 100 万回前後かかる計算で、この回はたまたま早く当たっただけです。回数は大きく見えますが、自動化された攻撃には現実的な数で、しかも**再送のたびに SMS の料金が発生する**ので、前の節の SMS ポンピングと同じ請求がサイトに来ます。失敗回数をアカウントの単位で数えて再送をまたいで持ち越すサーバは、100 回で止まり、当たる確率は 1 万分の 1 にとどまります。
+
+## 登録を変えるときが、いちばん狙われる
+
+Cisco の事例で攻撃者が最初にしたことは、**自分の端末を 2 つ目の要素として登録する**ことでした。1 回の承認で手に入れたログインを、何度でも使える入口に変えたわけです。SIM スワップも、見方を変えれば「電話番号という 2 つ目の要素の登録先を書き換える」攻撃です。
+
+NIST は、電話番号の登録と変更を、新しい認証器を結び付けることとして扱います。
+
+> Setting or changing the pre-registered telephone number is considered to be the binding of a new authenticator
+>
+> （事前に登録された電話番号を設定・変更することは、新しい認証器を結び付けることとみなす）
+>
+> （[SP 800-63B-4 3.1.3.3](https://pages.nist.gov/800-63-4/sp800-63b.html#pstnOOB)）
+
+そして、新しい認証器を結び付けるときには、そのアカウントで今使える最も高い保証レベル（または新しい認証器を使うレベルの低い方）での認証を求めます（[SP 800-63B-4 4.1.2.1](https://pages.nist.gov/800-63-4/sp800-63b.html#bindexisting)）。つまり、パスキーを持っている利用者が電話番号を変えるなら、パスキーで認証し直させる、ということです。ログインの瞬間よりも、**登録を変える瞬間**のほうが攻撃者にとって価値が高いので、ここを最も固くします。
+
+<Callout type="warn" title="よくある誤解: 番号照合を入れたのでフィッシング対策は済んだ">
+  番号照合は承認疲れの攻撃をほぼ無効にしますが、偽サイトによる中継は止めません。
+  数字はログインを始めた画面に出るので、偽サイトは本物から受け取った数字をそのまま見せられます。
+  中継を止められるのは、応答に相手のオリジンが入る方式（WebAuthn やパスキー）だけです。
+  NIST は、AAL2 の対象となるアプリに、フィッシング耐性のある方式を選択肢として用意することを求めています。
+  SMS や番号照合を残す場合も、それは移行の途中の手段と位置づけるのが現実的です。
+</Callout>
+
+## サイトの側でできること
+
+ここまでの話を、サイトを作る側の対策として並べ直します。
+
+| 対策 | 防ぐもの | 防がないもの |
+| --- | --- | --- |
+| 通知の送信回数の上限（最後の成功から数える） | 承認疲れのうち、粘る攻撃 | 1 回目で押す利用者、中継 |
+| 番号照合、接続元とアプリ名の表示 | 承認疲れ | 中継（地域の表示に利用者が気づかない限り） |
+| OTP の失敗回数をアカウント単位で数え、再送で戻さない | コードの総当たり | 中継、SIM スワップ |
+| 番号ごと・範囲ごとの SMS 送信の上限、検証の完了率の監視 | SMS ポンピング | アカウントへの攻撃 |
+| SIM の変更・番号の移転の兆候を見て SMS を控える | SIM スワップの一部 | SS7、兆候の取れない事業者 |
+| 電話番号や端末の登録の変更に、最も強い要素での再認証と通知を求める | 1 回の突破を恒久的な入口に変えること | 最初の 1 回の突破 |
+| WebAuthn・パスキーを選択肢として用意し、移行を促す | 中継を含むすべて | 端末そのものを乗っ取られた場合 |
+
+どの対策も、「誰が 2 つ目の要素を受け取れるか」と「何回試せるか」と「登録を誰が変えられるか」の 3 つのどれかを絞っています。逆に、表の最後の行以外は、**利用者が偽サイトにいることを検出する手段を持っていません**。それができるのは、第 174 回で見たとおり、ブラウザがオリジンを書き込む方式だけです。
+
+## まとめ
+
+- SMS のコードは、サイトの管理の外にある携帯網を通って届く。SMSC は加入者のデータベースに番号の居場所を問い合わせて届けるので、その答えを書き換えられると攻撃者に届く
+- SIM スワップは携帯電話会社の窓口の本人確認を、SS7 の悪用はシグナリングの網の信頼を突く。どちらもサイトからは正常な SMS の送信にしか見えない
+- NIST SP 800-63B-4 は電話網による方式を唯一の制限付きの認証器とし、SIM の変更や番号の移転の兆候を確かめることを勧めている。メールは経路外の認証に使ってはならない
+- SMS ポンピングは利用者ではなくサイトの料金を狙う。送信の流量と、送った数に対する入力された数を監視する
+- 承認だけのプッシュは、何を承認しているのかが画面と結びついておらず、承認疲れで破られる。NIST は送信回数の上限を求め、比べさせるだけの方式を認めていない
+- 番号照合は承認疲れを無効にするが、中継型のフィッシングでは数字も中継されるので止まらない
+- OTP の失敗回数は、再送で 0 に戻すと上限が意味を失う。模型では約 42 万回の試行で破られた
+- 1 回の突破を恒久的な入口に変えるのが、端末や電話番号の登録の変更。ここに最も強い要素での再認証を求める
+- 偽サイトにいることを機械的に見抜けるのは、応答にオリジンが入る WebAuthn とパスキーだけ
+
+2 つ目の要素がどれほど強くても、ログインが終わった後の状態は Cookie やトークンが運びます。中継型のフィッシングが最後に盗んでいたのも、そのセッション Cookie でした。次の第 176 回では、認証の結果を運ぶセッションと Cookie を見ます。
