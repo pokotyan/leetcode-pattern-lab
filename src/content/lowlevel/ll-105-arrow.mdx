@@ -1,0 +1,435 @@
+---
+title: 列の形のまま渡す：Apache Arrow
+description: pandas、Polars、DuckDB、Spark は、なぜ互いの表を一瞬で受け渡せるのか。メモリ上の列の並べ方を 1 つに決めた Apache Arrow の作りを、バッファのバイト列、ライブラリ間のコピーの有無、ファイルとプロセスをまたぐ受け渡しで確かめます
+chapter: db
+order: 10
+status: published
+topics:
+  - Apache Arrow
+  - 列指向のメモリ形式
+  - 有効ビットマップ
+  - オフセットバッファ
+  - string view
+  - レコードバッチ
+  - Arrow IPC
+  - C Data Interface
+  - PyCapsule Interface
+  - pandas
+  - Polars
+  - PySpark
+  - Arrow Flight / ADBC
+requires:
+  - ll-104-db-vectorized
+  - ll-15-cache
+  - ll-24-mmap-cow
+  - ll-31-abi
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 表を渡すたびに、何が起きているのか
+
+第 104 回の実験 4 では、DuckDB の集計結果を Python に渡す方法を変えて測りました。`fetchall()` で Python のタプルとして受け取ると 1.5 秒かかり、NumPy の配列や Arrow の表で受け取ると 30〜50 ms で済みました。同じ 1,000 万行でも、**受け取る側の形**によって 30 倍以上の差が出ます。
+
+データを扱う Python のプログラムでは、この「渡す」が何度も起きます。Parquet を読んで pandas で前処理し、一部を DuckDB で集計し、Polars に渡して整形し、Spark のジョブに投げる、といった具合です。ライブラリがそれぞれ独自のメモリの形を持っていれば、境目を越えるたびに、値を 1 つずつ読み出して相手の形に詰め直すことになります。
+
+pandas の作者の Wes McKinney は、2017 年に pandas の内部構造の問題を振り返った記事で、最大の問題をこう書いています（[Apache Arrow and the “10 Things I Hate About pandas”](https://wesmckinney.com/blog/apache-arrow-pandas-internals/)）。
+
+> The single biggest problem was data interchange, particularly moving large tabular datasets from one process’s memory space to another’s. It was extremely expensive, and there was no standard solution for doing it.
+
+この問題への答えとして作られたのが **Apache Arrow** です。2016 年 2 月に Apache の最上位プロジェクトとして発表され、発表文は「establishes a de-facto standard for columnar in-memory processing and interchange」と位置付けています（[ASF の発表](https://news.apache.org/foundation/entry/the_apache_software_foundation_announces87)）。この回では、Arrow が何を決めたのかと、それによって何がコピーなしで渡り、何が渡らないのかを見ます。
+
+## Arrow が決めたもの：メモリ上の列の並べ方
+
+Arrow の中心は、ライブラリではなく**仕様**です。仕様書は、自分の範囲を次のように書いています（[Arrow Columnar Format](https://arrow.apache.org/docs/format/Columnar.html)）。
+
+> The Arrow columnar format includes a language-agnostic in-memory data structure specification, metadata serialization, and a protocol for serialization and generic data transport.
+
+決めているのは、**ある型の列が、メモリ上でどのバイト列として並ぶか**です。Parquet のようなファイル形式ではなく、計算している最中のメモリの形です。同じ仕様書は、この形が目指す性質として、連続した読み出し、O(1) の任意位置の参照、SIMD とベクトル化への向き、そして「Relocatable without “pointer swizzling”, allowing for true zero-copy access in shared memory」を挙げています。
+
+最後の性質が重要です。Arrow の列は、ポインタではなく**バッファの先頭からの位置**で中身を指します。だから、バッファを別の場所に置いても、別のプロセスと共有しても、中身を書き換えずにそのまま読めます。Python のリストのように、要素ごとにヒープ上のオブジェクトを指すポインタを持つ形とは正反対です。
+
+その代わりに失うものもあります。仕様書は「The Arrow columnar format provides analytical performance and data locality guarantees in exchange for comparatively more expensive mutation operations.」と書いています。途中に 1 行を挿入する、文字列を 1 つ長くする、といった変更は苦手です。Arrow は、**一度作ったら読むだけ**の使い方を前提にしています。
+
+### 整数の列：値の配列と、有効ビットマップ
+
+`[1, null, 3, 4]` という 32 ビット整数の列を作り、中のバッファを覗いてみます。
+
+```python
+import pyarrow as pa
+arr = pa.array([1, None, 3, 4], pa.int32())
+for i, b in enumerate(arr.buffers()):
+    print(i, b.size, b.address % 64, b.to_pybytes().hex(" "))
+```
+
+```text
+== int32  type=int32  len=4 null_count=1
+  buffer[0] size=  1 addr%64= 0 bytes=0d
+  buffer[1] size= 16 addr%64= 0 bytes=01 00 00 00 00 00 00 00 03 00 00 00 04 00 00 00
+```
+
+バッファは 2 つです。
+
+- `buffer[1]` は値の配列です。4 バイトの整数が 4 つ、リトルエンディアンで隙間なく並んでいます（第 3 回）。C の `int32_t` の配列とまったく同じ形なので、NumPy にも C のコードにも、そのまま渡せます
+- `buffer[0]` は**有効ビットマップ**で、1 ビットが 1 つの値に対応します。`0x0d` は 2 進数で `00001101` で、下位のビットから順に「有効、null、有効、有効」です。仕様書は「A 1 (set bit) for index j indicates that the value is not null, while a 0 (bit not set) indicates that it is null.」と定めています
+
+null の位置の値は `00 00 00 00` ですが、意味はありません。null かどうかはビットマップだけが決めます。値の配列に「穴」を作らないので、合計を取るループは分岐なしで全要素を読み、最後にビットマップで null の分を除けます。第 104 回の選択ベクトルと同じく、**判定と計算を別のループに分ける**考え方です。
+
+どのバッファも、アドレスを 64 で割った余りが 0 です。仕様書は 8 バイトか 64 バイトの境界にそろえることを勧め、「If possible, we suggest that you prefer using 64-byte alignment and padding.」と書いています。64 バイトは多くの CPU のキャッシュラインの大きさで（第 15 回）、512 ビットの SIMD レジスタ 1 本分でもあります。
+
+### 文字列の列：オフセットと、詰めた中身
+
+文字列は長さがばらばらなので、もう 1 つバッファが要ります。
+
+```text
+== string  type=string  len=4 null_count=1        ← ["ab", null, "cde", ""]
+  buffer[0] size=  1 bytes=0d
+  buffer[1] size= 20 bytes=00 00 00 00 02 00 00 00 02 00 00 00 05 00 00 00 05 00 00 00
+  buffer[2] size=  5 bytes=61 62 63 64 65
+```
+
+`buffer[2]` には、すべての文字列の中身が区切りなしで詰めてあります（`abcde`）。`buffer[1]` は**オフセット**で、要素数より 1 つ多い 5 個の整数 `0, 2, 2, 5, 5` です。i 番目の文字列は、オフセットの i 番目から i+1 番目の手前までです。仕様書の言い方では「The offsets buffer contains length + 1 signed integers ... which encode the start position of each slot in the data buffer.」です。
+
+null の 2 番目と空文字列の 4 番目は、どちらも長さ 0 ですが、ビットマップで区別されます。
+
+McKinney の記事は、この形の利点を「In Arrow, each string is right next to the previous one in memory, so you can scan all of the data in a column of strings without any cache misses.」と書いています。Python の文字列の列なら、要素ごとに別々の場所にあるオブジェクトを辿ることになります。
+
+### 新しい文字列の形：string view
+
+オフセット方式には弱点があります。2 つの文字列が等しいかを確かめるには、毎回データバッファまで読みに行く必要があります。また、フィルタで一部の行を抜き出すと、中身を新しいバッファに詰め直さなければなりません。
+
+そこで、仕様の 1.4 版で **string view**（binary view）という別の形が加わりました。仕様書によれば、この形は「adapted from TU Munich’s UmbraDB」です。同じ考え方は、Velox、Polars、DuckDB などでも使われています（[DataFusion のブログ](https://datafusion.apache.org/blog/2024/09/13/string-view-german-style-strings-part-1/)）。
+
+```text
+== string_view  type=string_view  len=4 null_count=1   ← ["ab", null, "a long string over 12B", ""]
+  buffer[0] size=  1 bytes=0d
+  buffer[1] size= 64 bytes=02 00 00 00 61 62 00 00 00 00 00 00 00 00 00 00    ← 1 つ目: 長さ 2、"ab"
+                           00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00    ← 2 つ目: null
+                           16 00 00 00 61 20 6c 6f 00 00 00 00 00 00 00 00    ← 3 つ目: 長さ 22、先頭 4 バイト "a lo"、
+                           00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00       バッファ番号 0、位置 0
+  buffer[2] size= 22 bytes=61 20 6c 6f 6e 67 20 73 74 72 69 6e 67 20 6f 76 65 72 20 31 32 42
+```
+
+1 つの要素は 16 バイトの固定長の「view」です。先頭 4 バイトが長さで、12 バイト以下の文字列はその後ろに中身をそのまま入れます（仕様書の「the string’s bytes are inlined」）。それより長い文字列は、先頭 4 バイトの写しと、データバッファの番号と位置を持ちます。先頭 4 バイトが view の中にあるので、多くの比較はデータバッファを読まずに決着します。view は固定長なので、行を抜き出すときも view だけを集めればよく、中身は元のバッファを指したままにできます。
+
+### 辞書エンコーディング
+
+同じ値が何度も現れる列は、値の一覧（辞書）と、そこへの番号の列で表せます。
+
+```text
+== dictionary dictionary<values=string, indices=int32, ordered=0>   ← ["tokyo", "osaka", "tokyo", "tokyo"]
+  indices     buffer[1] bytes=00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00
+  dictionary  buffer[1] bytes=00 00 00 00 05 00 00 00 0a 00 00 00
+              buffer[2] bytes=74 6f 6b 79 6f 6f 73 61 6b 61            ← "tokyoosaka"
+```
+
+仕様書は「Any array can be dictionary-encoded.」と書いています。第 104 回で見た DuckDB の dictionary Vector や、Parquet の辞書符号化と同じ発想を、メモリ上の共通の形として決めたものです。
+
+### 切り出しはコピーしない
+
+列の一部を取り出す `slice` は、元のバッファを指したまま、**開始位置（offset）と長さ**だけを変えた新しい列を作ります。
+
+```text
+slice: offset 2 same data buffer: True
+```
+
+位置で指す形なので、部分を表すのに中身を動かす必要がありません。
+
+### レコードバッチ：表の単位
+
+同じ長さの列を束ねたものが**レコードバッチ**です。仕様書は「a record batch is an ordered collection of arrays, known as its fields, each having the same length as one another but potentially different data types」と定義しています。PyArrow の `Table` は、同じスキーマのレコードバッチを並べたもので、1 つの列は複数の塊（chunk）に分かれていることがあります。
+
+第 104 回の DuckDB の DataChunk も「同じ長さの列の束」でしたが、中の Vector の形は DuckDB 独自で、constant や sequence のように Arrow にはない持ち方も含みます。似ているが同じではない、という点が、後の実験で効いてきます。
+
+<Callout type="note" title="Parquet と Arrow は役割が違う">
+  Arrow の FAQ は、Parquet を「not a "runtime in-memory format"」とし、ファイル形式は処理の前にメモリ上の構造へ復元する必要がある、と書いています。
+  そのうえで「We intend for Arrow to be that in-memory data structure.」と続け、両者は「complement each other」だとしています（[Arrow FAQ](https://arrow.apache.org/faq/)）。
+  Parquet は、圧縮と符号化で**保存と転送の量を減らす**ための形です。Arrow は、そのまま**計算に使う**ための形です。
+  Parquet の中身は読み物の<a href={`${import.meta.env.BASE_URL}reading/lake-file-format/`}>ファイル形式</a>で扱いました。
+</Callout>
+
+## 同じプロセスの中で渡す
+
+### 形が同じなら、ポインタを渡すだけ
+
+2 つのライブラリが同じメモリの形を使っているなら、表を渡すのにバイト列をコピーする必要はありません。バッファのアドレスと、型と長さの情報を渡せば済みます。問題は、その「情報」の渡し方をどう決めるかです。
+
+ライブラリごとに C++ のクラスや Rust の構造体の形は違うので、それをそのまま渡すことはできません（第 31 回の ABI の問題です）。そこで Arrow は、渡すための最小限の構造体を C で定めました。**C Data Interface** です（[The Arrow C data interface](https://arrow.apache.org/docs/format/CDataInterface.html)）。
+
+> The Arrow C data interface defines a very small, stable set of C definitions that can be easily copied in any project’s source code and used for columnar data interchange in the Arrow format.
+
+中身は 2 つの構造体です。
+
+```c
+struct ArrowSchema {          // 型の情報
+  const char* format;         // "i" は int32、"u" は utf8 の文字列、など
+  const char* name;
+  const char* metadata;
+  int64_t flags;
+  int64_t n_children;
+  struct ArrowSchema** children;
+  struct ArrowSchema* dictionary;
+  void (*release)(struct ArrowSchema*);
+  void* private_data;
+};
+
+struct ArrowArray {           // データ
+  int64_t length;
+  int64_t null_count;
+  int64_t offset;
+  int64_t n_buffers;
+  int64_t n_children;
+  const void** buffers;       // 有効ビットマップ、オフセット、値の各バッファへのポインタ
+  struct ArrowArray** children;
+  struct ArrowArray* dictionary;
+  void (*release)(struct ArrowArray*);
+  void* private_data;
+};
+```
+
+`buffers` は、さきほど覗いたバッファそのものへのポインタです。受け取った側は、自分の列の型にこのポインタを包むだけで、中身はコピーしません。
+
+難しいのは**誰がメモリを解放するか**です。渡した側（producer）のメモリを受け取った側（consumer）が使っている間は、渡した側がそれを捨ててはいけません。仕様は、メモリは渡した側が持ち続け、「The only way the consumer influences data lifetime is by calling the base structure’s release callback.」と定めています。受け取った側は使い終わったら `release` を呼び、渡した側はそこで初めて解放します。言語やメモリ管理の方式が違うライブラリのあいだで、所有権を関数ポインタ 1 つで受け渡す仕組みです。
+
+この仕様の目標は「Allow zero-copy sharing of Arrow data between independent runtimes and components running in the same process.」で、プロセスをまたぐことは目標に入っていません（同文書）。それは後で見る IPC 形式の役割です。
+
+### Python での入口：PyCapsule Interface
+
+Python のライブラリ同士では、この 2 つの構造体を **PyCapsule**（名前とデストラクタを付けたポインタの入れ物）に入れて渡します。Arrow は、そのためのメソッドの名前を決めています（[The Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html)）。
+
+- `__arrow_c_schema__`：型
+- `__arrow_c_array__`：列やレコードバッチ
+- `__arrow_c_stream__`：表やデータフレーム、ストリーム
+
+このメソッドを持つオブジェクトなら、受け取る側は相手のライブラリを import しなくても読めます。手元で確かめると、3 つとも持っていました。
+
+```text
+polars.DataFrame   __arrow_c_stream__: True
+pandas.DataFrame   __arrow_c_stream__: True
+duckdb relation    __arrow_c_stream__: True
+polars -> pa.table(df) same buffer: True
+pl.DataFrame(rel) via capsule: [{'x': 1}]
+```
+
+pandas は 3.0 で「DataFrame and Series now support the Arrow PyCapsule Interface for both export and import of data」としました（[What’s new in 3.0.0](https://pandas.pydata.org/docs/whatsnew/v3.0.0.html)）。Polars は 1.3 から対応し（[Polars: Arrow producer/consumer](https://docs.pola.rs/user-guide/misc/arrow/)）、DuckDB の文書は「Polars reads it this way even without pyarrow installed.」と書いています（[DuckDB: Export to Apache Arrow](https://duckdb.org/docs/2.0/guides/python/export_arrow.html)）。PyArrow は、渡す側にも受け取る側にもなる 1 つの実装にすぎず、**決まっているのはメソッドの名前と構造体の形**です。
+
+### 手元で確かめる 1：どこまでコピーなしで渡るか
+
+| 項目 | 値 |
+| --- | --- |
+| マシン | Apple M1 Pro（8 コア）、メモリ 32 GB、macOS 26.2 |
+| Python | 3.14.0（venv） |
+| ライブラリ | pyarrow 26.0.1、pandas 3.1.1、polars 2.1.0、duckdb 2.0.0、numpy 2.5.4 |
+
+1,000 万行の 32 ビット整数の列を PyArrow で作り、各ライブラリに渡したあとの列が、**元と同じアドレスのバッファ**を指しているかを調べました。
+
+```text
+pyarrow -> numpy (to_numpy)              same buffer as pyarrow: True
+pyarrow -> pandas (numpy dtype)          same buffer as pyarrow: False
+pyarrow -> pandas (ArrowDtype)           same buffer as pyarrow: True
+pyarrow -> polars                        same buffer as pyarrow: True
+pyarrow -> duckdb -> pyarrow             same buffer as pyarrow: False
+```
+
+- NumPy、Polars、ArrowDtype を使った pandas は、元のバッファをそのまま使っています
+- 既定の pandas（整数を NumPy の型で持つ）は、コピーしていました。pyarrow の `to_pandas()` は、同じ型の列を 2 次元の塊にまとめ直すからです
+- DuckDB に通して戻した結果も、別のバッファです。DuckDB は Arrow の表を**コピーせずにスキャン**できますが、問い合わせの結果は DuckDB の Vector で作られ、出口で Arrow の形に書き出されます。SQL を実行すれば新しい値ができるので、当然といえば当然です
+
+null が混ざると、話が変わります。
+
+```text
+nulls -> numpy zero_copy_only: ArrowInvalid Needed to copy 1 chunks with 1 nulls, but zero_copy_only was True
+nulls -> pandas default dtype: float64 [1.0, nan, 3.0]
+```
+
+NumPy の配列には有効ビットマップがありません。null を表すには、値の配列そのものに印を入れるしかなく、整数には NaN がないので、pandas の NumPy 型は**浮動小数点数に変えて NaN を入れます**。Arrow の形のままなら、整数は整数のまま、null はビットマップで表せます。
+
+次に、同じ受け渡しにかかる時間を測りました。1,000 万行の整数の列と、500 種類の都市名の文字列の列です（最短値）。
+
+```text
+rows=10,000,000 pyarrow=26.0.1 pandas=3.1.1 polars=2.1.0
+arrow table nbytes: 152.6 MiB
+pyarrow -> polars（int 列だけ）                    0.0 ms
+pyarrow -> polars（文字列列だけ）                  14.5 ms
+pyarrow -> polars（string_view にしてから）        0.0 ms
+pyarrow -> pandas (ArrowDtype)                     0.1 ms
+pyarrow -> pandas (既定: int は numpy, str は str)  3.6 ms
+pyarrow -> NumPy の object 配列（文字列列）       327.2 ms
+pyarrow -> Python の list (to_pylist)             448.7 ms
+```
+
+- 形が同じなら、152 MiB の表でも 0.1 ms 以下です。動くのはポインタと型の情報だけで、時間はデータの大きさに比例しません
+- Polars に文字列の列を渡すと 14.5 ms かかりました。Polars は文字列を string view で持つので、オフセット方式の列を受け取ると view を作り直します。先に `string_view` にしておけば 0 ms です。**同じ Arrow でも、型が違えば変換が要ります**
+- pandas 3 の既定の文字列型 `str` は、PyArrow がある環境では Arrow の文字列の列そのものです（「backed by PyArrow under the hood, if installed」、[What’s new in 3.0.0](https://pandas.pydata.org/docs/whatsnew/v3.0.0.html)）。3.6 ms には、整数の列を NumPy の配列へまとめ直すコピーが含まれます
+- 文字列を 1 つずつ Python のオブジェクトにすると、300〜450 ms かかります。第 104 回の `fetchall()` と同じ構図で、1,000 万個のオブジェクトを作る費用です
+
+<Callout type="warn" title="「Arrow 対応」は、コピーなしを意味しない">
+  2 つのライブラリが Arrow を話せても、型の選び方（string と string_view、32 ビットと 64 ビットのオフセット、NumPy 型か Arrow 型か）が食い違えば、境目で変換が走ります。
+  受け渡しが遅いときは、両側の列の型を `schema` や `dtype` で並べて見るのが最初の一歩です。
+</Callout>
+
+## ファイルとプロセスをまたいで渡す
+
+### IPC 形式：メモリの形をそのままバイト列に
+
+C Data Interface はポインタを渡すので、同じアドレス空間の中でしか使えません。別のプロセスや別の機械に渡すには、バイト列にする必要があります。そのための形が **Arrow IPC 形式**です。
+
+ストリーム形式では、先頭にスキーマのメッセージが 1 つ来て、そのあとにレコードバッチのメッセージが続きます（仕様書の「The schema comes first in the stream, and it is the same for all of the record batches that follow.」）。`[3, null, 5, 7]` の 1 列を書き出して、バイト列を見ました。
+
+```text
+total 304
+schema metadata 120 body 0
+record batch metadata 136 body 24
+ff ff ff ff 78 00 00 00 ...                 ← 先頭: 継続の印と、メタデータの長さ 0x78 = 120
+... 0d 00 00 00 00 00 00 00                 ← 本体: 有効ビットマップ（8 バイトに詰め物）
+    03 00 00 00 00 00 00 00 05 00 00 00 07 00 00 00   ← 本体: 値の配列
+    ff ff ff ff 00 00 00 00                 ← 終わりの印
+```
+
+レコードバッチの本体の 24 バイトは、さきほどメモリで見たバッファと**同じバイト列**です。メタデータ（FlatBuffers で書かれた、各バッファの位置と長さ）だけが前に付きます。第 81 回の Protocol Buffers は、整数を可変長に符号化して詰めました。Arrow IPC は符号化をせず、メモリの形をそのまま書きます。読む側はメタデータを読み、本体のバッファの位置を記録するだけで、値を 1 つずつ復元する必要がありません。仕様書も、レコードバッチを「without need for memory copying」で組み立て直せると書いています。
+
+ファイル形式は、ストリーム形式の前後に `ARROW1` という印と、各レコードバッチの位置を記した目次（footer）を付けたもので、任意のバッチに直接飛べます。Arrow の FAQ によれば、Feather の第 2 版は、この IPC ファイル形式と同じものです。
+
+### 手元で確かめる 2：mmap で開く
+
+5,000 万行・3 列の整数の表（メモリ上で 572 MiB）を、Arrow IPC ファイル、Parquet、pandas の pickle の 3 つで保存しました。ファイルの大きさは、Arrow IPC が 572 MiB、Parquet が 152 MiB、pickle が 572 MiB です。Arrow IPC はメモリの形そのままなので、圧縮しない限りメモリ上と同じ大きさになります。
+
+Arrow IPC のファイル（48 個のレコードバッチ）を `pa.memory_map` で開き、段階ごとに時間と、プロセスの最大の常駐メモリ（RSS）と、Arrow のメモリプールから確保した量（pool）を見ました。
+
+```text
+open_file           12.63 ms   RSS +   1 MiB   pool 0 MiB
+get_batch(10)        0.55 ms   RSS +  13 MiB   pool 0 MiB
+sum batch10 qty      0.18 ms   RSS +  14 MiB   pool 0 MiB
+read_all            25.16 ms   RSS + 574 MiB   pool 0 MiB
+sum all qty          4.40 ms   RSS + 574 MiB   pool 0 MiB
+```
+
+- ファイルを開いた時点では、目次を読んだだけで、メモリはほぼ増えません
+- 10 番目のバッチ（約 105 万行、12 MiB）を取り出すと、増えたのはそのバッチの分だけです。触ったページだけがページキャッシュから対応付けられます（第 24 回）
+- 全体を `read_all` しても、pool は 0 のままです。データは Arrow のヒープにコピーされず、ファイルを対応付けたページを指しています。RSS が増えて見えるのは、対応付けたページに触れたからです
+- 572 MiB の `read_all` が 25 ms で済むのは、ファイルがすでにページキャッシュに載っていたからです。ファイルを書いてから時間が経ち、ページキャッシュから追い出されていた最初の実行では、同じ `read_all` に 956 ms、`get_batch(10)` に 25 ms かかりました。mmap はコピーを省きますが、ディスクから読む時間までは省けません
+
+同じ表を 3 つの形式から読み込んだときの比較です（それぞれ別のプロセスで、ページキャッシュに載った状態の 2 回目の実行）。
+
+```text
+mmap        40.5 ms   max RSS +  573 MiB  (pool=0 MiB)
+read       138.8 ms   max RSS +  575 MiB  (pool=572 MiB)
+parquet    525.0 ms   max RSS +  819 MiB  (pool=590 MiB)
+pickle     365.5 ms   max RSS +  619 MiB  (pool=0 MiB)
+```
+
+`read` は同じ Arrow IPC ファイルを普通のファイルとして読んだもので、572 MiB を Arrow のメモリプールにコピーしています。Parquet は 4 分の 1 の大きさですが、読むには復号と展開が要り、時間もメモリもいちばん多く使いました。Arrow の FAQ の言う「reading Arrow IPC files does not involve any decoding because the on-disk representation is the same as the in-memory representation」を、そのまま測った形です。
+
+<Callout type="tip" title="使い分け">
+  長く保存する、ネットワークで送る、他のシステムに渡すなら、小さくなる Parquet が向いています。
+  同じ機械の中で、複数のプロセスが同じ大きな表を何度も読むなら、Arrow IPC を mmap で開くと、ページキャッシュを全員で共有できます。
+</Callout>
+
+### ネットワーク越しに：Flight と ADBC
+
+IPC 形式のバイト列を RPC で送る仕組みが **Arrow Flight** です。仕様書は「an RPC framework for high-performance data services based on Arrow data, and is built on top of gRPC and the IPC format」と説明しています（[Arrow Flight RPC](https://arrow.apache.org/docs/format/Flight.html)）。その上に SQL の問い合わせを載せたのが **Flight SQL** です（[Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html)）。
+
+データベースのドライバの側からも、同じ動きがあります。JDBC や ODBC は 1 行ずつ結果を取り出す API で、列の形のデータを渡すには一度行に直す必要があります。ADBC の FAQ は「JDBC uses row-based interfaces like ResultSet. When working with columnar data, like Arrow data, this means that we have to convert the data at least once and possibly twice」と書いています（[ADBC FAQ](https://arrow.apache.org/adbc/current/faq.html)）。**ADBC** は、問い合わせの結果を Arrow のストリームとして返すクライアント API で、「result sets of queries in ADBC are all returned as streams of Arrow data, not row-by-row」と定めています（[ADBC](https://arrow.apache.org/docs/format/ADBC.html)）。同じ FAQ は、両者の関係を「ADBC is a client API specification.」「Flight SQL is a wire protocol.」と区別しています。
+
+ドライバの一覧には、PostgreSQL、SQLite、DuckDB、BigQuery、Snowflake、Trino などが並んでいます（[ADBC Drivers](https://arrow.apache.org/adbc/current/driver/index.html)）。ただし、PostgreSQL のドライバは「It wraps libpq」で、サーバとのあいだは PostgreSQL 自身の行ごとのプロトコルです。**ADBC が変えるのはアプリとドライバの境目で、ドライバとサーバのあいだは変わりません**。サーバ自身が Arrow で結果を返す例としては、BigQuery の Storage Read API（「serialized using either Apache Avro format, or Apache Arrow」、[BigQuery Storage API](https://cloud.google.com/bigquery/docs/reference/storage)）や、Snowflake の Python コネクタの `fetch_arrow_all()` があります。
+
+## Spark と Arrow
+
+### JVM と Python のあいだ
+
+Spark の本体は JVM の上で動き、PySpark のプログラムは Python のプロセスで動きます（Spark の仕組みは読み物の<a href={`${import.meta.env.BASE_URL}reading/compute-spark/`}>Spark の中身</a>で扱いました）。Spark のデータを pandas に渡すとき、Python の関数を各行に適用するとき、データはこの 2 つのプロセスのあいだを行き来します。Spark の文書は、Arrow の役割をこう書いています（[Apache Arrow in PySpark](https://spark.apache.org/docs/latest/api/python/tutorial/sql/arrow_pandas.html)）。
+
+> Apache Arrow is an in-memory columnar data format that is used in Spark to efficiently transfer data between JVM and Python processes.
+
+ここでの Arrow は、同じプロセスの中のポインタ渡しではなく、**プロセスのあいだを IPC 形式のバイト列で渡す**使い方です。Arrow を使わない場合、行は 1 つずつ pickle で直列化されます。
+
+関わる設定は主に 2 つです。
+
+- `spark.sql.execution.arrow.pyspark.enabled`：`toPandas()` と、pandas の DataFrame からの `createDataFrame()` に Arrow を使う（[Spark Configuration](https://spark.apache.org/docs/latest/configuration.html)）。4.1 までは既定で無効、4.2 から既定で有効です
+- `spark.sql.execution.pythonUDF.arrow.enabled`：普通の Python UDF の受け渡しに Arrow を使う。文書は「Since Spark 4.2, Arrow optimization is enabled by default for regular Python UDFs.」としています
+
+さらに、**pandas UDF** は、Arrow のバッチを pandas の Series として受け取り、まとめて計算する関数です。文書は「Pandas UDFs are user defined functions that are executed by Spark using Arrow to transfer data and Pandas to work with the data, which allows vectorized operations.」と書いています。4.0 からは、`DataFrame.toArrow()` で PyArrow の表を直接受け取ることもできます。
+
+### 手元で確かめる 3：Arrow を切ると何が起きるか
+
+Spark 4.3.0 をローカル（`local[8]`）で動かし、500 万行・3 列の DataFrame をキャッシュしてから測りました。Spark 4.3 の PySpark は pandas 3 に完全には対応していないという警告を出したので、この実験だけ Python 3.13.3、pandas 2.3.3、pyarrow 26.0.1 の別の環境を使いました。Java は OpenJDK 21 です。
+
+```text
+spark 4.3.0 arrow.pyspark.enabled default = true  pythonUDF.arrow.enabled default = true
+rows=5,000,000
+toPandas  Arrow 有効         249.8 ms
+toPandas  Arrow 無効      14,237.6 ms
+toArrow                     193.0 ms
+createDataFrame(pandas) Arrow 有効    1,642.0 ms
+createDataFrame(pandas) Arrow 無効   57,422.0 ms
+```
+
+`toPandas()` は Arrow を切ると約 57 倍、pandas からの `createDataFrame()` は約 35 倍遅くなりました。Arrow がないと、JVM 側で行を 1 つずつ pickle にし、Python 側で 1 行ずつ Python のオブジェクトに戻してから、pandas の列に詰め直します。Arrow があれば、JVM 側で列の形のバッチを作り、Python 側はそれをほぼそのまま pandas の列にできます。`toArrow()` は、最後の pandas への変換もしない分、さらに速くなっています。
+
+次は、`price * 1.1` を整数にして合計する処理を、4 通りで書きました。
+
+```python
+@udf("long")
+def plus_tax_row(p): return int(p * 1.1)                    # 1 行ずつ呼ばれる Python 関数
+
+@pandas_udf("long")
+def plus_tax_vec(p: pd.Series) -> pd.Series:                # バッチごとに呼ばれる
+    return (p * 1.1).astype("int64")
+
+df.select(F.sum((F.col("price") * 1.1).cast("long")))      # Spark の式だけ
+```
+
+```text
+Python UDF（pickle で 1 行ずつ）          5,149.6 ms
+Python UDF（Arrow で受け渡し）            1,976.1 ms
+pandas UDF（Arrow のバッチで受け渡し）      1,205.2 ms
+Spark の式（Python を通らない）              108.4 ms
+```
+
+- 同じ 1 行ずつの Python UDF でも、受け渡しを Arrow にするだけで 2.6 倍速くなりました。関数は 1 行ずつ呼ばれますが、プロセスのあいだはバッチで運ばれます
+- pandas UDF は、受け渡しに加えて計算もバッチでまとめるので、さらに速くなります
+- いちばん速いのは、Python を通さない Spark の式で、pandas UDF の 10 倍以上です。Arrow はプロセスの境目を安くしますが、**境目を越えないのがいちばん安い**ことに変わりはありません
+
+pandas UDF の実行計画には、`ArrowEvalPython` という演算子が現れます。
+
+```text
++- HashAggregate(keys=[], functions=[partial_sum(pythonUDF0#908L)])
+   +- Project [pythonUDF0#908L]
+      +- ArrowEvalPython [plus_tax_vec(price#2)#875L], [pythonUDF0#908L], 200
+         +- InMemoryTableScan [price#2]
+```
+
+この演算子が、JVM の行を Arrow のバッチにまとめて Python のワーカーに送り、結果のバッチを受け取って行に戻しています。
+
+<Callout type="note" title="Spark Connect でも Arrow">
+  クライアントとサーバを分ける Spark Connect では、結果を「streamed back to the client through gRPC as Apache Arrow-encoded row batches」と説明しています（[Spark Connect Overview](https://spark.apache.org/docs/latest/spark-connect-overview.html)）。
+  ここでも、境目を越える形として Arrow が使われています。
+</Callout>
+
+## Arrow が解決しないこと
+
+ここまでの実験から、Arrow の効き目の範囲を整理します。
+
+| 場面 | Arrow で何が変わるか | 変わらないこと |
+| --- | --- | --- |
+| 同じプロセスのライブラリ間 | 型が一致すれば、ポインタを渡すだけ。大きさに関係なく一瞬 | 型が違えば変換が走る（string と string_view、NumPy 型への詰め直し） |
+| 同じ機械のファイル | IPC 形式を mmap すれば、復号もコピーもなし | ファイルは圧縮した Parquet より大きい |
+| プロセス間（Spark の JVM と Python） | 1 行ずつの pickle が、列のバッチの受け渡しになる | 境目を越える費用そのものは残る。Spark の式で書ければそれがいちばん速い |
+| データベースとの間 | ADBC でアプリ側の API が列の形になる。Arrow で返すサーバもある | サーバのワイヤプロトコルが行ごとなら、その部分は変わらない |
+| 計算そのもの | 各エンジンが同じ形を読めるので、組み合わせやすい | 速さは各エンジンの実行（第 104 回のベクトル化や並列化）で決まる |
+
+Arrow は**計算エンジンではなく、エンジン同士の約束**です。pandas、Polars、DuckDB、Spark は、それぞれ別の実行方式と最適化を持ったまま、境目でだけ同じ形を使います。McKinney が嫌った「境目のたびに値を 1 つずつ詰め直す」費用を、型さえそろえれば消せるようにしたのが Arrow の成果です。
+
+## まとめ
+
+- Apache Arrow は、メモリ上の列の並べ方を言語に依存しない形で決めた仕様。2016 年に Apache の最上位プロジェクトとして始まった
+- 列は、値の配列、有効ビットマップ、（可変長なら）オフセットとデータのバッファでできている。バッファは 64 バイト境界にそろえることが勧められている
+- 中身はポインタではなく位置で指すので、別の場所に置いても共有しても書き換えずに読める。切り出しはオフセットを変えるだけ。その代わり、変更は苦手
+- 文字列には、オフセット方式に加えて、16 バイトの view に短い文字列と先頭 4 バイトを入れる string view がある。Polars はこちらを使う
+- 同じプロセスの中では、C Data Interface の 2 つの構造体と `release` コールバックでバッファを渡す。Python では PyCapsule Interface の `__arrow_c_stream__` などがその入口で、pandas、Polars、DuckDB が対応している
+- 型が一致すればライブラリ間の受け渡しは大きさに関係なく 0.1 ms 以下。型が食い違うと変換が走り、Python のオブジェクトにすると数百 ms かかる
+- IPC 形式は、メモリの形にメタデータを付けただけのバイト列。ファイルを mmap で開けば、復号もヒープへのコピーもない。保存と転送には Parquet、計算と受け渡しには Arrow
+- Flight は IPC 形式を gRPC で送る RPC、Flight SQL はその上の SQL のプロトコル、ADBC は結果を Arrow で返すクライアント API
+- PySpark は JVM と Python のあいだを Arrow で渡す。手元の 500 万行では、Arrow を切ると `toPandas()` が約 57 倍遅くなった。それでも、Python を通さない Spark の式がいちばん速い
+
+ADBC の PostgreSQL ドライバは、サーバとのあいだでは PostgreSQL 自身のプロトコルを話していました。次の第 106 回では、そのクライアントとサーバのあいだで、接続の確立、認証、問い合わせと結果の受け渡しが、どのようなバイト列でやり取りされているのかを見ます。
