@@ -1,0 +1,549 @@
+---
+title: タグを 1 行足すとき
+description: 計測や広告のタグを 1 行足すと、利用者のブラウザは誰に何を送り始めるのか。電気通信事業法の外部送信規律、EU の ePrivacy 指令と GDPR の同意、同意バナーと CMP、IAB TCF、Google の Consent Mode、サーバサイドのタグ管理を一次資料で確かめ、手元のヘッドレス Chrome でページの送信先を列挙して公表文の表を作ります
+chapter: law
+order: 4
+status: published
+topics:
+  - 外部送信規律（電気通信事業法第 27 条の 12）
+  - 情報送信指令通信
+  - オプトアウト措置
+  - ePrivacy 指令 第 5 条第 3 項
+  - Planet49 判決
+  - 同意バナー
+  - CMP
+  - IAB TCF v2.2
+  - Google Consent Mode
+  - サーバサイドのタグ管理
+requires:
+  - ll-252-data-transfer
+  - ll-138-third-party-cookie
+  - ll-139-tracking-prevention
+  - ll-140-request-headers
+---
+
+import Callout from '../../components/Callout.astro'
+
+## タグは「送れ」という指示
+
+第 252 回の最後で、サイトに広告や計測の**タグ**を置いた場合、サイト運営者がタグで集まる情報を取り扱っていなければ、個人情報保護法の上では運営者からタグ事業者への「提供」に当たらないことがある、と見ました（[個人情報保護委員会 Q&A 8-10](https://www.ppc.go.jp/personalinfo/faq/APPI_QA/)）。では、タグを置くことに何の決まりもないのかというと、そうではありません。
+
+タグは、HTML に書き足す 1 行の `<script>` です。けれど、その 1 行が利用者のブラウザにしていることを言葉にすると、次のようになります。
+
+| タグが書かれたページを開くと | 送られるもの | 送り先 |
+| --- | --- | --- |
+| スクリプトのファイルを取りに行く | IP アドレス、User-Agent、Referer（第 140 回） | スクリプトを置いている事業者 |
+| スクリプトが Cookie を読み書きする | 端末ごとの ID | ブラウザの中（保存） |
+| スクリプトが計測用の URL に要求を送る | 閲覧したページの URL、ID、画面の大きさ、会員 ID など、スクリプトが集めたもの | 計測・広告の事業者 |
+| スクリプトが iframe や別のスクリプトを読み込む | 上のすべてを、さらに別の事業者へ | ページを書いた人が直接は知らない事業者 |
+
+つまりタグは、**利用者の端末に向けて「この情報をあそこへ送れ」と指示するプログラム**です。日本の電気通信事業法も、EU の ePrivacy 指令も、この「指示」に着目して規律を置いています。この回では、日本の**外部送信規律**、EU の**端末への保存・アクセスへの同意**、それを実装する**同意バナー・CMP・IAB TCF・Google の Consent Mode**、そして**サーバサイドのタグ管理**がこれらの扱いをどう変えるかを見ます。最後に、手元のヘッドレス Chrome でページが実際にどこへ何を送っているかを列挙し、公表文に載せる表の雛形を自動で作ります。
+
+<Callout type="warn" title="この回は法律の助言ではありません">
+  条文・ガイドライン・FAQ の読み方を、設計と運用の判断材料として整理したものです。自社のサービスが規律の対象か、どの方法で対応するかは、法務や専門家に確認してください。
+</Callout>
+
+## 外部送信規律の骨組み
+
+### 条文
+
+2023 年 6 月 16 日に施行された電気通信事業法の改正で、**第 27 条の 12** が加わりました（[総務省: 外部送信規律](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu.html)）。中心の部分を引きます。
+
+> 電気通信事業者又は第三号事業を営む者（…総務省令で定める電気通信役務を提供する者に限る。）は、その利用者に対し電気通信役務を提供する際に、当該利用者の電気通信設備を送信先とする情報送信指令通信（…情報送信機能…を起動する指令を与える電気通信の送信をいう。…）を行おうとするときは、…あらかじめ、…送信されることとなる当該利用者に関する情報の内容、当該情報の送信先となる電気通信設備その他の総務省令で定める事項を当該利用者に通知し、又は当該利用者が容易に知り得る状態に置かなければならない。
+>
+> （[電気通信事業法 第 27 条の 12](https://laws.e-gov.go.jp/law/359AC0000000086)）
+
+**情報送信指令通信**とは、利用者の端末に記録された利用者に関する情報を利用者以外の者へ送る機能を「起動する指令」を、端末に向けて送ることです。ウェブなら、タグを含む HTML や JavaScript をブラウザに返すことがこれに当たります。総務省の FAQ は、この規律を「利用者の端末から外部に情報を送信するよう指令するプログラム等を利用者の端末に送信する行為全般を規制するもの」と説明しています（[外部送信規律 FAQ 1-7](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)）。
+
+エンジニアの判断に降りてくるのは、次の 3 つの問いです。
+
+1. **このサービスは規律の対象か**（誰が、どのサービスで）
+2. **この送信は除外されるか**（何を、なぜ送るのか）
+3. **除外されないなら、どの方法で利用者に確認の機会を与えるか**（通知・公表・同意・オプトアウト）
+
+### 1. 対象となる事業者とサービス
+
+対象は「電気通信事業者又は第三号事業を営む者」、つまり**電気通信事業を営む者**のうち、施行規則が定める 4 類型の役務を、ブラウザやアプリを通じて提供する者です（[電気通信事業法施行規則 第 22 条の 2 の 27](https://laws.e-gov.go.jp/law/360M50001000025)）。
+
+| 類型（規則第 22 条の 2 の 27） | FAQ の例（[FAQ 1-9](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)） |
+| --- | --- |
+| 第 1 号 他人の通信を媒介する | 利用者間のメッセージ |
+| 第 2 号 利用者が書き込んだ情報を不特定の利用者に送る | SNS、電子掲示板、動画共有、オンラインショッピングモール |
+| 第 3 号 検索 | オンライン検索サービス |
+| 第 4 号 不特定の利用者の閲覧に供する情報の送信 | ニュース配信、気象情報、動画配信、地図 |
+
+範囲の線引きは FAQ にいくつも例があります。設計の場面で効くものを並べます（いずれも [FAQ](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)）。
+
+| 場面 | FAQ の考え方 |
+| --- | --- |
+| 小売業者が自社サイトで自社商品を売る | 小売業の手段として電気通信を使っているにすぎず、電気通信事業に当たらないので対象外（1-12、1-13） |
+| 同じ会社がオンラインショッピングモールも運営する | モールは対象（1-14） |
+| 自社サイトの中にニュース配信のページと会社案内のページがある | ニュース配信のページは第 4 号で対象、会社案内のページは対象外（2-12） |
+| ニュースサイトを始めたばかりで利用者が少ない | 利用者が少なくても対象（1-11） |
+| 開発環境・検証環境 | 電気通信事業に当たらず対象外（2-11） |
+| Cookie を使っていない | 送信させる指令をしていれば対象（1-7） |
+
+最後の行は重要です。外部送信規律は **Cookie の規制ではありません**。Cookie を使わずに URL のクエリやリクエストの本文で送っても、送らせているなら対象です。
+
+逆に、自社の商品を売るだけの EC サイトや、会社案内だけのコーポレートサイトは、法律上は対象外になりえます。ただし、同じドメインの中に記事や動画のページがあれば、そのページは対象になります。**ページ単位で判断が変わる**ので、「うちは EC だから関係ない」と全体で決めてしまわないことです。
+
+### 2. 「外部」は他社とは限らない
+
+FAQ 1-16 は、送信先となる「当該利用者以外の者の電気通信設備」には、第三者のサーバだけでなく、**そのサービスを提供する事業者自身のサーバも含まれる**としています。総務省のパンフレットの絵が「第三者のサーバ」になっているのは便宜上だ、とも書かれています。
+
+そのうえで、条文は 4 つの除外を置いています。
+
+| 号 | 除外されるもの | 具体的には |
+| --- | --- | --- |
+| 第 1 号 | サービスの利用に送信が必要な情報 | 規則第 22 条の 2 の 30 が 5 つを挙げる。画面を適正に表示するために必要な情報その他サービスの提供に「真に必要な情報」、入力内容の再表示、認証情報の再表示、不正検知、サーバの負荷軽減など。いずれも「必要の範囲内」に限る |
+| 第 2 号 | 事業者自身が発行した識別符号を、自身に送らせるもの | FAQ 6-1 によれば、いわゆるファーストパーティ Cookie に保存した ID |
+| 第 3 号 | 利用者が送信に同意している情報 | 同意を取れば、通知・公表は不要 |
+| 第 4 号 | オプトアウト措置を講じ、それを公表していて、利用者が停止を求めていない情報 | 規則第 22 条の 2 の 31 の事項を公表する |
+
+（[電気通信事業法 第 27 条の 12](https://laws.e-gov.go.jp/law/359AC0000000086)、[同施行規則 第 22 条の 2 の 30・第 22 条の 2 の 31](https://laws.e-gov.go.jp/law/360M50001000025)）
+
+第 1 号の「真に必要な情報」について、FAQ 6-2 は、原則として**サービスを提供する事業者自身に送られる情報**と、**第三者に送ることが必要不可欠な情報**が当たるとしています。ただし注記で、事業者自身に送られる情報であっても「一般の利用者から見て送信されることが通常想定できない情報や、通常想定できない利用目的で利用される情報」は該当しない、としています（[FAQ 6-2](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)）。
+
+ファーストパーティ Cookie の ID と一緒に送る閲覧履歴などは、第 2 号では除外されません（FAQ 6-3）。ファーストパーティ Cookie の ID を使って**第三者**に情報を送る場合も、それが必要不可欠でない限り除外されません（FAQ 6-4）。「ファーストパーティ Cookie だから対象外」という単純な線は引けないということです。
+
+### 3. 4 つの方法
+
+除外に当たらない送信については、次のどれかで利用者に**確認の機会**を与えます（[FAQ 1-1](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)）。
+
+| 方法 | 根拠 | 実装の形 |
+| --- | --- | --- |
+| 通知 | 本文 | ポップアップなどで即時に表示する（一部だけ表示するなら、残りの画面へすぐ行けるようにする） |
+| 容易に知り得る状態に置く（公表） | 本文 | タグを置いたページか、そこから容易に到達できるページに表示する |
+| 同意を得る | 第 3 号 | 同意を得てから送信させる |
+| オプトアウト措置 | 第 4 号 | 停止の求めを受け付け、停止の方法などを公表する |
+
+日本の規律は、**公表だけで足りる**ところが EU と大きく違います。多くのサイトが「外部送信について」というページを用意してフッターからリンクしているのは、この公表の方法を選んでいるからです。
+
+## 何を、どう書くか
+
+### 書く事項
+
+公表する事項は、**情報送信指令通信ごとに** 3 つです。
+
+> 一　当該情報送信指令通信が起動させる情報送信機能により送信されることとなる利用者に関する情報の内容
+> 二　前号に規定する情報の送信先となる電気通信設備を用いて当該情報を取り扱うこととなる者の氏名又は名称
+> 三　第一号に規定する情報の利用目的
+>
+> （[電気通信事業法施行規則 第 22 条の 2 の 29](https://laws.e-gov.go.jp/law/360M50001000025)）
+
+FAQ は、それぞれについて次のように補っています（[FAQ 4-1〜4-8](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)）。
+
+| 事項 | FAQ の考え方 |
+| --- | --- |
+| 情報の内容 | Cookie の ID や広告 ID、閲覧したページの URL などの行動の情報、氏名などを含む（4-1）。「閲覧した Web サイトの URL、当該サイトを閲覧した日時等」のように、利用者が実際に送られている情報を適切に認識できる粒度で書く（4-7） |
+| 取り扱う者 | **氏名又は名称**を明記する。サービス名の方が知られているなら併記が望ましいが、名称は省けない（4-2） |
+| 利用目的 | 原則として、送信先と自社の**双方**の利用目的を書く（4-3）。送信先の利用目的を書いたページへのリンクでもよいが、概略を併せて示すのが望ましく、リンク先が日本語以外ならリンクだけでは足りない（4-5、4-6） |
+
+送信先の事業者が日本語の説明ページを用意している例として、FAQ 4-8 は Google のページ（[Google: 利用者情報の外部送信について](https://business.safety.google/intl/ja/tba-jp/)）を挙げています。
+
+### 書き方
+
+表示の仕方にも要件があります。日本語を用い、専門用語を避け、平易な表現を用いること、操作をしなくても文字が適切な大きさで表示されること、などです（[施行規則 第 22 条の 2 の 28](https://laws.e-gov.go.jp/law/360M50001000025)、[FAQ 3-1](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)）。
+
+エンジニアにとって厄介なのは、**表の中身がコードと一致していなければならない**ことです。公表文は法務やマーケティングの担当が書くことが多い一方、タグを足すのはタグマネージャを触る担当で、実際に何が送られるかを知っているのはスクリプトだけです。この回の後半の実験は、このずれを埋めるためのものです。
+
+## 個人情報保護法とはどこで重なるか
+
+第 252 回で見た個人情報保護法の**個人関連情報の第三者提供（第 31 条）**と、外部送信規律は、どちらも Cookie ID のような情報を扱いますが、見ている場面が違います。
+
+| | 個人情報保護法 第 31 条 | 電気通信事業法 第 27 条の 12 |
+| --- | --- | --- |
+| 誰に掛かるか | 個人関連情報取扱事業者（業種を問わない） | 4 類型の役務を提供する電気通信事業者など |
+| 何を捉えるか | 事業者が個人関連情報を**第三者に提供**すること | 事業者が利用者の端末に**送信を指令**すること |
+| 情報の種類 | 提供先で個人データになることが想定される個人関連情報 | 利用者に関する情報全般（個人情報かどうかを問わない） |
+| タグで直接送られる場合 | 運営者が取り扱っていなければ「提供」に当たらないことがある（Q&A 8-10） | まさにこの場面が対象 |
+| 求められること | 提供先が本人同意を得ていることの確認 | 通知・公表、同意、オプトアウトのいずれか |
+
+（[個人情報保護法 第 31 条](https://laws.e-gov.go.jp/law/415AC0000000057)、[個人情報保護委員会 Q&A](https://www.ppc.go.jp/personalinfo/faq/APPI_QA/)、[電気通信事業法 第 27 条の 12](https://laws.e-gov.go.jp/law/359AC0000000086)）
+
+ブラウザから直接タグ事業者へ送られる経路は、個人情報保護法の第三者提供の枠からこぼれることがあり、外部送信規律はそこを拾う位置にあります。反対に、**自社のサーバがいったん受け取ってから他社へ渡す**経路は、外部送信規律ではなく個人情報保護法の問題になります。これは後半のサーバサイドのタグ管理の節で、実験の結果と合わせてもう一度見ます。
+
+両方に当たる場面もあります。ニュースサイトが会員 ID をタグに渡し、広告事業者がそれを自社の会員情報と紐付けるなら、外部送信規律の公表と、個人情報保護法上の手当て（運営者が取り扱っているなら第 27 条や第 31 条）の両方を考えることになります。
+
+<Callout type="note" title="2026 年 7 月公布・未施行の改正">
+  2026 年 7 月 17 日に公布された「個人情報の保護に関する法律等の一部を改正する法律」は、
+  電話番号、メールアドレス、Cookie ID などの**特定の個人に連絡できる記述等を含む個人関連情報**について、
+  不適正利用と不正取得の禁止を個人情報と同様に及ぼす内容を含んでいます。
+  施行は原則として公布の日から起算して 2 年を超えない範囲内で、2026 年 11 月の時点ではまだ施行されていません
+  （[個人情報保護委員会: 令和 8 年 改正個人情報保護法について](https://www.ppc.go.jp/personalinfo/legal/r8kaiseihogohou/)、[同: 個人情報保護法等の一部を改正する法律について（PDF）](https://www.ppc.go.jp/files/pdf/260717_kaiseihounitsuite.pdf)）。
+  タグで集めた Cookie ID を何に使うかが、施行後は外部送信規律とは別の経路でも問われることになります。
+</Callout>
+
+## EU: 端末に触れるなら、原則として同意
+
+### ePrivacy 指令 第 5 条第 3 項
+
+EU で Cookie の同意を求めているのは、GDPR ではなく **ePrivacy 指令**（2002/58/EC、2009 年改正）です。
+
+> Member States shall ensure that the storing of information, or the gaining of access to information already stored, in the terminal equipment of a subscriber or user is only allowed on condition that the subscriber or user concerned has given his or her consent, having been provided with clear and comprehensive information, …
+>
+> （[Directive 2002/58/EC, Art. 5(3)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:02002L0058-20091219)）
+
+端末への**保存**と、端末にすでに保存されている情報への**アクセス**には、事前の同意が要ります。例外は、通信の送信のためだけのものと、利用者が明示的に求めたサービスの提供に**厳密に必要な**（strictly necessary）ものの 2 つです。指令なので、各国の国内法を通じて適用されます。
+
+日本との違いは 2 点です。1 つは、**原則が同意**で、公表やオプトアウトでは足りないこと。もう 1 つは、対象が電気通信事業者に限られず、ウェブサイトを運営する者に広く及ぶことです。総務省の FAQ も、外部送信規律は ePrivacy 指令を参照したが「特定の海外法令と規律の対象や内容を同じくするものではありません」としています（[FAQ 1-5](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)）。
+
+### 「同意」の中身は GDPR から来る
+
+ePrivacy 指令の同意は、GDPR の同意の定義と条件を借りています。
+
+> ‘consent’ of the data subject means any freely given, specific, informed and unambiguous indication of the data subject's wishes by which he or she, by a statement or by a clear affirmative action, signifies agreement …
+>
+> （[GDPR Art. 4(11)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679)）
+
+さらに第 7 条第 3 項は、同意はいつでも撤回でき、「It shall be as easy to withdraw as to give consent.」としています（[GDPR Art. 7(3)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679)）。
+
+### Planet49 判決
+
+この同意の解釈を EU 司法裁判所が示したのが、2019 年 10 月 1 日の **Planet49 判決**（C-673/17、大法廷）です。懸賞サイトが、広告目的の Cookie への同意欄に**あらかじめチェックを入れておいた**ことが問題になりました。判決の主文は 3 点です（[CJEU C-673/17](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:62017CJ0673)）。
+
+| 主文 | 内容 | 実装への意味 |
+| --- | --- | --- |
+| 1 | 利用者が外さないと拒否できない**事前チェック済みのチェックボックス**では、有効な同意にならない | 同意の初期値は「同意しない」 |
+| 2 | 端末に保存・アクセスされる情報が**個人データかどうかで解釈は変わらない** | 「個人データではない ID だから同意は要らない」は通らない |
+| 3 | 提供すべき情報には、**Cookie の有効期間**と、**第三者がその Cookie にアクセスできるかどうか**が含まれる | バナーや詳細画面に、保存期間と第三者の有無を出す |
+
+### Cookie 以外の「アクセス」
+
+第 5 条第 3 項は Cookie という言葉を使っていません。欧州データ保護会議（EDPB）は、2024 年 10 月 7 日に採択した**ガイドライン 2/2023**で、計測用のピクセルや URL に ID を付けて追跡する方法も対象になりうると整理しました。
+
+> The addition of tracking information to URLs or images (pixels) sent to the user constitutes an instruction to the terminal equipment to send back the targeted information (the specified identifier). In the case of dynamically constructed tracking pixels, it is the distribution of the applicative logic (usually a JavaScript code) that constitutes the instruction.
+>
+> （[EDPB Guidelines 2/2023 on Technical Scope of Art. 5(3) of ePrivacy Directive, 3.1](https://www.edpb.europa.eu/our-work-tools/our-documents/guidelines/guidelines-22023-technical-scope-art-53-eprivacy-directive_en)）
+
+JavaScript を配ること自体を「指示」とみなす考え方は、日本の「情報送信指令通信」とよく似ています。ただし、日本の規律がその指示に対して通知・公表を求めるのに対し、EU では端末へのアクセスとして**同意**を求める、という違いが残ります。
+
+## 同意バナーをどう作るか
+
+### 監督機関が問題にした型
+
+EU の各国の監督機関は、同意バナーの具体的な作り方まで踏み込んでいます。2023 年 1 月 17 日に EDPB が採択した **Cookie Banner Taskforce の報告書**は、プライバシー保護団体 noyb が各国で申し立てた多数の苦情を扱うために、各国の監督機関が合意した最低限の線をまとめたものです（[EDPB: Report of the work undertaken by the Cookie Banner Taskforce](https://www.edpb.europa.eu/our-work-tools/our-documents/other/report-work-undertaken-cookie-banner-taskforce_en)）。
+
+| 苦情の型 | 報告書の立場 |
+| --- | --- |
+| A: 最初の層に「拒否」がない | どの層にも拒否の選択肢がないのは違反、という意見が「大多数」。少数の監督機関は、第 5 条第 3 項が拒否のボタンを明示していないとして違反と言えないとした |
+| B: 事前チェック済みの欄 | 有効な同意にならない（GDPR 前文 32 と第 5 条第 3 項） |
+| C: 拒否が目立たないリンク | 文中に埋もれた「拒否」のリンクやバナーの外にある拒否のリンクは、十分な視覚的な支えがなければ有効な同意にならない例 |
+| D・E: ボタンの色とコントラスト | 一律の基準は課せないが、拒否のボタンの文字がほとんど読めないほどコントラストが低いものは明らかに誤解を招く |
+| H: 正当な利益を持ち出す | Cookie の保存・読み出しの法的根拠を管理者の正当な利益にすることはできない |
+| I: 「必須」の分類の誤り | 厳密に必要でないものを「必須」に入れている例がある。サイト運営者が Cookie の一覧を保ち、必須であることを示す責任を負う |
+| K: 撤回の手段 | 同意を得た後は、いつでも容易に撤回できる手段を置く。常に表示されるアイコンなど特定の形は強制できない |
+
+フランスの監督機関 CNIL は、2021 年 5 月に約 20 の組織へ是正を求めた際、それらのサイトが「ne permettaient pas aux internautes de refuser les cookies aussi facilement que de les accepter」（Cookie を受け入れるのと同じくらい簡単に拒否できなかった）ことを理由に挙げています（[CNIL: Refuser les cookies doit être aussi simple que de les accepter](https://www.cnil.fr/fr/refuser-les-cookies-doit-etre-aussi-simple-que-de-les-accepter-une-vingtaine-dorganismes-mis-en)）。
+
+### エンジニアが決めること
+
+バナーの文言は法務が決めても、**バナーが実際に効いているか**はフロントエンドの実装で決まります。
+
+| 決めること | 守る形 |
+| --- | --- |
+| 同意の前に何を読み込むか | 同意が要るタグは、同意が記録されるまで**読み込まない**。読み込んでから送信だけ止める作りは、読み込み自体が送信になる（後の実験の A を参照） |
+| 初期値 | すべて「同意しない」。前回の選択を覚えていればそれを使う |
+| 「すべて拒否」 | 「すべて同意」と同じ層に、同じ手間で押せるボタンとして置く |
+| 撤回 | どのページからでも設定画面へ戻れるリンクを置き、撤回したらタグを止め、保存済みの Cookie も消す |
+| 同意の記録 | いつ、どの版の文言に、何に同意したかを残す（第 249 回の証跡と同じ考え方） |
+| 「必須」の範囲 | 必須に分類したものの理由を一覧として残す |
+
+## CMP と IAB TCF
+
+### CMP
+
+**CMP（Consent Management Platform）**は、同意バナーを表示し、利用者の選択を記録し、その結果をページ上の他のスクリプトへ伝える部品です。自作することもできますが、多くのサイトは製品を使います。CMP は「同意を集める画面」であると同時に、**タグを出し入れする門番**でもあります。門番として正しく働いているかは、画面を見ても分からず、通信を見て初めて確かめられます。
+
+### IAB TCF v2.2
+
+広告の取引には、サイトの運営者から広告の配信事業者、その先の多数の事業者までが関わります。それぞれが同意を確かめるために、業界団体の IAB Europe が定めた共通の枠組みが **Transparency & Consent Framework（TCF）**です。CMP は利用者の選択を **TC String** という文字列に符号化し、ページ上の `__tcfapi` という関数を通じて、登録された事業者（Global Vendor List に載った事業者）に渡します。
+
+2023 年の **v2.2** では、IAB Europe の FAQ によれば主に次の点が変わりました（[IAB Europe: FAQ TCF v2.2](https://iabeurope.eu/wp-content/uploads/2023/07/230727-FAQ-_-TCF-v2.2-updated-27-July-2023.pdf)）。
+
+- 広告とコンテンツの個人化に関わる目的 3〜6 について、事業者が選べる法的根拠を同意だけにし、正当な利益を外した
+- 目的や機能の説明を法律の文言から利用者向けの説明に改め、具体例を付けた
+- 事業者に、収集するデータの種類や目的ごとの保存期間などの追加の情報を求めた
+- CMP の最初の層に、法的根拠を得ようとしている**事業者の総数**を表示させる
+- 利用者が CMP の画面を再び開いて同意を容易に撤回できるようにする
+
+CMP と事業者の実装期限は 2023 年 11 月 20 日でした。
+
+TCF そのものも法的な判断の対象になっています。EU 司法裁判所は 2024 年 3 月 7 日の判決（C-604/22）で、TC String は IP アドレスなどと合理的な手段で結び付けられる限り**個人データに当たる**とし、規則を定めて処理に影響を及ぼす業界団体は、状況によっては**共同管理者**になりうると判断しました（[CJEU C-604/22](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:62022CJ0604)）。同意の記録そのものも保護の対象だということです。
+
+## Google の Consent Mode
+
+Google のタグ（Google アナリティクス、Google 広告など）には、CMP の結果を受け取るための **Consent Mode** があります。同意の種類は次のとおりです（[Google: Consent mode](https://developers.google.com/tag-platform/security/concepts/consent-mode)）。
+
+| 種類 | 何への同意か |
+| --- | --- |
+| `ad_storage` | 広告に関する Cookie などの保存 |
+| `ad_user_data` | 広告目的でユーザーのデータを Google に送ること |
+| `ad_personalization` | パーソナライズ広告 |
+| `analytics_storage` | アクセス解析に関する Cookie などの保存 |
+| `functionality_storage` / `personalization_storage` / `security_storage` | 機能、個人化、セキュリティのための保存 |
+
+`ad_user_data` と `ad_personalization` は後から加わった 2 つで、Google は EEA の利用者の行動を Google のタグで計測するなら、利用者の同意の選択を Google に渡す必要があるとしています（[Google タグ マネージャー ヘルプ: Updates to consent mode for traffic in European Economic Area (EEA)](https://support.google.com/tagmanager/answer/13695607?hl=en)）。
+
+実装には**基本モード**と**詳細モード**があり、同意の前に何が送られるかが違います（[Google: Consent mode](https://developers.google.com/tag-platform/security/concepts/consent-mode)、[Google 広告 ヘルプ: About consent mode](https://support.google.com/google-ads/answer/10000067?hl=en)）。
+
+| | 基本モード（basic） | 詳細モード（advanced） |
+| --- | --- | --- |
+| タグの読み込み | 利用者がバナーを操作するまで**読み込まない** | ページを開いた時点で読み込む |
+| 拒否されたとき | Google には何も送られない（同意の状態さえ送られない） | Cookie を使わない送信（cookieless ping）を送る |
+| cookieless ping の中身 | — | タイムスタンプ、User-Agent、リファラ、広告クリックの有無を示すフラグ、同意の状態、ページ読み込みごとの乱数など |
+| コンバージョンのモデル化 | 一般的なモデル | 広告主ごとのモデル |
+
+詳細モードで拒否されても、**送信そのものは起きている**ことに注意します。外部送信規律から見ると、FAQ 1-7 のとおり Cookie を使わない送信も対象なので、詳細モードの cookieless ping も公表の表に載せる必要があると読めます。EU では、EDPB のガイドライン 2/2023 のように JavaScript による送信の指示を端末へのアクセスとみる立場をとると、cookieless ping も第 5 条第 3 項の対象になりうることになります。ただし、この点を cookieless ping について直接判断した一次資料は見つけられませんでした。解釈が分かれうる点として、扱いは法務と決めてください。
+
+## 実験の環境
+
+ここから、ページが実際に何を送っているかを手元で確かめます。
+
+| 項目 | バージョン |
+| --- | --- |
+| OS | macOS 26.2（Darwin 25.2.0、arm64） |
+| Python | 3.14.0（`python3 -I` で実行、標準ライブラリのみ） |
+| ブラウザ | Google Chrome 157.0.8103.38（`--headless=new`） |
+| 操作の方法 | Chrome DevTools Protocol を `--remote-debugging-pipe` で直接話す（Playwright は使わない） |
+| 法令の版 | 電気通信事業法と同施行規則は、2026 年 11 月 6 日に e-Gov 法令 API で取得した版 |
+
+<Callout type="note" title="外へは送らない">
+  実験で使うホスト名はすべて `.test` で、Chrome の `--host-resolver-rules` で `127.0.0.1` に向けています。
+  同じ設定で `.test` 以外の名前はすべて解決できないようにし、さらに観測した要求のホストに `.test` 以外がないことを毎回確かめました。
+</Callout>
+
+## 実験: ページが実際にどこへ送っているか
+
+### 作ったページ
+
+ニュースサイト `news.test` の記事ページを 1 つ作り、別のオリジンのサーバを 4 つ立てます。Python の `http.server` で 5 つのポートを開いただけのものです。
+
+| ホスト | 役割 | ページからの読み込まれ方 |
+| --- | --- | --- |
+| `news.test:8000` | 記事ページ、自前の簡単な CMP（`cmp.js`） | 本体 |
+| `cdn.test:8001` | ライブラリの配信 | `<script src>` |
+| `analytics.test:8002` | 計測のタグ `a.js` と、計測データの受け口 `/collect` | `<script src>` |
+| `ads.test:8003` | 広告のタグ `px.js` と、計測用の画像 `/px` | **広告に同意したときだけ** CMP が読み込む |
+| `video.test:8004` | 動画プレーヤー。中から自分の `/stat` へ送る | `<iframe>` |
+
+ページには、ログイン中の会員を想定した `dataLayer` を置きます。会員 ID と、`taro@example.com` の SHA-256 です（第 251 回で見たとおり、ハッシュにしても個人データのままです）。
+
+計測のタグは、Consent Mode の詳細モードを真似て、同意があれば ID を付けて送り、なければ ID なしで送ります。
+
+```javascript
+var p = new URLSearchParams();
+if (window.consent.analytics) {
+  var m = document.cookie.match(/(?:^|; )_ana=([^;]*)/);
+  var cid = m ? m[1] : String(Math.random()).slice(2, 12);
+  document.cookie = "_ana=" + cid + "; path=/; max-age=63072000";
+  p.set("cid", cid);
+} else {
+  p.set("gcs", "denied");
+}
+p.set("dl", location.href);
+p.set("dt", document.title);
+p.set("sr", screen.width + "x" + screen.height);
+p.set("ul", navigator.language);
+var base = window.SST ? "/g/collect" : "http://analytics.test:8002/collect";
+navigator.sendBeacon(base + "?" + p.toString());
+```
+
+広告のタグは、Consent Mode の基本モードのように、同意がなければそもそも読み込まれません。読み込まれると、会員 ID とメールアドレスのハッシュを画像の URL に載せて送ります。
+
+`window.SST` が真のときは、計測データを `news.test` 自身の `/g/collect` に送り、`news.test` のサーバがそれを `analytics.test` へ転送します。これがサーバサイドのタグ管理の最小の形です。
+
+### ヘッドレス Chrome から通信を集める
+
+Playwright は手元に入っていなかったので、Chrome DevTools Protocol（CDP）を直接使いました。`--remote-debugging-pipe` を付けて起動すると、Chrome はファイル記述子 3 から命令を読み、4 へ結果を書きます。1 つのメッセージは NUL 文字で区切った JSON です。
+
+```python
+to_chrome_r, to_chrome_w = os.pipe()
+from_chrome_r, from_chrome_w = os.pipe()
+cmd = 'exec "$0" "$@" 3<&%d 4>&%d' % (to_chrome_r, from_chrome_w)
+proc = subprocess.Popen(
+    ["/bin/sh", "-c", cmd, CHROME, "--headless=new", "--remote-debugging-pipe",
+     f"--user-data-dir={profile}",
+     "--host-resolver-rules=MAP *.test 127.0.0.1, MAP * ~NOTFOUND",
+     "--disable-site-isolation-trials",
+     "--disable-features=HttpsUpgrades,IsolateOrigins,site-per-process", ...],
+    pass_fds=(to_chrome_r, from_chrome_w))
+```
+
+最初は Python の `preexec_fn` で `dup2` して fd 3 と 4 に付け替えようとしましたが、Chrome は「Remote debugging pipe file descriptors are not open.」と出して終了しました。シェルの `exec` のリダイレクトで付け替える形にして動きました。
+
+別オリジンの iframe は、サイト分離のために別のターゲットとして扱われ、その通信を取りこぼすことがありました。この実験では iframe の通信も同じセッションで見たいので、サイト分離を切っています。
+
+ページを開いたあとは、次の 3 つのイベントを集めます。
+
+| イベント | 取れるもの |
+| --- | --- |
+| `Network.requestWillBeSent` | URL、メソッド、種類（Script、Ping、Image など）、誰が送らせたか（initiator） |
+| `Network.requestWillBeSentExtraInfo` | 実際に送られたヘッダ（Cookie、Referer、User-Agent）と、送られなかった Cookie とその理由 |
+| `Network.responseReceivedExtraInfo` | 返ってきた `Set-Cookie` と、保存されなかった Cookie とその理由 |
+
+これを `news.test` 以外の送信先ごとにまとめ、クエリの名前を利用者向けの言葉に置き換える辞書と、送信先ごとに**取り扱う者の名称と利用目的を人が書いておく台帳**を突き合わせて、公表文の表を作ります。
+
+```python
+REGISTRY = {
+    "cdn.test": ("株式会社 CDN（例）", "スクリプトの配信"),
+    "analytics.test": ("アナリティクス株式会社（例）", "アクセス解析"),
+    "ads.test": ("アド株式会社（例）", "広告の効果測定・ターゲティング"),
+}
+PARAM_LABEL = {
+    "dl": "閲覧したページの URL", "url": "閲覧したページの URL",
+    "parent": "埋め込み元ページの URL", "dt": "ページのタイトル",
+    "sr": "画面の大きさ", "ul": "ブラウザの言語設定",
+    "cid": "端末ごとに割り振った ID", "mid": "会員 ID",
+    "em": "メールアドレスのハッシュ値", "ev": "行動の種類（ページ閲覧など）",
+    "gcs": "同意の状態", "v": "動画の ID",
+}
+```
+
+`video.test` は、わざと台帳に載せていません。
+
+### 結果 A: 同意なし
+
+```
+## A: 同意なし
+観測したホスト: analytics.test, cdn.test, news.test, video.test
+*.test 以外への要求: []
+  [1] Script   http://cdn.test:8001/lib.js
+  [1] Script   http://analytics.test:8002/a.js
+  [1] Ping     http://analytics.test:8002/collect?gcs=denied&dl=http%3A%2F%2Fnews.test%3A8000%2Farticle%3Fid%3D42&dt=%E8%A8%98%E4%BA%8B+42&sr=800x600&ul=ja
+  [1] Document http://video.test:8004/embed?v=abc
+  [1] Fetch    http://video.test:8004/stat?v=abc&parent=http%3A%2F%2Fnews.test%3A8000%2F
+```
+
+| 送信先 | 取り扱う者 | 送信される情報 | 利用目的 | 送信させたもの |
+| --- | --- | --- | --- | --- |
+| cdn.test | 株式会社 CDN（例） | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer） | スクリプトの配信 | news.test |
+| analytics.test | アナリティクス株式会社（例） | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer）、同意の状態、閲覧したページの URL、ページのタイトル、画面の大きさ、ブラウザの言語設定 | アクセス解析 | analytics.test、news.test |
+| video.test | **未登録** | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer）、動画の ID、埋め込み元ページの URL | **要記入** | news.test、video.test |
+
+何にも同意していない状態で、`news.test` 以外の 3 つのホストへ送信が起きています。
+
+- **スクリプトを取りに行くだけで送信になる。** `cdn.test` には ID もクエリも送っていませんが、IP アドレス、User-Agent、Referer は届いています。
+- **同意がなくても計測の送信は起きる。** `gcs=denied` の送信には ID はありませんが、閲覧したページの URL、タイトル、画面の大きさが載っています。
+- **iframe は自分で送る。** `video.test` の `/stat` は、記事ページのコードではなく、iframe の中のコードが送らせたものです。「送信させたもの」の列に `video.test` が出ています。ページを書いた人が知らないうちに、送信先が増えます。
+
+Referer が `http://news.test:8000/` のようにオリジンだけになっているのは、ブラウザの既定のリファラポリシー `strict-origin-when-cross-origin` のためです（第 140 回）。けれど計測のタグは `dl` に `location.href` をそのまま載せているので、記事の URL は結局すべて届いています。**ヘッダで絞っても、スクリプトはクエリで送れる**ということです。
+
+### 結果 B: 計測と広告に同意して 2 回開く
+
+```
+## B: analytics と ads に同意（2 回訪問）
+  [1] Script   http://cdn.test:8001/lib.js
+  [1] Script   http://analytics.test:8002/a.js
+  [1] Script   http://ads.test:8003/px.js
+  [1] Ping     http://analytics.test:8002/collect?cid=3195275900&dl=http%3A%2F%2Fnews.test%3A8000%2Farticle%3Fid%3D42&dt=%E8%A8%98%E4%BA%8B+42&sr=800x600&ul=ja
+  [1] Document http://video.test:8004/embed?v=abc
+  [1] Image    http://ads.test:8003/px?ev=page_view&mid=m-1001&em=3df36ef44a86ba6433126b5899410e5cd481163a0f05fa83eef3edf60abe58ac&url=http%3A%2F%2Fnews.test%3A8000%2Farticle%3Fid%3D42  Set-Cookie: ad_id=A-55; Path=/; Max-Age=31536000  -> 保存されず: SchemefulSameSiteUnspecifiedTreatedAsLax
+  [1] Fetch    http://video.test:8004/stat?v=abc&parent=http%3A%2F%2Fnews.test%3A8000%2F
+  [2] Script   http://cdn.test:8001/lib.js
+  [2] Script   http://analytics.test:8002/a.js
+  [2] Script   http://ads.test:8003/px.js
+  [2] Image    http://ads.test:8003/px?ev=page_view&mid=m-1001&em=3df36ef44a86ba6433126b5899410e5cd481163a0f05fa83eef3edf60abe58ac&url=http%3A%2F%2Fnews.test%3A8000%2Farticle%3Fid%3D42  Set-Cookie: ad_id=A-55; Path=/; Max-Age=31536000  -> 保存されず: SchemefulSameSiteUnspecifiedTreatedAsLax
+  [2] Ping     http://analytics.test:8002/collect?cid=3195275900&dl=http%3A%2F%2Fnews.test%3A8000%2Farticle%3Fid%3D42&dt=%E8%A8%98%E4%BA%8B+42&sr=800x600&ul=ja
+  [2] Document http://video.test:8004/embed?v=abc
+  [2] Fetch    http://video.test:8004/stat?v=abc&parent=http%3A%2F%2Fnews.test%3A8000%2F
+```
+
+| 送信先 | 取り扱う者 | 送信される情報 | 利用目的 | 送信させたもの |
+| --- | --- | --- | --- | --- |
+| cdn.test | 株式会社 CDN（例） | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer） | スクリプトの配信 | news.test |
+| analytics.test | アナリティクス株式会社（例） | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer）、端末ごとに割り振った ID、閲覧したページの URL、ページのタイトル、画面の大きさ、ブラウザの言語設定 | アクセス解析 | analytics.test、news.test |
+| ads.test | アド株式会社（例） | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer）、行動の種類（ページ閲覧など）、会員 ID、メールアドレスのハッシュ値、閲覧したページの URL | 広告の効果測定・ターゲティング | news.test |
+| video.test | **未登録** | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer）、動画の ID、埋め込み元ページの URL | **要記入** | news.test、video.test |
+
+同意すると `ads.test` が加わり、会員 ID とメールアドレスのハッシュが送られました。
+
+`cid=3195275900` は 1 回目と 2 回目で同じです。この ID は `analytics.test` のスクリプトが **`news.test` の Cookie（`_ana`）として**保存したもので、`analytics.test` への要求の Cookie ヘッダには載っていません。ファーストパーティ Cookie に入れた ID を、スクリプトがクエリに写して第三者へ送っているわけです。FAQ 6-4 が「ファーストパーティ Cookie に保存された ID を利用して第三者に送信する場合は除外されない」としているのは、この形です。
+
+一方、`ads.test` が返した `Set-Cookie: ad_id=...` は、Chrome に**保存されませんでした**。理由は `SchemefulSameSiteUnspecifiedTreatedAsLax` で、`SameSite` 属性のない Cookie を `Lax` として扱うため、クロスサイトの画像の応答からは設定できなかったということです。サードパーティ Cookie として使うには `SameSite=None; Secure` が要り、それには HTTPS が要ります（第 138 回）。ブラウザごとの制限はさらに違います（第 139 回）。けれど、**Cookie が保存されなくても、会員 ID とハッシュはクエリで届いています**。ブラウザの Cookie の制限は、外部送信の有無を左右しません。
+
+### 結果 C: サーバサイドで転送する
+
+```
+## C: B と同じ同意、サーバサイド計測
+  [1] Script   http://cdn.test:8001/lib.js
+  [1] Script   http://analytics.test:8002/a.js
+  [1] Script   http://ads.test:8003/px.js
+  [1] Document http://video.test:8004/embed?v=abc
+  [1] Image    http://ads.test:8003/px?ev=page_view&mid=m-1001&em=3df36ef44a86ba6433126b5899410e5cd481163a0f05fa83eef3edf60abe58ac&url=http%3A%2F%2Fnews.test%3A8000%2Farticle%3Fid%3D42%26sst%3D1  Set-Cookie: ad_id=A-55; Path=/; Max-Age=31536000  -> 保存されず: SchemefulSameSiteUnspecifiedTreatedAsLax
+  [1] Fetch    http://video.test:8004/stat?v=abc&parent=http%3A%2F%2Fnews.test%3A8000%2F
+```
+
+| 送信先 | 取り扱う者 | 送信される情報 | 利用目的 | 送信させたもの |
+| --- | --- | --- | --- | --- |
+| analytics.test | アナリティクス株式会社（例） | IP アドレス、ブラウザの種類（User-Agent）、参照元ページ（Referer） | アクセス解析 | news.test |
+
+（`cdn.test`、`ads.test`、`video.test` の行は B と同じなので省きます。）
+
+ブラウザから見ると、`analytics.test` の `/collect` への送信は**消えました**。残っているのはスクリプト本体の取得だけです。けれど、サーバ側の記録には次の 2 行がありました。
+
+```
+サーバ側の記録: [{'server': 'analytics.test', 'from': '127.0.0.1', 'ua': 'Python-urllib/3.14'},
+  {'server': 'news.test', 'forwarded_to': 'analytics.test', 'status': 200,
+   'query': 'cid=1016696285&dl=http%3A%2F%2Fnews.test%3A8000%2Farticle%3Fid%3D42%26sst%3D1&dt=%E8%A8%98%E4%BA%8B+42&sr=800x600&ul=ja&uip=...'}]
+```
+
+`news.test` のサーバが、ブラウザから受け取った ID、URL、タイトルなどに、**利用者の IP アドレス（`uip`）を足して** `analytics.test` へ送っています。`analytics.test` から見た送り元は、もうブラウザではなく `Python-urllib` です。**ブラウザで通信を見る方法では、この送信は見えません。** 公表の表を作るには、ブラウザの観測に加えて、サーバの転送の設定と送信の記録も台帳に入れる必要があります。
+
+## サーバサイドのタグ管理は何を変えるか
+
+Google タグ マネージャーのサーバサイドのタグ付けは、タグをブラウザで動かす代わりに、事業者が管理するサーバでコンテナを動かし、そこで受けたデータを各事業者へ振り分ける仕組みです。Google は、サーバ上のデータには他に送るまで事業者だけがアクセスできる、と説明しています（[Google: An introduction to server-side tagging](https://developers.google.com/tag-platform/tag-manager/server-side/intro)）。実験 C は、これを最小の形で作ったものです。
+
+経路を 2 つの区間に分けて、それぞれどの規律の問題になるかを整理します。
+
+| 区間 | 外部送信規律 | 個人情報保護法 |
+| --- | --- | --- |
+| ブラウザ → 自社のサーバ | 自社のサーバも「当該利用者以外の者」に含まれる（FAQ 1-16）。自社への送信は原則「真に必要な情報」とされるが、通常想定できない情報や利用目的は除かれる（FAQ 6-2 注 2） | 自社が取得する。利用目的の特定・通知などの問題 |
+| 自社のサーバ → 計測・広告の事業者 | 端末への指令ではないので、情報送信指令通信には当たらないと読める。FAQ 4-3・4-4 も、送信先が取得した後にさらに第三者へ提供することは「本規律の対象外」としている | 自社が取り扱った情報を渡すので「提供」になる。個人データなら第 27 条（委託なら第 27 条第 5 項）、個人関連情報で提供先が個人データとして取得することが想定されるなら第 31 条（第 252 回） |
+
+（[外部送信規律 FAQ](https://www.soumu.go.jp/main_sosiki/joho_tsusin/d_syohi/gaibusoushin_kiritsu_00002.html)、[個人情報保護委員会 Q&A 8-10](https://www.ppc.go.jp/personalinfo/faq/APPI_QA/)）
+
+サーバサイドのタグ管理を、外部送信規律に正面から当てはめた FAQ は見つけられませんでした。上の表の 1 行目と 2 行目は、FAQ の一般的な説明からの読み方です。そのうえで言えるのは、次のことです。
+
+- **規律が消えるのではなく、移る。** ブラウザから他社への直接の送信が減る分、自社が取り扱って他社へ渡す部分が増え、個人情報保護法の「提供」の問題になる。Q&A 8-10 の「運営者が取り扱っていないから提供に当たらない」という整理は、もう使えない
+- **自社への送信も、目的によっては公表が要る。** 広告事業者へ転送するために自社のサーバへ集める送信が、利用者から見て「通常想定できる」かどうかは、慎重に判断する必要がある
+- **EU では、ブラウザで Cookie を保存・読み出す限り第 5 条第 3 項の問題は残る。** 実験 C でも `_ana` は `news.test` の Cookie として保存されている。条文は保存する者がファーストパーティかどうかで区別していない
+- **見えにくくなる。** 利用者も監督機関も研究者も、ブラウザの開発者ツールで送信先を確かめられなくなる。だからこそ、自社で転送先の台帳を持ち、公表の表に反映させる責任が重くなる
+
+<Callout type="warn" title="読み込んだスクリプトは、書き換えられうる">
+  タグは他社のサーバから読み込むコードです。配信元が侵害されれば、同じ `<script>` の 1 行が入力フォームの中身を攻撃者へ送るコードに変わります。
+  この Web スキミングは、個人情報保護法の漏えい等報告の対象として明示的に扱われるようになりました（第 255 回）。
+  決済や会員登録のページに読み込むスクリプトを絞り、CSP（第 141 回）で送信先を制限し、
+  この回の実験のように送信先を定期的に列挙して差分を見ることは、外部送信規律の公表を正しく保つためにも、改ざんに気づくためにも役立ちます。
+</Callout>
+
+## 運用に落とす
+
+タグは、マーケティングの担当がタグマネージャの画面から、コードのレビューを経ずに足せることが多い部品です。公表の表を一度作っても、**次のタグが足された日に古くなります**。実験のスクリプトは、そのまま運用の部品になります。
+
+| 仕組み | やること |
+| --- | --- |
+| タグの台帳 | 送信先のホストごとに、取り扱う者の名称、利用目的、同意のカテゴリ、担当者を持つ。実験の `REGISTRY` がこれ |
+| 定期的な列挙 | 本番の主要なページをヘッドレスブラウザで開き、同意なし・同意ありの両方で送信先を列挙する。台帳にないホスト（実験の `video.test`）が出たら知らせる |
+| 同意のテスト | 「同意なしで、広告のホストへの要求が 0 件」「拒否した後に計測の Cookie が残っていない」を自動テストにする |
+| 公表の表の生成 | 台帳と列挙の結果から、公表文の表を生成する。人が書くのは名称と目的だけにする |
+| サーバの転送 | サーバサイドのタグ管理の転送先の設定も台帳に入れる。ブラウザの観測では見えない（実験 C） |
+| タグを足す手順 | タグを足す申請に「送信先」「送る項目」「目的」「同意のカテゴリ」を必須にする |
+
+列挙で分かるのは「どこへ何が送られたか」までです。**送信先がそれを何に使うか**は通信からは分かりません。利用目的の欄は、契約と送信先の公表している説明を確かめて、人が書くしかありません。また、実験のようにクエリの名前を辞書で訳せるのは、自分で書いたスクリプトだからです。実際のタグのパラメータは事業者ごとに違い、意味が公開されていないものもあります。辞書にないものは「未分類のパラメータ」として出し、事業者に確かめることになります。
+
+通信を開けて読む方法は他にもあります。第 172 回のような中間者プロキシを使えば、アプリの通信も同じように列挙できます。
+
+## まとめ
+
+- タグは、利用者の端末に「この情報をあそこへ送れ」と指示するプログラム。スクリプトを取りに行くだけでも IP アドレス、User-Agent、Referer が送られる
+- 電気通信事業法の外部送信規律（第 27 条の 12、2023 年 6 月 16 日施行）は、4 類型の役務を提供する電気通信事業者などに、送信される情報の内容、取り扱う者の名称、利用目的を、通知・公表・同意・オプトアウトのいずれかで示すよう求める。Cookie を使わなくても、送信先が自社のサーバでも対象になりうる
+- 自社商品を売るだけの EC サイトや会社案内のページは対象外になりうるが、判断はページ単位。ファーストパーティ Cookie の ID でも、第三者へ送るなら原則として除外されない
+- 個人情報保護法の第 31 条は「提供」を、外部送信規律は「送信の指令」を見る。タグの直接送信は前者からこぼれることがあり、後者が拾う。2026 年 7 月公布・未施行の改正は、連絡に使える個人関連情報に不適正利用・不正取得の禁止を及ぼす
+- EU では ePrivacy 指令第 5 条第 3 項により、端末への保存・アクセスは厳密に必要なものを除き事前の同意が要る。同意は GDPR の定義に従い、撤回は同意と同じくらい容易でなければならない
+- Planet49 判決: 事前チェック済みの欄は同意にならない。個人データかどうかで変わらない。Cookie の有効期間と第三者のアクセスの有無を示す
+- 同意バナーでは、拒否を同意と同じ層・同じ手間にし、同意の前に同意が要るタグを読み込まない。EDPB の Cookie Banner Taskforce と CNIL が具体例を示している
+- IAB TCF v2.2 は広告の個人化の目的から正当な利益を外し、事業者の総数の表示と撤回の容易さを求めた。TC String は個人データになりうる（C-604/22）
+- Google の Consent Mode の基本モードは同意まで何も送らず、詳細モードは拒否されても Cookie を使わない送信をする。後者も外部送信の表に載せる前提で考える
+- 実験では、同意なしでも 3 つのホストへ送信が起き、iframe が自分で送信し、Cookie が保存されなくてもクエリで会員 ID とハッシュが届いた。サーバサイドの転送はブラウザから見えなかった
+- サーバサイドのタグ管理は規律を消さず、外部送信規律から個人情報保護法の「提供」へ重心を移す。台帳と定期的な列挙で、公表の表をコードと一致させ続ける
