@@ -15,9 +15,106 @@ const base = import.meta.env.BASE_URL
 
   <link href={`${base}pagefind/pagefind-ui.css`} rel="stylesheet" />
   <div id="search"></div>
+  <div id="ai-terms" class="mt-3 flex min-h-6 flex-wrap items-center gap-2 text-xs" hidden></div>
   <script is:inline src={`${base}pagefind/pagefind-ui.js`}></script>
   <script is:inline>
-    new PagefindUI({ element: '#search', showSubResults: true, showImages: false, resetStyles: false })
+    const ui = new PagefindUI({ element: '#search', showSubResults: true, showImages: false, resetStyles: false })
+
+    // Chrome 内蔵の Gemini Nano（Prompt API）で別の検索語を提案する。
+    // デスクトップ版 Chrome の一部でしか動かないため、使えない環境では何も出さない。
+    // https://developer.chrome.com/docs/ai/prompt-api
+    const box = document.getElementById('ai-terms')
+    document.querySelector('#search .pagefind-ui__drawer').before(box)
+    const options = {
+      expectedInputs: [{ type: 'text', languages: ['ja'] }],
+      expectedOutputs: [{ type: 'text', languages: ['ja'] }],
+    }
+    const schema = { type: 'array', items: { type: 'string' }, maxItems: 5 }
+    const SYSTEM = [
+      'あなたは、コンピュータの低レイヤとシステム設計を扱う技術記事サイトの検索を手伝う。',
+      '入力された語や質問について、記事の本文に書かれていそうな別の検索語を最大 5 個返す。',
+      '略語なら略さない形、カタカナ語なら英語表記、俗称なら正式名称、ほかに関係の深い専門用語を選ぶ。',
+      '各語は 1〜3 語の短い名詞句にし、入力と同じ語は含めない。',
+    ].join('\n')
+
+    let base = null
+    let pending = null
+    let timer = 0
+
+    function show(label, terms = []) {
+      box.hidden = false
+      box.replaceChildren()
+      const head = document.createElement('span')
+      head.textContent = label
+      head.style.color = 'var(--fg-muted)'
+      box.append(head)
+      for (const t of terms) {
+        const b = document.createElement('button')
+        b.type = 'button'
+        b.textContent = t
+        b.className = 'rounded border px-2 py-0.5'
+        b.style.cssText = 'border-color: var(--border); background: var(--bg-soft); color: var(--fg)'
+        b.addEventListener('click', () => ui.triggerSearch(t))
+        box.append(b)
+      }
+    }
+
+    async function suggest(query) {
+      pending?.abort()
+      const q = query.trim()
+      if (q.length < 2) {
+        box.hidden = true
+        return
+      }
+      pending = new AbortController()
+      let session
+      try {
+        show('別の検索語を考えています…')
+        session = await base.clone({ signal: pending.signal })
+        const raw = await session.prompt(q, { responseConstraint: schema, signal: pending.signal })
+        const terms = [...new Set(JSON.parse(raw).map((t) => t.trim()))].filter((t) => t && t !== q)
+        if (terms.length > 0) show('こちらでも探す:', terms)
+        else box.hidden = true
+      } catch (e) {
+        if (e.name !== 'AbortError') box.hidden = true
+      } finally {
+        session?.destroy()
+      }
+    }
+
+    async function start() {
+      base = await LanguageModel.create({
+        ...options,
+        initialPrompts: [{ role: 'system', content: SYSTEM }],
+        monitor(m) {
+          m.addEventListener('downloadprogress', (e) => show(`モデルをダウンロード中… ${Math.round(e.loaded * 100)}%`))
+        },
+      })
+      box.hidden = true
+      document.getElementById('search').addEventListener('input', (e) => {
+        if (!e.target.matches('.pagefind-ui__search-input')) return
+        clearTimeout(timer)
+        timer = setTimeout(() => suggest(e.target.value), 600)
+      })
+    }
+
+    async function init() {
+      if (!('LanguageModel' in self)) return
+      const state = await LanguageModel.availability(options)
+      if (state === 'unavailable') return
+      if (state === 'available') return start()
+      // ダウンロードには利用者の操作が要るので、ボタンを押してもらう
+      box.hidden = false
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.textContent = 'Chrome 内蔵の AI で別の検索語を提案する（初回はモデルのダウンロードがあります）'
+      b.className = 'rounded border px-2 py-1'
+      b.style.cssText = 'border-color: var(--border); color: var(--accent)'
+      b.addEventListener('click', () => start().catch(() => (box.hidden = true)), { once: true })
+      box.replaceChildren(b)
+    }
+
+    init().catch(() => {})
   </script>
 </BaseLayout>
 
