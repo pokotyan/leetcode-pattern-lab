@@ -41,8 +41,8 @@ const handsOn = d.handsOn.map((h) => {
       </div>
     </aside>
 
-    <article class="prose min-w-0">
-      <details class="not-prose mb-4 rounded-lg border px-3 py-2 lg:hidden" style="border-color: var(--border)">
+    <article class="prose min-w-0" data-pagefind-body data-pagefind-filter="区画:低レイヤ">
+      <details data-pagefind-ignore class="not-prose mb-4 rounded-lg border px-3 py-2 lg:hidden" style="border-color: var(--border)">
         <summary class="cursor-pointer text-xs font-bold" style="color: var(--fg-muted)">章から探す</summary>
         <div class="mt-2">
           <LowLevelTree current={entry.id} />
@@ -110,6 +110,7 @@ const handsOn = d.handsOn.map((h) => {
       }
 
       <nav
+        data-pagefind-ignore
         class="not-prose mt-16 flex flex-wrap gap-3 border-t pt-6 text-sm"
         style="border-color: var(--border)"
       >

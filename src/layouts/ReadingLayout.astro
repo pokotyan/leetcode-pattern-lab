@@ -28,7 +28,7 @@ const foundations = d.basedOn.map((b) => ({
 
 <BaseLayout title={`${d.title} | システム設計 | Pattern Lab`} description={d.description} area="system-design">
   <div class="grid gap-10 lg:grid-cols-[minmax(0,1fr)_16rem]">
-    <article class="prose min-w-0">
+    <article class="prose min-w-0" data-pagefind-body data-pagefind-filter="区画:システム設計">
       <p class="not-prose m-0 flex flex-wrap items-center gap-2 text-xs font-bold">
         <a href={`${base}system-design/`} class="no-underline" style="color: var(--accent)">システム設計</a>
         <a href={`${base}reading/`} class="no-underline" style="color: var(--accent)">仕組みを読む</a>
@@ -99,6 +99,7 @@ const foundations = d.basedOn.map((b) => ({
       <slot />
 
       <nav
+        data-pagefind-ignore
         class="not-prose mt-16 flex flex-wrap gap-3 border-t pt-6 text-sm"
         style="border-color: var(--border)"
       >
