@@ -1,0 +1,379 @@
+---
+title: リクエストとクエリとプロファイルを結ぶ
+description: アクセスログ、スロークエリログ、プロファイルは、それぞれ別の単位で時間を数えています。リクエスト ID を SQL のコメントに埋めて 3 つを 1 件の要求の単位で結び、N+1 の見分け方、データベースの外で使われている時間、CPU プロファイルに写らない待ち時間を、手元のアプリケーションで確かめます。計測をベンチマークごとに自動で取る仕組みと、計測そのものの費用も測ります
+chapter: tune
+order: 6
+status: published
+topics:
+  - リクエスト ID
+  - SQL コメント
+  - N+1 の検出
+  - pt-query-digest の embedded-attributes
+  - pprof
+  - fgprof
+  - on-CPU と off-CPU
+  - wall-clock プロファイル
+  - 往復の時間
+  - pprotein
+  - 計測の自動化
+  - 計測のオーバーヘッド
+  - sqlcommenter
+requires:
+  - ll-264-slow-query
+  - ll-241-profile-reading
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 3 つの記録はつながっていない
+
+第 263 回ではアクセスログで「どのエンドポイントに時間を使っているか」を、第 264 回ではスロークエリログで「どの SQL にデータベースの時間を使っているか」を集計しました。第 264 回の最後には、2 つの問いが残りました。
+
+- 主キーで利用者を 1 件引く `SELECT users` が 30 秒で 96,276 回呼ばれていた。それは、どの要求から何回ずつ呼ばれたのか
+- 要求の時間のうち、データベースの外（アプリケーション自身の処理や、データベースとの往復）で使われている時間はどれだけか
+
+どちらも、1 つの記録だけでは答えられません。アクセスログは要求を単位に、スロークエリログは SQL を単位に、プロファイルは関数を単位に時間を数えていて、互いを指す手掛かりを持っていないからです。
+
+この回では、3 つを**1 件の要求の単位で結ぶ**方法を見ます。
+
+| 結び方 | 答えられる問い |
+| --- | --- |
+| リクエスト ID をアクセスログと SQL の両方に書く | 1 件の要求が何本の SQL を投げ、そのうち何秒がデータベースの中だったか |
+| SQL のコメントにルートの名前を書く | どのエンドポイントがどの SQL にどれだけ時間を使ったか |
+| CPU プロファイルと wall-clock プロファイルを並べる | アプリケーションの時間のうち、CPU を使っていた時間と待っていた時間 |
+
+## リクエスト ID を通す
+
+### 発想
+
+ISUCON9 本選で優勝した白金動物園の mirakui さんは、次のように書いています（[チーム白金動物園として ISUCON 9 本選で優勝しました](https://blog.mirakui.com/entry/2019/10/14/011554)）。
+
+> アプリケーション側でリクエストごとにユニーク ID を生成し、Nginx のアクセスログや、MySQL のクエリログなどに出すようにしました。SQL にはリクエスト ID をコメントとして含めました。これによって、どのリクエストでどのようなクエリが発行されているかが簡単に分析できるようになりました。また、クエリログに似たような SQL が大量に吐かれているとき、リクエスト ID を見れば、1リクエストから大量に N+1 で出ているのか、複数のリクエストから同じクエリが叩かれているのかがすぐに分かります。
+
+最後の 1 文が、第 264 回で残った 1 つ目の問いそのものです。
+
+### 手元での組み立て
+
+第 263 回から使っているアプリケーションに、次の 3 か所の変更を入れました。
+
+1. **nginx が ID を作って渡す。** 第 263 回でアクセスログに書いていた `$request_id` を、アプリケーションへの要求のヘッダーにも載せます。
+
+   ```nginx
+   location / {
+       proxy_set_header X-Request-ID $request_id;
+       proxy_pass http://app;
+   }
+   ```
+
+2. **アプリケーションが ID とルートを受け取る。** ハンドラを包む関数で、ヘッダーの ID と、そのハンドラを登録したときのルートのパターンを `context.Context` に入れます。
+
+   ```go
+   func wrap(route string, h http.HandlerFunc) http.HandlerFunc {
+   	return func(w http.ResponseWriter, r *http.Request) {
+   		ctx := context.WithValue(r.Context(), keyRID, r.Header.Get("X-Request-ID"))
+   		ctx = context.WithValue(ctx, keyRoute, route)
+   		h(w, r.WithContext(ctx))
+   	}
+   }
+
+   mux.HandleFunc("GET /api/items", wrap("GET /api/items", itemList))
+   ```
+
+3. **SQL の先頭にコメントとして書く。** クエリを投げる直前に、`context` から ID とルートを取り出して付けます。
+
+   ```go
+   func q(ctx context.Context, query string) string {
+   	rid, _ := ctx.Value(keyRID).(string)
+   	route, _ := ctx.Value(keyRoute).(string)
+   	return fmt.Sprintf("/* rid=%s route=%s */ %s", rid, strings.Replace(route, " ", ":", 1), query)
+   }
+
+   db.QueryRowContext(ctx, q(ctx, "SELECT id, name FROM users WHERE id = ?"), id)
+   ```
+
+ルートの空白を `:` に置き換えているのは、後で正規表現で切り出しやすくするためです。
+
+MySQL 8.0.46 は `long_query_time=0` で起動し、すべての SQL をスロークエリログに書かせています。データベースの側は、第 264 回でインデックスを 2 つ足した後の状態から始めます。一覧のエンドポイントに 1 回だけ要求を送ると、アクセスログとスロークエリログにはそれぞれ次のように出ました。
+
+```text
+time:12/Nov/2026:00:57:20 +0000	status:200	method:GET	uri:/api/items?page=1	size:2368	reqtime:0.418	apptime:0.418	request_id:2936fad0251045a3f3e7c36ef1d1a869
+```
+
+```text
+/* rid=2936fad0251045a3f3e7c36ef1d1a869 route=GET:/api/items */ SELECT id, user_id, title, price, created_at FROM items ORDER BY created_at DESC LIMIT 20 OFFSET 20;
+/* rid=2936fad0251045a3f3e7c36ef1d1a869 route=GET:/api/items */ SELECT id, name FROM users WHERE id = 589;
+/* rid=2936fad0251045a3f3e7c36ef1d1a869 route=GET:/api/items */ SELECT id, name FROM users WHERE id = 69;
+/* rid=2936fad0251045a3f3e7c36ef1d1a869 route=GET:/api/items */ SELECT id, name FROM users WHERE id = 389;
+...（同じ形の行があと 17 行）
+```
+
+1 件の要求から、商品の一覧を引く 1 本と、利用者を 1 件ずつ引く 20 本、合わせて 21 本の SQL が出ていることが、ID で引くだけで分かります。
+
+<Callout type="warn" title="コメントに入れてよいもの">
+  SQL のコメントは SQL の文字列の一部です。利用者が送ってきた値をそのまま埋め込むと、値に `*/` が含まれていたときにコメントが閉じ、続きが SQL として解釈されます。
+  今回の ID は nginx が作った 16 進数の文字列で、`proxy_set_header` がクライアントの送ってきた同名のヘッダーを上書きしています。ルートの名前もアプリケーションのコードに書いた定数です。
+  本番でクライアントの送ってきた ID を引き継ぐ場合は、使える文字を英数字とハイフンなどに限って検査してから埋め込みます。
+</Callout>
+
+## 要求ごとの内訳
+
+### 2 つのログを ID で結合する
+
+この状態で、第 263 回と同じ 16 並列の閉ループの負荷を、nginx を通して 30 秒かけました。環境は Apple M1 Pro / macOS 26.2、OrbStack の Docker、Go 1.24.6 です。同じ機械で他の重い処理も動いていました。
+
+```text
+$ ./lg -base http://127.0.0.1:32651 -c 16 -d 30s
+requests=14808 errors=0 rps=493.6
+```
+
+アクセスログ 14,808 行と、スロークエリログ 55,631 件ができました。スロークエリログを 1 件ずつ読んで `rid=` ごとに本数と `Query_time` の合計を数え、アクセスログの `request_id` と突き合わせる 40 行ほどの Python のスクリプトを書いて、ルートごとに集計しました。
+
+```text
+route                              reqs  q/req  max  queries    db_s   req_s   db%
+GET /api/items                     1516   21.0   21    31836   59.12  203.40    29
+GET /api/items/:id                 6607    2.0    2    13094    7.64   90.50     8
+GET /api/items/:id/comments        1913    5.0   11     9652    6.80   52.37    13
+POST /api/items/:id/comments        601    1.0    1      601   59.87   64.19    93
+GET /api/search                     448    1.0    1      448    1.31    4.85    27
+GET /css/app.css                   1952    0.0    0        0    0.00    0.00     0
+GET /image/:id                     1771    0.0    0        0    0.00    5.89     0
+```
+
+| 列 | 意味 |
+| --- | --- |
+| `reqs` | 要求の件数（アクセスログ） |
+| `q/req`、`max` | 1 件の要求が投げた SQL の本数の平均と最大 |
+| `queries` | SQL の本数の合計 |
+| `db_s` | その要求から出た SQL の `Query_time` の合計（スロークエリログ） |
+| `req_s` | 要求の `reqtime` の合計（アクセスログ） |
+| `db%` | `db_s` ÷ `req_s` |
+
+### 96,276 回の正体
+
+第 264 回の 30 秒では、`SELECT users` が 96,276 回呼ばれていました。今回の 30 秒では 44,546 回です（要求の総数が違うので、回数は比べられません）。この 44,546 回がどこから来たのかは、表から分解できます。
+
+| 呼び出し元 | 計算 | 回数 |
+| --- | --- | --- |
+| 一覧 | 1,516 件 × 20 回 | 30,320 |
+| コメント一覧 | 9,652 本 − 1,913 本（コメントを引く 1 本） | 7,739 |
+| 商品詳細 | 13,094 本 − 6,607 本（商品を引く 1 本） | 6,487 |
+| 合計 | | 44,546 |
+
+7 割近くが一覧からで、その一覧は 1 件の要求の中で利用者を 20 回ずつ引いています。商品詳細の 6,487 回は、1 件の要求につき 1 回です（存在しない商品への 404 では利用者を引かないので、6,607 件より少なくなっています）。同じ 1 本の SQL でも、**一覧からの 20 回は 1 本にまとめられる N+1、商品詳細からの 1 回はまとめようのない 1 回**です。スロークエリログを SQL ごとに集計しただけでは、この 2 つは同じ行に入っています。
+
+### N+1 を機械的に探す
+
+要求ごとに「同じ形の SQL が何回繰り返されたか」を数えれば、N+1 の候補を機械的に拾えます。SQL の数字と文字列を `?` に置き換え（第 264 回のフィンガープリントの簡易版）、1 件の要求の中での最大の繰り返し回数をルートごとに出しました。
+
+```text
+GET:/api/items                      20  SELECT id, name FROM users WHERE id = ?;
+GET:/api/items/{id}/comments        10  SELECT id, name FROM users WHERE id = ?;
+GET:/api/items/{id}                  1  SELECT id, user_id, title, price, created_at FROM items WHER
+GET:/api/search                      1  SELECT id, title, price FROM items WHERE title LIKE ? LIMIT
+POST:/api/items/{id}/comments        1  INSERT INTO comments (item_id, user_id, body, created_at) VA
+```
+
+一覧では 20 回、コメント一覧では最大 10 回、同じ形の SQL が 1 件の要求の中で繰り返されています。繰り返しの回数がページの大きさ（20 件、10 件）と一致していることが、N+1 の典型的な現れ方です。
+
+ただし、見つけた N+1 をすべて直す必要はありません。ISUCON13 で優勝した NaruseJun の tohutohu さんは、「N+1に関してもただ闇雲にコードを見てN+1を発見して潰していけばいいわけではなく、ちゃんと計測結果を見て優先度を決めて改善していく必要がありました。」と書いています（[ISUCON13で優勝しました](https://zenn.dev/tohutohu/articles/923bdf5dcd73af)）。上の表なら、要求の時間の合計が大きい一覧が先で、件数の少ないコメント一覧は後です。直し方は第 267 回で扱います。
+
+## SQL コメントで集計を分ける
+
+### フィンガープリントはコメントを捨てる
+
+SQL の先頭に、要求ごとに違う ID を付けました。これで pt-query-digest の集計が要求の数だけばらばらになっては困ります。第 264 回で見たとおり、pt-query-digest のフィンガープリントは「Strip comments.」、つまりコメントを取り除いてから作られます。実際、今回のログを集計すると、第 264 回と同じ Query ID（`SELECT users` なら `0x203D841293D09E9ECEDF684AA5695AD1`）の 6 行にまとまりました。
+
+```text
+# Rank Query ID                            Response time Calls R/Call V/M 
+# ==== =================================== ============= ===== ====== ====
+#    1 0x820FEBE237BF525D1903C22BB584E78A  59.8723 44.4%   601 0.0996  0.17 INSERT comments
+#    2 0x0F9B40A8C3A032EE795E3F34AF5747B7  45.8243 34.0%  1516 0.0302  0.12 SELECT items
+#    3 0x203D841293D09E9ECEDF684AA5695AD1  20.2703 15.0% 44546 0.0005  0.13 SELECT users
+#    4 0x44C405C4A776BE965F3695ABB78327D5   3.8452  2.9%  1913 0.0020  0.07 SELECT comments
+#    5 0x4517DA52F99BC8D325E043457AC3D6E3   3.6214  2.7%  6607 0.0005  0.05 SELECT items
+#    6 0xD1D6B09029427162FA148553ACE4F390   1.3051  1.0%   448 0.0029  0.11 SELECT items
+```
+
+performance_schema のダイジェストも同じで、MySQL の文書は正規化の手順に「Comments are removed and whitespace is adjusted.」を挙げています（第 264 回）。コメントを付けても、SQL ごとの集計は崩れません。
+
+### コメントの中身で集計する
+
+逆に、コメントの中身で集計し直すこともできます。pt-query-digest の `--embedded-attributes` は、文書の言葉では「Two Perl regex patterns to capture pseudo-attributes embedded in queries.」です（[pt-query-digest](https://docs.percona.com/percona-toolkit/pt-query-digest.html)）。1 つ目の正規表現でコメント全体を、2 つ目で `名前=値` の組を切り出すと、その名前を `--group-by` に使えます。
+
+```bash
+pt-query-digest --embedded-attributes '^/\* .*? \*/,(\w+)=(\S+)' \
+  --group-by route --report-format profile slow.log
+```
+
+```text
+# Rank Query ID                            Response time Calls R/Call V/M 
+# ==== =================================== ============= ===== ====== ====
+#    1 0x                                  59.8723 44.4%   601 0.0996  0.17 POST:/api/items/{id}/comments
+#    2 0x                                  59.1156 43.9% 31836 0.0019  0.14 GET:/api/items
+#    3 0x                                   7.6410  5.7% 13094 0.0006  0.15 GET:/api/items/{id}
+#    4 0x                                   6.8044  5.1%  9652 0.0007  0.08 GET:/api/items/{id}/comments
+#    5 0x                                   1.3051  1.0%   448 0.0029  0.11 GET:/api/search
+```
+
+データベースの時間を、SQL ごとではなく**エンドポイントごと**に並べた表です。一覧（`GET:/api/items`）は 1 本あたり 1.9 ミリ秒と速いのに、31,836 本を投げてデータベースの時間の 43.9% を使っています。
+
+ISUCON14 で 4 位になった LayerX のチームは、同じ発想を道具として用意していました（[ISUCON14 に「都営三田線~」で参加し4位になりました](https://zenn.dev/layerx/articles/3bd55b77e047c4)）。
+
+> 今年は新兵器として「SQLに呼び出し元ファイルと関数名をコメントする」ようなパッケージを事前に用意し、アプリケーションに組み込みました。
+
+実装は「Go の `database/sql/driver.Driver` をラップする新たな Driver を作り、その中で SQL の先頭にコメントを追記するような実装になってます。」と説明されています。ドライバの層で付ければ、アプリケーションのすべてのクエリの呼び出しを書き換えずに済みます。同じ記事には、集計に使った `mysqldumpslow` が数字をプレースホルダに置き換えてしまうので、行番号を全角数字で書いた、という工夫も書かれています。集計の道具がコメントの中身をどう扱うかまで確かめておかないと、せっかく埋めた情報が集計で消えます。
+
+本番向けには、同じ考え方を ORM やドライバの拡張として提供する [sqlcommenter](https://google.github.io/sqlcommenter/) があります。説明は「sqlcommenter is a suite of middlewares/plugins that enable your ORMs to augment SQL statements before execution」で、付けるコメントには、ルートやコントローラーの名前のほか、分散トレーシングの `traceparent` が含まれます。リクエスト ID の役目を、トレースの ID が担う形です。
+
+## プロファイル：CPU を使った時間と待った時間
+
+### データベースの外の時間
+
+さきほどの表で、一覧の `db%` は 29% でした。要求の時間の合計 203.40 秒のうち、MySQL が SQL を実行していた時間は 59.12 秒です。1 件あたりにすると、要求は 134 ミリ秒、データベースの中は 39 ミリ秒で、残りの 95 ミリ秒はどこかほかで使われています。
+
+スロークエリログの `Query_time` は、MySQL がその文を実行していた時間です。アプリケーションが SQL を送り、結果を受け取るまでの**往復**のうち、ネットワークを行き来する時間や、MySQL が次の文を受け取るまでの時間は含まれません。今回の構成では、アプリケーションは macOS の上で、MySQL は OrbStack の仮想マシンの中で動いていて、その間をポートの転送が中継しています。21 本の SQL を 1 本ずつ順に投げる一覧では、この往復の費用が 21 回積み重なります。95 ミリ秒を 21 で割ると、1 往復あたりおよそ 4.5 ミリ秒です。
+
+これを確かめるには、アプリケーションの側から時間を見る必要があります。プロファイルの出番です。
+
+### CPU プロファイルに写るもの
+
+アプリケーションには `net/http/pprof` と [fgprof](https://github.com/felixge/fgprof) を組み込み、別のポートで公開しました。
+
+```go
+import _ "net/http/pprof"
+
+http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler())
+go func() { log.Println(http.ListenAndServe(*debugAddr, nil)) }()
+```
+
+30 秒の負荷の途中の 15 秒間、2 つのプロファイルを同時に取りました。
+
+```bash
+curl -o cpu.pprof 'http://127.0.0.1:6265/debug/pprof/profile?seconds=15' &
+curl -o fg.pprof  'http://127.0.0.1:6265/debug/fgprof?seconds=15' &
+```
+
+まず Go の標準の CPU プロファイルです。
+
+```text
+$ go tool pprof -top shop cpu.pprof
+Duration: 15.08s, Total samples = 2.21s (14.65%)
+      flat  flat%   sum%        cum   cum%
+     1.06s 47.96% 47.96%      1.07s 48.42%  syscall.syscall
+     0.37s 16.74% 64.71%      0.37s 16.74%  runtime.kevent
+     0.16s  7.24% 71.95%      0.16s  7.24%  runtime.pthread_cond_timedwait_relative_np
+     0.15s  6.79% 78.73%      0.15s  6.79%  runtime.pthread_cond_signal
+     0.11s  4.98% 83.71%      0.11s  4.98%  runtime.pthread_cond_wait
+...
+```
+
+15 秒間のうち、標本は 2.21 秒ぶんしかありません。8 コアの機械で、アプリケーションは平均して 0.15 コアほどしか CPU を使っていなかったということです。その中身も、システムコール（ソケットの読み書き）とスケジューラが大半です。第 241 回で見たとおり、CPU プロファイルは CPU を使っていた時間の内訳で、待っている時間は写りません。
+
+### wall-clock プロファイル
+
+fgprof は、待っている時間も含めて数えるプロファイラです。README は仕組みを次のように説明しています。
+
+> fgprof is implemented as a background goroutine that wakes up 99 times per second and calls `runtime.GoroutineProfile`. This returns a list of all goroutines regardless of their current On/Off CPU scheduling status and their call stacks.
+
+1 秒に 99 回、**すべてのゴルーチン**のスタックを集めます。CPU で動いているかどうかを問わないので、I/O を待っているゴルーチンも数えられます。README はこの種の計測を「This kind of profiling is also known as wall-clock profiling.」と呼んでいます。対して Go の標準の CPU プロファイラについては、「Since Go uses non-blocking I/O, Goroutines that wait on I/O are parked and not running on any threads. Therefore they end up being largely invisible to Go's builtin CPU profiler.」と書いています。
+
+同じ 15 秒について、アプリケーションの関数と、MySQL の応答を読む関数の行を 2 つのプロファイルから拾って並べました（`-top -cum` の出力から抜粋）。
+
+| 関数 | CPU プロファイル（cum） | fgprof（cum） |
+| --- | --- | --- |
+| `mysqlConn.readPacket`（MySQL の応答を読む） | 0.30 s | 191.03 s |
+| `main.getUser`（利用者を 1 件引く） | 0.63 s | 105.16 s |
+| `main.itemList`（一覧） | 0.48 s | 104.40 s |
+| `main.postComment`（コメント投稿） | 表示されず | 31.57 s |
+| `main.itemDetail`（商品詳細） | 0.13 s | 30.67 s |
+| `main.itemComments`（コメント一覧） | 0.17 s | 23.70 s |
+| `main.writeJSON`（JSON の出力） | 0.04 s | 表示されず |
+
+（「表示されず」は、そのプロファイルの上位に現れなかったもの）
+
+2 つの表は、まったく違うものを見ています。
+
+- **CPU プロファイルでは、コメント投稿はほとんど存在しない。** 第 264 回で見たとおり、コメントの書き込みはコミット時のディスクへの同期を待っていて、アプリケーションの CPU はほぼ使いません。fgprof では 31.57 秒、一覧と商品詳細に次ぐ大きさです。
+- **fgprof では、一覧の時間の 7 割が利用者を引く処理の中にある。** `go tool pprof -peek 'main\.getUser$'` で呼び出し元を見ると、`main.getUser` の 105.16 秒のうち 72.82 秒が `main.itemList` からで、これは一覧の 104.40 秒の 70% に当たります。`main.getUser` の時間のほぼすべて（99.85%）は `database/sql` の `QueryRowContext` の中、その先は `readPacket`、つまり MySQL の応答を待つ時間です。往復の数だけ待ち時間が積み重なっていることが、アプリケーションの側から見えます。
+- **JSON の出力は、どちらで見ても小さい。** 今回のアプリケーションでは、CPU の重い処理を探すのはまだ先です（第 276 回）。
+
+fgprof の合計は 15 秒に対して 794.73 秒（5,297.91%）でした。15 秒のあいだ平均して 53 本ほどのゴルーチンがいて、そのすべてを数えているからです。そこには、nginx との接続で次の要求を待っているだけのゴルーチンや、`database/sql` が裏で接続を管理するゴルーチンも含まれます。fgprof の表は**アプリケーションの関数に絞って**（`-focus='main\.'` などで）読むのが実用的です。
+
+<Callout type="note" title="CPU プロファイルが役に立つとき">
+  fgprof の README も、CPU を使っている時間の分析では標準のプロファイラの方が優れていると認めています（「Go's builtin sampling CPU profiler can only show On-CPU time, but it's better than fgprof at that.」）。
+  2 つは置き換えではなく、問いで使い分けます。**応答が遅いのに CPU 使用率が低いなら fgprof（待ち）、CPU 使用率が高いなら CPU プロファイル（計算）**です。データベースがボトルネックのうちは前者が、データベースを片付けてアプリケーションの CPU が詰まってきたら後者が役に立ちます。
+  ISUCON13 で 2 位になった織時屋の記録にも、序盤は「alpと多分fgprofで`getLivecommentsHandler`が重いので」、終盤は「pprofの上位のjson encodeを@tokiが別の早いライブラリに変える」という、両方の使い方が残っています（[ISUCON13で2位になりました(織時屋)](https://trap.jp/post/2049/)）。
+</Callout>
+
+## ベンチマークごとに自動で取る
+
+ここまで、アクセスログ、スロークエリログ、2 種類のプロファイルを手で取ってきました。実際には、改善のたびにこれを繰り返します。ベンチマークの前にログを空にし、終わったら集計し、プロファイルを取り、結果を前回と並べる。手で回すと、空にし忘れて前回のぶんが混ざる、プロファイルを取り忘れる、誰がどの結果を見ているのか分からなくなる、といったことが起きます。
+
+ISUCON の上位チームの多くは、これを自動化しています。広く使われている [pprotein](https://github.com/kaz/pprotein) を紹介した記事は、この道具を「3大計測ポイント(?)であるプロファイル、スロークエリログ、アクセスログをまとめて計測して可視化してくれる神ツールです。」と説明し、無い場合の手間を次のように書いています（[pprotein でボトルネックを探して ISUCON で優勝する](https://zenn.dev/team_soda/articles/20231206000000)）。
+
+> pproteinがないと、ログのローテートをしたり、ログを手元に持ってきてalpなどで分析したり、 go tool pprof で毎回計測を走らせたり、それらの計測結果をチームメンバーに共有したり、と色々なことをしないといけなくて大変です。
+
+計測を始めるきっかけには、ベンチマーカーの最初の要求を使います。ISUCON のベンチマーカーは、最初にデータを初期化する `/initialize` を呼びます。同じ記事は「そのinitialize処理の最後にpproteinでの計測を自動でスタートするようにすると便利です。」と勧めています。ISUCON13 で優勝したチームの tohutohu さんも、「これは、 /initialize の最後にフックを挟むことで自動で計測を開始し、Web上からpprof,alp,slpの結果をインタラクティブに見ることのできるツールです。」「これを利用すれば、ベンチ前のログローテートなどをしなくてもベンチごとの計測結果を溜めて見ることができます。」と書いています（[ISUCON13で優勝しました](https://zenn.dev/tohutohu/articles/923bdf5dcd73af)）。
+
+道具が何であれ、自動化の要点は 3 つです。
+
+1. **計測の区切りを、負荷の区切りに合わせる。** 1 回のベンチマークのぶんだけが 1 組の結果に入るようにする。
+2. **結果を残して並べる。** 前回の表と並べられなければ、第 263 回で見た「直した行の減り方と全体の件数」を確かめられない。
+3. **誰でも同じ場所で見られるようにする。** チームの全員が、同じ数字を見て次の手を決める。
+
+本番のサービスでは、同じ役目を継続的なプロファイリングの基盤や分散トレーシングが担います。tohutohu さんの記事でも、Pyroscope や OpenTelemetry を使う案を検討したうえで、ベンチマークの 1 回ごとに分けて見やすいことを理由に pprotein を選んだと書かれています。競技は「1 回のベンチマーク」という明確な区切りがあり、本番は区切りのない連続した流れである、という違いが道具の選び方に表れています。
+
+## 計測の費用
+
+### すべての SQL を書く費用
+
+計測は無料ではありません。`long_query_time=0` で 30 秒間に書かれたスロークエリログは、実際の内容だけで 17,254,643 バイト（55,631 件）でした。SQL の先頭にコメントを付けたぶん、第 264 回より 1 件あたりが大きくなっています。
+
+書く費用を確かめるために、MySQL と同じネットワークの中から、主キーで利用者を 1 件引く SQL を 8 並列で 40,000 回投げる小さな Go のプログラムを走らせ、`slow_query_log` を 1（記録する）と 0（記録しない）に交互に切り替えて 5 組ずつ測りました。他の処理で機械が混んでいたため、時間を空けて 2 回繰り返しています。
+
+| 組 | 記録する（1 秒あたりの SQL） | 記録しない（1 秒あたりの SQL） |
+| --- | --- | --- |
+| 1 回目の 1 | 6,300 | 5,406 |
+| 1 回目の 2 | 6,128 | 18,329 |
+| 1 回目の 3 | 8,761 | 20,045 |
+| 1 回目の 4 | 8,104 | 23,160 |
+| 1 回目の 5 | 9,474 | 13,605 |
+| 2 回目の 1 | 9,822 | 14,318 |
+| 2 回目の 2 | 4,449 | 10,842 |
+| 2 回目の 3 | 18,385 | 18,486 |
+| 2 回目の 4 | 10,874 | 18,599 |
+| 2 回目の 5 | 4,794 | 6,247 |
+
+10 組のうち 9 組で、記録しない方が速くなりました。中央値は、1 回目が 8,104 と 18,329、2 回目が 9,822 と 14,318 です。ばらつきが大きく、倍率を 1 つの数字で言うことはできませんが、**1 本 0.1 ミリ秒程度の SQL を大量に投げる負荷では、すべてを記録するだけで処理できる量が目に見えて落ちる**ことは確かめられました。なお、今回はログのファイルを macOS のディレクトリに置き、仮想マシンから共有して書かせていたので、仮想マシンの中のディスクに書くより書き込みの費用は大きく出ている可能性があります。
+
+1 組ずつの差がこれほど揺れること自体も、計測の教訓です。他の処理が同じ機械を使っている環境では、1 回ずつの比較は当てになりません。交互に何度も測り、組で比べます。第 278 回では、最後のベンチマークの点数のぶれとして同じ問題を扱います。
+
+### 止め忘れ
+
+ISUCON11 本選で優勝した fujiwara組の sfujiwara さんは、終盤に「今までずっと有効にしていた MySQL の slow query log を無効化して更に数字を伸ばした」と書いています（[ISUCON11で優勝しました](https://sfujiwara.hatenablog.com/entry/isucon11-final)）。逆の失敗もあります。mirakui さんは、ベンチマークのたびにフレームグラフを自動で作る仕組みについて、次のように書いています（[チーム白金動物園として ISUCON 9 本選で優勝しました](https://blog.mirakui.com/entry/2019/10/14/011554)）。
+
+> あまりに便利だったので最後の最後まで使っていて、stackprof を有効にしたまま最終スコアとして提出していたことに後で気づきました……。
+
+計測の仕組みは、入れるときに外し方も決めておきます。設定ファイルの 1 行や環境変数 1 つで全部を止められるようにしておけば、最後に外し忘れることも、外したせいで壊すことも減ります。後片付けの全体は第 278 回で扱います。
+
+### プロファイラの費用
+
+プロファイラにも費用があります。Go の CPU プロファイラは 1 秒に 100 回の割り込みで標本を取るので（第 241 回）、常時有効にしていても負担は小さい部類です。fgprof の README は「The overhead of fgprof increases with the number of active goroutines (including those waiting on I/O, Channels, Locks, etc.) executed by your program.」と書き、ゴルーチンが 1,000 本未満ならほぼ気にしなくてよく、1 万本を超えると目に見える負担になりうる、としています。どちらも、取得の要求が来たときだけ動き、その期間が過ぎれば止まります。
+
+## 次の回へ
+
+この回で、1 件の要求の時間を、データベースの中、データベースとの往復、アプリケーションの計算に分けて見られるようになりました。手元のアプリケーションでは、一覧の時間の 7 割がデータベースの外にあり、その正体は 21 回の往復の待ちでした。そして第 264 回では、2 位の一覧のクエリが `OFFSET` の値で実行計画を切り替えていることも見ました。次の第 266 回からは、計測で見つけたものを直す側に移ります。最初はインデックスです。並べ替えに合わせた張り方、複合インデックスの列の順番、`EXPLAIN` の読み方を、同じ MySQL で張る前と後を比べながら見ます。
+
+## まとめ
+
+- アクセスログ、スロークエリログ、プロファイルは、要求・SQL・関数という別の単位で時間を数えていて、そのままでは互いを指せない
+- nginx の `$request_id` をヘッダーでアプリケーションに渡し、SQL の先頭にコメントとして書けば、1 件の要求が投げた SQL を ID で引ける
+- ID でアクセスログとスロークエリログを結合すると、要求 1 件あたりの SQL の本数と、要求の時間のうちデータベースの中の割合がルートごとに出る
+- 同じ SQL の回数でも、1 件の要求の中で繰り返されているもの（N+1）と、要求ごとに 1 回ずつのものがある。前者だけがまとめられる
+- pt-query-digest のフィンガープリントも performance_schema のダイジェストもコメントを取り除くので、コメントを付けても SQL ごとの集計は崩れない
+- `--embedded-attributes` と `--group-by` を使えば、コメントに書いたルートの名前でデータベースの時間を集計し直せる
+- コメントに利用者の入力をそのまま入れない。`*/` でコメントが閉じれば SQL の注入になる
+- スロークエリログの `Query_time` は MySQL の中の時間で、往復の待ちは含まない。往復の多いエンドポイントでは、データベースの外の時間の方が大きくなりうる
+- CPU プロファイルは待ちを写さない。fgprof のような wall-clock プロファイラは、すべてのゴルーチンを数えるので、I/O やコミットの待ちが見える。応答が遅いのに CPU が空いていれば後者を使う
+- 計測は、ベンチマークの区切りに合わせて自動で取り、結果を残して並べ、全員が同じ場所で見る
+- すべての SQL を記録すると、軽い SQL の多い負荷では処理できる量が目に見えて落ちた。計測の仕組みは、入れるときに外し方も決めておく

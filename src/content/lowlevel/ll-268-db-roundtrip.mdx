@@ -1,0 +1,356 @@
+---
+title: データベースとの往復を減らす
+description: N+1 を消した後にも、ドライバの設定やコードの書き方で、目に見えない往復と待ちが残ります。プリペアドステートメントの 2 往復と interpolateParams、参照だけのトランザクション、コネクションプールの大きさとアイドルの本数、外部キー制約のロック、ログの書き出しを、Docker の MySQL とネットワークの遅延を足す実験で一つずつ確かめます
+chapter: tune
+order: 9
+status: published
+topics:
+  - ラウンドトリップ
+  - プリペアドステートメント
+  - interpolateParams
+  - COM_STMT_PREPARE
+  - トランザクション
+  - コネクションプール
+  - SetMaxOpenConns
+  - SetMaxIdleConns
+  - 外部キー制約
+  - 共有ロック
+  - スロークエリログ
+  - general log
+requires:
+  - ll-267-n-plus-one
+  - ll-106-db-connection
+---
+
+import Callout from '../../components/Callout.astro'
+
+## N+1 を消した後に残る往復
+
+第 267 回では、N+1 の時間がほぼ「往復の回数 × 1 往復の時間」で決まることを確かめ、往復の回数を N から定数回に減らしました。
+
+ところが、コードの上で 1 回に見えるクエリが、ネットワークの上では 1 往復とは限りません。ドライバが裏で準備のための往復を足していたり、フレームワークがトランザクションの開始と終了を足していたりします。往復の回数が変わらなくても、空いている接続が無くて待っていたり、データベースの中でロックを待っていたりすることもあります。
+
+この回では、アプリケーションとデータベースの間にある、こうした **見えにくい往復と待ち** を 5 つ取り上げます。どれも ISUCON の上位チームが実際に手を入れたものです。
+
+| 節 | 何が増えるか | ISUCON での例 |
+| --- | --- | --- |
+| プリペアドステートメント | 1 クエリが 2 往復になる | ISUCON14 の 4 位チームが `interpolateParams=true` で点数を伸ばした |
+| 参照だけのトランザクション | 開始と終了の 2 往復が足される | ISUCON11 本選の講評と優勝チーム |
+| コネクションプール | 空き接続を待つ、接続を張り直す | ISUCON11 本選の優勝チームが上限を 10 から 60 へ |
+| 外部キー制約 | 親の行に共有ロックを取る | ISUCON11 本選の講評と優勝チーム |
+| ログ | 1 クエリごとにファイルへ書く | ISUCON11 本選の優勝チームが最後にスロークエリログを止めた |
+
+## 実験の環境
+
+| 項目 | 内容 |
+| --- | --- |
+| マシン | Apple M1 Pro、macOS、Docker Engine 29.4.0（VM に 8 CPU） |
+| データベース | `mysql:8.4` イメージ（MySQL 8.4.13）。`max_connections` は既定の 151 |
+| クライアント | Go 1.24.6、`database/sql` と go-sql-driver/mysql v1.10.1 で書いた計測用のプログラム |
+| ネットワーク | MySQL と同じ Docker のブリッジネットワークに置いたクライアントのコンテナから TCP で接続 |
+| 遅延 | 第 267 回と同じく、クライアントのコンテナで `tc qdisc add dev eth0 root netem delay 1ms` を使い、送信するパケットを 1 ms 遅らせる |
+
+表は、利用者 1 万行の `users`、科目 100 行の `courses`、科目と利用者を結ぶ履修の表を 2 つ（外部キーあり・なし）です。往復とロックの数は、MySQL の `SHOW GLOBAL STATUS` の増分と `performance_schema.data_locks` から数えました。
+
+<Callout type="warn" title="同じマシンで他の負荷が動いていた">
+  第 266 回、第 267 回と同じく、計測の間はホストの load average が 30〜120 で推移していました。
+  時間の値は揺れるので、往復の回数やロックの有無のように負荷に左右されない値を主に見ます。時間が揺れて結論が出なかったものは、そう書きます。
+</Callout>
+
+## 1 回のクエリは何往復か
+
+第 106 回で、MySQL のプロトコルには、SQL の文字列をそのまま送る COM_QUERY と、サーバー側のプリペアドステートメント（COM_STMT_PREPARE と COM_STMT_EXECUTE）があることを見ました。Go の MySQL ドライバは、プレースホルダ（`?`）付きのクエリを、既定ではサーバー側のプリペアドステートメントで送ります。
+
+```go
+db.QueryRow("SELECT account_name FROM users WHERE id = ?", id)
+```
+
+この 1 行で、ドライバは次の 3 つのコマンドを送ります。
+
+1. COM_STMT_PREPARE: SQL の文字列を送り、文の ID を受け取る
+2. COM_STMT_EXECUTE: 文の ID と値 `id` を送り、結果を受け取る
+3. COM_STMT_CLOSE: 文を解放する
+
+go-sql-driver/mysql の README は、`interpolateParams` の説明でこう書いています。「This reduces the number of roundtrips, since the driver has to prepare a statement, execute it with given parameters and close the statement again with `interpolateParams=false`.」（[go-sql-driver/mysql README](https://github.com/go-sql-driver/mysql#interpolateparams)）。`interpolateParams=true` にすると、ドライバがプレースホルダに値を埋め込んだ SQL の文字列を作り、COM_QUERY 1 回で送ります。
+
+手元で、主キーで 1 行引くクエリを 3 通りに流し、1 回あたりのコマンドの数を数えました。
+
+```
+## 遅延なし
+default (server prepare)   median   0.045 ms  min   0.039 ms  per query: stmt_prepare=1.00 stmt_execute=1.00 stmt_close=1.00 select=1.00
+interpolateParams=true     median   0.024 ms  min   0.023 ms  per query: stmt_prepare=0.00 stmt_execute=0.00 stmt_close=0.00 select=1.00
+db.Prepare once, reuse     median   0.094 ms  min   0.019 ms  per query: stmt_prepare=0.00 stmt_execute=1.00 stmt_close=0.00 select=1.00
+
+## 遅延 1 ms
+default (server prepare)   median   2.559 ms  min   2.104 ms  per query: stmt_prepare=1.00 stmt_execute=1.00 stmt_close=1.00 select=1.00
+interpolateParams=true     median   1.224 ms  min   1.055 ms  per query: stmt_prepare=0.00 stmt_execute=0.00 stmt_close=0.00 select=1.00
+db.Prepare once, reuse     median   1.178 ms  min   1.037 ms  per query: stmt_prepare=0.00 stmt_execute=1.00 stmt_close=0.00 select=1.00
+```
+
+既定の書き方は、1 回のクエリで準備・実行・解放を 1 回ずつ送っています。遅延 1 ms を足すと、`interpolateParams=true` の 1.22 ms に対して 2.56 ms で、ちょうど 2 倍です。
+
+3 つのコマンドを送っているのに 3 倍ではなく 2 倍なのは、COM_STMT_CLOSE には応答が無いからです。MySQL のプロトコルの文書は「No response packet is sent back to the client.」と書いています（[MySQL: COM_STMT_CLOSE](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_close.html)）。ドライバは解放のパケットを送ったら、応答を待たずに次へ進みます。**待つ往復は、準備と実行の 2 回** です。
+
+3 つ目の `db.Prepare` は、文を一度だけ準備して、それを使い回す書き方です。実行のたびの往復は COM_STMT_EXECUTE の 1 回だけになり、`interpolateParams=true` と同じ速さでした。ただし、準備した文は接続ごとにサーバー側に残るので、多くの種類の文を準備しっぱなしにすると、サーバーのメモリと文の数の上限（`max_prepared_stmt_count`）を使います。
+
+### N+1 との掛け算
+
+既定の 2 往復は、第 267 回の N+1 と掛け算になります。151 回のクエリがそれぞれ 2 往復なら、302 往復です。N+1 を直す前でも後でも、DSN に 1 つ設定を足すだけで往復が半分になります。
+
+ISUCON14 で 4 位になったチームの参加記には、点数の推移の中に「23894: interpolateParams=true」という 1 行があり、直前の 21,372 点から伸びています（[LayerX: ISUCON14 に「都営三田線~」で参加し4位になりました](https://zenn.dev/layerx/articles/3bd55b77e047c4)）。ISUCON14 の参照実装は、DSN を `mysql.NewConfig()` で組み立て、`ParseTime` などを設定していますが、`InterpolateParams` は設定していません（[isucon14 webapp/go/main.go](https://github.com/isucon/isucon14/blob/main/webapp/go/main.go)）。
+
+<Callout type="warn" title="値の埋め込みをドライバに任せてよいか">
+  `interpolateParams=true` では、値を SQL の文字列に埋め込むのはドライバの仕事になります。ドライバは文字列の値をエスケープして埋め込みますが、README は、文字コードによってはこれが安全でないことを警告しています。
+  「This can not be used together with the multibyte encodings BIG5, CP932, GB18030, GBK or SJIS.」とあり、これらを指定すると拒否されます。`utf8mb4` なら使えます。
+  自分で文字列を連結して SQL を作るのとは違い、ドライバの埋め込みは型とエスケープを処理します。それでも、サーバー側で値と SQL を分けて送るプリペアドステートメントとは仕組みが違うことは知っておきます。
+</Callout>
+
+既定のプリペアドでは、準備・実行・解放の 3 つのコマンドを送ります。ただし解放には応答が無いので、待つ往復としては 2 回です。
+
+## 参照だけのトランザクション
+
+フレームワークやコードの書き方によっては、読むだけの処理もトランザクションで囲まれています。
+
+```go
+tx, _ := db.BeginTx(ctx, nil)   // START TRANSACTION: 1 往復
+tx.QueryRow(...)                // 1 往復
+tx.QueryRow(...)                // 1 往復
+tx.Commit()                     // COMMIT: 1 往復
+```
+
+読むクエリが 2 本なら、トランザクションの開始と終了で往復が 2 回増えます。手元で、2 本の `SELECT` をトランザクションで囲む場合と囲まない場合を比べました（`interpolateParams=true`）。
+
+```
+## 遅延なし
+BEGIN + SELECT x2 + COMMIT   median   0.075 ms  min   0.065 ms  per request: select=2.00 begin=1.00 commit=1.00 Questions=4.00
+SELECT x2 (no tx)            median   0.053 ms  min   0.046 ms  per request: select=2.00 begin=0.00 commit=0.00 Questions=2.00
+
+## 遅延 1 ms
+BEGIN + SELECT x2 + COMMIT   median   6.091 ms  min   4.206 ms  per request: select=2.00 begin=1.00 commit=1.00 Questions=4.00
+SELECT x2 (no tx)            median   3.725 ms  min   2.103 ms  per request: select=2.00 begin=0.00 commit=0.00 Questions=2.00
+```
+
+1 回の処理で MySQL が受けた文（`Questions`）は 4 と 2 です。遅延 1 ms のとき、最小値で 4.2 ms と 2.1 ms、ちょうど往復の数の比になっています。
+
+ISUCON11 本選の講評は、この点についてはっきり書いています。「参考実装でトランザクションを取っている部分は全てアプリケーションとして正しい仕様であり、レスポンスの整合性を保つために必要なものでした。アプリケーションとしては正しいものの、ユーザーがそこまでの精度を求めていないという想定のもと、トランザクションを外しても許容するようなベンチマーカーとなっています。」（[ISUCON11 本選 問題の解説と講評](https://isucon.net/archives/56163308.html)）。優勝したチームの改善の一覧にも、「参照だけのエンドポイントで無駄にトランザクションを張っていたのをやめる」があります（[ISUCON11で優勝しました - 酒日記 はてな支店](https://sfujiwara.hatenablog.com/entry/isucon11-final)）。
+
+外してよいかどうかは、**複数の読み取りが同じ時点のデータを見ている必要があるか** で決まります。第 99 回で見たとおり、InnoDB の既定の分離レベル（REPEATABLE READ）では、トランザクションの中の読み取りは同じスナップショットを見ます。外すと、1 本目と 2 本目の `SELECT` の間に他の更新が入れば、2 本目はその更新後のデータを見ます。たとえば「科目の一覧」と「その科目の件数」を別々に読んで、両者が食い違ってもよいか、です。講評が書いているように、これは仕様の判断です。読み取りが 1 本だけなら、トランザクションで囲む意味はありません。
+
+## コネクションプール
+
+第 106 回で、Go の `database/sql` の `sql.DB` 自体がプールであること、既定では同時に開く接続の上限が無く、アイドルで残すのは 2 本だけであることを見ました。Go のソースのコメントは次のとおりです（[database/sql](https://pkg.go.dev/database/sql#DB.SetMaxOpenConns)）。
+
+- `SetMaxOpenConns`: 「If n \<= 0, then there is no limit on the number of open connections. The default is 0 (unlimited).」
+- `SetMaxIdleConns`: 「The default max idle connections is currently 2. This may change in a future release.」
+
+ISUCON の参照実装は、この 2 つを設定していないことがあります。先ほどの ISUCON14 の参照実装も、`sqlx.Connect` の後に設定していませんでした。一方、上限が小さすぎても点数は伸びません。ISUCON11 本選で優勝したチームは、「db.SetMaxOpenConns(10) のままで MySQL の負荷が上がりきらないことに気が付いたので、 MaxOpenConns を 10 -> 20 -> 40 -> 60 と調整して最適値を探ってスコアを上げ」たと書いています（[ISUCON11で優勝しました](https://sfujiwara.hatenablog.com/entry/isucon11-final)）。
+
+### 上限は、待ちの長さで決まる
+
+上限が小さいと、空いた接続が無いときに問い合わせは待たされます。上限が大きすぎると、データベースが同時に抱える仕事が増えます。どこが適切かは、1 本の接続が 1 回の問い合わせに使われる時間で変わります。
+
+手元で、64 個のゴルーチンから主キーで 1 行引くクエリを 5 秒間流し続け、`SetMaxOpenConns` を 1 から 64 まで変えました（`SetMaxIdleConns` は同じ値）。`MaxOpenConns=0` は上限なしです。`WaitCount` と `avg wait` は `db.Stats()` の値で、空いた接続を待った回数と、1 回あたりの平均の待ち時間です。
+
+```
+## 遅延なし
+MaxOpenConns=1   conc=64  qps   8068.6  latency median   3.252 p99  78.849 ms  WaitCount   40342  avg wait   7.826 ms
+MaxOpenConns=2   conc=64  qps  13021.4  latency median   2.613 p99  36.151 ms  WaitCount   65105  avg wait   5.011 ms
+MaxOpenConns=4   conc=64  qps  10156.2  latency median   2.895 p99  46.207 ms  WaitCount   50777  avg wait   5.920 ms
+MaxOpenConns=8   conc=64  qps  21110.0  latency median   1.716 p99  18.547 ms  WaitCount  105542  avg wait   2.655 ms
+MaxOpenConns=16  conc=64  qps  29521.2  latency median   1.207 p99  13.808 ms  WaitCount  147590  avg wait   1.629 ms
+MaxOpenConns=32  conc=64  qps  30241.0  latency median   0.809 p99  18.624 ms  WaitCount  151172  avg wait   1.065 ms
+MaxOpenConns=64  conc=64  qps  28815.6  latency median   0.306 p99  28.044 ms  WaitCount       0  avg wait   0.000 ms
+MaxOpenConns=0   conc=64  qps  23610.2  latency median   0.482 p99  28.327 ms  WaitCount       0  avg wait   0.000 ms
+
+## 遅延 1 ms
+MaxOpenConns=1   conc=64  qps    411.0  latency median 106.049 p99 828.984 ms  WaitCount    2054  avg wait 154.802 ms
+MaxOpenConns=2   conc=64  qps    934.4  latency median  46.790 p99 341.505 ms  WaitCount    4670  avg wait  67.094 ms
+MaxOpenConns=4   conc=64  qps    820.6  latency median  37.602 p99 1438.861 ms  WaitCount    4099  avg wait  85.898 ms
+MaxOpenConns=8   conc=64  qps   2276.4  latency median  15.364 p99 475.254 ms  WaitCount   11374  avg wait  24.623 ms
+MaxOpenConns=16  conc=64  qps   6972.2  latency median   6.654 p99  40.507 ms  WaitCount   34845  avg wait   6.893 ms
+MaxOpenConns=32  conc=64  qps  13807.2  latency median   3.386 p99  20.911 ms  WaitCount   69004  avg wait   2.320 ms
+MaxOpenConns=64  conc=64  qps  21581.8  latency median   2.137 p99  15.050 ms  WaitCount       0  avg wait   0.000 ms
+MaxOpenConns=0   conc=64  qps  25551.6  latency median   1.840 p99  10.494 ms  WaitCount       0  avg wait   0.000 ms
+```
+
+値は揺れていますが（遅延なしの 2 本と 4 本の逆転など）、2 つの条件で形がはっきり違います。
+
+- **遅延なし**: 16 本で毎秒約 3 万回に達し、それ以上増やしても伸びません。1 回の問い合わせはデータベースの CPU の仕事でほぼ決まり、MySQL が動いている Docker の VM の CPU は 8 つです。CPU が埋まった後に接続を増やしても、実行を待つ列が MySQL の中に移るだけです
+- **遅延 1 ms**: 接続の数にほぼ比例して伸び、64 本で毎秒 2 万回を超えました。1 本の接続は、1 回の問い合わせの間、ほとんどの時間をネットワークの往復を待って過ごします。その間 CPU は空いているので、接続を増やすほど同時に多くの往復を重ねられます
+
+第 261 回のリトルの法則で書けば、「同時に処理中の数 = 処理量 × 1 回の時間」です。接続の数が同時に処理中の数の上限なので、処理量の上限は「接続の数 ÷ 1 回の時間」になります。1 回の時間が往復の待ちで長いほど、同じ処理量に必要な接続の数は増えます。遅延 1 ms で 1 回 2 ms 強かかるなら、32 本の上限は毎秒約 1.4 万回になります。手元の 32 本の 13,807 回は、この見積もりとよく合っています。
+
+適切な上限は、実際の負荷をかけて探すしかありません。ISUCON11 本選の優勝チームが 10、20、40、60 と変えて測ったのは、その手順です。目安は、`db.Stats()` の `WaitCount` と `WaitDuration` が増え続けているなら上限が足りない、データベースの CPU が埋まっていてレイテンシだけが伸びるなら多すぎる、です。そして第 106 回で見たとおり、データベースが受ける接続の数は、アプリケーションのプロセスの数との掛け算になります。MySQL の `max_connections`（手元では既定の 151）を超えないようにします。
+
+### アイドルの 2 本
+
+既定のアイドル 2 本は、負荷が波のように来るときに効いてきます。32 個のゴルーチンが同時に 1 回ずつ問い合わせ、50 ms 休む、を 40 回繰り返しました（遅延 1 ms、`SetMaxOpenConns(32)`）。新しく張った接続の数は、MySQL の `Connections` の増分です。
+
+```
+MaxOpenConns=32 MaxIdleConns=2    new connections  1195 over 40 bursts  burst median  50.492 ms
+MaxOpenConns=32 MaxIdleConns=32   new connections    31 over 40 bursts  burst median   6.770 ms
+```
+
+アイドル 2 本では、1 回の波で 32 本に増やし、波が過ぎると 30 本を閉じ、次の波でまた張り直しています。40 回の波で 1,195 本を張りました。1 回の波の時間は、接続を張り直す分だけ長くなり、中央値で 50 ms と 6.8 ms、7 倍の差になりました。アイドルを 32 本残せば、張ったのは最初の 31 本だけです。
+
+`SetMaxOpenConns` を設定するなら、`SetMaxIdleConns` も同じくらいの値にします。設定しないと、上限を上げた効果の一部が、張り直しで消えます。
+
+## 外部キー制約
+
+外部キー制約は、子の表の行が、存在する親の行を指していることをデータベースが保証する仕組みです。履修の表なら、存在しない科目や利用者を指す行は入れられません。
+
+ISUCON11 本選の講評は、この問題について「今回は十分な外部制約キーを初めから設定した状態で問題を提供しました。外部制約キーは参照整合性を担保する上で便利な機能ですが、INSERT・UPDATE・DELETE時に参照先・参照元レコードを確認する必要があるため、追加のCPUオーバーヘッドが生じます。」と書いています。優勝したチームの改善の一覧には「外部キーを全部やめる」があります。
+
+### 子を書くと、親に共有ロックが付く
+
+確認の手間のほかに、もう 1 つ効いてくるのがロックです。MySQL のリファレンスは「If a FOREIGN KEY constraint is defined on a table, any insert, update, or delete that requires the constraint condition to be checked sets shared record-level locks on the records that it looks at to check the constraint.」と書いています（[MySQL 8.4 リファレンス: Locks Set by Different SQL Statements in InnoDB](https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html)）。
+
+外部キーのある `reg_fk` と、同じ列に索引だけを張った `reg_nofk` に、それぞれ 1 行挿入して、そのトランザクションが持っているロックを `performance_schema.data_locks` で見ました。
+
+```sql
+BEGIN;
+INSERT INTO reg_fk (course_id, user_id) VALUES (7, 42);
+SELECT object_name, index_name, lock_type, lock_mode, lock_data
+FROM performance_schema.data_locks WHERE thread_id = PS_CURRENT_THREAD_ID();
+ROLLBACK;
+```
+
+```
+-- 外部キーあり（reg_fk）
++-------------+------------+-----------+---------------+-----------+
+| object_name | index_name | lock_type | lock_mode     | lock_data |
++-------------+------------+-----------+---------------+-----------+
+| courses     | NULL       | TABLE     | IS            | NULL      |
+| courses     | PRIMARY    | RECORD    | S,REC_NOT_GAP | 7         |
+| reg_fk      | NULL       | TABLE     | IX            | NULL      |
+| users       | NULL       | TABLE     | IS            | NULL      |
+| users       | PRIMARY    | RECORD    | S,REC_NOT_GAP | 42        |
++-------------+------------+-----------+---------------+-----------+
+
+-- 外部キーなし（reg_nofk）
++-------------+------------+-----------+-----------+-----------+
+| object_name | index_name | lock_type | lock_mode | lock_data |
++-------------+------------+-----------+-----------+-----------+
+| reg_nofk    | NULL       | TABLE     | IX        | NULL      |
++-------------+------------+-----------+-----------+-----------+
+```
+
+外部キーがあると、子の行を 1 行入れただけで、親の `courses` の 7 番と `users` の 42 番に共有ロック（`S`）が付いています。第 100 回で見たとおり、共有ロックは他の共有ロックとは両立しますが、排他ロック（`X`）とは両立しません。つまり **親の行を更新しているトランザクションがあると、子の挿入はその終わりを待ちます**。
+
+確かめました。一方のセッションで科目 7 番を更新して 3 秒間コミットせずにおき、その 0.5 秒後に別のセッションから科目 7 番を指す履修の行を挿入します。
+
+```bash
+# セッション 1: 親の行を更新して 3 秒持つ
+BEGIN; UPDATE courses SET updated_at = NOW() WHERE id = 7; SELECT SLEEP(3); COMMIT;
+# セッション 2（0.5 秒後）: 子の行を挿入して、かかった時間を測る
+SET @t := NOW(6); INSERT INTO reg_fk (course_id, user_id) VALUES (7, 42);
+SELECT TIMESTAMPDIFF(MICROSECOND, @t, NOW(6))/1000 AS insert_ms;
+```
+
+```
++--------+-----------+
+| tbl    | insert_ms |
++--------+-----------+
+| reg_fk | 2615.7430 |
++--------+-----------+
++----------+-----------+
+| tbl      | insert_ms |
++----------+-----------+
+| reg_nofk |    0.4830 |
++----------+-----------+
+```
+
+外部キーのある表への挿入は、親の更新が終わるまで 2.6 秒待ちました。外部キーの無い表では 0.48 ms です。履修の登録と科目の情報の更新は、アプリケーションの上では別の処理ですが、外部キーがあるとデータベースの中で互いを待つことになります。
+
+### 確認の手間は、この環境では測りきれなかった
+
+講評が書いている CPU の手間も測ろうとしました。外部キーのある表とない表に、20 万行を `INSERT ... SELECT` で入れる時間を、順番を入れ替えて 3 回ずつ測りました（この実験だけ、ディスクへの同期の待ちを除くため `innodb_flush_log_at_trx_commit=2`、`sync_binlog=0` にしています）。
+
+| 回 | 外部キーあり | 外部キーなし |
+| --- | --- | --- |
+| 1 | 6,232 ms | 3,908 ms |
+| 2 | 5,017 ms | 5,876 ms |
+| 3 | 9,328 ms | 6,681 ms |
+
+3 回中 2 回は外部キーのあるほうが遅かったものの、他の負荷による揺れのほうが大きく、この環境では差を言い切れませんでした。1 行ずつ 3,000 行を挿入する実験でも同じでした。CPU の手間は、1 行ごとに親の索引を 1 回たどる分なので、親の行がバッファプールに載っていれば小さいものです。手元で確実に見えたのは、ロックの待ちのほうでした。
+
+### 外すかどうか
+
+ISUCON では、講評の言うとおり外部キーを外す改善が認められています。本番では、外部キーはデータの整合性をデータベースが最後に守ってくれる仕組みで、外すと、存在しない親を指す行を防ぐのはアプリケーションの責任になります。
+
+外す前に、次を確かめます。
+
+- 親の行を更新する処理と、子の行を挿入する処理が、同じ親について同時に走ることがあるか。あるなら、外部キーのロックで待ちが起きている可能性がある
+- 子の挿入が、親の存在をすでに確かめた後で行われているか（同じトランザクションの中で親を読んでいるなど）。それなら外部キーの確認は二重になっている
+- 親の削除のときに子を消す（`ON DELETE CASCADE`）など、外部キーに仕事を任せていないか。外すと、その仕事をアプリケーションに移す必要がある
+
+<Callout type="note" title="子の列の索引">
+  MySQL では、外部キーを張ると、子の列に索引が無ければ自動で作られます（[MySQL 8.4 リファレンス: FOREIGN KEY Constraints](https://dev.mysql.com/doc/refman/8.4/en/create-table-foreign-keys.html)）。手元で `ALTER TABLE ... DROP FOREIGN KEY` で外部キーだけを外したところ、自動で作られた索引は残っていました。
+  親の削除や更新のときに子を探すのにも、子の列で親を引く JOIN にも、この索引が使われます（第 102 回）。外部キーを外すときに、索引まで消さないようにします。
+</Callout>
+
+## ログを書く
+
+性能を測るために、第 264 回ではスロークエリログを `long_query_time=0` にして、すべてのクエリを書き出しました。これはクエリの数だけファイルに書くということです。
+
+ISUCON11 本選の優勝チームは、点数を伸ばす最後の手順として「最後にダメ押しで今までずっと有効にしていた MySQL の slow query log を無効化して更に数字を伸ばした」と書いています（[ISUCON11で優勝しました](https://sfujiwara.hatenablog.com/entry/isucon11-final)）。
+
+手元で、16 本の接続から主キーで 1 行引くクエリを 5 秒間流し、ログなし、スロークエリログ（`long_query_time=0`）、general log（受け取ったすべての文を書くログ）の 3 通りで、ファイルの増え方を見ました。順番を変えて 2 回ずつです。
+
+```
+round 1 off:     qps  10178.4 | log bytes before []                  after []                  questions 50913
+round 1 slow0:   qps  15359.0 | log bytes before [181]               after [18349889]          questions 76816
+round 1 general: qps  15786.0 | log bytes before [18350110 221]      after [18350110 6860931]  questions 78951
+round 2 off:     qps  15845.0 | log bytes before [18350110 6861196]  after [18350110 6861196]  questions 79246
+round 2 slow0:   qps  12633.8 | log bytes before [18350291 6861196]  after [33445121 6861196]  questions 63190
+round 2 general: qps  17316.0 | log bytes before [33445342 6861417]  after [33445342 14386645] questions 86601
+```
+
+（出力は、計測用のプログラムの行から qps だけを残して詰めています。`log bytes` はスロークエリログと general log のファイルの大きさです。）
+
+| ログ | 1 クエリあたりに書いた量 | 毎秒 1.5 万クエリなら |
+| --- | --- | --- |
+| スロークエリログ（`long_query_time=0`） | 約 239 バイト | 毎秒 約 3.6 MB、1 時間で約 13 GB |
+| general log | 約 87 バイト | 毎秒 約 1.3 MB、1 時間で約 4.7 GB |
+
+スロークエリログは、1 回のクエリごとに、時刻、利用者、所要時間、Rows examined などの見出しと SQL 本体を書きます。
+
+```
+# Time: 2026-11-12T01:05:41.334874Z
+# User@Host: root[root] @ localhost []  Id: 11020
+# Query_time: 0.000120  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1794445541;
+select @@version_comment limit 1;
+```
+
+1 秒あたりのクエリ数は、他の負荷による揺れ（ログなしの 2 回で 10,178 と 15,845）のほうが大きく、この環境ではログの有無による差は見えませんでした。それでも書く量は確実にあり、1 時間で 10 GB を超えるペースでディスクを埋めていきます。ディスクの書き込みが詰まりやすい環境や、クエリの数がもっと多い状態では、この書き込みが効いてきます。
+
+ログは計測のための道具なので、計測するときだけ有効にします。ISUCON では、計測の段階が終わったら止めるのが最後の手順の 1 つで、第 278 回で改めて扱います。本番では、`long_query_time=0` は短い時間だけ有効にし、普段は閾値を上げておくのが普通です。アプリケーション自身が 1 リクエストごとに書くログ（アクセスログ、SQL のデバッグログ）も、同じように量を見積もります。
+
+## 本番で使うとき
+
+この回で見たものは、どれも本番で次の順に確かめられます。
+
+1. **ドライバの設定を読む。** プレースホルダ付きのクエリが何往復になるか。Go の MySQL ドライバなら `interpolateParams`、他の言語のドライバにも、サーバー側のプリペアドとクライアント側の埋め込みを切り替える設定があることが多い。文字コードの制約も一緒に確かめる
+2. **プールの設定を明示する。** `SetMaxOpenConns`、`SetMaxIdleConns`、`SetConnMaxLifetime`。プロセスの数との掛け算が `max_connections` を超えないか。`db.Stats()` の待ちの回数と時間をメトリクスとして出す
+3. **トランザクションの範囲を見直す。** 読むだけの処理を囲んでいないか。囲む必要があるのは、複数の読み取りの整合性が仕様で必要なときと、書き込みを伴うとき
+4. **外部キーのロックを疑う。** 原因の分からないロック待ちがあれば、`performance_schema.data_locks` で、子の書き込みが親の行に共有ロックを取っていないかを見る
+5. **ログの量を見積もる。** 1 クエリあたりのバイト数 × クエリ数で、ディスクに書く量を出す
+
+往復の時間は、データベースが遠くなるほど効いてきます。第 275 回では、データベースを別のサーバーに分けたときに、ここで見た往復がどう効くかを扱います。
+
+## 次の回へ
+
+第 266 回から、データベースへのクエリを、速く、少なく、待たずに流す手を見てきました。それでも、データベースに聞く限り、最低 1 往復はかかります。次の第 269 回では、変わらないデータや変わりにくいデータをアプリケーションのメモリに持ち、データベースに聞かずに答える方法と、そのときに生まれる食い違いの扱いを見ます。
+
+## まとめ
+
+- コード上の 1 回のクエリは 1 往復とは限らない。Go の MySQL ドライバは既定で、プレースホルダ付きのクエリを準備・実行・解放の 3 コマンドで送る
+- 解放（COM_STMT_CLOSE）には応答が無いので、待つ往復は 2 回。手元では遅延 1 ms で 2.56 ms と、`interpolateParams=true` の 1.22 ms のちょうど 2 倍だった
+- `interpolateParams=true` は値をドライバが埋め込んで 1 往復にする。BIG5、CP932、GB18030、GBK、SJIS では使えない。文を一度だけ準備して使い回しても 1 往復になる
+- 読むだけの処理をトランザクションで囲むと、開始と終了の 2 往復が足される。外してよいかは、複数の読み取りが同じ時点を見る必要があるかという仕様の判断
+- Go の `database/sql` は既定で接続数の上限なし、アイドル 2 本。上限が小さすぎると空き接続を待ち、アイドルが少ないと負荷の波ごとに接続を張り直す。手元では 40 回の波で 1,195 本を張り直し、1 回の波が 7 倍長くなった
+- 適切な接続数は 1 回の問い合わせの時間で変わる。CPU で決まるなら CPU の数の付近で頭打ちになり、往復の待ちで決まるなら接続数に比例して伸びる。リトルの法則で「接続数 ÷ 1 回の時間」が上限になる
+- 外部キーのある表に子の行を書くと、親の行に共有ロックが付く。親を更新中のトランザクションがあると子の挿入は待つ。手元では 2.6 秒待った
+- 外部キーの確認の CPU の手間は、この環境では負荷の揺れに埋もれて言い切れなかった。外すときは、整合性をアプリケーションが守ることと、子の列の索引を残すことを確かめる
+- `long_query_time=0` のスロークエリログは 1 クエリあたり約 239 バイト、general log は約 87 バイトを書いた。計測のときだけ有効にし、終わったら止める

@@ -465,7 +465,7 @@ mysql-connector-python で、普通のカーソルと `prepared=True` のカー�
   MySQL でも PostgreSQL でも、SQL として書く `PREPARE stmt FROM ...` / `EXECUTE stmt` は、それ自体が COM_QUERY や Simple Query で送られる 1 つの文です。
   結果はテキストの形で返り、準備した文はサーバ側のセッションに残ります。
   ドライバのプリペアドがどちらで実装されているか（サーバ側か、クライアントで値を埋め込んでいるだけか）は、ドライバと設定によって違います。
-  Go の MySQL ドライバのように、既定はサーバ側のプリペアド（準備・実行・解放の 3 往復）で、`interpolateParams=true` にするとクライアント側で値を埋め込んで 1 往復にするものもあります（[go-sql-driver/mysql](https://github.com/go-sql-driver/mysql#interpolateparams)）。
+  Go の MySQL ドライバのように、既定はサーバ側のプリペアド（準備・実行・解放の 3 コマンド。解放には応答が無いので、待つ往復は 2 回）で、`interpolateParams=true` にするとクライアント側で値を埋め込んで 1 往復にするものもあります（[go-sql-driver/mysql](https://github.com/go-sql-driver/mysql#interpolateparams)）。
 </Callout>
 
 ### 1 メッセージの上限: max_allowed_packet

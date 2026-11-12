@@ -1,0 +1,451 @@
+---
+title: インデックスを張る
+description: 遅いクエリが特定できたら、最初に試すのはインデックスです。ORDER BY と LIMIT に合わせる、複合インデックスの列の順番を決める、降順と昇順が混ざる並べ替えに対応する、索引だけで答える、多角形の中の点を空間インデックスで探す。どれも EXPLAIN の読み方と一緒に、Docker の MySQL 8.4 で張る前と後を測って確かめます
+chapter: tune
+order: 7
+status: published
+topics:
+  - インデックス設計
+  - ORDER BY と LIMIT
+  - 複合インデックスの列順
+  - 降順インデックス
+  - 生成列（generated column）
+  - カバリングインデックス
+  - 空間インデックス
+  - R-tree
+  - ST_Contains
+  - EXPLAIN
+  - Using filesort
+  - Index Condition Pushdown
+  - Rows examined
+requires:
+  - ll-265-tie-together
+  - ll-97-db-index
+  - ll-101-db-planner
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 遅いクエリが分かったら
+
+第 265 回で、アクセスログの行と、スロークエリログのクエリと、プロファイルの関数を結び付けました。合計時間の大きいクエリがどれで、どの処理から呼ばれているのかが分かった状態です。ここからは、それを速くする手を順に見ていきます。
+
+最初に試すのは、ほとんどの場合インデックスです。ISUCON の過去問では、参照実装にインデックスがほとんど張られていないことが繰り返し見られます。ISUCON13 の講評は「参照実装の初期状態では、データベース上のインデックスがこれでもかっ！というほど存在しておりません。」と書き、インデックスを足すだけで「初期スコアは言語によりブレがあり、3,000点前後ですが、インデックスを付与していくことで10,000点程度まで上昇します。」と続けています（[ISUCON13 問題の解説と講評](https://isucon.net/archives/58001272.html)）。ISUCON14 でも「今年のデータベースも全くと言っていいほどインデックスが貼られておらず」とあります（[ISUCON14 問題の解説と講評](https://isucon.net/archives/58869617.html)）。
+
+B+tree の葉に何が並ぶか、セカンダリインデックスが主キーを持つこと、複合インデックスが左の列から並ぶことは、第 97 回で見ました。オプティマイザが統計からどの計画を選ぶかは、第 101 回で見ました。この回では、その知識を **クエリを見てどの列の組でインデックスを張るかを決める** 作業に使います。
+
+| 節 | 問い | ISUCON での例 |
+| --- | --- | --- |
+| ORDER BY と LIMIT | 並べ替えて先頭だけ返すクエリに、何を張るか | ISUCON10 予選の安い物件一覧 |
+| 降順と昇順の混在 | `DESC` と `ASC` が混ざる並べ替えに張れるか | ISUCON10 予選の検索 |
+| 複合の列順 | 等号の列と並べ替えの列のどちらを先にするか | ISUCON11 予選の時系列 |
+| カバリング | 表を読まずに索引だけで答えられるか | |
+| 空間インデックス | 多角形の中の点を探すには | ISUCON10 予選のなぞって検索 |
+| 張りすぎ | 張るほど何が遅くなるか | ISUCON11 予選の書き込み |
+
+## 実験の環境
+
+| 項目 | 内容 |
+| --- | --- |
+| マシン | Apple M1 Pro、macOS、Docker Engine 29.4.0（VM に 8 CPU） |
+| データベース | `mysql:8.4` イメージ（MySQL 8.4.13）、設定は既定のまま |
+| クライアント | Go 1.24.6 と go-sql-driver/mysql v1.10.1 で書いた計測用のプログラム。MySQL と同じ Docker ネットワークに置いたコンテナから TCP で接続 |
+| データ | `estate`（物件）50 万行、`cond`（機器の状態の記録）100 万行。どちらも乱数で生成 |
+
+計測用のプログラムは、同じクエリを同じ接続で数十〜数百回流して、所要時間の中央値と 90 パーセンタイルを出します。あわせて、MySQL の `performance_schema.events_statements_history` から、そのクエリの **Rows examined**（ストレージエンジンから受け取った行の数）と **Rows sent**（クライアントに返した行の数）を読みます。
+
+<Callout type="warn" title="同じマシンで他の負荷が動いていた">
+  計測の間、同じマシンの上で別の Docker コンテナがいくつも動いていて、ホストの load average は 30〜120 で推移していました。時間の値は揺れが大きいので、この回では中央値で比べ、桁が変わるかどうかを見ます。
+  Rows examined と EXPLAIN の結果は、負荷に左右されません。
+</Callout>
+
+`estate` と `cond` の形は次のとおりです。ISUCON10 予選と ISUCON11 予選の表を参考に、列を絞りました。
+
+```sql
+CREATE TABLE estate (
+  id INT NOT NULL PRIMARY KEY,
+  name VARCHAR(64) NOT NULL,
+  description VARCHAR(255) NOT NULL,
+  rent INT NOT NULL,               -- 3 万〜33 万
+  door_height INT NOT NULL,
+  door_width INT NOT NULL,
+  latitude DOUBLE NOT NULL,        -- 35.0〜36.0
+  longitude DOUBLE NOT NULL,       -- 139.0〜140.0
+  popularity INT NOT NULL          -- 0〜999,999
+);
+
+CREATE TABLE cond (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  isu_id INT NOT NULL,             -- 1〜1,000。機器 1 台あたり 1,000 行
+  ts DATETIME NOT NULL,            -- 1 秒ずつ増える時刻
+  level VARCHAR(16) NOT NULL,
+  message VARCHAR(255) NOT NULL
+);
+```
+
+## EXPLAIN で見る欄
+
+張る前と張った後は、まず `EXPLAIN` で比べます。表形式の `EXPLAIN` の読み方は第 101 回で触れたので、ここではこの回で使う欄だけを並べます（[MySQL 8.4 リファレンス: EXPLAIN Output Format](https://dev.mysql.com/doc/refman/8.4/en/explain-output.html)）。
+
+| 欄 | この回で見る値 | 意味 |
+| --- | --- | --- |
+| `type` | `ALL` | 表を頭から全部読む |
+| | `index` | 索引を頭から（または末尾から）順に読む。`LIMIT` があれば途中で止まる |
+| | `range` | 索引の一部の範囲を読む |
+| | `ref` | 索引を等号で引く |
+| `key` | | 実際に使う索引 |
+| `rows` | | 読む行数の見積もり |
+| `Extra` | `Using filesort` | 読んだ行を、索引の順ではなく後から並べ替える |
+| | `Backward index scan` | 索引を末尾から逆向きに読む |
+| | `Using index` | 表本体を読まず、索引だけで答える |
+| | `Using index condition` | 索引に含まれる列の条件を、ストレージエンジンの中で先に判定する |
+
+`Using filesort` という名前ですが、ファイルに書くとは限りません。メモリに収まればメモリで並べ替えます。問題は、並べ替えるために **条件に合う行を全部読まなければならない** ことです。
+
+## ORDER BY と LIMIT に合わせる
+
+ISUCON10 予選の不動産検索サービスでは、トップページに安い椅子と安い物件の一覧が出ます。講評は、その一覧の SQL に「index が効いてません。」と書き、次のクエリを挙げています（[ISUCON10 予選 問題の解説と講評](https://isucon.net/archives/55025156.html)）。
+
+```sql
+SELECT * FROM chair WHERE stock > 0 ORDER BY price ASC, id ASC LIMIT ?
+SELECT * FROM estate ORDER BY rent ASC, id ASC LIMIT ?
+```
+
+そして「ORDER BY を狙って index を貼らないとスコアが上がりにくくなっています。」と続けます。
+
+手元の `estate` で、2 つ目のクエリを `LIMIT 20` で流しました。
+
+```
+## インデックスなし
+         type: ALL
+          key: NULL
+         rows: 493671
+        Extra: Using filesort
+Q1 rent ASC  (no index)      median  168.002 ms  p90  330.396 ms  rows_examined   500020  rows_sent    20
+
+## ALTER TABLE estate ADD INDEX idx_rent (rent)
+         type: index
+          key: idx_rent
+         rows: 20
+        Extra: NULL
+Q1 rent ASC  idx(rent)       median    0.125 ms  p90    0.283 ms  rows_examined       20  rows_sent    20
+```
+
+20 行を返すために、張る前は 50 万行を読んで並べ替え、張った後は 20 行だけを読んでいます。所要時間は 168 ms から 0.125 ms で、1,000 倍を超えます。
+
+速くなった理由は 2 つが重なっています。
+
+1. **索引が、すでに `rent` の順に並んでいる。** 葉を左から読めば `ORDER BY rent` の順で行が出てくるので、並べ替えが要りません。`Extra` から `Using filesort` が消えたのはこのためです
+2. **`LIMIT 20` で、20 行読んだところで止まれる。** 第 101 回で見たとおり、実行計画の上の演算子は下から 1 行ずつ引き出すので、`LIMIT` が 20 行を受け取った時点で下の読み取りも止まります
+
+並べ替えが残ると、2 つ目の利点も消えます。並べ替えは、全部の行を受け取らないと 1 行目を出せないからです。**並べ替えて先頭だけ返すクエリでは、条件の列よりも先に、並べ替えの列に合う索引があるかを見る** のが基本になります。
+
+`ORDER BY rent ASC, id ASC` の `id` を索引に入れていないのに並べ替えが消えたのは、第 97 回で見たとおり、InnoDB のセカンダリインデックスの葉が主キーを持つからです。`(rent)` の索引は、実質的に `(rent, id)` の順に並んでいます。
+
+<Callout type="warn" title="ORDER BY を書かずに、並び順に頼らない">
+  ISUCON9 本選の講評には、インデックスを張ると結果の並び順が変わってしまう落とし穴が書かれています。「単純にインデックスを train_master に対して設定するとクエリ結果の順番が列車名順でなくなってしまいます。インデックスを張る場合には、順序にしたがって主キーを設定し、 ORDER BY を適切に設定する必要がありました。」（[ISUCON9 本選 問題の解説と講評](https://isucon.net/archives/53916974.html)）。
+  `ORDER BY` の無いクエリの結果の順番は、どの索引を使って読んだかで決まります。索引を足すと計画が変わり、順番も変わります。順番に意味があるなら、必ず `ORDER BY` で書きます。
+</Callout>
+
+## 降順と昇順が混ざるとき
+
+同じ講評は、物件の検索について次のように書いています。「毎回 popularity が降順 (DESC) であり、 ID の昇順 (ASC) で検索をしています。降順と昇順が組み合わさった ORDER BY は デフォルトでインストールされてる MySQL 5.7 では単純に index を貼っても効きません。」
+
+### 逆向きに読めば DESC, DESC にはなる
+
+`(popularity)` に索引を張ると、葉は実質的に `(popularity, id)` の昇順に並びます。これを末尾から逆向きに読めば `popularity DESC, id DESC` の順になります。しかし `popularity DESC, id ASC` の順には、どちら向きに読んでもなりません。同じ `popularity` の中で `id` を昇順にするには、その部分だけ向きを変える必要があるからです。
+
+手元の MySQL 8.4 で確かめました。
+
+```
+## ALTER TABLE estate ADD INDEX idx_pop (popularity)
+
+-- ORDER BY popularity DESC, id ASC LIMIT 20
+         type: ALL
+          key: NULL
+        Extra: Using filesort
+Q2 idx(popularity)           median  160.927 ms  p90  227.792 ms  rows_examined   500020  rows_sent    20
+
+-- ORDER BY popularity DESC, id DESC LIMIT 20
+         type: index
+          key: idx_pop
+        Extra: Backward index scan
+Q2b pop DESC id DESC idx(pop) median    0.080 ms  p90    0.202 ms  rows_examined       20  rows_sent    20
+```
+
+`id DESC` にすれば、`Backward index scan` で 20 行だけ読んで終わります。`id ASC` のままでは索引が使われず、索引の無いとき（中央値 137 ms）と変わりません。
+
+### MySQL 8 の降順インデックス
+
+MySQL 8.0 からは、索引の定義に書いた `DESC` が実際に効くようになりました。リファレンスは「DESC in an index definition is no longer ignored but causes storage of key values in descending order.」と書いています（[MySQL 8.4 リファレンス: Descending Indexes](https://dev.mysql.com/doc/refman/8.4/en/descending-indexes.html)）。5.7 までは、`DESC` と書いても構文として受け付けるだけで、昇順の索引が作られていました。
+
+```
+## ALTER TABLE estate ADD INDEX idx_pop_desc (popularity DESC, id ASC)
+         type: index
+          key: idx_pop_desc
+        Extra: NULL
+Q2 idx(pop DESC, id ASC)     median    0.079 ms  p90    0.228 ms  rows_examined       20  rows_sent    20
+
+EXPLAIN: -> Limit: 20 row(s)  (cost=0.064 rows=20) (actual time=0.334..0.374 rows=20 loops=1)
+    -> Index scan on estate using idx_pop_desc  (cost=0.064 rows=20) (actual time=0.201..0.24 rows=20 loops=1)
+```
+
+クエリの `ORDER BY` と同じ向きの組を索引に書けば、そのまま前から読むだけになります。
+
+### 5.7 では生成列で符号を反転する
+
+講評が想定した 5.7 での解き方は、並べ替えの向きを揃えることでした。「popularity は単純にマイナスをつければ昇順に変更できるので想定回答としては負の値をinitialize で入れてしまうか、 MySQL の generated columns を使って 負の値を持った popularity を作ってそこに入れるというのを想定していました。」
+
+`-popularity` の昇順は `popularity` の降順と同じです。符号を反転した列を作れば、`(popularity_neg, id)` の昇順の索引 1 本で `popularity DESC, id ASC` の順を表せます。生成列（generated column）は、ほかの列から計算される列です。InnoDB は、保存しない仮想の生成列にもセカンダリインデックスを張れます（[MySQL 8.4 リファレンス: Secondary Indexes and Generated Columns](https://dev.mysql.com/doc/refman/8.4/en/create-table-secondary-indexes.html)）。
+
+```sql
+ALTER TABLE estate
+  ADD COLUMN popularity_neg INT AS (-popularity) NOT NULL,
+  ADD INDEX idx_pop_neg (popularity_neg, id);
+```
+
+```
+-- ORDER BY popularity_neg ASC, id ASC LIMIT 20
+         type: index
+          key: idx_pop_neg
+        Extra: NULL
+Q3 gen col idx(neg,id)       median    0.087 ms  p90    0.195 ms  rows_examined       20  rows_sent    20
+
+-- ORDER BY popularity DESC, id ASC LIMIT 20（元のクエリのまま）
+         type: ALL
+          key: NULL
+        Extra: Using filesort
+Q2 (orig) w/ gen col idx     median  171.563 ms  p90  313.246 ms  rows_examined   500020  rows_sent    20
+```
+
+降順インデックスと同じ速さになりました。ただし、**クエリの側も書き換える必要があります**。元の `ORDER BY popularity DESC, id ASC` のままでは、オプティマイザは新しい索引を使いませんでした。
+
+MySQL には、`WHERE` などに書いた式が生成列の定義と一致すれば、その生成列の索引を候補にする仕組みがあります（[MySQL 8.4 リファレンス: Optimizer Use of Generated Column Indexes](https://dev.mysql.com/doc/refman/8.4/en/generated-column-index-optimizations.html)）。手元で `ORDER BY -popularity, id` と書いたときも、`key: idx_pop_neg` で `Using filesort` の無い計画になりました。一方、`popularity DESC` を `-popularity` の昇順と同じだと見なす変換はしません。生成列を使うなら、アプリケーションのクエリを生成列の名前か、定義と同じ式で書きます。
+
+<Callout type="note" title="版を上げる判断">
+  講評には、「降順の index を効かせたかったのと位置情報の検索を見て、 MySQL 8 に上げた人たちも多かったです。」とあります。
+  同時に、「MySQL 8 にしても良いのですが、単純に実施してしまうと 設定の違いにより、パフォーマンスが劣化することもあります。」とも書かれています。
+  ISUCON11 本選の講評も、MySQL 8.0 では既定で binlog が出力される点に注意を促しています（[ISUCON11 本選 問題の解説と講評](https://isucon.net/archives/56163308.html)）。
+  版を上げると、目的の機能のほかに既定値もまとめて変わります。生成列のように今の版でできる手があるなら、まずそれを試すほうが安全です。
+  また、ISUCON11 予選の講評は「なお、MariaDBでは DESC の指定は意味がありません。」と書いています（[ISUCON11 予選 問題の解説と講評](https://isucon.net/archives/56044867.html)）。
+  `DESC` が効くかどうかは製品と版で違うので、張った後に `EXPLAIN` で確かめます。
+</Callout>
+
+## 複合インデックスの列の順番
+
+ISUCON11 予選は、機器（ISU）ごとの状態の記録を時系列で扱う問題でした。講評は、記録の表について次のように書いています。「WHERE の jia_isu_uuid に対して index を張っても良いですが、ORDER BY まで含めて複合 index を張ると良いです。jia_isu_uuid は = でしか比較していないので、ASC, ASC で構いません。」
+
+手元の `cond` は、この表の形をまねたものです。機器 1,000 台がそれぞれ 1,000 行の記録を持ち、時刻 `ts` は全体で 1 秒ずつ増えていきます。次の 3 つのクエリを、索引を張り替えながら流しました。
+
+| 記号 | クエリ | 意味 |
+| --- | --- | --- |
+| A | `WHERE isu_id = 500 ORDER BY ts DESC LIMIT 1` | ある機器の最新の 1 件 |
+| B | `WHERE isu_id = 500 ORDER BY ts DESC` | ある機器の全件を新しい順に |
+| C | `WHERE isu_id = 500 AND ts >= '2026-01-10' ORDER BY ts DESC LIMIT 20` | ある機器の、ある時刻以降を新しい順に 20 件 |
+
+結果を、中央値と Rows examined で並べます。
+
+| 索引 | A 最新 1 件 | B 全件 | C 範囲 + 20 件 |
+| --- | --- | --- | --- |
+| なし | 485.7 ms / 1,000,001 | 503.2 ms / 1,001,000 | 454.3 ms / 1,000,020 |
+| `(isu_id)` | 2.120 ms / 1,001 | 2.418 ms / 2,000 | 2.840 ms / 1,020 |
+| `(ts)` | 0.475 ms / 502 | 276.1 ms / 1,001,000 | 20.29 ms / 19,502 |
+| `(ts, isu_id)` | 0.586 ms / 502 | 295.3 ms / 1,001,000 | 17.64 ms / **20** |
+| `(isu_id, ts)` | **0.113 ms / 1** | **2.985 ms / 1,000** | **0.069 ms / 20** |
+
+`(isu_id, ts)` がすべてのクエリで最も少なく読んでいます。A では 1 行だけです。
+
+`EXPLAIN` を並べると、理由が見えます。
+
+```
+(isu_id)      A: type: ref    key_len: 4  rows: 1000    Extra: Using filesort
+(ts)          A: type: index  key_len: 5  rows: 1       Extra: Using where; Backward index scan
+(isu_id, ts)  A: type: ref    key_len: 4  rows: 1000    Extra: Backward index scan
+(isu_id, ts)  C: type: range  key_len: 9  rows: 222     Extra: Using index condition; Backward index scan
+```
+
+- **`(isu_id)` だけ**: 機器 500 の 1,000 行には一気に絞れますが、その中は `ts` の順に並んでいない（主キー `id` の順）ので、1,000 行を読んで並べ替えます。最新の 1 件のために 1,000 行です
+- **`(ts)` だけ**: 時刻の新しいほうから逆向きに読み、機器 500 の行が出てくるまで捨て続けます。この表では機器が順番に記録を書くので、平均 500 行ほどで見つかります。A は運よく速いのですが、B のように「機器 500 の全件」になると、最後まで読んで捨てることになり、索引が無いのとほとんど変わりません
+- **`(isu_id, ts)`**: 機器 500 の範囲に一気に下り、その中は `ts` の順に並んでいます。末尾から読めば新しい順で、`LIMIT 1` なら 1 行で止まります。C では `key_len: 9`、つまり `isu_id`（4 バイト）と `ts`（5 バイト）の両方を使って範囲を決めています
+
+ここから、列の順番の決め方は次のようにまとめられます。
+
+1. **等号で比べる列を先に置く。** 等号の列で範囲を 1 つに絞れば、その中は次の列の順に並んでいる
+2. **並べ替えの列、または範囲で比べる列をその後に置く。** 範囲の条件（`>=`、`BETWEEN`）を前に置くと、その範囲の中で後ろの列は並んでいないので、後ろの列は並べ替えにも絞り込みにも使えない
+3. 範囲の列は、範囲として使えるのは 1 つまでと考える
+
+講評の「jia_isu_uuid は = でしか比較していないので、ASC, ASC で構いません。」も、この 1 から説明できます。等号で 1 つの値に絞った後は、`jia_isu_uuid` の向きはどちらでも同じです。向きが意味を持つのは、並べ替えに使う後ろの列だけです。そして、1 つの列だけを `DESC` で読むなら、前の節で見た `Backward index scan` で足ります。
+
+<Callout type="warn" title="Rows examined が小さいのに遅い">
+  表の `(ts, isu_id)` の C を見てください。Rows examined は 20 で `(isu_id, ts)` と同じなのに、時間は 17.64 ms と 0.069 ms で 250 倍違います。
+  `EXPLAIN` は `Using index condition` を示していました。これは Index Condition Pushdown（ICP）で、索引に含まれる列の条件をストレージエンジンが索引の項目の上で判定し、満たすものだけ表の行を読みます（[MySQL 8.4 リファレンス: Index Condition Pushdown Optimization](https://dev.mysql.com/doc/refman/8.4/en/index-condition-pushdown-optimization.html)）。
+  `(ts, isu_id)` の C では、時刻の範囲の末尾から索引の項目を逆向きにたどりながら `isu_id = 500` を判定し、20 件そろうまでに 19,000 個あまりを捨てています。`isu_id` を索引に持たない `(ts)` では、同じ判定を表の行を読んでから行うので、Rows examined は 19,502 でした。この手元の計測では、ICP で索引の中で捨てた項目は Rows examined に数えられていませんでした。
+  第 264 回で Rows examined と Rows sent の比を目安にしましたが、ICP が効いているときは、その比が実際の読み取りを小さく見せます。`EXPLAIN ANALYZE` の時間や、`EXPLAIN` の `rows` の見積もり（ここでは 444,780）も合わせて見ます。
+</Callout>
+
+## 索引だけで答える
+
+索引の葉に、クエリが必要とする列がすべて入っていれば、表本体を読まずに済みます（第 97 回のカバリングインデックス）。機器 500 の時刻と状態だけを返すクエリで比べました。
+
+```sql
+SELECT ts, level FROM cond WHERE isu_id = 500;
+```
+
+```
+## INDEX (isu_id, ts)
+ type: ref  key: ix  key_len: 4  rows: 1000  Extra: NULL
+D (isu_id,ts) not covering   median    2.381 ms  p90    4.715 ms  rows_examined     1000  rows_sent  1000
+
+## INDEX (isu_id, ts, level)
+ type: ref  key: ix  key_len: 4  rows: 1000  Extra: Using index
+D (isu_id,ts,level) covering median    0.347 ms  p90    0.773 ms  rows_examined     1000  rows_sent  1000
+```
+
+返す行の数は同じ 1,000 行ですが、`level` を索引に足すと `Extra` が `Using index` になり、時間は 7 分の 1 になりました。
+
+`(isu_id, ts)` の索引では、1,000 個の項目それぞれについて主キーを取り出し、クラスタ化インデックスをもう一度たどって `level` を読みます。機器 500 の記録は 1,000 秒おきに書かれているので、表の中では 1,000 行が別々のページに散らばっています。カバリングにすると、索引の葉の数ページを順に読むだけで済みます。
+
+カバリングは、`SELECT *` では使えません。必要な列を絞って書くことが前提です。また、列を足すほど索引が大きくなり、次に見る書き込みの負担も増えます。頻繁に呼ばれ、返す列が少ないクエリに絞って使います。
+
+## 多角形の中の点を探す
+
+ISUCON10 予選には、地図の上で指でなぞった多角形の中にある物件を探す「なぞって検索」がありました。講評によると、参照実装は「なぞった範囲の緯度経度の最小値と最大値を取り、一度検索し、 検索にヒットしたものの中で与えられた多角形の範囲内にあるか」を一つずつ確かめていて、「この部分は所謂 N+1 処理になっています。」（[ISUCON10 予選 問題の解説と講評](https://isucon.net/archives/55025156.html)）。N+1 そのものは次の第 267 回で扱います。ここでは、講評が示した索引による解き方を見ます。
+
+講評の解き方は、緯度と経度を 1 つの `POINT` 型の列にまとめ、`ST_Contains` で多角形に含まれるかを SQL の中で判定し、その列に空間インデックスを張ることでした。「ST_Contains は空間インデックスを使う時に一度、最小外接矩形 (MBR) を使ってオブジェクトを絞り込みます。」「さらにこの処理をする上で SPATIAL INDEX を貼れば上記のSQLにも index が効くようになります。」
+
+### 空間インデックスは R-tree
+
+`SPATIAL INDEX` は R-tree という木を作ります（[MySQL 8.4 リファレンス: Creating Spatial Indexes](https://dev.mysql.com/doc/refman/8.4/en/creating-spatial-indexes.html)）。B+tree が 1 次元の値を順に並べるのに対し、R-tree は図形をそれを囲む長方形（最小外接矩形、MBR）で表し、近くの長方形どうしをまとめた大きな長方形を上の段に置きます。探すときは、問い合わせの長方形と重なる枝だけを下ります。
+
+```
+             ┌──────────────────────────────┐
+             │ R1                 R2        │   根: 子の長方形を囲む長方形
+             │ ┌─────────┐       ┌────────┐ │
+             │ │ ・ ・    │       │  ・    │ │   葉: 点そのもの
+             │ │  ・  ・  │       │ ・  ・ │ │
+             │ └─────────┘       └────────┘ │
+             └──────────────────────────────┘
+   なぞった多角形の MBR が R2 としか重ならなければ、R1 の下は読まない
+```
+
+ただし、長方形で絞れるのは候補までです。多角形の中に本当に入っているかは、候補を 1 つずつ厳密に判定します。
+
+MySQL 8.4 では、空間インデックスを張る列は `NOT NULL` で、座標系の番号（SRID）を `SRID` 属性で 1 つに決めておく必要があります。リファレンスは「The optimizer can use spatial indexes defined on columns that are SRID-restricted.」と書いています。ここでは緯度と経度をそのまま平面の座標として扱うので、SRID 0 にしました。
+
+```sql
+ALTER TABLE estate
+  ADD COLUMN pt POINT AS (POINT(latitude, longitude)) STORED NOT NULL SRID 0;
+
+-- 多角形（4 つの頂点）の中の物件を、人気順に 50 件
+SELECT * FROM estate
+WHERE ST_Contains(ST_PolygonFromText('POLYGON((35.40 139.40, 35.48 139.42, 35.46 139.50, 35.41 139.47, 35.40 139.40))'), pt)
+ORDER BY popularity DESC, id ASC LIMIT 50;
+```
+
+多角形の中にある物件は 2,478 件、多角形を囲む長方形（緯度 35.40〜35.48、経度 139.40〜139.50）の中にある物件は 3,986 件でした。
+
+```
+## 空間インデックスなし
+ type: ALL  key: NULL  rows: 492798  Extra: Using where; Using filesort
+polygon full scan            median  803.315 ms  p90 8772.661 ms  rows_examined   500050  rows_sent    50
+
+## 参考: 長方形だけで絞る（緯度と経度の BETWEEN）
+ type: ALL  key: NULL  rows: 493155  Extra: Using where
+bbox no index                median  203.606 ms  p90  258.382 ms  rows_examined   500000  rows_sent  3986
+ type: range  key: ix_latlon  key_len: 16  rows: 81276  Extra: Using index condition
+bbox idx(lat,lon)            median   25.028 ms  p90   37.417 ms  rows_examined     3986  rows_sent  3986
+
+## ALTER TABLE estate ADD SPATIAL INDEX ix_pt (pt)
+ type: range  key: ix_pt  key_len: 34  rows: 3759  Extra: Using where; Using filesort
+polygon spatial idx          median   17.345 ms  p90   31.104 ms  rows_examined     4036  rows_sent    50
+```
+
+空間インデックスなしでは、50 万行すべてについて多角形の判定をしていて、中央値で 0.8 秒かかりました。空間インデックスを張ると 17 ms です。
+
+`EXPLAIN ANALYZE` を見ると、講評の説明どおりの 2 段階になっています。
+
+```
+-> Limit: 50 row(s)  (actual time=19.3..19.3 rows=50 loops=1)
+    -> Sort: estate.popularity DESC, estate.id, limit input to 50 row(s) per chunk  (actual time=19.2..19.2 rows=50 loops=1)
+        -> Filter: st_contains(<cache>(st_polygonfromtext('POLYGON(...)')),estate.pt)  (actual time=0.376..18.3 rows=2478 loops=1)
+            -> Index range scan on estate using ix_pt over (pt unprintable_geometry_value)  (actual time=0.153..14 rows=3986 loops=1)
+```
+
+R-tree の範囲走査で MBR に重なる 3,986 行を取り出し、`Filter` で `ST_Contains` を判定して 2,478 行に絞り、最後に人気順に並べて 50 行を返しています。3,986 行は、長方形の `BETWEEN` で絞った行数と一致します。
+
+比較のために張った `(latitude, longitude)` の B+tree の索引でも、25 ms まで速くなっています。ただし `EXPLAIN` の `rows: 81276` が示すとおり、範囲に使えたのは先頭の `latitude` だけで、緯度が範囲に入る約 8 万個の項目について経度を ICP で判定していました。前の節の 3 番目、範囲の列は 1 つまで、がここにも現れています。2 次元の範囲を 2 次元のまま絞れるのが R-tree の利点です。
+
+<Callout type="note" title="5.7 では STORED が必要だった">
+  講評には「※ MySQL 5.7 では Generated Columns に SPATIAL INDEX を貼る場合は STORED にしなければいけません。」とあります。
+  手元の 8.4 でも同じでした。仮想の生成列に空間インデックスを張ろうとすると、`ERROR 3106 (HY000): 'Spatial index on virtual generated column' is not supported for generated columns.` で拒否されます。前の節の `popularity_neg` のような普通のセカンダリインデックスは仮想の生成列に張れますが、空間インデックスには `STORED` が要ります。
+  講評によると、SQL で一度に取らず、多角形の判定をアプリケーションの側で行ったチームも多かったそうです。データベースの CPU が先に詰まる問題では、判定をどちらに置くかも選択肢になります。
+</Callout>
+
+## 張りすぎの代償
+
+索引は読むときには役に立ちますが、**書くたびに全部の索引を更新する** 必要があります。ISUCON11 予選の講評は、複合インデックスを勧めた直後に「ただし、不必要な index があると INSERT 時に index を計算する必要があり、POST /api/condition/:jia_isu_uuid が遅くなってしまうことに注意しましょう。」と書いています。この問題は、機器から状態の記録が次々に送られてくる、書き込みの多いアプリケーションでした。
+
+手元で、`cond` と同じ形の空の表を 2 つ作り、片方にだけセカンダリインデックスを 5 本張って、`cond` から 30 万行を `INSERT ... SELECT` で写しました。
+
+```sql
+CREATE TABLE w0 LIKE cond;   -- 主キーだけ
+CREATE TABLE w5 LIKE cond;
+ALTER TABLE w5 ADD INDEX a (isu_id, ts), ADD INDEX b (ts), ADD INDEX c (level, ts),
+               ADD INDEX d (isu_id, level), ADD INDEX e (message(32));
+INSERT INTO w0 (isu_id, ts, level, message) SELECT isu_id, ts, level, message FROM cond ORDER BY id LIMIT 300000;
+INSERT INTO w5 (isu_id, ts, level, message) SELECT isu_id, ts, level, message FROM cond ORDER BY id LIMIT 300000;
+```
+
+| 回 | 主キーだけ | セカンダリ 5 本 |
+| --- | --- | --- |
+| 1 回目 | 3,776 ms | 22,931 ms |
+| 2 回目 | 10,243 ms | 15,040 ms |
+| 3 回目 | 4,216 ms | 8,701 ms |
+
+| 表 | データの大きさ | 索引の大きさ |
+| --- | --- | --- |
+| `w0` | 45.6 MB | 0.0 MB |
+| `w5` | 45.6 MB | 54.7 MB |
+
+時間は他の負荷の影響で大きく揺れましたが、3 回とも索引のある表のほうが遅く、1.5〜6 倍かかりました。索引の大きさは、5 本でデータ本体を超えています。索引は書き込みの時間だけでなく、第 96 回のバッファプールの場所も取り合います。
+
+この実験では索引ごとの内訳は測っていませんが、`(level, ts)` や `message` のように、挿入する値が索引の中のあちこちに入る索引では、第 97 回で見たランダムな主キーと同じく、ページ分割が起きやすく、触るページも散らばります。
+
+## ISUCON で見られた流れ
+
+インデックスは、過去の問題で毎回のように最初の一手になっています。
+
+- ISUCON9 本選の講評は、列車検索について「次の通りDBにIndexを作ると、1500点くらい獲得できます。」と書き、`(date, train_class, train_name, station)` の 4 列の複合インデックスを示しています（[ISUCON9 本選 問題の解説と講評](https://isucon.net/archives/53916974.html)）。初期実装では「列車検索が遅すぎて初期スコアが出ません。」とあり、索引が点数を出すための前提になっていました
+- ISUCON10 予選の講評は、一覧の索引を張った後について「ここを抜けるとベンチマーカーからの負荷の掛け方が変化し、なぞって検索や CSV 入稿といった処理が増え、データの量も増えていきます。」と書いています。検索条件の列（`rent`、`price`、`height` など）への索引も、`pt-query-digest` などで遅いクエリを特定してから張るよう勧めています
+- ISUCON14 の講評は、示した索引を足すことで「Go言語では4000点程度までスコアを伸ばせることを確認しています。」と書いています。示された 13 本のうち 8 本が `(chair_id, created_at DESC)` のような、等号の列の後に時刻を置いた複合インデックスでした
+
+最後の点は、この回の複合インデックスの節と同じ形です。「ある利用者の、ある椅子の、最新の 1 件」を引くクエリは、Web アプリケーションでとても多く現れます。
+
+## 本番で使うとき
+
+ISUCON では、データの量も、流れるクエリの種類も、競技の間はほぼ決まっています。本番のサービスでは、次の点が加わります。
+
+**張る前に、クエリの側を見る。** 索引の列の順番は、そのクエリの `WHERE` の等号の列、範囲の列、`ORDER BY` の列から決まります。1 本の索引を複数のクエリで共有できることも多いので、同じ表に対するクエリを並べてから決めます。`(isu_id, ts)` があれば、`(isu_id)` だけの索引は要りません。左の列だけを使うクエリにも使えるからです。
+
+**張る作業も負荷になる。** InnoDB では、セカンダリインデックスの追加は表を読み書きできるまま進みます。リファレンスは「The table remains available for read and write operations while the index is being created.」と書いています（[MySQL 8.4 リファレンス: Online DDL Operations](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html)）。ただし、作っている間は表を全部読んで並べ替えるので、ディスクと CPU を使います。レプリカでも同じ作業が後から行われます。大きな表では、負荷の低い時間を選びます。
+
+**外す前に、見えなくする。** 使われていないように見える索引を外すと、まれにしか流れないクエリが急に遅くなることがあります。MySQL 8 では、索引を残したままオプティマイザから見えなくする `INVISIBLE` があります（[MySQL 8.4 リファレンス: Invisible Indexes](https://dev.mysql.com/doc/refman/8.4/en/invisible-indexes.html)）。見えなくしてしばらく様子を見て、問題がなければ外します。使われていない索引の候補は、`sys.schema_unused_indexes` で一覧にできます。ただしリファレンスは、このビューはサーバーが十分長く動いて負荷が代表的になったときに役立つ、と注意しています（[MySQL 8.4 リファレンス: The schema_unused_indexes View](https://dev.mysql.com/doc/refman/8.4/en/sys-schema-unused-indexes.html)）。
+
+**索引で足りないものもある。** 並べ替えの基準が毎回計算し直す値（距離や得点など）だと、索引は張れません。その場合は書き込みのときに計算して列に持つ（第 273 回）、あるいはアプリケーションの中に持つ（第 269 回）ほうに進みます。
+
+## 次の回へ
+
+この回では、1 本のクエリを速くする手を見ました。ところが、なぞって検索の参照実装のように、速いクエリを何十回も繰り返していることが遅さの原因の場合は、1 本ずつを速くしても限界があります。次の第 267 回では、この N+1 を、データベースとの往復の回数とレイテンシの積として測り、まとめて取る書き方に直します。
+
+## まとめ
+
+- 遅いクエリが分かったら、まずインデックスを疑う。ISUCON の参照実装では毎回のように不足していて、ISUCON13 では索引だけで約 3,000 点から約 10,000 点に上がった
+- 並べ替えて先頭だけ返すクエリには、`ORDER BY` の順に合う索引を張る。並べ替えが消えると `LIMIT` で途中で止まれる。手元の 50 万行では 168 ms が 0.125 ms になり、読んだ行は 50 万から 20 になった
+- InnoDB のセカンダリインデックスは主キーを含むので、`(rent)` は実質 `(rent, id)` の順に並ぶ。逆向きに読めば `DESC, DESC` にもなる
+- `DESC` と `ASC` が混ざる並べ替えは、同じ向きの索引では表せない。MySQL 8 では `(popularity DESC, id ASC)` の降順インデックスで、5.7 では符号を反転した生成列で揃える。生成列はクエリの側も書き換える
+- 複合インデックスは、等号の列を先、並べ替えや範囲の列を後に置く。`(isu_id, ts)` は最新の 1 件を 1 行で引けたが、`(ts, isu_id)` は範囲の後ろの列を使えなかった
+- Index Condition Pushdown が効くと、索引の中で捨てた項目は Rows examined に数えられない。行数が小さいのに遅いときは `EXPLAIN` の `rows` と `EXPLAIN ANALYZE` を見る
+- 返す列が索引に揃えば `Using index` になり、表本体を読まずに済む。手元では 7 分の 1 になった
+- 多角形の中の点を探すには、`POINT` 型の列と空間インデックス（R-tree）を使う。MBR で候補を絞ってから厳密に判定する。手元では全件の判定 0.8 秒が 17 ms になった
+- 索引は書き込みのたびに更新される。セカンダリ 5 本で、30 万行の挿入は 1.5〜6 倍かかり、索引の大きさはデータ本体を超えた
+- 本番では、張る作業の負荷、外す前に `INVISIBLE` で試すこと、索引では解けない並べ替えがあることも考える

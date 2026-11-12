@@ -1,0 +1,461 @@
+---
+title: スロークエリログを読む
+description: アクセスログで重いエンドポイントが分かったら、次はそのエンドポイントがどの SQL に時間を使っているかを調べます。MySQL のスロークエリログをすべてのクエリについて取り、pt-query-digest でフィンガープリントごとに集計し、調べた行数と返した行数の比、1 回は速いが回数の多いクエリ、同じ形なのに実行計画が違うクエリを、Docker の MySQL に負荷をかけた実測で確かめます
+chapter: tune
+order: 5
+status: published
+topics:
+  - スロークエリログ
+  - long_query_time
+  - pt-query-digest
+  - フィンガープリント
+  - Rows_examined
+  - Rows_sent
+  - performance_schema
+  - ステートメントダイジェスト
+  - プリペアドステートメント
+  - interpolateParams
+  - 呼び出し回数
+  - 実行計画の切り替わり
+requires:
+  - ll-263-access-log
+  - ll-101-db-planner
+---
+
+import Callout from '../../components/Callout.astro'
+
+## エンドポイントの次は SQL
+
+第 263 回では、nginx のアクセスログを alp で集計し、時間の合計で並べた表の上位に、商品の一覧とコメント一覧が来ることを確かめました。どちらもデータベースを引くエンドポイントです。けれどアクセスログには、その時間がどの SQL に使われたのかは書かれていません。
+
+この回では、データベースの側の記録を見ます。MySQL の**スロークエリログ**です。名前は「遅いクエリの記録」ですが、ISUCON の上位チームはこれを**すべてのクエリの記録**として使います。その理由と、集計の道具である pt-query-digest の読み方、そして集計が隠してしまうものを、第 263 回と同じアプリケーションに負荷をかけて確かめます。
+
+| 確かめること | 節 |
+| --- | --- |
+| スロークエリログに何が書かれるか | スロークエリログの 1 件 |
+| なぜすべてのクエリを記録するのか、設定の落とし穴 | すべてのクエリを記録する |
+| SQL を形でまとめて並べる | pt-query-digest |
+| 調べた行数と返した行数の比 | 調べた行数と返した行数 |
+| ログを書かずに集計する | performance_schema |
+| 1 回は速いが、回数が多いクエリ | 直した後に浮かぶもの |
+| 同じ形なのに速さが違うクエリ | 同じ形、違う計画 |
+
+## スロークエリログの 1 件
+
+MySQL の文書は、スロークエリログを次のように定義しています（[MySQL 8.0 Reference Manual: The Slow Query Log](https://dev.mysql.com/doc/refman/8.0/en/slow-query-log.html)）。
+
+> The slow query log consists of SQL statements that take more than `long_query_time` seconds to execute and require at least `min_examined_row_limit` rows to be examined.
+
+実行に `long_query_time` 秒より長くかかり、かつ `min_examined_row_limit` 行以上を調べた SQL が記録されます。文書には「The minimum and default values of `long_query_time` are 0 and 10, respectively.」とあり、既定では 10 秒です。`min_examined_row_limit` は、今回の MySQL では 0（行数で絞らない）でした。
+
+記録の 1 件は次のような形です。今回の実測で取ったものから 1 件を抜き出しました。
+
+```text
+# Time: 2026-11-12T00:57:28.303737Z
+# User@Host: root[root] @  [192.168.215.1]  Id:    18
+# Query_time: 0.015894  Lock_time: 0.000003 Rows_sent: 3  Rows_examined: 3
+SET timestamp=1794445048;
+SELECT id, user_id, body, created_at FROM comments WHERE item_id = 22952 ORDER BY created_at DESC LIMIT 10;
+```
+
+| 項目 | 意味 |
+| --- | --- |
+| `Query_time` | 実行にかかった秒数（マイクロ秒単位） |
+| `Lock_time` | ロックの獲得にかかった秒数 |
+| `Rows_sent` | クライアントに返した行の数 |
+| `Rows_examined` | サーバーが調べた行の数 |
+
+`Rows_sent` と `Rows_examined` は、文書ではそれぞれ「The number of rows sent to the client.」「The number of rows examined by the server layer (not counting any processing internal to storage engines).」と説明されています。後者は MySQL のサーバー層が受け取った行の数で、InnoDB の中で読み飛ばした行は含まれません。
+
+`Query_time` の扱いにも 1 つ注意があります。文書には「The time to acquire the initial locks is not counted as execution time.」とあります。最初のロックを待った時間は `Query_time` に入らず、`Lock_time` の側に出ます。
+
+## すべてのクエリを記録する
+
+### 速いクエリも積もる
+
+ISUCON9 本選で優勝した白金動物園の mirakui さんは、次のように書いています（[チーム白金動物園として ISUCON 9 本選で優勝しました](https://blog.mirakui.com/entry/2019/10/14/011554)）。
+
+> 今回、MySQL のスローログは `long_query_time = 0` にして、常に全部のクエリを出させていました。遅いクエリについ目が行ってしまいがちですが、ISUCON のような高トラフィック環境下では、10 ms もかからないようなクエリでも、量があることでアプリケーションの負荷になることがあります。スロークエリというのはインデックス張ったりしてわりと早めに減らせてしまうので、スロークエリだけを見ていると「あーもう DB ネックじゃなくなったね」という誤解をすることがあります（予選のときにこの思考になってしまってた）。今回は速いクエリに注目していたことで、大量に呼ばれているクエリに気づきやすくなりました。
+
+`long_query_time` を 1 秒や 0.1 秒にすると、記録されるのは 1 回が遅いクエリだけになります。第 263 回で、アクセスログを合計で並べる理由を「取り返せる時間の大きさ」と書きました。クエリも同じで、1 回 0.5 ミリ秒のクエリでも 10 万回呼ばれれば 50 秒です。それを見落とさないために、閾値を 0 にしてすべてを記録します。
+
+### 設定は接続のたびに写し取られる
+
+設定は、MySQL の起動時のオプション（`my.cnf` や `--long-query-time=0`）でも、動いているサーバーへの `SET GLOBAL` でも変えられます。ここに 1 つ落とし穴があります。
+
+今回の実測は、MySQL 8.0.46 を Docker で動かし、`--slow-query-log=1 --long-query-time=10` で起動したところから始めました。アプリケーションを起動して負荷をかけている途中で、`long_query_time` を 0 に変えます。
+
+```text
+mysql> SET GLOBAL long_query_time=0;
+mysql> SELECT @@global.long_query_time;
+0.000000
+
+$ ./lg -base http://127.0.0.1:8264 -c 8 -d 5s
+requests=664 errors=0 rps=132.8
+$ grep -c '^# Query_time' slow.log
+0
+```
+
+5 秒間に 664 件の要求を処理したのに、スロークエリログには 1 件も書かれませんでした。アプリケーションを起動し直してから同じ負荷をかけると、今度は 15,581 件が書かれました。
+
+```text
+$ ./lg -base http://127.0.0.1:8264 -c 8 -d 5s
+requests=1379 errors=0 rps=275.8
+$ grep -c '^# Query_time' slow.log
+15581
+```
+
+理由は、`long_query_time` に「全体の値」と「接続ごとの値」の 2 つがあるからです。MySQL の文書は「The client's session variables are initialized at connect time using the current values of the corresponding global variables.」と説明しています（[MySQL 8.0 Reference Manual: Using System Variables](https://dev.mysql.com/doc/refman/8.0/en/using-system-variables.html)）。接続ごとの値は**接続した瞬間に**全体の値から写し取られます。Go の `database/sql` のように接続を使い回すアプリケーションは、`SET GLOBAL` の前に張った接続を使い続けるので、古い値の 10 秒のままでした。
+
+`SET GLOBAL` で変えたときは、アプリケーションを再起動するか、接続を張り直させる必要があります。もう 1 つ、`SET GLOBAL` で変えた値は MySQL の再起動で元に戻ります（第 278 回）。競技でも本番でも、恒久的に使う設定は設定ファイルに書きます。
+
+## pt-query-digest
+
+### 実測の条件
+
+第 263 回と同じアプリケーション（商品 50,000 行、利用者 1,000 行、コメント 200,000 行、インデックスは主キーだけ）を、スロークエリログを有効にした MySQL につなぎ、16 並列の閉ループで 30 秒間負荷をかけました。今回は nginx を挟まず、アプリケーションに直接要求を送っています。環境は Apple M1 Pro / macOS 26.2、OrbStack の Docker、Go 1.24.6 です。同じ機械で他の重い処理も動いていたため、秒数の絶対値は揺れます。
+
+```text
+$ ./lg -base http://127.0.0.1:8264 -c 16 -d 30s
+requests=5035 errors=0 rps=167.8
+```
+
+30 秒間のスロークエリログは 13,704,303 バイト、59,091 件になりました。これを人が読むことはできないので、集計します。
+
+### フィンガープリントでまとめる
+
+[pt-query-digest](https://docs.percona.com/percona-toolkit/pt-query-digest.html) は Percona Toolkit に含まれるスロークエリログの集計ツールです。今回は 3.7.2 を Docker のイメージ（`percona/percona-toolkit`）で動かしました。
+
+```bash
+docker run --rm -v $PWD:/w:ro percona/percona-toolkit pt-query-digest /w/slow.log
+```
+
+alp が URI をまとめたように、pt-query-digest は SQL を**フィンガープリント**でまとめます。文書の説明は次のとおりです。
+
+> A query fingerprint is the abstracted form of a query, which makes it possible to group similar queries together. Abstracting a query removes literal values, normalizes whitespace, and so on.
+
+`WHERE id = 452` と `WHERE id = 589` は、どちらも `where id = ?` になり、同じ組に入ります。文書が挙げる変換には、ほかに「Strip comments.」「Lowercase the entire query.」「Replace all literals inside of IN() and VALUES() lists with a single placeholder, regardless of cardinality.」などがあります。`IN (1,2,3)` と `IN (1,2,3,4)` も同じ組です。そして、集計の考え方を SQL で書くと次のようになる、と説明しています。
+
+```sql
+SELECT WORST(query BY Query_time), SUM(Query_time), ...
+FROM /path/to/slow.log
+GROUP BY FINGERPRINT(query)
+ORDER BY SUM(Query_time) DESC
+LIMIT 10
+```
+
+既定の並び順は `Query_time` の**合計**です。第 263 回で alp を合計で並べたのと同じ考え方が、最初から採られています。
+
+### 冒頭の要約
+
+出力の冒頭は、ログ全体の要約です。
+
+```text
+# Overall: 59.09k total, 11 unique, 1.97k QPS, 5.52x concurrency _________
+# Time range: 2026-11-12T00:48:56 to 2026-11-12T00:49:26
+# Attribute          total     min     max     avg     95%  stddev  median
+# ============     ======= ======= ======= ======= ======= ======= =======
+# Exec time           166s     1us      3s     3ms     1ms    33ms    38us
+# Lock time          299ms       0   180ms     5us     2us   735us       0
+# Rows sent         39.16k       0      50    0.68    0.99    3.23       0
+# Rows examine     155.43M       0 195.62k   2.69k    0.99  20.88k       0
+# Query size         2.11M      27     106   37.36   69.19   13.05   31.70
+```
+
+約 5 万 9 千件の SQL が 11 種類にまとまりました。`5.52x concurrency` は、実行時間の合計と時間の幅から計算したおおよその同時実行数で、実際に 166 秒 ÷ 30 秒はほぼ 5.5 です。平均して 5.5 本のクエリが同時に走っていたことになります。
+
+注目すべきは最後の 2 行の対比です。返した行は合わせて 39,160 行なのに、調べた行は 1 億 5,543 万行です。返した 1 行のために、平均して約 4,000 行を調べています。
+
+### プロファイル
+
+続いて、組ごとの表（Profile）が出ます。
+
+```text
+# Profile
+# Rank Query ID                            Response time Calls R/Call V/M 
+# ==== =================================== ============= ===== ====== ====
+#    1 0x44C405C4A776BE965F3695ABB78327D5  85.3568 51.6%   674 0.1266  0.34 SELECT comments
+#    2 0x0F9B40A8C3A032EE795E3F34AF5747B7  31.3829 19.0%   546 0.0575  0.38 SELECT items
+#    3 0x820FEBE237BF525D1903C22BB584E78A  31.1413 18.8%   207 0.1504  0.23 INSERT comments
+#    4 0xDA556F9115773A1A99AA0165670CE848   7.8890  4.8% 19700 0.0004  0.07 ADMIN PREPARE
+#    5 0x203D841293D09E9ECEDF684AA5695AD1   7.7638  4.7% 15875 0.0005  0.06 SELECT users
+# MISC 0xMISC                               1.9674  1.2% 22089 0.0001   0.0 <6 ITEMS>
+```
+
+| 列 | 意味 |
+| --- | --- |
+| Query ID | フィンガープリントから作った識別子 |
+| Response time | その組の実行時間の合計と、全体に占める割合 |
+| Calls | 実行された回数 |
+| R/Call | 1 回あたりの平均 |
+| V/M | 分散を平均で割った値。大きいほど 1 回ごとのばらつきが大きい |
+| Item | 組の要約（文の種類と表の名前） |
+
+表示する組の数は `--limit` で決まり、既定値は `95%:20` です。文書の説明では、時間の大きい方から全体の 95% に当たる組か 20 組の、先に達した方までを出します。残りは MISC の行にまとめられます。
+
+1 位はコメント一覧のクエリで、データベースの時間の 51.6% を使っています。第 263 回のアクセスログでもコメント一覧は合計の 2 位でした。一覧（`SELECT items`）は 2 位で 19.0% です。
+
+4 位の `ADMIN PREPARE` は SQL ではありません。Go の MySQL ドライバが、`?` を含むクエリを送るたびに**サーバー側でプリペアドステートメントを作り、実行し、閉じている**ことの記録です。1 回のクエリのために 3 往復しています。7 位以下にも `ADMIN CLOSE STMT` が 19,688 回ありました。この往復を減らす話は第 268 回で扱いますが、スロークエリログを取ると、このようにアプリケーションのコードからは見えない往復も表に出てきます。
+
+## 調べた行数と返した行数
+
+### 1 位の組を読む
+
+プロファイルの後には、組ごとの詳しい報告が続きます。1 位の組は次のとおりでした。
+
+```text
+# Query 1: 22.47 QPS, 2.85x concurrency, ID 0x44C405C4A776BE965F3695ABB78327D5 at byte 2918930
+# Attribute    pct   total     min     max     avg     95%  stddev  median
+# ============ === ======= ======= ======= ======= ======= ======= =======
+# Count          1     674
+# Exec time     51     85s    34ms      3s   127ms   339ms   207ms    78ms
+# Lock time      0     1ms       0    89us     1us     4us     3us     1us
+# Rows sent      6   2.70k       0      10    4.11    7.70    1.97    3.89
+# Rows examine  82 128.69M 195.42k 195.62k 195.52k 192.13k       0 192.13k
+# Query size     3  69.61k     102     106  105.76  102.22    0.19  102.22
+# Query_time distribution
+#   1us
+#  10us
+# 100us
+#   1ms
+#  10ms  ################################################################
+# 100ms  #####################################
+#    1s  #
+#  10s+
+SELECT id, user_id, body, created_at FROM comments WHERE item_id = 26083 ORDER BY created_at DESC LIMIT 10\G
+```
+
+（一部の行を省略）
+
+1 回あたり平均 4.11 行を返すために、平均 195,520 行を調べています。コメントの表はおよそ 20 万行なので、**毎回、表のほぼ全体を読んでいる**ことになります。`item_id` で絞り込む手段（インデックス）がないので、全行を読んでから条件に合うものを残し、並べ替えているのです。
+
+報告の末尾には、そのクエリの最も遅かった実例が、`EXPLAIN` を付けてすぐ試せる形で添えられています。表の定義を確かめる `SHOW CREATE TABLE` も一緒に出ます。ここから第 101 回で見た実行計画の読み方につなげます。
+
+### 比で見当を付ける
+
+返した行数に対する調べた行数の比は、インデックスが足りているかどうかの手早い目安になります。ISUCON13 で優勝した NaruseJun の tohutohu さんは、スロークエリの集計を見るときの基準を次のように書いています（[ISUCON13で優勝しました](https://zenn.dev/tohutohu/articles/923bdf5dcd73af)）。
+
+> こちらも多くの場合はSumを見ますが、最序盤などインデックスを追加したい場合はRow Sent/Row Examinedの比を見ています。適切にインデックスが設定されている場合はこの比が5倍以下くらいになりますが、インデックスがない場合は100倍とかになるので適切なインデックスを考えて設定します。
+
+今回のコメント一覧は、195,520 ÷ 4.11 でおよそ 47,600 倍でした。主キーで 1 行を引く `SELECT users` は、調べた行も返した行も 1 行で、比は 1 倍です。
+
+ただし、比は目安です。次のような場合は、比が大きくても正常、または比が小さくても問題があります。
+
+- **集計のクエリ。** `COUNT(*)` や `SUM` は、多くの行を調べて 1 行を返すのが仕事です。比が大きいのは当然で、問題はその集計を毎回やり直していることの方です（第 273 回）。
+- **`LIMIT` で早く止まるクエリ。** 部分一致の検索（`LIKE '%chair%' LIMIT 50`）は、条件に合う行が早く 50 件見つかれば、そこで読むのをやめます。今回の検索のクエリは比が 50 倍前後でしたが、条件に合う行が少ない語で検索されると、表の全体を読みます。
+- **返す行がそもそも多すぎるクエリ。** 1 万行を返して、アプリケーションの側で 10 行だけ使っているなら、比は 1 倍でも無駄です。`Rows sent` の大きさそのものも見ます。
+
+## performance_schema
+
+### ログを書かずに集計する
+
+スロークエリログはファイルに 1 件ずつ書くので、すべてを記録すると、それ自体が負担になります（第 265 回で測ります）。MySQL には、文の実行をサーバーの中で集計しておく仕組みもあります。**performance_schema** の `events_statements_summary_by_digest` 表です。ISUCON14 に参加した matsuu さんは、「nginxはnjsを用いてjson形式のログを吐き、MySQLは performance_schema からスロークエリーを取得する形となりました。」と書いています（[DuckDB+Evidenceを駆使してISUCON14で21位になった話](https://matsuu.hatenablog.com/entry/2024/12/14/184649)）。
+
+この表は、pt-query-digest のフィンガープリントと同じ考え方で SQL を正規化した**ダイジェスト**ごとに、回数・時間・行数を足し合わせています。MySQL の文書は正規化について、「Literal values are converted to parameter markers.」「Comments are removed and whitespace is adjusted.」と書いています（[MySQL 8.0 Reference Manual: Performance Schema Statement Digests and Sampling](https://dev.mysql.com/doc/refman/8.0/en/performance-schema-statement-digests.html)）。今回の MySQL では、performance_schema は特に設定しなくても有効になっていました（`@@performance_schema` が 1）。
+
+次の SQL で、時間の合計が大きい順に並べます。時間の列はピコ秒単位なので、10 の 12 乗で割って秒にしています。
+
+```sql
+SELECT LEFT(DIGEST_TEXT, 60) AS digest_text,
+       COUNT_STAR AS calls,
+       ROUND(SUM_TIMER_WAIT / 1e12, 2) AS total_s,
+       ROUND(AVG_TIMER_WAIT / 1e9, 3) AS avg_ms,
+       SUM_ROWS_EXAMINED AS examined,
+       SUM_ROWS_SENT AS sent,
+       ROUND(SUM_ROWS_EXAMINED / NULLIF(SUM_ROWS_SENT, 0), 1) AS ratio
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SCHEMA_NAME = 'shop'
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 8;
+```
+
+### プリペアドステートメントは数えられていなかった
+
+さきほどの 30 秒の負荷の後にこの SQL を流すと、結果は**空**でした。表全体を見ても、`SCHEMA_NAME` が NULL の 4 種類・8 回しか入っていません。文の種類ごとの集計表（`events_statements_summary_global_by_event_name`）を見ると、理由が分かりました。
+
+```text
++----------------------------+------------+--------+
+| EVENT_NAME                 | COUNT_STAR | s      |
++----------------------------+------------+--------+
+| statement/com/Execute      |      32597 | 250.41 |
+| statement/sql/insert       |        251 |  37.62 |
+| statement/com/Close stmt   |      32597 |  28.14 |
+| statement/com/Prepare      |      31605 |  25.03 |
+...
+```
+
+アプリケーションの SELECT は、すべてプリペアドステートメントの実行（`statement/com/Execute`）として数えられていて、ダイジェストの表には現れていませんでした。手元の MySQL 8.0.46 では、サーバー側のプリペアドステートメントで実行された文はダイジェストごとの集計に載らなかった、ということです。
+
+Go の MySQL ドライバには、`?` の位置に値を埋め込んだ SQL 文字列をクライアントの側で作って送る `interpolateParams` という設定があります。README は「This reduces the number of roundtrips, since the driver has to prepare a statement, execute it with given parameters and close the statement again with `interpolateParams=false`.」と説明しています（[go-sql-driver/mysql](https://github.com/go-sql-driver/mysql#interpolateparams)）。接続の文字列に `interpolateParams=true` を足してアプリケーションを起動し直し、もう一度 30 秒の負荷をかけてから同じ SQL を流しました。
+
+```text
++--------------------------------------------------------------+-------+---------+---------+-----------+-------+---------+
+| digest_text                                                  | calls | total_s | avg_ms  | examined  | sent  | ratio   |
++--------------------------------------------------------------+-------+---------+---------+-----------+-------+---------+
+| SELECT `id` , `user_id` , `body` , `created_at` FROM `commen |  1056 |  157.02 | 148.695 | 211701167 |  4317 | 49039.0 |
+| SELECT `id` , `user_id` , `title` , `price` , `created_at` F |   813 |   55.81 |  68.649 |  41056420 | 16260 |  2525.0 |
+| INSERT INTO `comments` ( `item_id` , `user_id` , `body` , `c |   332 |   43.15 | 129.977 |         0 |     0 |    NULL |
+| SELECT `id` , NAME FROM `users` WHERE `id` = ?               | 24052 |   35.56 |   1.479 |     24053 | 24053 |     1.0 |
+| SELECT `id` , `user_id` , `title` , `price` , `created_at` F |  3549 |    5.57 |   1.569 |      3476 |  3476 |     1.0 |
+| SELECT `id` , `title` , `price` FROM `items` WHERE `title` L |   269 |    1.08 |   4.031 |    658888 | 13450 |    49.0 |
++--------------------------------------------------------------+-------+---------+---------+-----------+-------+---------+
+```
+
+今度は表に現れ、比の列も計算できました。コメント一覧が 49,039 倍、一覧が 2,525 倍、主キーで引くものが 1 倍、`LIMIT` で止まる検索が 49 倍です。順位はスロークエリログの集計と同じでした。
+
+一方、同じ 30 秒を pt-query-digest で集計すると、`SELECT users` の合計は 12.78 秒で、performance_schema の 35.56 秒とは 3 倍近く違いました。2 つは同じ実行を別の地点で測っているので、短いクエリほど、どこからどこまでを数えるかの違いが比率として大きく出ます。**順位を読むのに使い、絶対値は同じ道具の中でだけ比べる**のが安全です。
+
+<Callout type="warn" title="記録の取り方が、見えるものを変える">
+  プリペアドステートメントの件は、計測の設定ではなくアプリケーションの接続の設定で、見える結果が変わった例です。
+  performance_schema の表が空だったり、件数が少なすぎたりしたら、「遅いクエリがない」と結論する前に、文がどの形でサーバーに届いているかを確かめます。
+  スロークエリログの側では、同じ実行が `ADMIN PREPARE` と実際の SELECT と `ADMIN CLOSE STMT` に分かれて記録されていました。
+</Callout>
+
+## 直した後に浮かぶもの
+
+### 上位の 2 つにインデックスを張る
+
+1 位と 2 位のクエリのために、`comments(item_id, created_at)` と `items(created_at)` の 2 つのインデックスを足し、`interpolateParams=true` のまま同じ 30 秒の負荷をかけました。
+
+```text
+$ ./lg -base http://127.0.0.1:8264 -c 16 -d 30s
+requests=32393 errors=0 rps=1079.8
+```
+
+```text
+# Overall: 120.58k total, 9 unique, 4.02k QPS, 5.46x concurrency _________
+# Profile
+# Rank Query ID                            Response time Calls R/Call V/M 
+# ==== =================================== ============= ===== ====== ====
+#    1 0x820FEBE237BF525D1903C22BB584E78A  74.8642 45.7%  1293 0.0579  0.05 INSERT comments
+#    2 0x0F9B40A8C3A032EE795E3F34AF5747B7  65.1674 39.8%  3253 0.0200  0.01 SELECT items
+#    3 0x203D841293D09E9ECEDF684AA5695AD1  17.5099 10.7% 96276 0.0002  0.00 SELECT users
+#    4 0x4517DA52F99BC8D325E043457AC3D6E3   2.8868  1.8% 14561 0.0002  0.00 SELECT items
+#    5 0x44C405C4A776BE965F3695ABB78327D5   2.0298  1.2%  4231 0.0005  0.01 SELECT comments
+#    6 0xD1D6B09029427162FA148553ACE4F390   1.3951  0.9%   960 0.0015  0.00 SELECT items
+```
+
+処理した要求は 30 秒で 5,035 件（最初の実測）から 32,393 件になりました（間に `interpolateParams` の変更と機械の負荷の揺れも挟まっているので、倍率そのものには意味を持たせません）。コメント一覧のクエリは 1 回 0.5 ミリ秒になり、5 位に下がりました。
+
+代わりに、3 位に `SELECT users` が上がってきました。1 回は平均 0.2 ミリ秒と最速の部類ですが、**96,276 回**呼ばれて、データベースの時間の 10.7% を使っています。最初の実測では 15,875 回・4.7% でした。要求が増えたぶん、この 1 行で利用者を引くクエリも比例して増えたのです。
+
+### 回数の多さは、呼び方の問題
+
+`SELECT users` の 1 回 0.2 ミリ秒を、インデックスで速くする余地はほとんどありません。主キーで 1 行を引いているからです。減らせるのは**回数**です。一覧のエンドポイントは 20 件の商品を返すために、出品者を 1 件ずつ 20 回引いています。いわゆる N+1 です（第 267 回）。
+
+ISUCON13 で 2 位になった織時屋（traP）の記録にも、同じ型の判断があります（[ISUCON13で2位になりました(織時屋)](https://trap.jp/post/2049/)）。
+
+> slow queryでthemes, users, iconsへの単純SELECTクエリがそれぞれ5万件ほど飛んでおり、user timeでトップなので@tokiがキャッシュする
+
+1 回ずつは速い「単純 SELECT」が、回数のせいで最上位にいる。直し方はインデックスではなく、キャッシュ（第 269 回）や、まとめて引くこと（第 267 回）です。
+
+ただし、スロークエリログには「その 96,276 回が、どの要求から何回ずつ呼ばれたのか」は書かれていません。1 件の要求が 20 回呼んでいるのか、2 万件の要求が 1 回ずつ呼んでいるのかで、直し方は変わります。この区別を付ける方法は第 265 回で扱います。
+
+## 同じ形、違う計画
+
+### 平均の裏にある 2 つの山
+
+2 位に残った一覧のクエリ（`SELECT items ... ORDER BY created_at DESC LIMIT 20 OFFSET ?`）は、インデックスを張った後も 1 回平均 20 ミリ秒かかっています。詳しい報告を見ると、奇妙な点があります。
+
+```text
+# Query 2: 108.43 QPS, 2.17x concurrency, ID 0x0F9B40A8C3A032EE795E3F34AF5747B7 at byte 1871400
+# Attribute    pct   total     min     max     avg     95%  stddev  median
+# ============ === ======= ======= ======= ======= ======= ======= =======
+# Count          2    3253
+# Exec time     39     65s    59us   238ms    20ms    46ms    17ms    17ms
+# Rows sent     27  63.54k      20      20      20      20       0      20
+# Rows examine  97 124.62M      20  49.80k  39.23k  49.01k  19.81k  49.01k
+# Query_time distribution
+#   1us
+#  10us  #
+# 100us  ##############
+#   1ms  ##
+#  10ms  ################################################################
+# 100ms  #
+```
+
+調べた行数の最小は 20 行、最大は 49,800 行です。実行時間の分布も、100 マイクロ秒台と 10 ミリ秒台の 2 つの山に分かれています。同じフィンガープリントの中に、まったく違う 2 種類の実行が混ざっているのです。
+
+スロークエリログの 1 件ずつを `OFFSET` の値で分けて集計しました。
+
+| OFFSET | 件数 | 平均時間 | 調べた行数 |
+| --- | --- | --- | --- |
+| 0 | 55 | 0.31 ms | 20 |
+| 100 | 57 | 0.82 ms | 120 |
+| 200 | 71 | 1.2 ms | 220 |
+| 220 | 60 | 26.83 ms | 50,240 |
+| 960 | 68 | 26.73 ms | 50,980 |
+| 980 | 58 | 24.89 ms | 51,000 |
+
+（`OFFSET` ごとの値から一部を抜き出したもの）
+
+`OFFSET` が 200 までは、調べた行数は `OFFSET + 20` 行で、1 ミリ秒前後です。220 からは、表の全行（約 5 万行）を調べて 25 ミリ秒以上かかっています。`EXPLAIN` で 2 つを比べると、実行計画が違いました。
+
+```text
+mysql> EXPLAIN SELECT id, user_id, title, price, created_at FROM items ORDER BY created_at DESC LIMIT 20 OFFSET 0;
+| type  | key         | rows | Extra               |
+| index | idx_created |   20 | Backward index scan |
+
+mysql> EXPLAIN SELECT id, user_id, title, price, created_at FROM items ORDER BY created_at DESC LIMIT 20 OFFSET 720;
+| type | key  | rows  | Extra          |
+| ALL  | NULL | 50188 | Using filesort |
+```
+
+（列の一部を省略）
+
+`OFFSET` が小さいうちは、インデックスを後ろからたどって 20 件を拾います。`OFFSET` が大きくなると、インデックスをたどってから行を 1 件ずつ取りに行く費用より、表を頭から全部読んで並べ替える方が安い、とオプティマイザが見積もり、計画を切り替えます。第 101 回で見たコストに基づく選択が、リテラルの値 1 つで切り替わった例です。
+
+### フィンガープリントが隠すもの
+
+フィンガープリントは、リテラルの値を `?` に置き換えてまとめます。だからこそ数万件のログを数行に要約できるのですが、**値によって計画が変わるクエリでは、性質の違う実行を 1 行に混ぜてしまいます**。平均の 20 ミリ秒は、0.3 ミリ秒の実行と 27 ミリ秒の実行の加重平均で、どちらの実行の姿でもありません。
+
+この種のクエリを見分ける手掛かりは、報告の中にあります。
+
+- **最小と最大の差が桁で違う**（調べた行数 20 と 49,800）
+- **実行時間の分布の山が 2 つある**
+- **V/M（ばらつきの指標）が大きい**（今回は 0.01 と小さく出ていて、これだけでは気付けませんでした）
+
+気付いたら、報告の末尾の実例だけでなく、遅い側と速い側の実例を両方 `EXPLAIN` にかけます。一覧の直し方（`OFFSET` を使わずに、前のページの最後のキーから続きを取る）は第 273 回で扱います。
+
+## 書き込みの時間
+
+インデックスを張った後の 1 位は `INSERT comments` で、1 回平均 58 ミリ秒でした。調べた行数は 0 行で、行を探す費用はありません。
+
+MySQL 8.0 の既定の設定（`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`）では、トランザクションをコミットするたびに、InnoDB のログとバイナリログをディスクへ同期します。試しに、この 2 つを `SET GLOBAL` で緩めた状態（`2` と `0`）と元の状態で 15 秒ずつ負荷をかけ、performance_schema で `INSERT` の平均を見ました。
+
+| 設定 | 回数 | 1 回の平均 |
+| --- | --- | --- |
+| 同期を緩めた（`2`、`0`） | 237 | 6.542 ms |
+| 既定（`1`、`1`） | 351 | 108.957 ms |
+
+書き込みの時間の大部分は、ディスクへの同期を待つ時間でした。ここで見たいのは設定の良し悪しではなく、**スロークエリログの 1 位が、インデックスで直せる種類のものとは限らない**ということです。同期の回数を減らす方法（まとめて書く、非同期にする）は第 272 回で、その代わりに何を失うかは第 99 回の WAL の話とあわせて扱います。
+
+## 本番で使うとき
+
+**`long_query_time = 0` の費用。** すべてのクエリを書くと、ログの量は要求の数に比例します。今回、インデックスを張った後の 30 秒間のログは 29,236,213 バイト（120,577 件）でした。1 時間続ければ約 3.5 GB です。ISUCON11 本選で優勝した fujiwara組の sfujiwara さんは、終盤の改善として「最後にダメ押しで今までずっと有効にしていた MySQL の slow query log を無効化して更に数字を伸ばした」と書いています（[ISUCON11で優勝しました](https://sfujiwara.hatenablog.com/entry/isucon11-final)）。費用の大きさは第 265 回で測り、止め忘れの扱いは第 278 回で扱います。
+
+本番では、閾値を数百ミリ秒程度にして遅いものだけをログに書き、回数の多い速いクエリは performance_schema の集計で見る、という分担が現実的です。performance_schema の表はサーバーのメモリ上の集計なので、ファイルの書き込みは増えません。定期的に読み出して差分を取れば、時間ごとの推移も作れます。
+
+**ログに残る値。** スロークエリログは、リテラルの値を含む SQL をそのまま書きます。利用者のメールアドレスで検索するクエリなら、そのアドレスがログに残ります。ログの保存先と保存期間は、アクセスログと同じく、何が書かれうるかで決めます。performance_schema のダイジェストは、リテラルを `?` に置き換えた形で持ちます。
+
+**補足の項目。** MySQL 8.0.14 からは `log_slow_extra` を有効にすると、送受信したバイト数（`Bytes_sent` など）、行の読み方ごとの回数（`Read_key`、`Read_rnd_next` など）、並べ替えの回数と行数（`Sort_rows` など）、作った一時表の数（`Created_tmp_disk_tables` など）がファイルに追加されます（[MySQL 8.0 Reference Manual: The Slow Query Log](https://dev.mysql.com/doc/refman/8.0/en/slow-query-log.html)）。表を頭から読んだのか、並べ替えにディスクの一時表を使ったのかなど、`Rows_examined` だけでは分からない費用の手掛かりになります。
+
+**ログの切り替え。** ベンチマークや計測期間ごとにログを分けたいときは、ファイルの名前を変えてからログを切り替えさせます。MySQL の文書は「rename the current log file first before flushing it. At flush time, the server opens the new log file with the original name.」と説明しています（[MySQL 8.0 Reference Manual: Server Log Maintenance](https://dev.mysql.com/doc/refman/8.0/en/log-file-maintenance.html)）。切り替えは `FLUSH LOGS` 文や `mysqladmin flush-logs` で行います。動いている MySQL が開いているファイルを外から空にすると、MySQL は前に書いていた位置から書き続けることがあり、先頭が空白（NUL）で埋まったファイルになります。手元の実験でも、30 秒ぶんのログが実際の内容の 2 倍の大きさになりました。
+
+## 次の回へ
+
+この回では、データベースの時間をどの SQL が使っているかを集計しました。けれど、`SELECT users` の 96,276 回がどの要求から来たのか、データベースの外（アプリケーションとの往復や、アプリケーション自身の処理）でどれだけ時間を使っているのかは、スロークエリログには書かれていません。次の第 265 回では、リクエスト ID を使ってアクセスログとスロークエリログを 1 件ずつ結び、プロファイルと合わせて、1 件の要求の時間がどこで使われているのかを見ます。
+
+## まとめ
+
+- スロークエリログは、`long_query_time` 秒より長くかかった SQL を、実行時間・ロック時間・返した行数・調べた行数とともに記録する
+- 閾値を 0 にしてすべてのクエリを記録すると、1 回は速いが回数の多いクエリも見える。遅いクエリだけを見ていると、データベースが空いたと誤解しやすい
+- `long_query_time` の接続ごとの値は、接続した瞬間に全体の値から写される。`SET GLOBAL` の後は、接続を張り直すまで効かない
+- pt-query-digest は、リテラルを `?` に置き換えたフィンガープリントで SQL をまとめ、既定で実行時間の合計の順に並べる
+- 返した行数に対する調べた行数の比は、インデックスの過不足の手早い目安。ただし集計、`LIMIT` で止まる検索、返す行が多すぎるクエリでは読み替える
+- performance_schema の `events_statements_summary_by_digest` は、ログを書かずに同じ集計をサーバーの中で持つ。手元の MySQL 8.0.46 では、サーバー側のプリペアドステートメントで実行された文はこの表に載らなかった
+- 同じ実行でも、スロークエリログと performance_schema で時間の値は一致しない。順位を読み、絶対値は同じ道具の中で比べる
+- 遅いクエリを直すと、回数の多い速いクエリが上位に浮かぶ。直すべきは 1 回の速さではなく回数で、手はインデックスではなく呼び方の変更
+- フィンガープリントは値の違いを捨てる。値によって実行計画が変わるクエリは、最小と最大の差や分布の山の数で見分け、両側の実例を `EXPLAIN` にかける
+- 調べた行数が 0 でも遅い書き込みは、コミット時のディスクへの同期を待っていることがある。インデックスでは直らない
+- 本番では、ファイルのログは閾値を上げて遅いものだけにし、回数の多いクエリは performance_schema で見る。ログにはリテラルの値が残る

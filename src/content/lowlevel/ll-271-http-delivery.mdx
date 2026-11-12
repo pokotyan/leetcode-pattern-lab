@@ -1,0 +1,405 @@
+---
+title: HTTP とプロキシに任せる
+description: 静的ファイル、画像、変わらない応答を、アプリケーションが毎回作って送る必要はありません。nginx に直接返させる、Cache-Control と ETag で要求そのものや本文を減らす、X-Accel-Redirect で送り出しだけを任せる、圧縮を前もって済ませる、アプリケーションとの接続を使い回す、そして逆に nginx を外す判断まで、Docker の nginx 1.31.8 と Go のアプリケーションで 1 つずつ確かめます
+chapter: tune
+order: 12
+status: published
+topics:
+  - 静的ファイルの配信
+  - Cache-Control
+  - ETag と 304
+  - 条件付き GET
+  - X-Accel-Redirect
+  - internal
+  - gzip_static
+  - upstream keepalive
+  - TIME_WAIT とエフェメラルポート
+  - リバースプロキシを外す
+  - sendfile
+requires:
+  - ll-270-staleness
+  - ll-144-http-cache-cdn
+---
+
+import Callout from '../../components/Callout.astro'
+
+## アプリケーションの外へ出す
+
+第 269 回と第 270 回では、アプリケーションの中で応答を使い回しました。この回では、使い回しをアプリケーションの**外**に任せます。
+
+Web アプリケーションの前には、多くの場合 nginx のようなリバースプロキシが立っています。ブラウザやベンチマーカーは、HTTP の規則に従って応答をキャッシュし、変わっていないかを問い合わせます。この 2 つに仕事を渡せば、アプリケーションは**動的に作らなければならないものだけ**に集中できます。
+
+HTTP のキャッシュの規則そのもの（`max-age` と `s-maxage`、`ETag` と 304、共有のキャッシュで起きる取り違え）は、第 144 回で見ました。この回は、その規則を**サーバの負荷を減らす道具**として使う側から見ます。
+
+| 節 | 何を外へ出すか | 実測 |
+| --- | --- | --- |
+| 静的ファイル | ファイルを読んで送る仕事を nginx へ | アプリ経由と nginx 直接 |
+| 304 と Cache-Control | 本文を送る仕事、要求そのもの | ハッシュを毎回計算する 304 と、保存しておいた 304 |
+| X-Accel-Redirect | 認可はアプリ、送り出しは nginx | アプリが送る、X-Accel、nginx 直接 |
+| 圧縮 | 圧縮の計算を前もって | その場で圧縮と、圧縮済みのファイル |
+| keepalive | アプリとの接続を張る仕事 | 毎回張る、使い回す |
+| nginx を外す | プロキシそのもの | 直接と nginx 経由 |
+
+## 手元の環境
+
+Apple M1 Pro / macOS 26.2、Docker 29.4.0 の上に、同じネットワークで 3 つのコンテナを動かしました。
+
+```
+ hey 0.1.4（コンテナ）──→ nginx 1.31.8 :80 :81 :82 :83 ──→ app（Go 1.24.6）:8080
+                    └─────────────────────────────────────→ app に直接
+```
+
+負荷をかける hey も Linux 向けにビルドしてコンテナの中で動かし、Docker Desktop のポート転送を通らないようにしています。hey は 50 並列で 10 秒ずつ流しました。CPU 使用率は、負荷をかけ始めて 5 秒後の `docker stats` の値です（100% がコア 1 つ分）。
+
+実験の間、同じマシンでは他の作業も動いており、同じ条件でも毎秒の要求数は回によって 2〜4 倍揺れました。以下では、**同じ回に並べて測った組の比**と、揺れても変わらない傾向だけを読み取ります。
+
+nginx の設定の要点は次のとおりです。4 つの `server` が、この回で比べる 4 つの形です。
+
+```nginx
+upstream app_nokeep { server app:8080; keepalive 0; }
+upstream app_keep   { server app:8080; }   # 1.29.7 以降は既定で keepalive 32
+
+server { listen 80; location / { proxy_pass http://app_nokeep; } }  # 初期状態の形
+server { listen 81; location / { proxy_pass http://app_keep; } }    # すべてアプリへ
+
+server {                                                            # 仕事を分けた形
+  listen 82;
+  gzip on;
+  gzip_types application/javascript;
+  location /static/    { root /; expires 1d; }
+  location /protected/ { internal; alias /static/; }
+  location /           { proxy_pass http://app_keep; }
+}
+
+server { listen 83; gzip_static on; location /static/ { root /; } }  # 圧縮済み
+```
+
+静的ファイルは、React の本番用ビルド（`react-dom-client.production.js`、625,168 バイト）と、512 × 512 の JPEG 画像（44,597 バイト）を使いました。
+
+## 静的ファイルは nginx から返す
+
+初期状態のアプリケーションは、JavaScript や CSS、画像まで、アプリケーション自身が返していることがよくあります。Go なら `http.FileServer`、Ruby や Python ならフレームワークの静的ファイルの機能です。これを nginx から直接返すようにするのは、ISUCON ではほぼ毎回の定番です。ISUCON10 本選の講評に載った作問チーム（白金動物園）の解答例にも、静的ファイルの配信の項目として「nginx + static brotli」と「Cache-Control (expires 1d;)」が並んでいます（[講評](https://isucon.net/archives/55140539.html)）。
+
+625 KB の JavaScript を、アプリケーション経由（`:81`）と nginx 直接（`:82`）で 3 回ずつ取りました。圧縮は無しです。
+
+```text
+js app(via :81) | Requests/sec:   845.4641 | 50% in 0.0309 secs 99% in 0.4229 secs | nginx=159.59% app=76.07%
+js nginx        | Requests/sec:  4645.1425 | 50% in 0.0046 secs 99% in 0.0858 secs | nginx=196.02% app=0.00%
+js app(via :81) | Requests/sec:  2019.1028 | 50% in 0.0173 secs 99% in 0.1253 secs | nginx=188.15% app=104.80%
+js nginx        | Requests/sec:  5003.5293 | 50% in 0.0051 secs 99% in 0.0693 secs | nginx=174.29% app=0.00%
+js app(via :81) | Requests/sec:  2024.1054 | 50% in 0.0190 secs 99% in 0.1015 secs | nginx=173.49% app=71.49%
+js nginx        | Requests/sec: 13812.5522 | 50% in 0.0022 secs 99% in 0.0205 secs | nginx=236.42% app=0.00%
+```
+
+（出力から要求の数と接続の数の項目を省いています。以下同じです。）
+
+3 回とも nginx の直接配信が 2.5〜6.8 倍の要求をさばき、アプリケーションの CPU は 0 になっています。アプリケーション経由では、同じ 625 KB がアプリケーションから nginx へ、nginx からクライアントへと 2 回コピーされます。nginx の直接配信では、`sendfile` でカーネルの中のファイルの内容をそのままソケットへ送れます（第 48 回）。
+
+効いているのは速さだけではありません。アプリケーションの CPU が空けば、その分を動的な処理に回せます。ISUCON のように 1 台に nginx とアプリケーションとデータベースが同居している環境では、**アプリケーションの CPU を静的ファイルに使わない**ことの方が大きく効きます。
+
+## 要求そのものを減らす：Cache-Control と 304
+
+静的ファイルをどれだけ速く返しても、要求が来る限り仕事はあります。HTTP には、仕事を減らす段階が 2 つあります。
+
+| 段階 | ヘッダ | クライアントの動き | サーバの仕事 |
+| --- | --- | --- | --- |
+| 本文を送らない | `ETag` / `Last-Modified` | `If-None-Match` などで問い合わせる | 変わっていなければ 304（本文なし） |
+| 要求させない | `Cache-Control: max-age=N` | N 秒の間は問い合わせもしない | なし |
+
+ISUCON11 予選の講評は、この 2 つをそのまま並べています（[講評](https://isucon.net/archives/56044867.html)）。
+
+> ユーザ数の増加により、静的ファイルや icon の取得コストが目立つようになってきます。
+
+> これらのファイルに対しては 304 Not Modified を返すことで、負荷を下げることができます。
+
+> さらに、作成後は内容が変更されないため、Cache-Control に max-age を設定しリクエスト自体を減らすこともできます。
+
+ISUCON10 本選の講評も、静的ファイルについて同じことを書いています。
+
+> また、マニュアルにわざとらしく書いてあるとおり実ベンチマーカーは Cache-Control に対応しているので、 max-age を設定すれば静的ファイルへのリクエスト自体を減らすことができます。
+
+nginx は、静的ファイルに `ETag` を自動で付けます。`etag` の既定値は `on` で、文書は次のように説明しています（[ngx_http_core_module](https://nginx.org/en/docs/http/ngx_http_core_module.html#etag)）。
+
+> Enables or disables automatic generation of the “ETag” response header field for static resources.
+
+手元で確かめると、nginx は `ETag` と `Last-Modified` を付け、`expires 1d` から `Cache-Control: max-age=86400` を作りました。同じ `ETag` を `If-None-Match` に入れると、本文なしの 304 が返ります。
+
+```text
+$ curl -sI 127.0.0.1:32712/static/app.js
+HTTP/1.1 200 OK
+Server: nginx/1.31.8
+Content-Length: 625168
+Last-Modified: Thu, 12 Nov 2026 00:59:00 GMT
+ETag: "6af50f54-98a10"
+Expires: Fri, 13 Nov 2026 00:59:25 GMT
+Cache-Control: max-age=86400
+nginx static INM: 304 0B
+app static (via :81): 200 625168B
+```
+
+nginx の `ETag` は、ファイルの更新時刻と大きさから作られます（`6af50f54` が更新時刻、`98a10` が 625,168 の 16 進数）。中身を読まずに作れるので、問い合わせに答える費用は小さくて済みます。一方、Go の `http.FileServer` は `Last-Modified` は付けますが、`ETag` と `Cache-Control` は付けませんでした。
+
+### 304 を返す前の仕事
+
+304 で本文を省いても、**304 を返すかどうかを決めるまでの仕事**が重ければ、効果は小さくなります。ISUCON13 がまさにこの形でした。講評は、初期実装がアイコン画像のハッシュ値を毎回計算していたことを指摘しています（[講評](https://isucon.net/archives/58001272.html)）。
+
+> fillUserResponse関数(Go言語の場合)でデータベースから画像の生データを受け取り、都度SHA256の計算を行なっているところを、こちらのカラムに変更することで負荷の削減と、次の作業がしやすくなります。
+
+> また、ICON画像は条件付きGETに対応しています。こちらは当日のアプリケーションマニュアルにも書かれていました。画像のハッシュ値をAPIのレスポンスとして返すことで、そのハッシュ値を元に If-None-Match がついたリクエストをベンチマーカーが送ってくる仕様になっています。
+
+アプリケーションに 2 つの書き方を用意しました。`/icon/app` は、要求のたびに画像を読み、SHA-256 を計算して `ETag` と比べます。`/icon/hashed` は、起動時に計算したハッシュを持っておき（ISUCON13 の `icon_hash` 列にあたる）、一致すれば画像を読まずに 304 を返します。
+
+```go
+mux.HandleFunc("/icon/app", func(w http.ResponseWriter, r *http.Request) {
+	b, _ := os.ReadFile("/static/icon.jpg")
+	sum := sha256.Sum256(b)
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Write(b)
+})
+```
+
+一致する `If-None-Match` を付けて、交互に 3 回ずつ流しました。比較のため、`If-None-Match` を付けない（200 で本文を返す）場合も並べています。
+
+```text
+icon app 304 sha256 | Requests/sec:  4123.5648 | [304] 41284 responses  | nginx=33.42% app=126.77%
+icon app 304 saved  | Requests/sec:  9321.9347 | [304] 93254 responses  | nginx=48.75% app=38.60%
+icon app 200 sha256 | Requests/sec:   523.5034 | [200] 5563 responses   | nginx=41.40% app=110.98%
+icon app 304 sha256 | Requests/sec:  4284.5704 | [304] 43218 responses  | nginx=27.57% app=119.49%
+icon app 304 saved  | Requests/sec:  8058.6496 | [304] 80690 responses  | nginx=38.30% app=33.27%
+icon app 200 sha256 | Requests/sec:  4365.1384 | [200] 43689 responses  | nginx=60.36% app=118.34%
+icon app 304 sha256 | Requests/sec:  3132.2066 | [304] 31371 responses  | nginx=25.13% app=146.88%
+icon app 304 saved  | Requests/sec: 12536.3885 | [304] 125381 responses | nginx=41.92% app=48.20%
+icon app 200 sha256 | Requests/sec:  1077.6837 | [200] 10884 responses  | nginx=33.78% app=60.14%
+```
+
+- ハッシュを毎回計算する 304 は、毎秒 3,100〜4,300 件で、アプリケーションの CPU は 120〜147% でした。本文は送っていないのに、CPU はほとんど減っていません。2 回目の組では、200 で本文を返した場合（4,365 件）とほぼ同じです。
+- 保存しておいたハッシュで答える 304 は、毎秒 8,100〜12,500 件で、アプリケーションの CPU は 33〜48% に下がりました。同じ組で比べて 2〜4 倍です。
+- 200 の行は 523〜4,365 件と大きく揺れました。本文 44 KB を送る分、他の負荷の影響を強く受けています。
+
+**304 は通信量を減らしますが、計算は減らしません。** 計算を減らすには、比べる値（ハッシュ、更新時刻、版）を前もって持っておく必要があります。
+
+<Callout type="warn" title="If-None-Match の比べ方">
+  上のコードは、ヘッダの値と ETag を文字列としてそのまま比べています。
+  `If-None-Match` には複数の値や弱い比較（`W/` 付き）が入ることがあり、本来はそれらを解釈して比べます。
+  ISUCON13 の講評も、追記で、講評に載せた比べ方は「アドホックなもの」で一般的なサーバの実装としては必ずしも適切でない場合があると断っています。
+  手で書くより、フレームワークや `http.ServeContent` の条件付きリクエストの処理を使う方が安全です。
+</Callout>
+
+### max-age はクライアント次第
+
+`Cache-Control: max-age` で要求そのものが減るのは、**クライアントがその指示に従ってキャッシュする場合だけ**です。ISUCON のベンチマーカーは、回ごとに、どのヘッダに従うかがマニュアルに書かれています。ISUCON10 本選のように「Cache-Control に対応している」と明記された回もあれば、そうでない回もあります。ISUCON2026 で優勝した Typing Bears の参加記は、採用しなかった変更の 1 つとして次のように書いています（[参加記](https://zenn.dev/luvtechno/articles/isucon2026-competition-day)）。
+
+> 応答にキャッシュの有効期限を付ける（Cache-Control: max-age=4）: 532,435 点。ベンチマーカーはキャッシュしませんでした
+
+本番では、ブラウザは `max-age` に従いますが、HTTP クライアントのライブラリの多くは何もしなければキャッシュしません。API の利用者がどんなクライアントを使っているかで、`max-age` の効果は変わります。
+
+## 送り出しだけを任せる：X-Accel-Redirect
+
+画像やファイルを返す前に、**誰に見せてよいか**の判断が要ることがあります。ログインした本人にだけ見せるファイル、有効期限付きの URL などです。この判断はアプリケーションにしかできません。かといって、判断のためにアプリケーションが本文まで送ると、静的ファイルのときと同じ費用がかかります。
+
+nginx の `X-Accel-Redirect` は、この 2 つを分けます。アプリケーションは判断だけをして、応答のヘッダに `X-Accel-Redirect: /protected/icon.jpg` を入れて返します。nginx はそれを見て、指定された場所へ内部で転送し、ファイルを自分で送ります。nginx の文書は、`proxy_ignore_headers` の説明の中でこのヘッダの働きを次のように書いています（[ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_ignore_headers)）。
+
+> “X-Accel-Redirect” performs an internal redirect to the specified URI;
+
+転送先の `location` には `internal` を付け、外から直接取られないようにします（[ngx_http_core_module](https://nginx.org/en/docs/http/ngx_http_core_module.html#internal)）。
+
+> Specifies that a given location can only be used for internal requests. For external requests, the client error 404 (Not Found) is returned.
+
+```go
+mux.HandleFunc("/icon/accel", func(w http.ResponseWriter, r *http.Request) {
+	// ここで、この利用者に見せてよいかを判断する
+	w.Header().Set("X-Accel-Redirect", "/protected/icon.jpg")
+})
+```
+
+```text
+icon/accel via :82: 200 44597B image/jpeg
+protected direct: 404
+```
+
+`/protected/` を持たない `:81` に同じ要求を送ると、nginx は内部の転送先をアプリケーションに渡してしまい、404 になりました。X-Accel-Redirect は nginx の設定と組で働きます。
+
+3 つの返し方を 3 回ずつ比べました。
+
+```text
+icon app sha256   | Requests/sec:  1573.2180 | nginx=31.52%  app=81.96%
+icon x-accel      | Requests/sec:  8856.6409 | nginx=119.66% app=25.63%
+icon nginx static | Requests/sec: 18182.2239 | nginx=145.51% app=0.00%
+icon app sha256   | Requests/sec:  2805.7498 | nginx=24.67%  app=105.08%
+icon x-accel      | Requests/sec:  9410.3682 | nginx=0.00%   app=0.00%
+icon nginx static | Requests/sec: 14731.8076 | nginx=228.63% app=0.00%
+icon app sha256   | Requests/sec:  3839.1480 | nginx=42.20%  app=98.37%
+icon x-accel      | Requests/sec:  6720.1406 | nginx=191.64% app=53.84%
+icon nginx static | Requests/sec:  3437.9367 | nginx=97.73%  app=0.00%
+```
+
+2 回目の X-Accel の CPU が両方 0.00% なのは、`docker stats` の取得がうまくいかなかったためです。3 回目の `nginx static` は、他の負荷で大きく落ちています。
+
+最初の 2 回では、X-Accel はアプリケーションが送る場合の 3〜6 倍、nginx の直接配信はさらにその 1.5〜2 倍でした。X-Accel の要求は、アプリケーションを 1 往復するぶん直接配信より重くなりますが、本文はアプリケーションを通りません。
+
+### データベースに画像を入れない
+
+ISUCON では、画像がデータベースの列に入っている初期実装がよく出てきます（ISUCON11 予選の ISU の画像、ISUCON13 のアイコンなど）。この場合、画像を返すたびにデータベースから本文を読み、アプリケーションを通して送ります。上の `icon app` より、データベースの往復と転送の分だけさらに重くなります。
+
+ISUCON11 予選の講評は、画像の列について次のように書いています。
+
+> isu の SELECT はSELECT *というように画像データまで取得するクエリが多くありました。ここで image を取得しないように修正すると、あまり手間をかけずに DB との通信量を減らすことができます。
+
+画像を返す処理でなくても、`SELECT *` が画像の列まで運んでいることがあります。画像をファイルに書き出して nginx から返す（認可が要るなら X-Accel-Redirect で）、データベースからは画像の列を読まない、の 2 つが典型的な直し方です。ファイルに書き出すと、複数台にしたときに**どのサーバにファイルがあるか**という問題が生まれます。これは第 275 回で扱います。
+
+## 圧縮を前もって済ませる
+
+テキストのファイルは、圧縮すると転送量が大きく減ります。圧縮の仕組みと、秘密を含む応答を圧縮したときの危険は第 161 回で見ました。ここでは**圧縮の計算を誰がいつするか**を見ます。
+
+ISUCON10 本選の講評は、ベンチマーカーの送るヘッダについて次のように書いています。
+
+> 実ベンチマーカーはリクエストの際に Accept-Encoding: gzip, br, deflate のリクエストヘッダを送っていました。静的ファイルのリクエストはネットワーク帯域を考えるとそれなりに無視できない量があったはずで、nginx 等を用いて static gzip の設定をするか、実は対応していた brotli にしてあげるとかなり転送量を抑えられたかと思います。
+
+nginx の `gzip on` は、要求のたびにその場で圧縮します。`gzip_static on` は、あらかじめ `.gz` を付けて置いた圧縮済みのファイルを返します（[ngx_http_gzip_static_module](https://nginx.org/en/docs/http/ngx_http_gzip_static_module.html)）。
+
+> The ngx_http_gzip_static_module module allows sending precompressed files with the “.gz” filename extension instead of regular files.
+
+`gzip -9 -k app.js` で `app.js.gz` を作り、2 つを比べました。まず大きさです。
+
+```text
+gzip :32712 144990B      ← gzip on（その場で圧縮。既定の圧縮レベル 1）
+gzip :32713 110457B      ← gzip_static（gzip -9 で前もって圧縮）
+```
+
+その場の圧縮は、速さを優先する既定のレベル 1 なので、前もって最大のレベルで圧縮したものより 31% 大きくなりました。
+
+次に、`Accept-Encoding: gzip` を付けて負荷をかけました。hey（Go の HTTP クライアント）は何もしなければ受け取った gzip を展開するので、ヘッダを明示して展開させないようにしています（1 回目は展開させてしまい、クライアント側の展開の速さを測っていたので除外しました）。
+
+```text
+js nginx gzip on     | Requests/sec:   384.9013 | 50% in 0.0603 secs 99% in 0.5921 secs | nginx=549.96%
+js nginx gzip_static | Requests/sec:  5045.7027 | 50% in 0.0036 secs 99% in 0.0816 secs | nginx=168.48%
+js nginx gzip on     | Requests/sec:   766.8462 | 50% in 0.0439 secs 99% in 0.2750 secs | nginx=542.36%
+js nginx gzip_static | Requests/sec: 15549.0026 | 50% in 0.0016 secs 99% in 0.0232 secs | nginx=203.97%
+```
+
+その場の圧縮は、nginx が CPU を 5 コア以上使って毎秒 385〜767 件しか返せませんでした。圧縮済みのファイルなら 13〜20 倍の件数を、より少ない CPU で返しています。625 KB を要求のたびに圧縮し直すのは、同じ計算を何万回も繰り返しているのと同じです。
+
+変わらないファイルは前もって圧縮し、その場の圧縮は動的な応答だけに使います。その場の圧縮を使う場合も、小さな応答（数百バイト以下）は圧縮しても縮まず CPU だけを使うので、`gzip_min_length` で除外します。
+
+<Callout type="note" title="その場の圧縮は ETag を弱くする">
+  `gzip on` で圧縮した応答では、nginx は ETag を `W/"6af50f54-98a10"` のように弱い ETag に変えました。
+  圧縮の結果がバイト単位で同じとは限らないためです。
+  弱い ETag でも `If-None-Match` による 304 は働きますが、範囲を指定した要求（Range）には使えません。
+</Callout>
+
+## アプリケーションとの接続を使い回す
+
+nginx とアプリケーションの間も TCP の接続です。要求のたびに接続を張って閉じると、3 ウェイハンドシェイクと切断の往復が毎回加わります（第 66 回）。nginx は `upstream` の `keepalive` で、アプリケーションとの接続を使い回せます。
+
+nginx 1.29.7 で、この既定値が変わりました。現在の文書は次のように書いています（[ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive)）。
+
+> Since 1.29.7, keepalive connections are enabled by default, with a default limit of 32 connections per each worker process.
+
+> For HTTP, the proxy_http_version directive should be “1.1” (by default since 1.29.7) or set to “2” and the “Connection” header field should be cleared.
+
+それより前の版では、`keepalive` を書き、`proxy_http_version 1.1` と `proxy_set_header Connection ""` を加えないと、接続は毎回張り直されていました。ISUCON の過去問の環境はこれより古い nginx を使っているので、この設定は今も「最初にやること」の 1 つです。今回の nginx 1.31.8 では、`keepalive 0` を書いて昔の動きを再現しました。
+
+25 バイトの JSON を返す API を、使い回さない（`:80`）、使い回す（`:81`）で比べました。`new_conns` は、アプリケーションが受け付けた新しい接続の数です。
+
+```text
+api nginx keepalive0  | Requests/sec:  1776.2087 | 50% in 0.0114 secs 99% in 0.1793 secs | [200] 17797 responses  | new_conns=17798
+api nginx keepalive32 | Requests/sec:  9220.4356 | 50% in 0.0025 secs 99% in 0.0418 secs | [200] 92250 responses  | new_conns=137
+api nginx keepalive0  | Requests/sec:  2715.2057 | 50% in 0.0073 secs 99% in 0.1252 secs | [200] 27218 responses  | new_conns=27219
+api nginx keepalive32 | Requests/sec: 12627.7188 | 50% in 0.0019 secs 99% in 0.0320 secs | [200] 126435 responses | new_conns=542
+api nginx keepalive0  | Requests/sec:  1859.1799 | 50% in 0.0084 secs 99% in 0.2637 secs | [200] 18678 responses  | new_conns=18679
+api nginx keepalive32 | Requests/sec:  9946.7725 | 50% in 0.0018 secs 99% in 0.0543 secs | [200] 100513 responses | new_conns=137
+```
+
+使い回さないと、要求の数とほぼ同じ数の接続を張っています（17,797 件の応答に 17,798 本）。使い回すと、10 万件前後の応答を 137〜542 本の接続でさばき、毎秒の要求数は 4.6〜5.4 倍になりました。
+
+使い回す場合でも、接続の数は 32 × ワーカー数（今回は 8）の 256 本を超えることがありました。`keepalive 32` は**空いた接続を手元に残しておく数**の上限で、同時に使う接続の数の上限ではないからです。文書も「the keepalive directive does not limit the total number of connections to upstream servers」と注意しています。
+
+### 使い回さないと、ポートが尽きる
+
+この実験を続けて流したとき、`keepalive 0` の回に 502 Bad Gateway が出始めました。2 回目には、10 秒間の要求のすべてが 502 になりました。
+
+```text
+api nginx keepalive0  | Requests/sec: 3254.4088 | [200] 28008 responses [502] 4810 responses | new_conns=28009
+api nginx keepalive32 | Requests/sec: 11102.3057 | [200] 104562 responses [502] 7128 responses | new_conns=66
+api nginx keepalive0  | Requests/sec: 436.2355 | [502] 4414 responses | new_conns=1
+```
+
+nginx のエラーログには、同じ行が 2 万回以上並んでいました。
+
+```text
+$ docker logs tune-271-nginx 2>&1 | grep -o "connect() to [^ ]* failed ([0-9]*: [^)]*)" | sort | uniq -c
+  20946 connect() to 192.168.166.2:8080 failed (99: Cannot assign requested address)
+$ docker exec tune-271-nginx cat /proc/sys/net/ipv4/ip_local_port_range
+32768	60999
+```
+
+接続を張る側（ここでは nginx）は、接続ごとに送信元のポートを 1 つ使います。使えるポートは 32768〜60999 の 28,232 個です。そして、自分から閉じた接続は、閉じた後もしばらく TIME_WAIT という状態でポートを持ち続けます（Linux では 60 秒）。毎秒 2,000〜3,000 本の接続を張っては閉じると、10 秒ほどで 2 万〜3 万個のポートが TIME_WAIT で埋まり、新しい接続を張れなくなります。直後に測った TIME_WAIT の数は 28,281 でした。
+
+2 行目の `keepalive 32` の回でも 502 が出ているのは、直前の `keepalive 0` の回が残した TIME_WAIT のためです。使い回す設定でも、新しい接続を張る必要が生じた瞬間にポートが無ければ失敗します。
+
+ISUCON11 予選の講評が、トレンドを改善してユーザが増えたときに「ファイルディスクリプタ数の上限を増やすなど、nginx、アプリケーション、DB の各種 limit パラメーターを緩和しないとエラーが出て fail することがあります」と書いているのは、こうした**速くしたことで初めて当たる上限**のことです。接続を使い回すことは、速さだけでなく、こうした上限から遠ざかるためにも必要です。
+
+## nginx を外す
+
+ここまでは nginx に仕事を渡す話でした。逆に、**nginx そのものを外す**という判断もあります。ISUCON11 予選の講評は、チューニングの候補の 1 つとして「そもそもnginxを使わず、直接アプリケーションと通信させるようにする」を挙げています。
+
+ISUCON13 で 2 位になった織時屋（traP）の参加記は、反省点として次のように書いています（[参加記](https://trap.jp/post/2049/)）。
+
+> nginxの負荷に悩んでいたのでnginxを剥がす作業をするべきだった
+
+ISUCON2026 で優勝した Typing Bears の参加記では、11 時 7 分から 14 分の作業として「署名を前もって計算し、nginx を外す（139,709 → 388,921）」が挙がっています（[参加記](https://zenn.dev/luvtechno/articles/isucon2026-competition-day)）。この参加者は 1 人で参加し、作業の大半を Claude Code のエージェントに任せていたため、判断の経緯は人間のチームとは異なります。参加記自身も、2 つの変更を同じ走行で入れたので効果を分けて測れていないと書いています。
+
+> 署名テーブルと nginx の撤去を同じ走行で入れたので、それぞれの効果は分けて測れていませんでした。
+
+手元で、25 バイトの API を直接（`app:8080`）と nginx 経由（`:81`、接続は使い回す）で比べました。
+
+直前の実験が残した TIME_WAIT が消えるのを待ってから、2 つを交互に 3 回ずつ流しています。
+
+```text
+api direct            | Requests/sec: 44459.6564 | 50% in 0.0005 secs 99% in 0.0091 secs | app=100.48%
+api nginx keepalive32 | Requests/sec:  9185.3169 | 50% in 0.0010 secs 99% in 0.0445 secs | nginx=22.57% app=38.62%
+api direct            | Requests/sec: 17806.1544 | 50% in 0.0010 secs 99% in 0.0255 secs | app=97.21%
+api nginx keepalive32 | Requests/sec:  3092.4303 | 50% in 0.0036 secs 99% in 0.1477 secs | nginx=41.88% app=49.63%
+api direct            | Requests/sec: 16873.2429 | 50% in 0.0012 secs 99% in 0.0256 secs | app=95.13%
+api nginx keepalive32 | Requests/sec:  9001.5133 | 50% in 0.0029 secs 99% in 0.0386 secs | nginx=58.68% app=43.56%
+```
+
+揺れは大きいものの、3 組とも直接の方が 1.9〜5.8 倍多くの要求をさばいています。直接のときはアプリケーションが CPU をほぼ 1 コア分使い切っているのに対し、nginx 経由ではアプリケーションの CPU は 40〜50% にとどまり、待ちが増えています。応答が 25 バイトしかない API では、1 件あたりの仕事の大半が「受け取って渡す」ことなので、プロキシ 1 段の費用が相対的に大きく出ます。応答を作る処理が重い API なら、この差は小さくなります。
+
+### 外すかどうかの判断
+
+nginx を外して得られるのは、プロキシ 1 段分の CPU とコピーと往復です。失うものも並べておきます。
+
+| nginx が担っていたこと | 外したときの代わり |
+| --- | --- |
+| 静的ファイルの配信 | アプリケーションで返す。静的ファイルが多いなら外さない |
+| アクセスログ（alp で集計する。第 263 回） | アプリケーションでログを書く。Typing Bears も Go でアクセスログを書くようにしている |
+| TLS の終端、HTTP/2 | アプリケーションで行う。CPU の使い方が変わる |
+| 複数台への振り分け | DNS やベンチマーカーの設定で振り分ける |
+| 遅いクライアントの吸収（バッファリング） | アプリケーションが遅いクライアントに付き合う |
+
+判断の手がかりは、**nginx が CPU をどれだけ使っているか**です。上の keepalive の実験では、要求の小さな API に対して nginx がアプリケーションと同じかそれ以上の CPU を使う場面がありました。動的な API が大半で、静的ファイルを別の手段（`max-age` で要求自体を減らす、CDN に置く）で片付けた後なら、nginx を外す候補になります。逆に、静的ファイルや画像の配信が多いうちは、ここまで見たように nginx に任せる方が速くなります。
+
+本番のサービスでは、nginx やロードバランサを外すことはまずありません。TLS の終端、振り分け、遅いクライアントの吸収、障害時の切り離しといった、性能以外の役割を担っているからです（第 87 回）。それでも「プロキシ 1 段にも費用がある」ことは変わりません。プロキシを何段も重ねた構成では、1 段ごとの接続の使い回しと、各段で同じ仕事（圧縮、ログ）を二重にしていないかを確かめます。
+
+次の第 272 回では、読み込みの側から書き込みの側に移ります。書き込みをまとめる、後回しにする、という技術です。
+
+## まとめ
+
+- 静的ファイルは nginx から直接返す。実測では、アプリケーション経由の 2.5〜6.8 倍をさばき、アプリケーションの CPU は 0 になった
+- HTTP には仕事を減らす段階が 2 つある。304 は本文を送らない。`Cache-Control: max-age` は要求そのものをさせない
+- nginx は静的ファイルに ETag を自動で付け、`expires` から `Cache-Control` を作る。Go の `http.FileServer` は ETag を付けなかった
+- 304 は通信量を減らすが、計算は減らさない。要求のたびに SHA-256 を計算する 304 は、保存しておいたハッシュで答える 304 の 2〜4 倍遅かった（ISUCON13 の icon_hash）
+- `max-age` が効くのはクライアントが従うときだけ。ベンチマーカーやクライアントのライブラリがキャッシュするかを確かめる
+- 認可が要るファイルは、判断だけをアプリケーションで行い、送り出しを X-Accel-Redirect で nginx に任せる。転送先には `internal` を付ける
+- 画像をデータベースに入れない。少なくとも `SELECT *` で画像の列を運ばない
+- 変わらないファイルは前もって圧縮して `gzip_static` で返す。その場の圧縮より 13〜20 倍多く返せ、大きさも 24% 小さかった
+- nginx とアプリケーションの接続は使い回す。使い回さないと要求ごとに接続を張り、毎秒の要求数は約 5 分の 1 になった。nginx 1.29.7 からは既定で使い回すが、過去問の環境の nginx は古い
+- 接続を張っては閉じると、TIME_WAIT で送信元のポートが尽き、502 になる。実測では 2 万回以上の `Cannot assign requested address` が出た
+- nginx を外すと 1 段分の費用が消えるが、静的ファイル、ログ、TLS、振り分けの役割を誰が引き継ぐかを先に決める
