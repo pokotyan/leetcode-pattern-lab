@@ -1,0 +1,381 @@
+---
+title: 閉じたアプリに届ける（Web Push と FCM）
+description: タブを閉じたブラウザや、OS に止められたスマートフォンのアプリには、サーバから接続を張れない。そこで端末との接続をブラウザや OS の事業者の配信基盤に預け、サーバは暗号化した短いメッセージを渡すだけにする。Web Push の購読・暗号化・VAPID を手で組んで本物の Chrome に届け、FCM と APNs が引き受けることと、アプリの側で作らなければならないことを分ける
+chapter: realtime
+order: 2
+status: published
+topics:
+  - Web Push（RFC 8030）
+  - push service
+  - PushManager.subscribe
+  - userVisibleOnly
+  - メッセージの暗号化（RFC 8291 / aes128gcm）
+  - VAPID（RFC 8292）
+  - TTL / Topic / Urgency
+  - Service Worker の push イベント
+  - ホーム画面の Web アプリと Declarative Web Push
+  - FCM（Firebase Cloud Messaging）
+  - APNs
+  - notification メッセージと data メッセージ
+  - トピック配信 / collapse key
+  - 登録トークンの掃除
+  - Notification Service Extension
+  - 通知チャネルと POST_NOTIFICATIONS
+requires:
+  - ll-88-server-push
+  - ll-149-symmetric
+  - ll-150-public-key
+  - ll-179-jwt
+---
+
+import Callout from '../../components/Callout.astro'
+
+## この回で見るもの
+
+前回の SSE と WebSocket は、どれも**画面が開いている間だけ**働きます。タブを閉じればブラウザは接続を切りますし、スマートフォンの OS は、画面に出ていないアプリの通信を電池のために止めます。止まったアプリに向けて、サーバから新しい接続を張る手段はありません。端末の多くは NAT の内側にいて、外から到達できる住所を持たないからです。
+
+それでも、チャットの新着や二段階認証の確認は、アプリを閉じていても届きます。仕組みは単純です。
+
+- 端末の OS（またはブラウザ）が、**自分の事業者の配信サーバとの接続を 1 本だけ**張り続ける
+- アプリのサーバは、端末ではなく**その配信サーバ**にメッセージを渡す
+- 配信サーバは、その 1 本の接続で端末に届け、OS がアプリを起こすか、通知を出す
+
+この配信サーバを、Web Push の仕様は **push service** と呼びます。Chrome では Google の FCM、Safari では Apple の APNs、Firefox では Mozilla の Autopush がこの役を担います。どれを使うかはブラウザが決め、サイトの側は選べません（[web.dev: How push works](https://web.dev/articles/push-notifications-overview)）。ネイティブアプリでも構図は同じで、Android は FCM、iOS は APNs です。
+
+この回では、まず Web Push を標準モジュールだけで組み、RFC のテストベクタと照合したうえで、本物の Chrome が作った購読に送って届くことを確かめます。そのあとで FCM を見て、**FCM を使えば何が済み、何をしたいときにアプリの側で作る必要があるのか**を分けます。
+
+## 実験の環境
+
+| 項目 | バージョン |
+| --- | --- |
+| OS | macOS（Darwin 25.2.0、arm64） |
+| Node | v24.22.1（暗号化、VAPID、push service の模型をすべて `node:crypto` と `node:http` で実装） |
+| Google Chrome | 157.0.8103.52（Playwright 1.56.1 から起動。通知の許可は `grantPermissions` で与えた） |
+
+FCM の HTTP v1 API（ネイティブアプリ向けの送信口）は、Firebase のプロジェクトとサービスアカウントが無いと呼べないため、この回では実行していません。後半の FCM の記述は、すべて公式ドキュメントに基づきます。
+
+## 3 者の関係
+
+Web Push の登場人物は 3 つです（[RFC 8030 2](https://www.rfc-editor.org/rfc/rfc8030.html#section-2)）。
+
+```
+  アプリケーションサーバ                 push service                     ブラウザ（user agent）
+  （自分のサーバ）                       （FCM / APNs / Autopush）
+        │                                      │                                 │
+        │                                      │◀── ① 購読を作る ───────────────│
+        │◀──────────── ② 購読（endpoint と鍵）をサイトの JS が送る ─────────────│
+        │                                      │                                 │
+        │── ③ POST endpoint ──────────────────▶│                                 │
+        │    暗号化した本文 + VAPID の署名       │── ④ 常時接続で届ける ─────────▶│
+        │◀── 201 Created ──────────────────────│                       Service Worker が起きて
+        │    （受け付けた。届いたではない）        │                       通知を出す
+```
+
+押さえておくことは 3 つあります。
+
+- **push service は中身を読めない。** 本文はブラウザだけが持つ鍵で暗号化して渡す（RFC 8291）
+- **push service は送り主を確かめる。** 購読を作ったサイトのサーバだけが送れるよう、署名を付ける（RFC 8292、VAPID）
+- **201 は配達ではない。** RFC 8030 は 201 を「受け付けた」とし、ブラウザに届いたことは示さないと書いています（[RFC 8030 5](https://www.rfc-editor.org/rfc/rfc8030.html#section-5)）
+
+## 購読を作る
+
+ブラウザの側では、Service Worker を登録し、`PushManager.subscribe()` を呼びます。
+
+```js
+const reg = await navigator.serviceWorker.register('/sw.js')
+const sub = await reg.pushManager.subscribe({
+  userVisibleOnly: true,
+  applicationServerKey: VAPID_PUBLIC_KEY, // アプリケーションサーバの P-256 公開鍵
+})
+await fetch('/api/subscriptions', { method: 'POST', body: JSON.stringify(sub) })
+```
+
+手元の Chrome 157 で作った購読は次のようになりました（長い値は途中で切っています）。
+
+```
+{"endpoint":"https://fcm.googleapis.com/fcm/send/ePOXfnuhQGQ…",
+ "expirationTime":null,
+ "keys":{"p256dh":"BDommDm4sjLJVts1vwN1…","auth":"OM8taRP8VOyvgEWE26mDFA"}}
+```
+
+- `endpoint` は、この購読に送るための URL です。Chrome では `fcm.googleapis.com` になります。Chrome 自身も、送信先のオリジンが `fcm.googleapis.com` なら正しく動いている、と説明しています（[Chrome for Developers](https://developer.chrome.com/blog/web-push-interop-wins)）
+- `p256dh` は、ブラウザが作った P-256 の公開鍵です。本文の暗号化に使います
+- `auth` は、ブラウザが作った 16 バイトの秘密の値です（[RFC 8291 3.2](https://www.rfc-editor.org/rfc/rfc8291.html#section-3.2)）
+
+この 3 つを自分のサーバに保存しておけば、以後はいつでもメッセージを送れます。逆に言えば、**`endpoint` と鍵が漏れれば、VAPID の秘密鍵を持たない第三者でも中身を読めるメッセージは作れてしまう**ので、購読の情報は認証情報に準じて扱います（送ること自体は、次に見る VAPID で止められます）。
+
+<Callout type="warn" title="userVisibleOnly は true しか通らない">
+  Push API の仕様は、ブラウザが「必ず通知を出すこと」を求める場合に、`userVisibleOnly: false` の購読を拒否してよいとしています（[W3C Push API](https://www.w3.org/TR/push-api/)）。
+  Chrome はユーザーに見えるメッセージを伴う購読しか受け付けません（[web.dev](https://web.dev/articles/push-notifications-subscribing-a-user)）。
+  さらに、push イベントで通知を出さなかった場合、Chrome は「This site has been updated in the background.」という既定の通知を代わりに出します（[web.dev](https://web.dev/articles/push-notifications-handling-messages)）。
+  **画面に何も出さずにデータだけを同期する用途には、Web Push は使えない**と考えてください。
+</Callout>
+
+## 中身を暗号化する（RFC 8291）
+
+push service は第三者です。中身を読まれないよう、アプリケーションサーバはブラウザの公開鍵に向けて本文を暗号化します。手順は TLS 1.3 の鍵の作り方とよく似ています（第 160 回）。
+
+1. アプリケーションサーバが、送るたびに使い捨ての P-256 の鍵ペアを作る
+2. その秘密鍵とブラウザの `p256dh` で **ECDH** を行い、共有の秘密を得る（第 150 回）
+3. 共有の秘密と `auth` を **HKDF** に通して中間の鍵を作り、さらにランダムな 16 バイトの salt と混ぜて、AES-128-GCM の鍵と nonce を作る（第 148 回、第 149 回）
+4. 本文の後ろに区切りの 1 バイト `0x02` を付け、AES-128-GCM で暗号化する
+
+鍵を導く部分は、`node:crypto` で次の数行です。
+
+```js
+// key_info = "WebPush: info" || 0x00 || ua_public || as_public
+const keyInfo = Buffer.concat([Buffer.from('WebPush: info\0'), uaPub, asPub])
+const ikm = hkdf(auth, ecdhSecret, keyInfo, 32)
+const cek = hkdf(salt, ikm, Buffer.from('Content-Encoding: aes128gcm\0'), 16)
+const nonce = hkdf(salt, ikm, Buffer.from('Content-Encoding: nonce\0'), 12)
+```
+
+できた本文の先頭には、受け手が復号に使う情報が平文で並びます（[RFC 8188 2.1](https://www.rfc-editor.org/rfc/rfc8188.html#section-2.1)）。
+
+| 位置 | 長さ | 中身 |
+| --- | --- | --- |
+| 0 | 16 | salt |
+| 16 | 4 | レコードの大きさ（4096） |
+| 20 | 1 | 次の欄の長さ（65） |
+| 21 | 65 | アプリケーションサーバの使い捨ての公開鍵 |
+| 86 | 残り | 暗号文と、GCM の認証タグ 16 バイト |
+
+RFC 8291 の付録 A には、固定の鍵と salt で計算した途中の値がすべて載っています。同じ入力で自作の実装を動かすと、すべて一致しました。
+
+```
+$ node testvector.mjs
+IKM    S4lYMb_L0FxCeq0WhDx813KgSYqU26kOyzWUdsXYyrg true
+CEK    oIhVW04MRdy2XN9CiKLxTg true
+NONCE  4h_95klXJ5E_qnoN true
+body   144 bytes, matches RFC 8291 section 5: true
+decrypt "When I grow up, I want to be a watermelon"
+```
+
+本文の大きさには上限があります。push service は 4096 バイトを超える本文を受け付けなくてもよく、見出しの 86 バイト、認証タグの 16 バイト、区切りの 1 バイトを引くと、**平文は最大 3993 バイト**です（[RFC 8291 4](https://www.rfc-editor.org/rfc/rfc8291.html#section-4)）。画像や長い本文は送れないので、通知には「何が起きたか」と ID だけを入れ、詳細は Service Worker が自分のサーバから取りに行くのが普通です。
+
+## 送り主を名乗る（VAPID）
+
+購読の作成時に `applicationServerKey` を渡すと、その購読は**その鍵の持ち主からのメッセージだけを受け付ける**ようになります（[RFC 8292 4](https://www.rfc-editor.org/rfc/rfc8292.html#section-4)）。送るときは、対応する秘密鍵で署名した JWT（第 179 回）を付けます。
+
+```
+Authorization: vapid t=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOi…, k=BKx…（公開鍵）
+```
+
+JWT の中身は 3 つです（[RFC 8292 2](https://www.rfc-editor.org/rfc/rfc8292.html#section-2)）。
+
+- `aud`: 送り先の push service のオリジン（`https://fcm.googleapis.com` など）。必須
+- `exp`: 有効期限。必須で、**要求の時刻から 24 時間を超えてはならない**
+- `sub`: 連絡先の `mailto:` か `https:` の URI。push service の運営者が、問題のある送り手に連絡するためのもの
+
+署名の鍵（VAPID）と、本文の暗号化に使う使い捨ての鍵は、別にしなければなりません（[RFC 8292 2](https://www.rfc-editor.org/rfc/rfc8292.html#section-2)）。
+
+## 本物の Chrome に送る
+
+ここまでの実装で、Chrome 157 の購読に実際に送りました。送り先は Google の `fcm.googleapis.com` です。
+
+```
+endpoint origin: https://fcm.googleapis.com
+normal                 -> 201 Created
+service worker got: [{"text":"hello from app server","at":1794798999347}]
+no VAPID               -> 401 Unauthorized  Authorization header must be specified: unauthenticated
+other VAPID key        -> 403 Forbidden  the VAPID credentials in the authorization header do not correspond to the credentials used to create the subscriptions.
+body 4096              -> 201 Created
+body 4097              -> 400 Bad Request  binary data passed in the request must be less than 4096 bytes.
+no TTL                 -> 201 Created
+unsubscribed +0s       -> 201 Created
+unsubscribed +5s       -> 410 Gone  push subscription has unsubscribed or expired.
+unsubscribed +30s      -> 410 Gone  push subscription has unsubscribed or expired.
+```
+
+自作の暗号化と署名で、Service Worker に本文が届きました。拒否の応答からは、RFC と実際の push service の違いも見えます。
+
+- **署名が無ければ 401、別の鍵なら 403。** RFC 8292 が例に挙げているとおりの使い分けです（[RFC 8292 4.2](https://www.rfc-editor.org/rfc/rfc8292.html#section-4.2)）
+- **4097 バイトは 413 ではなく 400。** RFC 8030 は大きすぎる本文に 413 を返してよいとしていますが（[RFC 8030 7.2](https://www.rfc-editor.org/rfc/rfc8030.html#section-7.2)）、FCM は 400 を返しました
+- **TTL が無くても 201。** RFC 8030 は TTL の無い要求に 400 を返さなければならないとしていますが（[RFC 8030 5.2](https://www.rfc-editor.org/rfc/rfc8030.html#section-5.2)）、FCM は受け付けました。push service によって扱いが違うので、TTL は常に付けます
+- **購読を解除した直後は 201、5 秒後からは 410。** 解除の情報が push service に伝わるまでの間は、送っても受け付けられ、届かずに消えます
+
+最後の点は運用に直結します。RFC 8030 は、失効した購読への送信に 404 を返すと定めています（[RFC 8030 7.3](https://www.rfc-editor.org/rfc/rfc8030.html#section-7.3)）。実際には 410 を返す push service もあり、web.dev は 410 を受けたらサーバから購読を消すよう勧めています（[web.dev](https://web.dev/articles/push-notifications-web-push-protocol)）。**404 と 410 を受けたら購読を削除する**処理を、送信の側に必ず入れます。
+
+## push service に預ける間のこと
+
+送ったメッセージは、ブラウザが接続してくるまで push service に預けられます。預け方を決めるヘッダが 3 つあります。FCM の上では、端末がつながっていない状態を意図して作れないので、ここは RFC 8030 のとおりに動く push service の模型を Node で書いて確かめました。
+
+```
+--- 2. 端末が離れている間に同じ Topic で 3 回送る
+score 1     -> 201
+score 2     -> 201
+score 3     -> 201
+received    -> [ 'score 3' ]
+
+--- 3. TTL が切れた後に端末がつながる
+TTL: 0      -> 201
+TTL: 1      -> 201
+TTL: 60     -> 201
+received    -> [ 'new mail' ]
+
+--- 4. Urgency: 端末が「high だけ」と言っている間
+low         -> 201
+high        -> 201
+received(high only) -> [ '2FA code 482913' ]
+received(any)       -> [ 'weekly digest' ]
+```
+
+- **`TTL`**（秒）: 預ける長さです。過ぎたメッセージは届けてはならず（[RFC 8030 5.2](https://www.rfc-editor.org/rfc/rfc8030.html#section-5.2)）、上の例では 1 秒の呼び鈴と 0 秒の着信が消えました。着信や二段階認証のコードのように、遅れて届いても意味の無いものは短くします
+- **`Topic`**: 同じ Topic の未配達のメッセージを置き換えます（[RFC 8030 5.4](https://www.rfc-editor.org/rfc/rfc8030.html#section-5.4)）。スコアや未読数のように最新の値だけが要るものに付けると、端末がつながったときに古い値が並びません
+- **`Urgency`**: `very-low`、`low`、`normal`、`high` の 4 段階です。ブラウザは電池や回線の状態に応じて「この緊急度以上だけ届けて」と push service に伝えられます（[RFC 8030 5.3](https://www.rfc-editor.org/rfc/rfc8030.html#section-5.3)）
+
+## Service Worker で受ける
+
+メッセージが届くと、ブラウザはサイトの Service Worker を起こし、`push` イベントを渡します。ページが閉じていても動くのは、このためです。
+
+```js
+self.addEventListener('push', (event) => {
+  const data = event.data?.json() ?? {}
+  event.waitUntil(self.registration.showNotification(data.title, { body: data.body, data: { url: data.url } }))
+})
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close()
+  event.waitUntil(clients.openWindow(event.notification.data.url))
+})
+```
+
+`event.waitUntil()` に渡した処理が終わるまでに通知を出さなければなりません（[web.dev](https://web.dev/articles/push-notifications-handling-messages)）。
+
+### iOS と iPadOS の制約
+
+iOS と iPadOS は 16.4 で Web Push に対応しましたが、対象は**ホーム画面に追加した Web アプリに限られます**。Safari のタブで開いたページからは購読できません。通知の許可を求めるのも、ボタンを押すなどの利用者の直接の操作に応じたときだけです（[WebKit, 2023](https://webkit.org/blog/13878/web-push-for-web-apps-on-ios-and-ipados/)）。配信には、ネイティブアプリと同じ APNs が使われます。
+
+iOS / iPadOS 18.4 では、**Declarative Web Push** も使えるようになりました（[WebKit: Safari 18.4](https://webkit.org/blog/16574/webkit-features-in-safari-18-4/)）。本文を `"web_push": 8030` を含む決まった形の JSON にすると、Service Worker を動かさずにブラウザが直接通知を出します。Service Worker で内容を書き換えることもでき、その処理が失敗したときは JSON の通知がそのまま出ます（[WebKit: Meet Declarative Web Push](https://webkit.org/blog/16535/meet-declarative-web-push/)）。この形式は W3C の Push API の草案にも取り込まれていますが（[W3C Push API](https://www.w3.org/TR/push-api/)）、Chrome と Firefox の実装状況は執筆時点で確認できませんでした。
+
+## アプリの場合: FCM と APNs
+
+ネイティブアプリでも、仕組みは Web Push と同じです。端末の OS が事業者の配信サーバと 1 本の接続を持ち、アプリのサーバはそこにメッセージを渡します。
+
+- **Android**: Google Play services が FCM との接続を持ちます。FCM は、この経路を Google Play services を載せた承認済みの端末に限っています（[FCM architecture](https://firebase.google.com/docs/cloud-messaging/fcm-architecture)）
+- **iOS**: OS が APNs との接続を持ちます。iOS の端末に届けられるのは APNs だけです
+
+FCM は Android の配信経路であると同時に、**iOS と Web への中継**も引き受けます。iOS 宛てなら APNs に、Web 宛てなら各ブラウザの push service に転送します。iOS に送るには、Apple の開発者アカウントで作った APNs の認証キー（`.p8`）を Firebase に登録します（[FCM: Apple 向けの設定](https://firebase.google.com/docs/cloud-messaging/ios/get-started)）。Web に送るときは、この回で見た VAPID の鍵を使います（[FCM: Web 向けの設定](https://firebase.google.com/docs/cloud-messaging/web/get-started)）。
+
+```
+                       ┌──▶ Android（Google Play services の接続）
+  アプリのサーバ ──▶ FCM ──┼──▶ APNs ──▶ iOS
+   （HTTP v1 API）        └──▶ 各ブラウザの push service ──▶ Web（Service Worker）
+```
+
+送信は HTTP v1 API で行います。`POST https://fcm.googleapis.com/v1/projects/{プロジェクト ID}/messages:send` に、サービスアカウントから得た有効期限の短い OAuth 2.0 のアクセストークンを付けて送ります（[FCM HTTP v1](https://firebase.google.com/docs/cloud-messaging/send/v1-api)）。以前のサーバキーで送る API は廃止され、Firebase Admin SDK の Node.js 版からも `sendToDevice()` などの旧 API が v13.0.0（2024 年 11 月）で削除されています（[Admin Node.js SDK release notes](https://firebase.google.com/support/release-notes/admin/node)）。
+
+1 通のメッセージは、共通の部分と、プラットフォームごとの上書きでできています。
+
+```json
+{
+  "message": {
+    "token": "（端末の登録トークン）",
+    "notification": { "title": "新しいメッセージ", "body": "佐藤さんから 1 件" },
+    "data": { "thread_id": "t-8812" },
+    "android": { "ttl": "300s", "collapse_key": "inbox", "notification": { "channel_id": "messages" } },
+    "apns": {
+      "headers": { "apns-priority": "10", "apns-collapse-id": "inbox" },
+      "payload": { "aps": { "thread-id": "t-8812", "mutable-content": 1 } }
+    }
+  }
+}
+```
+
+`apns` の中の `headers` と `payload` は、APNs のヘッダとペイロードをそのまま渡すものです（[FCM REST reference](https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages)）。つまり iOS の細かい指定は、FCM を使っていても **APNs の仕様を読んで書く**ことになります。
+
+<Callout type="note" title="登録トークンから FID へ">
+  FCM は、端末の登録トークンから Firebase Installation ID（FID）に基づく登録へ移行している途中です（[FCM: Manage registration](https://firebase.google.com/docs/cloud-messaging/manage-tokens)）。
+  送信先にも `fid` を指定できるようになり、Web の SDK でも `getToken()` は非推奨になっています（[FCM: Web 向けの設定](https://firebase.google.com/docs/cloud-messaging/web/get-started)）。
+  また、複数の端末をまとめて宛先にするデバイスグループは非推奨となり、2027 年 9 月 29 日に廃止されます（[FCM: Migrate off device groups](https://firebase.google.com/docs/cloud-messaging/migrate-off-device-groups)）。
+  これから作るなら、新しい形に合わせておきます。
+</Callout>
+
+### notification メッセージと data メッセージ
+
+FCM のメッセージには 2 種類あり、**誰が通知を出すか**が違います（[FCM: Message types](https://firebase.google.com/docs/cloud-messaging/customize-messages/set-message-type)）。
+
+| | notification メッセージ | data メッセージ |
+| --- | --- | --- |
+| 中身 | `notification` に title と body | `data` に任意のキーと値 |
+| アプリがバックグラウンドのとき | **FCM の SDK がシステムトレイに出す**。Android ではアプリのコールバック（`onMessageReceived`）は呼ばれない | アプリのコールバックが呼ばれ、アプリが通知を組み立てる |
+| アプリが前面にあるとき | アプリのコールバックが呼ばれる | アプリのコールバックが呼ばれる |
+| 向いている用途 | 決まった形の通知を、アプリのコードなしで出す | 見た目を作り込む、出す前に処理する |
+
+本文の上限はどちらも 4096 バイトですが、トピック宛ては 2048 バイトです（[FCM: Error codes](https://firebase.google.com/docs/cloud-messaging/error-codes)）。
+
+## FCM を使うと済むこと
+
+FCM を使えば、次のことは自分で作らずに済みます。
+
+| 機能 | FCM での形 | 上限や条件 |
+| --- | --- | --- |
+| Android への配信経路 | Google Play services の常時接続 | Google Play services のある承認済みの端末だけ |
+| iOS と Web への中継 | APNs と各ブラウザの push service に転送 | APNs の認証キーと VAPID の鍵の登録が要る |
+| 1 台に送る | 登録トークン（または FID）を指定 | 1 台あたり 1 分に 240 通、1 時間に 5,000 通まで（Android）（[FCM: Troubleshooting](https://firebase.google.com/docs/cloud-messaging/troubleshooting)） |
+| 多数の端末にまとめて送る | `sendEachForMulticast` | 1 回 500 件まで（[Admin SDK](https://firebase.google.com/docs/cloud-messaging/send/admin-sdk)） |
+| 話題で配る | トピック。端末が購読し、サーバはトピック名に送る | 1 端末 2,000 トピックまで。購読の変更は 1 プロジェクトで毎秒 3,000 件まで（[FCM: Topic messaging](https://firebase.google.com/docs/cloud-messaging/topic-messaging)） |
+| 組み合わせで配る | 条件式（`'news' in topics && 'ja' in topics`） | トピックは 5 個まで（[FCM: Send to topics](https://firebase.google.com/docs/cloud-messaging/send-topic-messages)） |
+| 古いものを置き換える | `collapse_key` | 端末ごとに同時に 4 種類まで（[FCM: Collapsible messages](https://firebase.google.com/docs/cloud-messaging/customize-messages/collapsible-message-types)） |
+| 預ける期間 | `ttl` | 0〜28 日。既定は 4 週間（[FCM: Message lifespan](https://firebase.google.com/docs/cloud-messaging/customize-messages/setting-message-lifespan)） |
+| 配信の集計 | コンソールのレポート、Data API、BigQuery への書き出し | 「端末に届いた」「表示された」は Android だけ。iOS は送信数と開封数まで（[FCM: Understand delivery](https://firebase.google.com/docs/cloud-messaging/understand-delivery)） |
+| 料金 | 無料 | （[Firebase pricing](https://firebase.google.com/pricing)） |
+
+送信量にも上限があります。既定のクォータは 1 プロジェクトで毎分 60 万通で、全員に一斉に送る場合は 5 分以上に散らすよう求められています。2 分以内に全員へ届ける使い方は支援されていません（[FCM: Throttling and quotas](https://firebase.google.com/docs/cloud-messaging/throttling-and-quotas)、[Troubleshooting](https://firebase.google.com/docs/cloud-messaging/troubleshooting)）。全員が通知を受けて一斉にアプリを開けば、今度は自分のサーバに要求が集中します。ISUCON10 本選で、通知を即時に送ると負荷がかえって高まった例を第 279 回で見ました。
+
+## アプリの側で作るもの
+
+FCM が運ぶのは**メッセージ**です。端末の上で通知をどう出すか、誰に何通送るかは、アプリとそのサーバの仕事として残ります。
+
+### どの OS でも
+
+- **利用者と端末の対応表。** 「このユーザーに送る」を実現するには、ユーザー ID と、その人の端末の登録トークン（FID）の対応を自分のサーバで持ちます。デバイスグループの廃止にあたり、Firebase もそう指示しています（[FCM: Migrate off device groups](https://firebase.google.com/docs/cloud-messaging/migrate-off-device-groups)）
+- **古い登録の掃除。** FCM は、1 か月接続の無い登録を古いとみなし、Android では 270 日使われなかった登録を期限切れにします。送信が `UNREGISTERED`（404）か、本文が正しいのに `INVALID_ARGUMENT`（400）で失敗したら、その登録を消します（[FCM: Manage registration](https://firebase.google.com/docs/cloud-messaging/manage-tokens)）。Web Push の 404 と 410 と同じ扱いです
+- **届いたかどうかの把握。** FCM が返すメッセージ ID は、受け付けたという意味で、端末に届いたことは示しません（[FCM: Message lifespan](https://firebase.google.com/docs/cloud-messaging/customize-messages/setting-message-lifespan)）。APNs の 200 も同じです（[Apple](https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns)）。1 通ごとに確かめたいなら、アプリが受け取ったときに自分のサーバへ報告を送る仕組みを作ります
+- **既読の同期や、送りすぎの制限。** 他の端末で読んだ通知を消す、1 人に 1 日何通までにする、といった制御のための API は FCM にはありません。セグメントへの配信、利用者の現地時刻に合わせた予約配信、A/B テストは Firebase コンソールの Notifications composer でできますが、API からは使えない絞り込みもあります（[FCM: Firebase console](https://firebase.google.com/docs/cloud-messaging/send/firebase-console)）
+- **中身の秘匿。** FCM までの通信は暗号化されていますが、端から端までの暗号化ではありません。機密を含むなら自分で暗号化するよう、FCM のドキュメント自身が書いています（[FCM: Message types](https://firebase.google.com/docs/cloud-messaging/customize-messages/set-message-type)）。Web Push は RFC 8291 で必ず暗号化されますが、ネイティブアプリの FCM と APNs にはその仕組みが無いということです
+
+### Android
+
+- **通知チャネル。** Android 8.0 以降、チャネルを指定しない通知は表示されません。FCM の `channel_id` は、アプリが先にそのチャネルを作っておくことが前提です（[Android: Channels](https://developer.android.com/develop/ui/compose/notifications/channels)、[FCM REST reference](https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages)）
+- **通知の許可。** Android 13 以降は `POST_NOTIFICATIONS` の実行時の許可が要り、新しく入れたアプリの通知は既定で止まっています（[Android: Notification permission](https://developer.android.com/develop/ui/compose/notifications/notification-permission)）。許可を求める画面とその時機は、アプリが決めます
+- **作り込んだ見た目。** FCM の notification メッセージで指定できるのは、タイトル、本文、アイコン、色、音、画像、チャネルなどです。アクションボタン、複数の通知のまとめ方、独自のレイアウトを指定する項目はありません（[FCM REST reference](https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages)）。これらが要るなら data メッセージで送り、アプリが `NotificationCompat` で組み立てます
+- **優先度の使い方。** `high` は端末の省電力状態を越えて届けるためのものです。`high` で送ったのに通知を出さないことが続くと、FCM は過去 7 日の様子からそのアプリのメッセージを `normal` に格下げします（[FCM: Android message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority)）。なお、通知とバックグラウンドの同期を別の種類として指定する `android_v2` がプレビューとして公開されています（[FCM: v2 API](https://firebase.google.com/docs/cloud-messaging/send/v2-api)）
+
+### iOS
+
+- **通知の許可。** アプリが `requestAuthorization` を呼んで求めます。FCM は代わりに求めません。仮の許可（provisional）で送った通知は、音もバナーも無く、通知センターにだけ並びます（[Apple: Asking permission](https://developer.apple.com/documentation/usernotifications/asking-permission-to-use-notifications)）
+- **画像と本文の書き換え。** 画像の添付、届いた暗号文の復号、本文の書き換えは、**Notification Service Extension** で行います。`mutable-content: 1` を付けた通知が届くと、表示の前にこの拡張が約 30 秒だけ動きます（[Apple: Modifying content](https://developer.apple.com/documentation/usernotifications/modifying-content-in-newly-delivered-notifications)）。FCM で画像付きの通知を送る場合も、この拡張をアプリに加える必要があります（[FCM: Apple 向けの設定](https://firebase.google.com/docs/cloud-messaging/ios/get-started)）。独自の見た目は Notification Content Extension、ボタンは起動時に登録するカテゴリで作ります（[Apple: Actionable notifications](https://developer.apple.com/documentation/usernotifications/declaring-your-actionable-notification-types)）
+- **割り込みの強さ。** `interruption-level` には `passive`、`active`、`time-sensitive`、`critical` があります。`critical` は、Apple に申請して許可（entitlement）を得なければ使えません（[Apple: Generating a remote notification](https://developer.apple.com/documentation/usernotifications/generating-a-remote-notification)、[Critical alerts](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.usernotifications.critical-alerts)）
+- **画面に出さない通知。** `content-available: 1` のバックグラウンド通知は低い優先度で扱われ、届くことは保証されません。Apple は 1 時間に 2〜3 回までにするよう書いています（[Apple: Background updates](https://developer.apple.com/documentation/usernotifications/pushing-background-updates-to-your-app)）。**「通知で起こして同期する」設計は、iOS では当てにできません**
+- **Live Activities。** ロック画面の配達状況のような表示を更新する ActivityKit のプッシュは、FCM の HTTP v1 API からも 2024 年 11 月から送れます（[Firebase release notes](https://firebase.google.com/support/releases)、[FCM: Live Activity](https://firebase.google.com/docs/cloud-messaging/customize-messages/live-activity)）。ただし表示そのものと、Live Activity 用のトークンを取る処理はアプリで作ります。更新には 1 時間あたりの回数の枠もあります（[Apple: ActivityKit push](https://developer.apple.com/documentation/activitykit/starting-and-updating-live-activities-with-activitykit-push-notifications)）
+- **VoIP の着信。** 通話アプリの着信は PushKit の VoIP プッシュで受け、受けたら CallKit に着信を報告しなければなりません。報告しないとアプリは終了させられ、繰り返すと VoIP プッシュが届かなくなります（[Apple: PushKit](https://developer.apple.com/documentation/pushkit/pkpushregistrydelegate/pushregistry(_:didreceiveincomingpushwith:for:completion:))）。FCM がこの経路を扱うという記述は、Firebase のドキュメントに見つかりませんでした
+
+<Callout type="warn" title="Google Play services の無い端末">
+  FCM の Android の経路は、Google Play services を載せた端末に限られます（[FCM architecture](https://firebase.google.com/docs/cloud-messaging/fcm-architecture)）。
+  Play services を載せずに出荷される端末に届ける必要があるなら、FCM とは別の配信経路を用意することになります。
+  どの経路が要るかは、届けたい地域と端末の構成を調べて決めます。
+</Callout>
+
+## どれを選ぶか
+
+| 状況 | 選ぶもの |
+| --- | --- |
+| 画面を開いている間だけ届けばよい | 第 88 回の SSE か WebSocket。push service を通さないぶん速く、大きさの上限も無い |
+| Web サイトで、閉じていても知らせたい | Web Push。iOS ではホーム画面に追加してもらうことが前提になる |
+| ネイティブアプリで、Android と iOS の両方 | FCM で送り、iOS の細かい指定は `apns` に APNs の形で書く。あるいは Android は FCM、iOS は APNs に直接送る |
+| 通知の見た目を作り込みたい | data メッセージ（Android）と Notification Service Extension（iOS）。アプリのコードが要る |
+| 画面に出さずにデータを同期したい | 押し出しに頼らない。Web Push は通知が必須で、iOS のバックグラウンド通知は届く保証が無い。アプリを開いたときに取りに行く設計を基本にする |
+
+## まとめ
+
+- 閉じたアプリには、サーバから接続を張れない。OS やブラウザが事業者の配信サーバ（push service）と 1 本の接続を持ち、サーバはそこへメッセージを渡す
+- Web Push の購読は、`endpoint` と、ブラウザの公開鍵 `p256dh` と、秘密の値 `auth` の 3 つ。Chrome の `endpoint` は FCM を指す
+- 本文は RFC 8291 で暗号化し、push service には読めない。ECDH と HKDF と AES-128-GCM の組み合わせで、平文は最大 3993 バイト
+- VAPID は、購読を作ったサーバだけが送れるようにする署名。JWT の `aud` は push service のオリジンで、有効期限は 24 時間以内
+- 201 は受け付けただけで、届いたことは示さない。FCM、APNs も同じ。404 と 410（FCM なら `UNREGISTERED`）を受けたら購読を消す
+- `TTL`、`Topic`（FCM では `collapse_key`）、`Urgency` で、預ける長さ、置き換え、緊急度を指定する
+- FCM は Android の配信経路で、iOS と Web への中継もする。トピック、条件、まとめて送る機能、配信の集計を持つ
+- 利用者と端末の対応表、古い登録の掃除、到達の確認、既読や頻度の制御、端から端までの暗号化は、アプリのサーバで作る
+- 端末の上の表示は OS ごとに作る。Android は通知チャネルと許可、作り込んだ通知は data メッセージから組み立てる。iOS は許可、Notification Service Extension、`interruption-level`、Live Activities、PushKit と CallKit
+
+次回は、アプリが自分で接続を持ち続ける側の手段として、細い回線と小さな機器のために作られた pub/sub のプロトコル **MQTT** を見ます。第 88 回の最後に裏方として置いたブローカが、そこでは主役になります。

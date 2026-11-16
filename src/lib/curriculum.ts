@@ -305,7 +305,7 @@ export const LOWLEVEL_CHAPTERS: Section[] = [
   {
     id: 'realtime',
     title: '第14章　リアルタイムに届ける',
-    summary: '要求に応答を返すだけでは足りない通信がある。サーバから押す手段、細い回線の上の pub/sub、HTTP 以外で使う QUIC、NAT を越えて端末同士を繋ぐ方法と WebRTC、ゲームの状態同期、同時に書いた変更を合わせる OT と CRDT、そして差分だけを送る同期',
+    summary: '要求に応答を返すだけでは足りない通信がある。サーバから押す手段、閉じたアプリに届ける Web Push と FCM、細い回線の上の pub/sub、HTTP 以外で使う QUIC、NAT を越えて端末同士を繋ぐ方法と WebRTC、ゲームの状態同期、同時に書いた変更を合わせる OT と CRDT、そして差分だけを送る同期',
   },
   {
     id: 'db',

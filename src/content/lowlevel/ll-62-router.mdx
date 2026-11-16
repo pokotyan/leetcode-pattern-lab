@@ -365,7 +365,7 @@ FRR の文書は、管理距離を「The lowest Admin Distance is the route sele
 
 アドレスだけでなくポートも書き換えるので、正確には **NAPT**（Network Address Port Translation）と呼びます。RFC 3022 は、NAPT が「(local IP addresses, local TU port number)」の組を「(registered IP address, assigned TU port number)」の組に対応させるものだとし、「This model fits the requirements of most Small Office Home Office (SOHO) groups（このモデルは、ほとんどの SOHO の要件に合う）」と述べています（[RFC 3022 2.2](https://www.rfc-editor.org/rfc/rfc3022.html#section-2.2)）。
 
-ここで注意したいのは、**NAPT はこの回の意味でのルーティングとは別の仕事**だということです。ルーターは本来、IP の送信元と宛先を書き換えません。上の実験でも 3 本の線の上で IP アドレスは同じでした。NAPT は、それをあえて書き換えています。対応表に行が無ければ外から入ってくるパケットを渡す先が分からないこと、それを越えて端末同士をつなぐ方法は、第 91 回で詳しく見ます。
+ここで注意したいのは、**NAPT はこの回の意味でのルーティングとは別の仕事**だということです。ルーターは本来、IP の送信元と宛先を書き換えません。上の実験でも 3 本の線の上で IP アドレスは同じでした。NAPT は、それをあえて書き換えています。対応表に行が無ければ外から入ってくるパケットを渡す先が分からないこと、それを越えて端末同士をつなぐ方法は、第 92 回で詳しく見ます。
 
 ## 箱の中の話: L3 スイッチと、速く引くための表
 
