@@ -96,6 +96,21 @@ RFC 5598 は MTA を「1 回のアプリケーション層の中継を担うも�
 
 組織の境界も大事です。RFC 5598 は、管理者が異なる範囲を **ADMD**（Administrative Management Domain）と呼びます。上の図で言えば、送信者の MSA と MTA が 1 つの ADMD、受信側の MTA 以降が別の ADMD です。**ADMD の境界を越えるところで、相手の言うことを信じてよいかが問題になります**。SPF、DKIM、DMARC は、どれもこの境界で使う道具です。
 
+### 役割の名前とソフトウェアの名前は対応しない
+
+MUA や MTA は**役割**の名前で、製品の名前ではありません。1 つのソフトウェアが複数の役割を受け持つのが普通です。
+
+| ソフトウェア・サービス | 受け持つ役割 | 根拠 |
+| --- | --- | --- |
+| Postfix | MSA（`master.cf` の `submission` で 587 番を開く）、MTA（25 番）、MDA（`local(8)` でメールボックスに書く） | [master(5)](https://www.postfix.org/master.5.html)、[Postfix の概要](https://www.postfix.org/OVERVIEW.html) |
+| Dovecot | MDA（LDA、LMTP）、MS（IMAP、POP3 で読み出させる） | [Dovecot LDA](https://doc.dovecot.org/2.4.1/core/config/delivery/lda.html)、[LMTP](https://doc.dovecot.org/2.4.1/core/config/delivery/lmtp.html) |
+| Amazon SES、SendGrid などの配信サービス | 送信側の MSA と MTA（API か SMTP の提出で受け取り、相手の MX へ中継する） | [Amazon SES の SMTP 接続](https://docs.aws.amazon.com/ses/latest/dg/smtp-connect.html) |
+| Gmail、Microsoft 365 | 送信側の MSA・MTA から、受信側の MTA・MDA・MS、画面の MUA まで | — |
+
+Dovecot の文書は LDA を「MTA からメールを受け取り、利用者のメールボックスに入れる MDA」と説明しています。第 196 回の実験は、Postfix が MTA、Dovecot の LDA が MDA を受け持つ構成です。
+
+いまはメールサーバを自分で立てず、配信サービスやクラウドのメールを使うことがほとんどです。そうすると役割の境目がサービスの内側に隠れ、普段はこれらの名前を目にしなくなります。それでも、届かないメールを調べるときには必要になります。`Received:` の行を下から読んで、どの区間のどのサーバで止まったかを切り分けるとき（第 199 回）や、バウンスを返したのが誰かを確かめるとき（第 206 回）です。どちらも、この役割の区切りに沿って考えることになります。
+
 ## 封筒と便箋: エンベロープとヘッダ
 
 SMTP で 1 通を送るとき、送る側は大きく 2 種類の情報を渡します（会話の詳細は第 197 回）。
