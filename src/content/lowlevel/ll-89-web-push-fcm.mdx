@@ -25,7 +25,7 @@ requires:
   - ll-88-server-push
   - ll-149-symmetric
   - ll-150-public-key
-  - ll-179-jwt
+  - ll-180-jwt
 ---
 
 import Callout from '../../components/Callout.astro'
@@ -155,7 +155,7 @@ decrypt "When I grow up, I want to be a watermelon"
 
 ## 送り主を名乗る（VAPID）
 
-購読の作成時に `applicationServerKey` を渡すと、その購読は**その鍵の持ち主からのメッセージだけを受け付ける**ようになります（[RFC 8292 4](https://www.rfc-editor.org/rfc/rfc8292.html#section-4)）。送るときは、対応する秘密鍵で署名した JWT（第 179 回）を付けます。
+購読の作成時に `applicationServerKey` を渡すと、その購読は**その鍵の持ち主からのメッセージだけを受け付ける**ようになります（[RFC 8292 4](https://www.rfc-editor.org/rfc/rfc8292.html#section-4)）。送るときは、対応する秘密鍵で署名した JWT（第 180 回）を付けます。
 
 ```
 Authorization: vapid t=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOi…, k=BKx…（公開鍵）
@@ -320,7 +320,7 @@ FCM を使えば、次のことは自分で作らずに済みます。
 | 配信の集計 | コンソールのレポート、Data API、BigQuery への書き出し | 「端末に届いた」「表示された」は Android だけ。iOS は送信数と開封数まで（[FCM: Understand delivery](https://firebase.google.com/docs/cloud-messaging/understand-delivery)） |
 | 料金 | 無料 | （[Firebase pricing](https://firebase.google.com/pricing)） |
 
-送信量にも上限があります。既定のクォータは 1 プロジェクトで毎分 60 万通で、全員に一斉に送る場合は 5 分以上に散らすよう求められています。2 分以内に全員へ届ける使い方は支援されていません（[FCM: Throttling and quotas](https://firebase.google.com/docs/cloud-messaging/throttling-and-quotas)、[Troubleshooting](https://firebase.google.com/docs/cloud-messaging/troubleshooting)）。全員が通知を受けて一斉にアプリを開けば、今度は自分のサーバに要求が集中します。ISUCON10 本選で、通知を即時に送ると負荷がかえって高まった例を第 279 回で見ました。
+送信量にも上限があります。既定のクォータは 1 プロジェクトで毎分 60 万通で、全員に一斉に送る場合は 5 分以上に散らすよう求められています。2 分以内に全員へ届ける使い方は支援されていません（[FCM: Throttling and quotas](https://firebase.google.com/docs/cloud-messaging/throttling-and-quotas)、[Troubleshooting](https://firebase.google.com/docs/cloud-messaging/troubleshooting)）。全員が通知を受けて一斉にアプリを開けば、今度は自分のサーバに要求が集中します。ISUCON10 本選で、通知を即時に送ると負荷がかえって高まった例を第 280 回で見ました。
 
 ## アプリの側で作るもの
 

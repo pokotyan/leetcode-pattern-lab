@@ -1,0 +1,427 @@
+---
+title: 「〜 over 〜」の見取り図
+description: JMAP over WebSocket、DNS over HTTPS、IP over UDP、SCSI over TCP。「〜 over 〜」と呼ばれる組み合わせは数え切れないほどありますが、下の層が上の層に渡すものは 4 種類しかありません。運び手ごとに何を載せると何ができるのかを並べ、載せる理由と代償を整理したうえで、JMAP を HTTP と WebSocket の両方で話して、運び手を替えると上の層が何を自分で書き足すことになるのかを確かめます
+chapter: atop
+order: 10
+status: published
+topics:
+  - X over Y
+  - カプセル化
+  - バイト列 / メッセージ / データグラム / フレーム
+  - JMAP over WebSocket（RFC 8887）
+  - WebSocket のサブプロトコル（Sec-WebSocket-Protocol）
+  - Extended CONNECT / MASQUE
+  - LSP と MCP の標準入出力
+  - オーバーレイ（GRE / VXLAN / Geneve）
+  - SCSI over TCP（iSCSI）/ NVMe/TCP
+  - IPv6 over BLE / 6LoWPAN
+  - プロトコルトンネリングの悪用
+  - Stalwart
+requires:
+  - ll-165-layering
+  - ll-88-server-push
+  - ll-170-tls-vpn
+  - ll-91-quic-beyond-http
+---
+
+import Callout from '../../components/Callout.astro'
+
+## 「over」は何を言っているのか
+
+メールを読むプロトコル JMAP について、「JMAP over WebSocket」で、プッシュ通知と API の要求・応答を 1 本の接続で扱えるようになる、という発表があります（[JMAP is Game Changer（Speaker Deck）](https://speakerdeck.com/tascript/jmap-is-game-changer)）。第 206 回で見たとおり、JMAP は本来 HTTP の上で JSON をやり取りするプロトコルです。それを WebSocket の上に載せ替えると、何が変わるのでしょうか。
+
+この「〜 over 〜」という言い方は、ネットワークの至るところに出てきます。DNS over HTTPS、SIP over WebSocket、IP over UDP、SCSI over TCP、PPP over Ethernet、IPv6 over Bluetooth Low Energy。冗談で書かれた「伝書鳩の上の IP」の RFC まであります（[RFC 1149](https://www.rfc-editor.org/rfc/rfc1149.html)）。
+
+数が多いので一覧を暗記する意味はありません。覚えておきたいのは、**「X over Y」は「Y が、X の必要とするものを渡せる」という主張だ**ということです。Y が渡せるものの種類は少なく、X が求めるものとの食い違いをどこで埋めるかで、組み合わせの性質がほぼ決まります。この回では、その見方を先に作り、運び手ごとに主な組み合わせを並べ、最後に JMAP を HTTP と WebSocket の両方で実際に話して、運び手を替えたときに上の層が何を書き足すことになるのかを確かめます。
+
+第 165 回では、TLS や SSH の上に別のプロトコルを載せる 3 つの型（最初から包む、途中で切り替える、1 つのポートで振り分ける）を見ました。この回はそれを、TLS と SSH 以外の運び手にまで広げた地図です。
+
+## 下が渡すものは 4 種類
+
+下の層が上の層に渡すものは、おおむね次の 4 つのどれかです。
+
+| 渡すもの | 性質 | 代表的な運び手 |
+| --- | --- | --- |
+| **順序どおりのバイト列** | 欠けず、並びも変わらない。ただし**切れ目がない** | TCP、TLS、SSH のチャネル、パイプ（標準入出力）、QUIC のストリーム |
+| **メッセージ** | 送った単位のまま届く。届けば欠けない | WebSocket のメッセージ、HTTP の要求と応答、MQTT の PUBLISH |
+| **データグラム** | 単位のまま届くが、失われる・並び替わる・重複することがある | UDP、DTLS、QUIC の DATAGRAM |
+| **フレームやパケット** | 宛先の付いた単位。リンクや網の上を運ばれる | Ethernet のフレーム、IP のパケット |
+
+上の層の側にも、同じ 4 つのどれを前提に作られているかがあります。前提と下の性質が合っていれば、そのまま載せられます。合っていなければ、間に何かを足します。
+
+- **バイト列の上にメッセージを載せる**: 切れ目を自分で書く。長さを前に付けるか（gRPC の 5 バイトの前置き、第 83 回）、区切りの文字を決めるか（改行）
+- **メッセージの上にメッセージを載せる**: 多くはそのまま 1 対 1 で入る。ただし、下が教えてくれていた「これは要求か応答か」「どの要求への応答か」が失われることがあり、そのときは上で書き足す（後半の JMAP の実験がこの例）
+- **バイト列の上にデータグラムやパケットを載せる**: 区切りを書いたうえで、下が勝手に再送することを受け入れる。IP パケットを TCP で運ぶと、TCP の上に TCP が載り、再送が二重になる（第 168 回、第 170 回）
+- **データグラムの上にバイト列を載せる**: 再送と並べ直しを自分で持つ。QUIC が UDP の上でやっていることそのもの（第 80 回）
+
+「X over Y」と聞いたら、まず **Y は 4 つのどれを渡すのか、X は 4 つのどれを求めるのか**を確かめます。食い違いがあれば、その差を埋めているのが誰か（X の仕様か、間の層か、実装か）を探します。
+
+## なぜ載せ替えるのか
+
+わざわざ別の運び手に載せるのには理由があります。動機はほぼ次の 6 つに分かれます。
+
+| 動機 | 何が起きているか | 例 |
+| --- | --- | --- |
+| **通り道がそれしかない** | 社内網やホテルの Wi-Fi が、443 番の HTTPS 以外を通さない | SSTP、OpenConnect（第 170 回）、IKE と ESP を TCP で包む方式 |
+| **ブラウザから使いたい** | ブラウザの JavaScript は任意の TCP や UDP の口を開けない。開けるのは HTTP、WebSocket、WebTransport、WebRTC だけ | JMAP / XMPP / SIP / MQTT over WebSocket、VNC をブラウザで見る noVNC |
+| **既にある基盤を借りたい** | HTTP なら、TLS の終端、ロードバランサ、認証、ログ、CDN をそのまま使える | gRPC（HTTP/2）、DNS over HTTPS、MCP の Streamable HTTP |
+| **網を仮想化したい** | 物理の網の形と関係なく、利用者ごとの L2 や L3 を作る | VXLAN、Geneve（第 61 回、第 65 回）、GRE |
+| **古い網と新しい網をつなぎたい** | 片方の網にしかない種類のパケットを、もう片方の網の上で運ぶ | 6in4、Teredo、DS-Lite、MAP-E（第 64 回） |
+| **古い仕組みを新しい媒体で動かしたい** | 本来はケーブルで直結していたものを、IP の網越しに使う | iSCSI（SCSI over TCP）、NVMe/TCP、USB/IP、PPPoE |
+
+もう 1 つ、**隠したい**という動機があります。利用者のプライバシーを守る方向（DNS の問い合わせを HTTPS に紛れさせる。第 76 回）にも、監視を避けて外と通信する方向（後述する DNS トンネル）にも働きます。同じ技術が、立場によって守りにも攻めにもなります。
+
+## 運び手ごとに並べる
+
+ここからは、運び手（Y の側）ごとに、何が載っていて、それで何ができるのかを並べます。この連載で詳しく扱った回があるものは、回の番号を添えています。
+
+### WebSocket の上
+
+WebSocket は、HTTP の接続を「メッセージを双方向に流す管」に切り替える仕組みです（[RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html)、第 88 回）。管の中で何を話すかは、ハンドシェイクの `Sec-WebSocket-Protocol` ヘッダで**サブプロトコル**の名前を出して決めます。名前は IANA が登録しています（[IANA WebSocket Subprotocol Name Registry](https://www.iana.org/assignments/websocket/websocket.xhtml)）。登録簿を眺めると、この運び手が何に使われているかがよく分かります。
+
+| サブプロトコル名 | 載っているもの | できること |
+| --- | --- | --- |
+| `jmap` | JMAP（[RFC 8887](https://www.rfc-editor.org/rfc/rfc8887.html)） | メールの API 呼び出しと変更通知を 1 本の接続で |
+| `xmpp` | XMPP（[RFC 7395](https://www.rfc-editor.org/rfc/rfc7395.html)） | ブラウザからチャットのサーバに直接つなぐ |
+| `sip` | SIP（[RFC 7118](https://www.rfc-editor.org/rfc/rfc7118.html)） | ブラウザから電話の呼び出しを制御する。音声そのものは WebRTC（第 93 回） |
+| `mqtt` | MQTT（[MQTT 5.0 の 6 章](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)） | ブラウザの画面から IoT のブローカに pub/sub する（第 90 回） |
+| `coap` | CoAP（[RFC 8323](https://www.rfc-editor.org/rfc/rfc8323.html)） | 小さな機器向けの REST を、UDP が通らない網から |
+| `rfb` | VNC の画面転送（[RFC 6143](https://www.rfc-editor.org/rfc/rfc6143.html)） | ブラウザの中でリモートの画面を操作する |
+| `v12.stomp`、`amqp` | メッセージブローカのプロトコル | ブラウザからキューを購読する |
+| `ocpp1.6`、`ocpp2.0.1` | 電気自動車の充電器の管理プロトコル | 充電器と管理サーバの間の常時接続 |
+| `hub.bsc.bacnet.org` | BACnet（ビルの設備制御） | 空調や照明の制御を IP の網越しに |
+| `opcua+uacp` | OPC UA（工場の機器） | 工場の機器の情報をブラウザやクラウドへ |
+| `sqlnet.oracle.com` | Oracle Database の接続 | DB への接続を HTTP の経路に通す |
+| `text.ircv3.net` | IRC | ブラウザから IRC に |
+
+登録簿の外にも例があります。Kubernetes は、`kubectl exec`、`cp`、`attach`、`port-forward` の通り道を、標準化されなかった SPDY から WebSocket に移しました。理由は、多くのプロキシやゲートウェイがもう SPDY を通さないからだと説明されています。サブプロトコル名は `v5.channel.k8s.io` です（[Kubernetes 1.31: Streaming Transitions from SPDY to WebSockets](https://kubernetes.io/blog/2024/08/20/websockets-transition/)）。**通り道がそれしかない**という動機の典型です。
+
+上の層の仕様は、WebSocket の何を使うかを細かく決めています。MQTT は binary フレームだけを使い、1 つのフレームに MQTT のパケットが複数入っても、途中で切れていてもよいとしています。つまり WebSocket を**バイト列**として使っています。JMAP は text フレームだけを使い、1 つのメッセージにちょうど 1 つの JSON を入れます。こちらは WebSocket を**メッセージ**として使っています。同じ運び手でも、使い方は載せる側が決めます。
+
+### HTTP の要求と応答の上
+
+HTTP の要求と応答は、「1 つ送ると 1 つ返る」メッセージの対です。この形に合うものは、そのまま載ります。
+
+| 組み合わせ | できること | 詳しくは |
+| --- | --- | --- |
+| JMAP（[RFC 8620](https://www.rfc-editor.org/rfc/rfc8620.html)） | 複数のメソッド呼び出しを 1 回の POST にまとめる | 第 206 回 |
+| DNS over HTTPS（[RFC 8484](https://www.rfc-editor.org/rfc/rfc8484.html)） | DNS のメッセージを HTTPS の本体に入れ、ふつうの Web 通信に紛れさせる | 第 76 回 |
+| gRPC（HTTP/2） | 長さを前置きしたメッセージを HTTP/2 のストリームで流し、状態はトレーラで返す（[gRPC over HTTP2](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)） | 第 83 回 |
+| MCP の Streamable HTTP | AI のクライアントとツールのサーバが、POST と GET、必要なら SSE で JSON-RPC を交わす（[MCP: Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)） | 第 192 回（認可） |
+| Docker Engine API | HTTP を TCP ではなく Unix ドメインソケット（`/var/run/docker.sock`）の上で話す | 第 225 回 |
+
+最後の例は、HTTP の下を TCP から別のものに替えています。HTTP は「順序どおりのバイト列」さえあれば動くので、下がネットワークを通らないソケットでも構いません。
+
+### HTTP の CONNECT の上
+
+HTTP には、要求と応答を交わすのではなく、**接続そのものを別の用途に明け渡す**方法があります。`CONNECT` メソッドと、HTTP/2 以降の Extended CONNECT です。これを使うと、HTTP の上に、より下の層のものが載ります。
+
+| 何を運ぶか | 仕組み | 詳しくは |
+| --- | --- | --- |
+| TCP の接続 | `CONNECT host:port` | 第 170 回 |
+| UDP のデータグラム | CONNECT-UDP（[RFC 9298](https://www.rfc-editor.org/rfc/rfc9298.html)） | 第 91 回 |
+| IP のパケット | CONNECT-IP（[RFC 9484](https://www.rfc-editor.org/rfc/rfc9484.html)） | 第 91 回 |
+| WebSocket | HTTP/2 の Extended CONNECT（[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html)）、HTTP/3（[RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html)） | 第 88 回 |
+| PPP のフレーム | SSTP（終わらない POST の本体に流す） | 第 170 回 |
+
+この段では、**上のほうの層（HTTP）の上に、下のほうの層（UDP や IP）が載る**という逆転が起きています。層の上下は、仕様の上での順番であって、何の上に何を載せてよいかを縛るものではありません。
+
+### TLS、QUIC、DTLS の上
+
+| 運び手 | 載っているもの | できること | 詳しくは |
+| --- | --- | --- | --- |
+| TLS | DNS（[RFC 7858](https://www.rfc-editor.org/rfc/rfc7858.html)、853 番） | 問い合わせを暗号化する | 第 76 回 |
+| TLS | syslog（[RFC 5425](https://www.rfc-editor.org/rfc/rfc5425.html)、6514 番）、RADIUS（[RFC 6614](https://www.rfc-editor.org/rfc/rfc6614.html)、2083 番）、SNMP（[RFC 6353](https://www.rfc-editor.org/rfc/rfc6353.html)） | 運用のための通信を守る | 第 172 回 |
+| TLS | IMAP、SMTP、PostgreSQL、MQTT（8883 番）など | 最初から包むか、途中で切り替える | 第 165 回、第 169 回 |
+| QUIC | HTTP/3、DNS（[RFC 9250](https://www.rfc-editor.org/rfc/rfc9250.html)）、SMB、WebTransport、MoQ | ストリームとデータグラムを 1 本の接続に同居させる | 第 80 回、第 91 回 |
+| DTLS | SCTP（[RFC 8261](https://www.rfc-editor.org/rfc/rfc8261.html)） | WebRTC のデータチャネル。SCTP の複数ストリームを、NAT を越える UDP の上で使う | 第 93 回 |
+| UDP | SCTP（[RFC 6951](https://www.rfc-editor.org/rfc/rfc6951.html)） | OS が SCTP を知らなくても、アプリの中で SCTP を動かす | — |
+
+最後の 2 行は、TCP の代わりとして作られた SCTP が、そのままでは NAT やファイアウォールを越えられないため、UDP（とその上の DTLS）に包まれて使われている例です。**新しいトランスポートは、既に通る UDP の上に作るしかない**という事情は、QUIC が UDP の上にある理由と同じです。
+
+### SSH と標準入出力の上
+
+SSH のチャネルも、プロセスの標準入出力も、「順序どおりのバイト列」です。
+
+| 運び手 | 載っているもの | できること | 詳しくは |
+| --- | --- | --- | --- |
+| SSH | SFTP、Git、NETCONF（[RFC 6242](https://www.rfc-editor.org/rfc/rfc6242.html)）、X11、ポート転送 | 鍵で確かめた 1 本の接続に、ファイル転送や機器の設定を載せる | 第 166 回、第 168 回 |
+| 標準入出力 | LSP（エディタと言語サーバ） | `Content-Length` ヘッダで JSON-RPC を区切る（[LSP Specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)） | — |
+| 標準入出力 | MCP の stdio トランスポート | 改行で JSON-RPC を区切る。埋め込みの改行は禁止 | — |
+| 標準入出力 | `ssh -W`、`ProxyCommand` | 別のプログラムのパイプを、SSH の接続の運び手にする | 第 168 回 |
+
+パイプはネットワークではありませんが、プロトコルから見れば TCP と同じ「切れ目のないバイト列」です。後半の実験で、この 2 つの区切り方の違いを確かめます。
+
+### IP や UDP の上（パケットの中にパケット）
+
+ここからは、**パケットやフレームを、丸ごと別のパケットに入れる**組み合わせです。トンネルやオーバーレイと呼ばれます。
+
+| 組み合わせ | 何を何に入れるか | できること | 詳しくは |
+| --- | --- | --- | --- |
+| IP in IP（[RFC 2003](https://www.rfc-editor.org/rfc/rfc2003.html)）、GRE（[RFC 2784](https://www.rfc-editor.org/rfc/rfc2784.html)） | IP（GRE は任意のプロトコル）を IP に | 2 つの拠点の間に仮想の線を引く | — |
+| 6in4（[RFC 4213](https://www.rfc-editor.org/rfc/rfc4213.html)）、Teredo（[RFC 4380](https://www.rfc-editor.org/rfc/rfc4380.html)） | IPv6 を IPv4 に（Teredo は UDP に入れて NAT を越える） | IPv4 しかない網から IPv6 に出る | 第 64 回 |
+| DS-Lite（[RFC 6333](https://www.rfc-editor.org/rfc/rfc6333.html)）、MAP-E（[RFC 7597](https://www.rfc-editor.org/rfc/rfc7597.html)） | IPv4 を IPv6 に | IPv6 だけの網の上で IPv4 を使い続ける | 第 64 回 |
+| VXLAN（[RFC 7348](https://www.rfc-editor.org/rfc/rfc7348.html)、UDP 4789）、Geneve（[RFC 8926](https://www.rfc-editor.org/rfc/rfc8926.html)、UDP 6081） | Ethernet のフレームを UDP に | 利用者ごとの L2 を、物理の L3 の網の上に何百万も作る | 第 61 回、第 65 回 |
+| ESP in UDP（[RFC 3948](https://www.rfc-editor.org/rfc/rfc3948.html)、UDP 4500）、WireGuard | 暗号化した IP を UDP に | NAT を越える VPN | 第 170 回 |
+| GTP-U（UDP 2152） | 利用者の IP パケットを、携帯網の中の UDP に | 端末が基地局を移っても、同じ IP アドレスのまま通信を続ける | — |
+
+### リンクの上、遠くの機器
+
+| 組み合わせ | できること | 詳しくは |
+| --- | --- | --- |
+| PPP over Ethernet（[RFC 2516](https://www.rfc-editor.org/rfc/rfc2516.html)） | 電話回線の時代の「ログインしてからつなぐ」仕組みを、光回線の Ethernet の上で使う | 第 64 回 |
+| EAP over LAN（IEEE 802.1X） | IP アドレスをもらう前に、Ethernet や Wi-Fi の上で認証する | 第 172 回 |
+| iSCSI（[RFC 7143](https://www.rfc-editor.org/rfc/rfc7143.html)、TCP 3260） | SCSI のコマンドを TCP で運び、遠くのディスクを手元のディスクとして使う | — |
+| NVMe/TCP（TCP 4420） | NVMe のコマンドを TCP で運ぶ。iSCSI の後継の位置づけ | — |
+| RoCE v2（UDP 4791） | InfiniBand の RDMA を、UDP と IP の上で使う。GPU の計算機をつなぐ網で使われる | — |
+| USB/IP | USB の要求を TCP で運び、遠くの USB 機器を手元に挿したように見せる（[Linux: USB/IP protocol](https://docs.kernel.org/usb/usbip_protocol.html)） | — |
+| IPv6 over BLE（[RFC 7668](https://www.rfc-editor.org/rfc/rfc7668.html)）、IPv6 over IEEE 802.15.4（[RFC 4944](https://www.rfc-editor.org/rfc/rfc4944.html)） | 電池で動く小さな機器に IPv6 のアドレスを持たせる。802.15.4 の方式は Thread の土台 | 第 56 回 |
+| IP over InfiniBand（[RFC 4391](https://www.rfc-editor.org/rfc/rfc4391.html)） | RDMA 用の網で、ふつうの IP の通信もする | — |
+| IP over 伝書鳩（[RFC 1149](https://www.rfc-editor.org/rfc/rfc1149.html)、[RFC 2549](https://www.rfc-editor.org/rfc/rfc2549.html)、[RFC 6214](https://www.rfc-editor.org/rfc/rfc6214.html)） | 4 月 1 日の冗談。ただし「IP はデータグラムを運べる何の上でも動く」ことの説明としては正確 | — |
+
+iSCSI や NVMe/TCP は、**「遅れて届いてもよいが、欠けてはならない」ディスクのコマンド**を運ぶので、TCP のバイト列の上に長さで区切ったメッセージを載せています。RoCE v2 が TCP ではなく UDP を選んでいるのは、RDMA が再送と順序の管理を NIC の中で自分で持つためで、ここでも「下が何を渡し、上が何を自分で持つか」の分担で運び手が決まっています。
+
+<Callout type="warn" title="同じ技術は、監視をすり抜ける道にもなる">
+  「別のプロトコルの中に包む」ことは、ファイアウォールや監視の装置から中身を隠すことでもあります。MITRE ATT&CK は、攻撃者が検知や遮断を避けるために通信を別のプロトコルの中に包む手口を「Protocol Tunneling」としてまとめています（[T1572](https://attack.mitre.org/techniques/T1572/)）。
+  中でも DNS は、どの網でもまず通され、ネットワークの認証が終わる前から使えることさえあるため、命令や盗んだデータを問い合わせと応答に埋め込む通り道として使われます（[T1071.004](https://attack.mitre.org/techniques/T1071/004/)）。
+  守る側から見ると、**「443 番しか開けていないから安全」は成り立ちません**。どの運び手の上にも、ほかの何でも載せられるからです。見るべきは、ポート番号ではなく、どの宛先に、どれだけの量と頻度で通信しているかです。
+</Callout>
+
+## 実験の環境
+
+ここからは、JMAP を HTTP と WebSocket の 2 通りで話し、続けて標準入出力の 2 通りの区切り方を比べます。JMAP のサーバには、冒頭の発表でも使われていた OSS のメールサーバ Stalwart を使いました。
+
+| 項目 | 版 |
+| --- | --- |
+| Docker Engine | 29.4.0（macOS の Docker Desktop） |
+| Stalwart | 1.2.1（`stalwartlabs/stalwart:latest`、初期設定前の起動モード） |
+| Python | 3.14.0（標準ライブラリだけで HTTP と WebSocket を話す） |
+| Node.js | 24.22.1（組み込みの `WebSocket` で、ブラウザと同じ規則のクライアントとして） |
+
+```
+docker run -d --name llover-stalwart -p 127.0.0.1:18080:8080 stalwartlabs/stalwart:latest
+```
+
+Stalwart は設定ファイルがないと、一時的な管理者のパスワードをログに出して起動します。この管理者のアカウントにもメールボックスがあり、そのまま JMAP を話せます。
+
+<Callout type="warn" title="この実験は TLS を省いている">
+  RFC 8887 は、JMAP over WebSocket の接続に TLS 1.2 以上を使わなければならないとしています（[RFC 8887, Section 5.1](https://www.rfc-editor.org/rfc/rfc8887#section-5.1)）。
+  この実験では、線の上のバイト列をそのまま見るために、手元のループバックだけで平文の `ws://` を使っています。外から届く場所でこの構成を使ってはいけません。
+</Callout>
+
+## 手元で確かめる: JMAP を HTTP で話す
+
+まず、JMAP のクライアントが最初に取りに行く Session オブジェクト（`GET /jmap/session`）を見ます。このサーバが WebSocket で話せるかどうかは、ここに書かれています。RFC 8887 は、対応するサーバは `urn:ietf:params:jmap:websocket` という名前の能力を載せることと定めています（[RFC 8887, Section 3](https://www.rfc-editor.org/rfc/rfc8887#section-3)）。
+
+```
+websocket capability: {'url': 'ws/jmap/ws', 'supportsPush': True}
+```
+
+`supportsPush` が `true` なので、WebSocket の上で変更の通知も受けられます。RFC の例では `url` は `wss://` から始まる完全な URL ですが、ホスト名を設定していないこの状態では、相対的なパスが返ってきました。
+
+受信箱に 3 通のメールを作っておき、「受信箱の新しい順に 2 通の ID を探し、その件名を取る」を 1 回の POST で送ります。2 つ目の呼び出しの `#ids` が、1 つ目の結果を参照する back-reference です。
+
+```
+POST /jmap/ HTTP/1.1
+Host: 127.0.0.1:18080
+Authorization: Basic …
+Content-Type: application/json
+Content-Length: 345
+Connection: close
+
+{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{"accountId":"d333333","filter":{"inMailbox":"a"},"sort":[{"property":"receivedAt","isAscending":false}],"limit":2},"q"],["Email/get",{"accountId":"d333333","#ids":{"resultOf":"q","name":"Email/query","path":"/ids"},"properties":["subject"]},"g"]]}
+```
+
+```
+--- 応答の 1 行目: HTTP/1.1 200 OK
+Email/query q {"ids":["maaaaad","iaaaaac"]}
+Email/get g {"list":[{"subject":"msg 2","id":"maaaaad"},{"subject":"msg 1","id":"iaaaaac"}]}
+要求のヘッダ部 174 バイト / 本体 345 バイト
+```
+
+検索と取得が 1 往復で済んでいます。注目したいのは、本体の JSON に**「これは要求である」とも「何番の要求か」とも書かれていない**ことです。書く必要がないのは、HTTP がそれを知っているからです。`POST` で送ったものは要求で、同じ交換の中で返ってきたものはその応答です。
+
+## 手元で確かめる: JMAP を WebSocket で話す
+
+次に、同じサーバの `/jmap/ws` に WebSocket でつなぎます。ハンドシェイクでは、サブプロトコルとして `jmap` を名乗ります。
+
+```
+GET /jmap/ws HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Authorization: Basic …
+Sec-WebSocket-Key: （ランダムな 16 バイトの Base64）
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Protocol: jmap
+```
+
+```
+HTTP/1.1 101 Switching Protocols
+connection: upgrade
+upgrade: websocket
+sec-websocket-accept: 14GFBT6pdn6da+dvYxah9w5YueU=
+sec-websocket-protocol: jmap
+Sec-WebSocket-Accept の検算: True
+```
+
+認証は、この最初の HTTP の要求の `Authorization` で 1 回だけ行います（[RFC 8887, Section 4.1](https://www.rfc-editor.org/rfc/rfc8887#section-4.1)）。以後、接続の中のメッセージには認証の情報は付きません。
+
+さきほどと同じ 2 つの呼び出しを、今度は WebSocket の text フレームで送ります。RFC 8887 では、クライアントから送るメッセージは次の形になります（[RFC 8887, Section 4.3.2](https://www.rfc-editor.org/rfc/rfc8887#section-4.3.2)）。
+
+```json
+{"@type":"Request","id":"R1","using":[...],"methodCalls":[...]}
+```
+
+HTTP のときにはなかった `@type` と `id` が増えています。結果は次のとおりです。
+
+```
+送った枠: 81 fe 01 75 49 a8 8d 16  （枠 8 バイト + 本体 373 バイト）
+受けた枠: 81 7e 01 6b  opcode=1
+応答: {"@type":"Response","requestId":"R1","n":2}
+```
+
+フレームの先頭を読みます。
+
+- `81`: 最後の断片（FIN）で、opcode 1（text）
+- `fe`: 最上位の 1 ビットが「マスクあり」、残りの 7 ビットが 126 で「長さは続く 2 バイトに書く」
+- `01 75`: 長さ 373 バイト
+- `49 a8 8d 16`: マスクの鍵。本体の各バイトをこの 4 バイトと XOR して送る
+
+サーバからの `81 7e 01 6b` には、マスクの鍵がありません。RFC 6455 は、**クライアントは送るすべてのフレームをマスクしなければならず、サーバはマスクしてはならない**としています（[RFC 6455, Section 5.1](https://www.rfc-editor.org/rfc/rfc6455#section-5.1)）。マスクは暗号化ではなく、ブラウザの中のスクリプトが、WebSocket を理解しない途中のキャッシュやプロキシに、HTTP の要求に見えるバイト列を送り込む攻撃を防ぐためのものです。
+
+比べると、HTTP では 1 回の呼び出しごとに 174 バイトのヘッダ（認証の情報を含む）が付いていたのに対し、WebSocket では 1 回あたり 8 バイトの枠と、本体に増えた 28 バイトの `@type` と `id` で済んでいます。ただし、これは HTTP/1.1 で毎回接続を張った場合との比較です。HTTP/2 ならヘッダは圧縮され、接続も使い回されるので、差はずっと小さくなります。**WebSocket に載せ替える主な理由は、バイト数ではありません。**
+
+### 同じ接続で、サーバから通知が来る
+
+WebSocket に載せ替える本当の理由は、次の動作です。同じ接続で `WebSocketPushEnable` を送り、別の接続（HTTP）から受信箱にメールを 1 通足します。
+
+```
+→ {"@type":"WebSocketPushEnable","dataTypes":["Email","Mailbox"]}
+（0.3 秒後に、別の接続からメールを 1 通作成）
++0.31s {"@type":"StateChange","changed":{"d333333":{"Mailbox":"sau","Email":"sau"}}}
+```
+
+メールを作った直後に、**クライアントが何も尋ねていないのに**、サーバから `StateChange` が届きました。中身は「このアカウントの Email と Mailbox の状態が `sau` に進んだ」ことだけで、メールそのものは入っていません。クライアントは、手元に持っている状態との差分を `Email/changes` で取りに行きます。その要求も、同じ WebSocket の接続で送れます。
+
+JMAP を HTTP で使う場合、変更を知る方法は、EventSource（SSE、第 88 回）でつなぎっぱなしにするか、サーバから指定の URL へ通知を送ってもらうか（Web Push の形、第 89 回）です。どちらも、通知を受けた後の取得は**別の HTTP の要求**になります。冒頭の発表が「1 つの接続で変更通知とデータを取得したい」と述べているのは、この点です（[JMAP is Game Changer](https://speakerdeck.com/tascript/jmap-is-game-changer)）。
+
+### HTTP が教えてくれていたことを、自分で書く
+
+ここで、WebSocket に載せ替えたときに増えた `@type` と `id` の意味がはっきりします。
+
+| HTTP の上では | WebSocket の上では |
+| --- | --- |
+| `POST` の本体なら要求、応答の本体なら応答 | 同じ管を両方向に、要求・応答・通知・エラーが流れる。だから `@type` で種類を書く |
+| 応答は、同じ交換の要求に対応する | 複数の要求を続けて送れ、応答の順番も決まっていない。だから `id` と `requestId` で対応を取る |
+| エラーは HTTP の状態コードと Problem Details で返る | 状態コードがないので、`"@type":"RequestError"` のメッセージで返す |
+
+実際に、JSON ではない文字列を送ると、接続は切られずに、エラーがメッセージとして返ってきました。
+
+```
+→ The quick brown fox
+← {"@type":"RequestError","type":"urn:ietf:params:jmap:error:notJSON","status":400,"detail":"Failed to parse JSON: ..."}
+```
+
+`status` の 400 は、HTTP の状態コードを**本体の中に書き写したもの**です。HTTP が運び手だったときに運び手が担っていた仕事が、運び手を替えたことで上の層に移ってきています。これは JMAP に限らない一般的な傾向で、**メッセージの種類、要求と応答の対応、エラーの伝え方、認証の範囲**の 4 つは、運び手を替えるたびに「誰が持つのか」を確かめ直す必要があります。
+
+なお、binary フレームを送ると、Stalwart は何も返さず、5 秒待っても応答はありませんでした。RFC 8887 は、binary フレームを受けた側は「無視するか、接続を閉じる」のどちらでもよいとしていて（[RFC 8887, Section 4.3.1](https://www.rfc-editor.org/rfc/rfc8887#section-4.3.1)）、Stalwart は無視するほうを選んでいるようです。
+
+### 認証の寿命が、接続の寿命になる
+
+RFC 8887 には、運び手を替えたことによる別の変化も書かれています。ハンドシェイクで示した認証の情報は、**その WebSocket の接続が続く限り有効**で、途中で期限が切れたら、サーバは以後の要求を認証されていないものとして扱うか、接続を閉じることができる、としています（[RFC 8887, Section 4.2](https://www.rfc-editor.org/rfc/rfc8887#section-4.2)）。
+
+HTTP なら、要求のたびに `Authorization` を付けるので、トークンを失効させれば次の要求から拒めます。WebSocket では、確かめるのは最初の 1 回だけです。**何時間もつながり続ける接続では、失効させたはずのトークンで開いた接続が生き残りうる**ので、サーバの側で期限を見て接続を切る処理が必要になります。
+
+### 名乗ったサブプロトコルを、確かめる
+
+最後に、サブプロトコルの交渉を見ます。`Sec-WebSocket-Protocol` を付けずに、また `chat` という別の名前を付けてつなぐと、Stalwart はどちらにも `sec-websocket-protocol: jmap` を付けて 101 を返しました。
+
+Python の自作クライアントはこれを気にせず使えますが、規則どおりのクライアントは違います。RFC 6455 は、**クライアントが求めていないサブプロトコルを応答が示したら、クライアントは接続を失敗させなければならない**と定めています（[RFC 6455, Section 4.1](https://www.rfc-editor.org/rfc/rfc6455#section-4.1)）。Node.js の組み込みの `WebSocket` で確かめると、そのとおりになりました。
+
+```
+undefined -> error
+["chat"]  -> error
+["jmap"]  -> open, protocol = jmap
+```
+
+ブラウザで JMAP over WebSocket のクライアントを書くときは、`new WebSocket(url, ["jmap"])` のように、サブプロトコルを必ず名乗ります。逆にサーバを書くときは、クライアントが名乗った一覧の中から選び、一覧になければヘッダを返さないのが規則です。第 165 回の ALPN と同じで、**双方が同じものを話すつもりだという確認は、一致しないときに断って初めて意味を持ちます**。
+
+## 手元で確かめる: パイプの上の 2 つの区切り方
+
+最後に、運び手を「順序どおりのバイト列」に替えます。同じ JSON-RPC のメッセージを、子プロセスの標準入力に 2 通りの区切り方で書き込みました。
+
+- **LSP の形**: `Content-Length: 45\r\n\r\n` を前に付け、その後ろにちょうど 45 バイトの本体
+- **MCP の stdio の形**: 本体の後ろに改行を 1 つ
+
+```
+[lsp]  1 通目の線の上: b'Content-Length: 45\r\n\r\n{"jsonrpc": "2.0", "id": 1, "method": "ping"}'
+[line] 1 通目の線の上: b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'
+```
+
+子プロセスは、受け取ったメッセージを 1 通ずつ `got ...` と表示します。書き込み方を 3 通り変えました。
+
+```
+[lsp] 2 通を 1 回の write で
+    got {"jsonrpc":"2.0","id":1,"method":"ping"}
+    got {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+[lsp] 1 通を 3 回に分けて write
+    got {"jsonrpc":"2.0","id":1,"method":"ping"}
+[lsp] 改行を含む整形済み JSON
+    got {"jsonrpc":"2.0","id":1,"method":"ping"}
+
+[line] 2 通を 1 回の write で
+    got {"jsonrpc":"2.0","id":1,"method":"ping"}
+    got {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+[line] 1 通を 3 回に分けて write
+    got {"jsonrpc":"2.0","id":1,"method":"ping"}
+[line] 改行を含む整形済み JSON
+    parse error: b'{\n'
+    parse error: b'  "jsonrpc": "2.0",\n'
+    parse error: b'  "id": 1,\n'
+    parse error: b'  "method": "ping"\n'
+    parse error: b'}\n'
+```
+
+パイプは、2 通を 1 回で書けば 1 回で読ませ、1 通を 3 回に分けて書けば分けて読ませることがあります。**書いた単位は届きません**。どちらの区切り方も、その上でメッセージの境目を正しく取り戻せています。
+
+違いが出たのは、本体に改行が入ったときです。長さで区切る LSP の形は、本体の中身を見ないので影響を受けません。改行で区切る形では、整形された JSON が 5 つの壊れたメッセージになりました。MCP の仕様が「メッセージは改行で区切り、埋め込みの改行を含んではならない」と定めているのはこのためです。さらに、サーバは標準出力に MCP のメッセージ以外を書いてはならないとしています（[MCP: Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)）。デバッグのつもりで `print()` を 1 行足すと、それは運び手の上に流れ、相手には壊れたメッセージとして届きます。ログは標準エラー出力に書きます。
+
+WebSocket の上の JMAP では、こうした区切りの心配はありませんでした。WebSocket がメッセージの単位を守って届けるからです。**区切りを誰が持つかは、運び手が渡すものが「バイト列」か「メッセージ」かで決まります。**
+
+## 載せると何が起きるか
+
+ここまでの組み合わせに共通して現れる代償を並べます。どれも、この連載のどこかで実際に確かめたものです。
+
+| 代償 | 何が起きるか | 出てくる場所 |
+| --- | --- | --- |
+| **ヘッダが重なり、MTU が減る** | 包むたびに外側のヘッダが増え、中に入るパケットが小さくなる。超えたものが黙って捨てられることがある | PPPoE で 1492（第 64 回）、IPv4 の上の VXLAN で 1450（第 65 回） |
+| **再送が二重になる** | 信頼できるバイト列の上に、再送する別のプロトコルを載せると、損失のたびに両方が再送し、遅延が膨らむ | IP を TCP で運ぶ VPN（第 168 回、第 170 回） |
+| **待たされる** | 1 本のバイト列に複数の流れを載せると、1 つの欠けが後ろ全部を止める | HTTP/2 の HOL ブロッキング（第 80 回） |
+| **運び手の仕事を上で作り直す** | 区切り、種類、対応付け、エラー、認証の範囲を、上の層が持つことになる | この回の JMAP と標準入出力の実験 |
+| **中身が見えなくなる** | 途中の装置が、中で何が話されているかを見分けられない。守る側の監視も効かなくなる | DoH と企業の網（第 76 回）、プロトコルトンネリング |
+| **途中の装置の都合に縛られる** | 運び手を理解する途中の装置（プロキシ、ロードバランサ）が、アイドルの接続を切る、知らない拡張を通さない | WebSocket の運用（第 88 回）、Kubernetes が SPDY をやめた理由 |
+
+包む前後のヘッダの量は、足し算で見積もれます。たとえば外側が IPv6 の WireGuard なら、IPv6 のヘッダ 40 バイト、UDP 8 バイト、WireGuard のデータのヘッダ 16 バイト（種類と予約 4、受け手の番号 4、カウンタ 8）、認証タグ 16 バイトで、合わせて 80 バイトです（[WireGuard Protocol](https://www.wireguard.com/protocol/)）。外の MTU が 1500 なら、トンネルの中で使えるのは 1420 バイトになります。
+
+## 「X over Y」を読むときの 4 つの問い
+
+新しい「X over Y」に出会ったら、次の 4 つを順に確かめると、その組み合わせの性質がほぼ分かります。
+
+1. **Y は何を渡すのか**: バイト列か、メッセージか、データグラムか、フレームか
+2. **X は何を求めるのか、差は誰が埋めるのか**: 区切り、再送、順序、要求と応答の対応を、X の仕様が持つのか、間の層が持つのか
+3. **どこで終わり、誰が中身を見られるのか**: Y を終える装置（ロードバランサ、プロキシ、トンネルの出口）は、X の中身を見られる。認証はどこで、何回行われるのか
+4. **何のために載せたのか**: 通り道、ブラウザ、基盤の借用、仮想化、網の接続、古い仕組みの延命、隠すこと。動機が分かれば、受け入れた代償にも納得がいく
+
+JMAP over WebSocket に当てはめると、次のようになります。Y（WebSocket）はメッセージを渡し、X（JMAP）は JSON のメッセージを求めるので区切りは要らないが、種類と対応付けは `@type` と `id` で X が自分で持つ。Y を終えるのは TLS を終える装置で、認証はハンドシェイクの 1 回だけ。載せた理由は、通知とデータの取得を 1 本の接続にまとめたいから。表の 1 行に収まる程度の分析ですが、実装で気をつける点（サブプロトコルを名乗る、認証の期限で接続を切る）は、すべてここから出てきます。
+
+## まとめ
+
+- 「X over Y」は「Y が、X の必要とするものを渡せる」という主張である。下の層が渡すものは、順序どおりのバイト列、メッセージ、データグラム、フレームやパケットの 4 種類しかない
+- 食い違いは間で埋める。バイト列の上のメッセージには区切りが要り、バイト列の上のパケットは再送が二重になり、データグラムの上のバイト列には再送と並べ直しが要る
+- 載せ替える動機は、通り道、ブラウザ、基盤の借用、網の仮想化、新旧の網の接続、古い仕組みの延命、そして隠すことにほぼ分かれる
+- WebSocket の上には、IANA に登録されたサブプロトコルとして JMAP、XMPP、SIP、MQTT、VNC、充電器やビル設備のプロトコルまでが載っている。HTTP の CONNECT の上には TCP、UDP、IP、PPP が載り、層の上下は逆転しうる
+- パケットの中にパケットを入れる組み合わせ（GRE、VXLAN、6in4、MAP-E、ESP in UDP、GTP-U）は、網の仮想化と新旧の網の接続のために使われる。iSCSI や NVMe/TCP、USB/IP は、直結していた機器を網越しに使う
+- JMAP を WebSocket に載せ替えると、要求ごとの HTTP ヘッダが消え、同じ接続でサーバからの `StateChange` を受け取れる。その代わり、HTTP が持っていたメッセージの種類、要求と応答の対応、エラーを、`@type`、`id`、`RequestError` で自分で書く
+- WebSocket では認証はハンドシェイクの 1 回だけなので、長く続く接続はトークンの期限をサーバの側で見て切る必要がある。サブプロトコルは必ず名乗り、求めていない名前が返ってきたら規則どおりのクライアントは接続を失敗させる
+- 標準入出力のようなバイト列の上では、長さで区切る（LSP）か、改行で区切る（MCP）かを決める。改行で区切るなら、本体の改行と、標準出力への余計な出力が、そのままメッセージを壊す
+- 包むことは隠すことでもあり、DNS や HTTPS の中に別の通信を入れる手口は攻撃にも使われる。443 番しか開けていないことは、何も通らないことを意味しない
