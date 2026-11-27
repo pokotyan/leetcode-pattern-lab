@@ -88,7 +88,7 @@ WebSocket は、HTTP の接続を「メッセージを双方向に流す管」�
 | `coap` | CoAP（[RFC 8323](https://www.rfc-editor.org/rfc/rfc8323.html)） | 小さな機器向けの REST を、UDP が通らない網から |
 | `rfb` | VNC の画面転送（[RFC 6143](https://www.rfc-editor.org/rfc/rfc6143.html)） | ブラウザの中でリモートの画面を操作する |
 | `v12.stomp`、`amqp` | メッセージブローカのプロトコル | ブラウザからキューを購読する |
-| `ocpp1.6`、`ocpp2.0.1` | 電気自動車の充電器の管理プロトコル | 充電器と管理サーバの間の常時接続 |
+| `ocpp1.6`、`ocpp2.0.1` | 電気自動車の充電器の管理プロトコル（OCPP） | 充電器の側が WebSocket のクライアントになって管理サーバにつなぎ、その接続を保つ（[ABB Terra AC Charger OCPP 1.6 Implementation Overview](https://library.e.abb.com/public/8f07987a3a284da6bf4e4f8f53cd6502/ABB_Terra_AC_Charger_OCPP1.6_ImplementationOverview%20_v1.8_FW1.6.6.pdf)） |
 | `hub.bsc.bacnet.org` | BACnet（ビルの設備制御） | 空調や照明の制御を IP の網越しに |
 | `opcua+uacp` | OPC UA（工場の機器） | 工場の機器の情報をブラウザやクラウドへ |
 | `sqlnet.oracle.com` | Oracle Database の接続 | DB への接続を HTTP の経路に通す |
@@ -163,7 +163,7 @@ SSH のチャネルも、プロセスの標準入出力も、「順序どおり�
 | DS-Lite（[RFC 6333](https://www.rfc-editor.org/rfc/rfc6333.html)）、MAP-E（[RFC 7597](https://www.rfc-editor.org/rfc/rfc7597.html)） | IPv4 を IPv6 に | IPv6 だけの網の上で IPv4 を使い続ける | 第 64 回 |
 | VXLAN（[RFC 7348](https://www.rfc-editor.org/rfc/rfc7348.html)、UDP 4789）、Geneve（[RFC 8926](https://www.rfc-editor.org/rfc/rfc8926.html)、UDP 6081） | Ethernet のフレームを UDP に | 利用者ごとの L2 を、物理の L3 の網の上に何百万も作る | 第 61 回、第 65 回 |
 | ESP in UDP（[RFC 3948](https://www.rfc-editor.org/rfc/rfc3948.html)、UDP 4500）、WireGuard | 暗号化した IP を UDP に | NAT を越える VPN | 第 170 回 |
-| GTP-U（UDP 2152） | 利用者の IP パケットを、携帯網の中の UDP に | 端末が基地局を移っても、同じ IP アドレスのまま通信を続ける | — |
+| GTP-U（UDP 2152） | 利用者の IP パケットを、携帯網の中の UDP に（[3GPP TS 29.281](https://www.etsi.org/deliver/etsi_ts/129200_129299/129281/18.02.00_60/ts_129281v180200p.pdf)） | 端末の IP アドレスは奥のゲートウェイ（PDN GW）が割り当て、基地局を移るときは手前のゲートウェイ（Serving GW）がトンネルの行き先を切り替える。端末は同じ IP アドレスのまま通信を続けられる（[3GPP TS 23.401, 4.4.3.2 / 4.4.3.3](https://www.etsi.org/deliver/etsi_ts/123400_123499/123401/19.06.00_60/ts_123401v190600p.pdf)） | — |
 
 ### リンクの上、遠くの機器
 
@@ -172,14 +172,14 @@ SSH のチャネルも、プロセスの標準入出力も、「順序どおり�
 | PPP over Ethernet（[RFC 2516](https://www.rfc-editor.org/rfc/rfc2516.html)） | 電話回線の時代の「ログインしてからつなぐ」仕組みを、光回線の Ethernet の上で使う | 第 64 回 |
 | EAP over LAN（IEEE 802.1X） | IP アドレスをもらう前に、Ethernet や Wi-Fi の上で認証する | 第 172 回 |
 | iSCSI（[RFC 7143](https://www.rfc-editor.org/rfc/rfc7143.html)、TCP 3260） | SCSI のコマンドを TCP で運び、遠くのディスクを手元のディスクとして使う | — |
-| NVMe/TCP（TCP 4420） | NVMe のコマンドを TCP で運ぶ。iSCSI の後継の位置づけ | — |
-| RoCE v2（UDP 4791） | InfiniBand の RDMA を、UDP と IP の上で使う。GPU の計算機をつなぐ網で使われる | — |
+| NVMe/TCP（TCP 4420） | NVMe のコマンドを TCP で運ぶ（[NVM Express TCP Transport Specification 1.1](https://nvmexpress.org/wp-content/uploads/NVM-Express-TCP-Transport-Specification-Revision-1.1-2024.08.05-Ratified.pdf)）。NVM Express は、iSCSI が TCP/IP の上の SCSI の運び方であるのと同じ意味で、NVMe/TCP は TCP/IP の上の NVMe の運び方だと説明している（[NVMe/TCP: What You Need to Know About the Specification](https://nvmexpress.org/?p=4184)） | — |
+| RoCE v2（UDP 4791） | RDMA を UDP に包み、IP の網の上で使う。Meta は AI の学習に使う GPU クラスタのノード間の通信に RoCE v2 を選び、数千台の GPU をつなぐクラスタを運用している（[RoCE networks for distributed AI training at scale](https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/)） | — |
 | USB/IP | USB の要求を TCP で運び、遠くの USB 機器を手元に挿したように見せる（[Linux: USB/IP protocol](https://docs.kernel.org/usb/usbip_protocol.html)） | — |
 | IPv6 over BLE（[RFC 7668](https://www.rfc-editor.org/rfc/rfc7668.html)）、IPv6 over IEEE 802.15.4（[RFC 4944](https://www.rfc-editor.org/rfc/rfc4944.html)） | 電池で動く小さな機器に IPv6 のアドレスを持たせる。802.15.4 の方式は Thread の土台 | 第 56 回 |
 | IP over InfiniBand（[RFC 4391](https://www.rfc-editor.org/rfc/rfc4391.html)） | RDMA 用の網で、ふつうの IP の通信もする | — |
 | IP over 伝書鳩（[RFC 1149](https://www.rfc-editor.org/rfc/rfc1149.html)、[RFC 2549](https://www.rfc-editor.org/rfc/rfc2549.html)、[RFC 6214](https://www.rfc-editor.org/rfc/rfc6214.html)） | 4 月 1 日の冗談。ただし「IP はデータグラムを運べる何の上でも動く」ことの説明としては正確 | — |
 
-iSCSI や NVMe/TCP は、**「遅れて届いてもよいが、欠けてはならない」ディスクのコマンド**を運ぶので、TCP のバイト列の上に長さで区切ったメッセージを載せています。RoCE v2 が TCP ではなく UDP を選んでいるのは、RDMA が再送と順序の管理を NIC の中で自分で持つためで、ここでも「下が何を渡し、上が何を自分で持つか」の分担で運び手が決まっています。
+iSCSI や NVMe/TCP は、**「遅れて届いてもよいが、欠けてはならない」ディスクのコマンド**を運ぶので、TCP のバイト列の上に長さで区切ったメッセージを載せています。一方 RoCE v2 は、TCP ではなく UDP に包みます。Meta の例では、GPU 同士をつなぐ専用の網を、損失なく転送する（lossless）ように作ったうえで使っています（同上）。ここでも、下の網に何を求め、上が何を自分で持つかの分担で運び手が決まっています。
 
 <Callout type="warn" title="同じ技術は、監視をすり抜ける道にもなる">
   「別のプロトコルの中に包む」ことは、ファイアウォールや監視の装置から中身を隠すことでもあります。MITRE ATT&CK は、攻撃者が検知や遮断を避けるために通信を別のプロトコルの中に包む手口を「Protocol Tunneling」としてまとめています（[T1572](https://attack.mitre.org/techniques/T1572/)）。
